@@ -1,0 +1,71 @@
+"""전역 설정: 샘플레이트/프레임률/파라미터 범위."""
+from dataclasses import dataclass, field
+
+
+@dataclass
+class AudioConfig:
+    sample_rate: int = 24000
+    hop_size: int = 240          # 10 ms 프레임
+    win_size: int = 1024
+    n_fft: int = 1024
+    n_mels: int = 80
+    fmin: float = 40.0
+    fmax: float = 12000.0
+
+    @property
+    def frame_rate(self) -> float:
+        return self.sample_rate / self.hop_size
+
+
+@dataclass
+class SourceConfig:
+    """성문(글로탈) 소스 설정."""
+    f0_min: float = 55.0
+    f0_max: float = 880.0
+    n_harmonics: int = 180        # 가산합성 상한(나이퀴스트 위에서는 자동 마스킹)
+    n_rd_tables: int = 16         # LF 파형 사전(Rd 그리드) 크기
+    rd_min: float = 0.3           # pressed(긴장)
+    rd_max: float = 2.7           # breathy(기식)
+    table_size: int = 2048
+
+
+@dataclass
+class FilterConfig:
+    """성도(공명) 필터 설정."""
+    n_formants: int = 6
+    n_antiformants: int = 2       # 비음/마찰음용 반공명(zero)
+    f_min: float = 150.0
+    f_max: float = 11000.0
+    bw_min: float = 30.0
+    bw_max: float = 800.0
+    ir_size: int = 512            # LTV 필터 임펄스응답 길이
+    n_allpass: int = 4            # 위상(군지연) 정형용 올패스 단수
+    # Kelly-Lochbaum 단면 수 N = 2 * L_tract * fs / c.
+    # 24 kHz, c=350 m/s, L=17.5 cm -> N=24 (균일관 공진이 정확히 500/1500/2500 Hz).
+    n_tract_sections: int = 24
+    tract_length_cm: float = 17.5
+    sound_speed_cm_s: float = 35000.0
+
+
+@dataclass
+class NoiseConfig:
+    n_bands: int = 40             # 노이즈 대역 게인 개수
+    # 성문 개방기에 동기화된 진폭변조(기식음) 세기 범위
+    am_depth_max: float = 1.0
+
+
+@dataclass
+class Config:
+    audio: AudioConfig = field(default_factory=AudioConfig)
+    source: SourceConfig = field(default_factory=SourceConfig)
+    filt: FilterConfig = field(default_factory=FilterConfig)
+    noise: NoiseConfig = field(default_factory=NoiseConfig)
+
+
+DEFAULT = Config()
+
+
+def sections_for(sample_rate: int, tract_length_cm: float = 17.5,
+                 sound_speed_cm_s: float = 35000.0) -> int:
+    """샘플레이트에 맞는 도파관 단면 수(단면당 왕복지연 = 1샘플)."""
+    return max(2, round(2.0 * tract_length_cm * sample_rate / sound_speed_cm_s))

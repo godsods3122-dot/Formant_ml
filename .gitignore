@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+out/
+runs/
+data/
+*.wav
+!docs/**/*.wav
+.DS_Store
