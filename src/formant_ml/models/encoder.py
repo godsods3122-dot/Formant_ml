@@ -16,6 +16,21 @@ from ..dsp.sibilant import SibilantParams
 from .synth import Controls
 
 
+def _init_basis(k: int, d: int) -> torch.Tensor:
+    """조음 좌표 기저의 초기값 (K, d).
+
+    0: 전체 이동(성도 길이/화자 규모)   1: F1 vs F2 대립(개구도)
+    2: 전/후설                          그 이상: 작은 난수
+    """
+    b = torch.randn(k, d) * 0.05
+    b[:, 0] = 1.0
+    if d > 1:
+        b[0, 1], b[1, 1] = 1.0, -1.0
+    if d > 2 and k > 2:
+        b[1, 2], b[2, 2] = 1.0, -1.0
+    return b
+
+
 class ConvGRUBackbone(nn.Module):
     def __init__(self, in_dim: int, hidden: int = 256, n_conv: int = 3):
         super().__init__()
@@ -52,7 +67,15 @@ class ControlEncoder(nn.Module):
 
         # amp, rd, f0 보정, tilt, jitter, shimmer
         self.head_source = nn.Linear(d, 6)
-        self.head_formant = nn.Linear(d, 3 * K)        # dfreq, bw, gain
+        # 포먼트 주파수: K 개를 독립으로 내지 않고 저차원 조음 좌표로 낸다.
+        self.basis_dim = int(getattr(cfg.filt, "formant_basis_dim", 0) or 0)
+        if self.basis_dim > 0:
+            self.head_formant_z = nn.Linear(d, self.basis_dim)
+            self.formant_basis = nn.Parameter(_init_basis(K, self.basis_dim))
+            self.formant_mean = nn.Parameter(torch.zeros(K))
+            self.head_formant = nn.Linear(d, 2 * K)    # bw, gain 만
+        else:
+            self.head_formant = nn.Linear(d, 3 * K)    # dfreq, bw, gain
         self.head_anti = nn.Linear(d, 2 * Ka)
         self.head_noise = nn.Linear(d, Nb + 3)         # 대역 + entry + am + roughness
         self.head_allpass = nn.Linear(d, 2 * Na)       # 성도 군지연
@@ -78,14 +101,23 @@ class ControlEncoder(nn.Module):
         jitter = torch.sigmoid(s[..., 4:5]) * 0.03      # 최대 3% 주기 요동
         shimmer = torch.sigmoid(s[..., 5:6]) * 0.30
 
-        # 포먼트: 누적합으로 F1 < F2 < ... 를 구조적으로 보장 (순서 뒤집힘 불가)
+        # 포먼트: 누적합으로 F1 < F2 < ... 를 구조적으로 보장 (순서 뒤집힘 불가).
+        # basis_dim > 0 이면 간격 로짓을 저차원 부분공간 안에서만 움직인다
+        # -> 5개 포먼트가 제각각 노는 물리적으로 불가능한 조합이 표현 불가능해진다.
         fo = self.head_formant(h)
-        step = F.softplus(fo[..., : self.K]) + 60.0
+        if self.basis_dim > 0:
+            z = self.head_formant_z(h)                          # (B, T, d)
+            logits = self.formant_mean + z @ self.formant_basis.T
+            bw_raw, gain_raw = fo[..., : self.K], fo[..., self.K:]
+        else:
+            logits = fo[..., : self.K]
+            bw_raw = fo[..., self.K: 2 * self.K]
+            gain_raw = fo[..., 2 * self.K:]
+        step = F.softplus(logits) + 60.0
         freq = cfg.filt.f_min + torch.cumsum(step, dim=-1)
         freq = freq.clamp(cfg.filt.f_min, cfg.filt.f_max)
-        bw = scale_sigmoid(fo[..., self.K: 2 * self.K],
-                           cfg.filt.bw_min, cfg.filt.bw_max)
-        gain = exp_sigmoid(fo[..., 2 * self.K:], max_value=4.0)
+        bw = scale_sigmoid(bw_raw, cfg.filt.bw_min, cfg.filt.bw_max)
+        gain = exp_sigmoid(gain_raw, max_value=4.0)
 
         an = self.head_anti(h)
         af = scale_sigmoid(an[..., : self.Ka], 200.0, 6000.0)

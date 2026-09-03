@@ -18,6 +18,7 @@
 
 - 설계와 로드맵: [`docs/PLAN.md`](docs/PLAN.md)
 - 구현된 방정식: [`docs/THEORY.md`](docs/THEORY.md)
+- 조음 제약(속도/포먼트 군집/비강/압력): [`docs/ARTICULATION.md`](docs/ARTICULATION.md)
 - 선행연구 정리: [`docs/LITERATURE.md`](docs/LITERATURE.md)
 - **목소리를 만들고 조종하는 법: [`docs/VOICE.md`](docs/VOICE.md)**
 

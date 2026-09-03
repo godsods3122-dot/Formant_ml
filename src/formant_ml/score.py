@@ -32,7 +32,7 @@ from .dsp.sibilant import PRESETS as SIB_PRESETS
 from .dsp.sibilant import SibilantParams
 from .gestures import GESTURES, base
 from .models.synth import Controls, PhysicalVoiceSynth
-from .presets import FRICATIVES, VOWELS
+from .presets import FRICATIVES, LOCUS, SIB_POLE_RELEASE_HZ, VOWELS
 from .utils import band_bump, band_shelf, ramp
 from .voice import VoiceProfile, extend_formants
 
@@ -46,6 +46,8 @@ SCALAR_PARAMS = {
     "shimmer": "진폭 요동 비율",
     "noise_entry": "난류 주입 위치 0=성문 … K=입술 … K+6=성도 완전 우회",
     "noise_am": "성문동기 노이즈 변조 깊이 (기식성)",
+    "aspiration": "성문 기식 노이즈 (성도 전체를 통과). 0.01≈-25dB, 0.05≈-11dB",
+    "velum_open": "연구개 개도 0~1 (비음). 0 이면 비강 극-영점이 정확히 상쇄된다",
     "noise_rough": "난류의 시간 변조 (0 = 정상 히스, 1 = 거친 난류)",
     "noise_gain": "난류 전체 세기",
     "noise_center": "난류 대역 중심 [Hz]",
@@ -94,6 +96,27 @@ def _vowel_formants(name: str, prof: VoiceProfile, n: int) -> list[float]:
     return extend_formants(f + list(prof.formants[len(f):]), n)
 
 
+def _locus_track(phone: str, vowel: str, prof: VoiceProfile, k: int, t: int,
+                 split: float) -> torch.Tensor:
+    """자음 locus -> 모음 목표의 포먼트 궤적 (1, T, K).
+
+    실제 전이 곡선은 여기서 그리지 않는다. 계단 목표만 주고, 곡선은
+    `gestures_dynamics` 의 임계감쇠 2차계가 만든다 — 혀의 관성이 곧 전이다.
+    """
+    vf = _vowel_formants(vowel, prof, k)
+    loc = LOCUS.get(phone)
+    if loc is None:
+        return torch.tensor(vf).reshape(1, 1, -1).expand(1, t, k).contiguous()
+    scale = (prof.formants[0] / VOWELS["a"][0]) if prof.formants else 1.0
+    cf = [v * scale for v in loc]
+    tracks = []
+    for i in range(k):
+        start = cf[i] if i < len(cf) else vf[i]
+        tracks.append(ramp(t, [(0.0, start), (split, start),
+                              (min(split + 1e-3, 1.0), vf[i]), (1.0, vf[i])]))
+    return torch.cat(tracks, dim=-1)
+
+
 # ------------------------------------------------------------- 세그먼트 만들기
 def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
     """세그먼트 하나 -> 프레임률 제어 dict (+ 'sib' 하위 dict)."""
@@ -136,32 +159,48 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
         cf, bw, pos, g = FRICATIVES.get(phone, FRICATIVES["s"])
         # 소스는 광대역, 모양은 치찰음 필터가 만든다(둘이 겹치면 손잡이가 죽는다).
         nb = band_shelf(NB, 500.0, g, a.sample_rate).reshape(1, 1, -1)
-        if kind == "fricative":
-            c["harmonic_amp"] = torch.zeros(1, t, 1)
-            c["noise_bands"] = nb.expand(1, t, NB).contiguous()
-            env = torch.ones(1, t, 1)
-        else:
-            split = float(seg.get("onset_ratio", 0.42))
-            c["harmonic_amp"] = ramp(t, [(0.0, 0.0), (split, 0.0),
-                                         (split + 0.08, 1.0), (1.0, 0.85)])
-            env = ramp(t, [(0.0, 1.0), (split, 1.0), (split + 0.1, 0.02), (1.0, 0.01)])
-            c["noise_bands"] = (nb * env).contiguous()
-            c["formant_freq"] = torch.cat([
-                ramp(t, [(0.0, _vowel_formants("i", prof, K)[k]),
-                         (split, _vowel_formants("i", prof, K)[k]),
-                         (split + 0.15, _vowel_formants(vowel, prof, K)[k]),
-                         (1.0, _vowel_formants(vowel, prof, K)[k])])
-                for k in range(K)], dim=-1)
-        # 치찰음 필터를 쓰는 동안에는 노이즈를 포먼트 캐스케이드에 통과시키지
-        # 않는다. 앞공동 공진을 '캐스케이드의 마지막 포먼트' 와 '치찰음 극' 두
-        # 군데서 모델링하면 이중 계산이 되어, 치찰음 파라미터를 돌려도 소리가
-        # 안 바뀐다(캐스케이드의 고정된 극이 이긴다).
-        c["noise_entry"] = torch.full((1, t, 1), float(K) + 6.0)
-        # 화자의 치찰음 지문을 이 구간에만 켠다
         sp = SIB_PRESETS.get(phone)
         sib = prof.sibilant_params((1, t, 1))
         if sp is not None and seg.get("use_profile_sibilant", True) is False:
             sib = SibilantParams.constant((1, t, 1), *sp, 1.0, prof.roughness)
+
+        if kind == "fricative":
+            c["harmonic_amp"] = torch.zeros(1, t, 1)
+            c["noise_bands"] = nb.expand(1, t, NB).contiguous()
+            env = torch.ones(1, t, 1)
+            c["formant_freq"] = _locus_track(phone, vowel, prof, K, t, split=1.0)
+        else:
+            # --- 자음 -> 모음 전이. 세 가지가 동시에 일어나야 '이어져' 들린다.
+            #   (1) 포먼트가 자음의 조음 위치(locus)에서 모음으로 미끄러진다.
+            #   (2) 협착이 열리며 압력이 성문으로 옮겨가 **기식 노이즈**가 난다.
+            #       이 성분만이 성도 전체를 통과하므로, 마찰음과 모음이 같은
+            #       공명기를 공유한다는 증거가 된다. 이게 없으면 두 스펙트럼을
+            #       그냥 크로스페이드한 소리가 되어 따로 논다.
+            #   (3) 앞공동이 길어져 치찰음 극이 내려간다.
+            split = float(seg.get("onset_ratio", 0.42))
+            vot = float(seg.get("vot", 0.05))          # 전이(성대 진동 시작)까지
+            rel = split + vot / max(float(seg.get("dur", 0.5)), 1e-3)
+            c["harmonic_amp"] = ramp(t, [(0.0, 0.0), (split, 0.0),
+                                         (rel, 1.0), (1.0, 0.85)])
+            env = ramp(t, [(0.0, 1.0), (split, 1.0), (rel, 0.02), (1.0, 0.01)])
+            c["noise_bands"] = (nb * env).contiguous()
+            c["formant_freq"] = _locus_track(phone, vowel, prof, K, t, split)
+            c["aspiration"] = ramp(t, [
+                (0.0, 0.0), (split, 0.0),
+                (min(split + 0.03, 1.0), float(seg.get("aspiration_peak", 0.08))),
+                (min(rel + 0.10, 1.0), 0.004), (1.0, 0.0)])
+            # 앞공동이 열리며 치찰음 극이 내려간다
+            p0 = float(sib.pole_f.reshape(-1)[0]) if torch.is_tensor(sib.pole_f) \
+                else float(sib.pole_f)
+            sib.pole_f = ramp(t, [(0.0, p0), (split, p0),
+                                  (min(rel + 0.05, 1.0), SIB_POLE_RELEASE_HZ),
+                                  (1.0, SIB_POLE_RELEASE_HZ)])
+        # 치찰음 필터를 쓰는 동안에는 노이즈를 포먼트 캐스케이드에 통과시키지
+        # 않는다. 앞공동 공진을 '캐스케이드의 마지막 포먼트' 와 '치찰음 극' 두
+        # 군데서 모델링하면 이중 계산이 되어, 치찰음 파라미터를 돌려도 소리가
+        # 안 바뀐다(캐스케이드의 고정된 극이 이긴다).
+        # 성도 전체를 통과하는 성분은 위의 `aspiration` 이 따로 담당한다.
+        c["noise_entry"] = torch.full((1, t, 1), float(K) + 6.0)
         sib.mix = env.clamp(0.0, 1.0) if kind == "syllable" else torch.ones(1, t, 1)
         c["sib"] = sib
     else:
@@ -245,7 +284,19 @@ def build_controls(score: dict, prof: VoiceProfile, cfg: Config) -> Controls:
     if not segs:
         raise ValueError("timeline 이 비어 있습니다")
     keys = set().union(*[set(s) for s in segs]) - {"sib"}
-    merged = {k: torch.cat([s[k] for s in segs], dim=1) for k in keys}
+    # 어떤 세그먼트에만 있는 키(예: aspiration)는 나머지 구간을 0 으로 채운다.
+    ref = {k: next(s[k] for s in segs if k in s) for k in keys}
+    merged = {}
+    for k in keys:
+        parts = []
+        for seg in segs:
+            if k in seg:
+                parts.append(seg[k])
+            else:
+                n = seg["f0"].shape[1]
+                parts.append(torch.zeros(1, n, ref[k].shape[-1],
+                                         dtype=ref[k].dtype))
+        merged[k] = torch.cat(parts, dim=1)
     sib_fields = {}
     for f in ("pole_f", "pole_bw", "zero_f", "zero_bw", "tilt", "mix", "roughness"):
         sib_fields[f] = torch.cat([getattr(s["sib"], f) for s in segs], dim=1)
@@ -266,6 +317,19 @@ def build_controls(score: dict, prof: VoiceProfile, cfg: Config) -> Controls:
               "noise_bands", "noise_am", "noise_rough"):
         if k in merged:
             merged[k] = _smooth(merged[k], n)
+
+    # 조음 동역학. 여기까지의 궤적은 '목표'이고, 실제 궤적은 조음기관의 관성이
+    # 만든다. 파라미터마다 담당 조음기관의 시간상수가 다르다(혀끝 35 ms,
+    # 혀몸통 60 ms, 턱 80 ms, 연구개 100 ms). 이걸 켜면 물리적으로 불가능한
+    # 조음 속도가 표현 자체로 불가능해진다.  score 에 `coarticulation: false`
+    # 를 쓰면 끄고, `speech_rate` 로 전체 속도를 조절한다(>1 이면 빠른 말투).
+    if score.get("coarticulation", True):
+        from .dsp.gestures_dynamics import apply_to_controls
+        scale = 1.0 / max(float(score.get("speech_rate", 1.0)), 0.2)
+        sib_in = {f"sib_{f}": v for f, v in sib_fields.items()}
+        moved = apply_to_controls(merged | sib_in, cfg.audio.frame_rate, scale)
+        merged = {k: v for k, v in moved.items() if not k.startswith("sib_")}
+        sib_fields = {k[4:]: v for k, v in moved.items() if k.startswith("sib_")}
 
     merged["formant_freq"] = enforce_formant_spacing(merged["formant_freq"])
 

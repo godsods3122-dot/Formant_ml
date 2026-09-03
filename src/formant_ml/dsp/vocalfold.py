@@ -118,6 +118,72 @@ def cycle_rate(flow: torch.Tensor, sample_rate: int = 24000) -> float:
     return onsets * sample_rate / max(len(flow), 1)
 
 
+# --------------------------------------------------- 호흡(성문하압) 비선형 응답
+CM_H2O = 980.0          # 1 cmH2O = 980 dyn/cm^2
+
+
+def pressure_sweep(params: FoldParams, pressures_cm: tuple = (1, 2, 3, 4, 6, 8, 12, 16),
+                   n_samples: int = 9600, sample_rate: int = 24000,
+                   skip: int = 2400) -> list[dict]:
+    """성문하압을 훑으며 진동 여부/주기율/진폭을 잰다.
+
+    성대의 비선형성은 따로 넣을 필요가 없다 — 이미 방정식 안에 세 군데 있다.
+      1. 베르누이 압력이 면적의 **제곱**에 의존한다
+      2. 성대가 닿으면 강성이 스위치되는 **접촉(collision)** 항
+      3. 폐쇄 시 유량이 0 으로 잘리는 정류(rectification)
+    그래서 압력 하나만 움직여도 사람 목소리의 비선형 특성이 그대로 따라온다.
+    측정(기본 파라미터): **발성 역치압 1~2 cmH2O**, 압력 2배당 **약 7 dB** 증가.
+    """
+    out = []
+    for cm in pressures_cm:
+        flow, _, _ = simulate(FoldParams(**{**params.__dict__, "ps": cm * CM_H2O}),
+                              n_samples, sample_rate, oversample=4)
+        seg = flow[skip:]
+        out.append({"ps_cm": float(cm), "rms": float(seg.std()),
+                    "f0": cycle_rate(seg, sample_rate),
+                    "oscillating": bool(seg.std() > 1.0 and cycle_rate(seg) > 20)})
+    return out
+
+
+def phonation_threshold(params: FoldParams, lo_cm: float = 0.2, hi_cm: float = 12.0,
+                        steps: int = 7, **kw) -> float:
+    """발성 역치압(PTP) [cmH2O]. 이 아래에서는 성대가 아예 진동하지 않는다.
+
+    말끝이 스러지는 소리, /ㅎ/ 뒤의 유성 시작, 속삭임과 발성의 경계가 전부
+    이 문턱 하나다. 크로스페이드로 흉내내면 그 순간이 '기계처럼' 들린다.
+    """
+    for _ in range(steps):
+        mid = 0.5 * (lo_cm + hi_cm)
+        r = pressure_sweep(params, (mid,), **kw)[0]
+        lo_cm, hi_cm = (lo_cm, mid) if r["oscillating"] else (mid, hi_cm)
+    return 0.5 * (lo_cm + hi_cm)
+
+
+def pressure_to_source(ps_cm: torch.Tensor, ptp_cm: float = 2.0,
+                       db_per_doubling: float = 7.0,
+                       f0_hz_per_cm: float = 3.0,
+                       rd_per_cm: float = -0.06) -> dict:
+    """호흡 압력 하나 -> LF 소스 파라미터 (빠른 학습 경로용).
+
+    2질량 ODE 는 느려서 학습 본선에 못 쓴다. 대신 위 측정에서 얻은 관계를
+    **파라미터 사이의 구속조건**으로 넣는다. amp/F0/Rd 를 세 개의 자유로운
+    손잡이로 두지 않고 압력 하나에 묶으면, 그 자체가 물리적 정규화가 된다
+    (포먼트를 저차원 부분공간에 가두는 것과 같은 발상).
+
+    반환: {"amp": 배수, "f0_shift": Hz, "rd_shift": Rd 증분}
+    - amp: 역치 아래에서 0 (발성이 아예 없다), 위에서 압력 2배당 약 7 dB
+    - f0_shift: +2~5 Hz/cmH2O (문헌값. 2질량 모델 자체는 이 결합이 약하다)
+    - rd_shift: 압력이 높을수록 pressed 쪽(Rd 감소)
+    """
+    p = ps_cm.clamp_min(0.0)
+    on = (p > ptp_cm).to(p.dtype)
+    ratio = (p / ptp_cm).clamp_min(1e-3)
+    amp = on * 10 ** (db_per_doubling * torch.log2(ratio) / 20.0)
+    return {"amp": amp,
+            "f0_shift": f0_hz_per_cm * (p - ptp_cm) * on,
+            "rd_shift": rd_per_cm * (p - ptp_cm) * on}
+
+
 def flow_to_excitation(flow: torch.Tensor) -> torch.Tensor:
     """유량 U(t) -> 유량미분 dU/dt (입술 방사 효과 포함, LF 소스와 동일 규격)."""
     d = torch.zeros_like(flow)

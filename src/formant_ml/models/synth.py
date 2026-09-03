@@ -22,11 +22,12 @@ import torch
 import torch.nn as nn
 
 from ..config import Config, DEFAULT
-from ..dsp.core import ltv_filter
+from ..dsp.core import ltv_filter, upsample
 from ..dsp.filters import (allpass_response, antiresonator_response,
                            bands_to_response, gated_cascade_response,
                            lip_radiation_response, resonator_stage_responses)
 from ..dsp.glottal import GlottalSource
+from ..dsp.nasal import f1_bandwidth_factor, nasal_response
 from ..dsp.noise import TurbulenceSource
 from ..dsp.sibilant import SibilantParams, sibilant_response
 from ..dsp.tract import tract_response
@@ -52,6 +53,11 @@ class Controls:
     #   0 = 성문(모든 포먼트 통과) … K = 입술 … K+6 = 성도 완전 우회.
     #   게이트가 부드러워서 K 에서 마지막 단이 19%, K+3 에서도 35% 잔물결이 남는다.
     noise_am: torch.Tensor                # (B, T, 1) 성문동기 변조 깊이 (기식성)
+    #   기식(aspiration) 노이즈: **성문**에서 나 성도 '전체'를 통과하는 난류.
+    #   마찰 노이즈(협착부에서 나 앞공동만 통과)와 물리적으로 다른 소스다.
+    #   협착이 열리는 순간 압력이 성문으로 옮겨가며 나는 소리이고, 무성자음과
+    #   뒤따르는 모음을 하나의 성도로 묶어주는 것이 바로 이 성분이다.
+    aspiration: torch.Tensor | None = None       # (B, T, 1)
     noise_rough: torch.Tensor | None = None      # (B, T, 1) 난류 시간변조(비정상성)
     # --- 소스 스펙트럼/미세요동 --------------------------------------------
     tilt: torch.Tensor | None = None      # (B, T, 1) dB/oct @1 kHz — 고역 조절
@@ -63,6 +69,8 @@ class Controls:
     allpass_freq: torch.Tensor | None = None    # (B, T, Na) 성도 군지연 정형
     allpass_radius: torch.Tensor | None = None
     # --- 그 밖 ------------------------------------------------------------
+    #   연구개 개도 0~1. 0 이면 비강 극-영점이 정확히 상쇄되어 아무 일도 없다.
+    velum_open: torch.Tensor | None = None       # (B, T, 1)
     antiformant_freq: torch.Tensor | None = None   # (B, T, Ka)
     antiformant_bw: torch.Tensor | None = None
     sib: SibilantParams | None = None     # 치찰음 극-영점 필터(화자 지문)
@@ -110,12 +118,23 @@ class PhysicalVoiceSynth(nn.Module):
         self.noise = TurbulenceSource(a.sample_rate, a.hop_size, cfg.noise.n_bands)
         self.register_buffer(
             "radiation", lip_radiation_response(a.sample_rate, self.n_freq, 0.0))
+        # 기식 소스의 고정 스펙트럼 모양(광대역, 저역이 약간 약하다).
+        from ..utils import band_shelf
+        self.register_buffer("asp_shape", bands_to_response(
+            band_shelf(cfg.noise.n_bands, 400.0, 1.0, a.sample_rate,
+                       slope_oct=0.5).reshape(1, 1, -1), self.n_freq,
+            min_phase=True))
 
     # ---------------------------------------------------------------- 성도 응답
     def _formant_paths(self, c: Controls):
         """(H_harm, H_noise) 복소응답. 노이즈는 협착 하류 단만 통과한다."""
         fs, nf = self.cfg.audio.sample_rate, self.n_freq
-        stages = resonator_stage_responses(c.formant_freq, c.formant_bw,
+        bw = c.formant_bw
+        if c.velum_open is not None:
+            # 곁가지로 에너지가 새면서 F1 이 넓어지고 약해진다 (비음화의 핵심 단서)
+            bw = torch.cat([bw[..., :1] * f1_bandwidth_factor(c.velum_open),
+                            bw[..., 1:]], dim=-1)
+        stages = resonator_stage_responses(c.formant_freq, bw,
                                            c.formant_gain, fs, nf)  # (B,T,K,F)
         h_harm = stages.prod(dim=2)
 
@@ -124,7 +143,7 @@ class PhysicalVoiceSynth(nn.Module):
         # w_i = 1 이면 그 단이 노이즈에도 적용됨(= 협착 하류)
         w = torch.sigmoid((idx.view(1, 1, k) - c.noise_entry) / 0.7)
         # 로그 영역 보간 (filters.gated_cascade_response 의 주석 참고).
-        h_noise = gated_cascade_response(c.formant_freq, c.formant_bw,
+        h_noise = gated_cascade_response(c.formant_freq, bw,
                                          c.formant_gain, w, fs, nf)
         return h_harm, h_noise
 
@@ -142,6 +161,8 @@ class PhysicalVoiceSynth(nn.Module):
         """반공명·올패스 등 두 경로가 공유하는 응답(성도 하류에 해당)."""
         fs, nf = self.cfg.audio.sample_rate, self.n_freq
         h = torch.ones_like(ref)
+        if c.velum_open is not None:
+            h = h * nasal_response(c.velum_open, fs, nf)
         if c.antiformant_freq is not None:
             h = h * antiresonator_response(c.antiformant_freq, c.antiformant_bw, fs, nf)
         if c.allpass_freq is not None:
@@ -179,9 +200,23 @@ class PhysicalVoiceSynth(nn.Module):
 
         voiced = ltv_filter(src, h_harm, hop, ir)
         unvoiced = ltv_filter(raw_noise, h_noise, hop, ir)
-        audio = voiced + unvoiced
+
+        # 기식 노이즈: 성문에서 나 성도 전체를 통과한다. 마찰 노이즈와 별개의
+        # 난수를 쓴다(같은 신호를 두 경로로 보내면 콤필터가 생긴다).
+        aspirated = torch.zeros_like(voiced)
+        if c.aspiration is not None and float(c.aspiration.abs().max()) > 0:
+            asp_src = self.noise(t, b, c.f0.device, c.f0.dtype,
+                                 am_depth=c.noise_am, glottal_phase=phase,
+                                 roughness=c.noise_rough, generator=generator)
+            g = upsample(c.aspiration.clamp_min(0.0), hop).squeeze(-1)
+            n = min(g.shape[1], asp_src.shape[1])
+            aspirated = ltv_filter(asp_src[:, :n] * g[:, :n],
+                                   h_harm * self.asp_shape, hop, ir)
+
+        audio = voiced + unvoiced + aspirated
         return {
             "audio": audio,
+            "aspirated": aspirated,
             "voiced": voiced,
             "unvoiced": unvoiced,
             "source": src,

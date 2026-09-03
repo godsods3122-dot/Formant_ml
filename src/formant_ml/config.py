@@ -46,6 +46,11 @@ class FilterConfig:
     bw_min: float = 30.0
     bw_max: float = 800.0
     ir_size: int = 512            # LTV 필터 임펄스응답 길이
+    # 포먼트가 움직이는 부분공간의 차원. 0 이면 K 개가 서로 독립(예전 동작).
+    # 포먼트는 (턱, 혀몸통, 혀끝, 입술) 정도의 소수 좌표로 결정되므로 독립일 수 없다.
+    # Story 의 면적함수 실증 직교모드에서는 2 개 모드가 분산의 97% 이상을 설명한다.
+    # 여기서는 여유를 둬 4 로 잡는다 (자음 협착까지 포함하므로 모음보다 크다).
+    formant_basis_dim: int = 4
     n_allpass: int = 4            # 성도 위상(군지연) 정형용 올패스 단수
     n_dispersion: int = 3         # 성문 소스 하모닉 위상차(올패스) 단수
     # Kelly-Lochbaum 단면 수 N = 2 * L_tract * fs / c.

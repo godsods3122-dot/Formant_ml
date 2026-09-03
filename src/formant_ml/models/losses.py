@@ -184,6 +184,42 @@ def formant_ordering_penalty(freq: torch.Tensor, margin: float = 100.0):
     return F.relu(margin - gap).mean()
 
 
+# --------------------------------------------------------------- 조음 제약
+def articulatory_rate_loss(freq: torch.Tensor, frame_rate: float,
+                           limits: torch.Tensor | None = None) -> torch.Tensor:
+    """생리적 최대 조음 속도를 넘는 만큼만 벌점 (hinge).
+
+    단순 L2 평활은 *모든* 움직임을 줄여 전이를 뭉갠다. 여기서는 상한 아래의
+    빠른 전이는 전혀 벌하지 않고, 혀가 낼 수 없는 속도만 자른다.
+    상한은 문헌의 F2 전이(10~25 Hz/ms)에서 잡았다 — `gestures_dynamics` 참고.
+    """
+    from ..dsp.gestures_dynamics import max_rate_limits
+    rate = (freq[:, 1:] - freq[:, :-1]).abs() * frame_rate          # (B, T-1, K)
+    lim = limits if limits is not None else max_rate_limits(
+        freq.shape[-1], freq.device, freq.dtype)
+    return (F.relu(rate - lim) / lim).mean()
+
+
+def formant_subspace_loss(freq: torch.Tensor, n_modes: int = 3,
+                          eps: float = 1e-9) -> torch.Tensor:
+    """포먼트가 저차원 부분공간 밖으로 움직이는 성분에 벌점.
+
+    포먼트는 독립적인 K 개의 자유도가 아니다. 성도 형상이 (턱, 혀몸통, 혀끝,
+    입술) 정도의 소수 좌표로 결정되고, 그 결과 포먼트들은 함께 움직인다.
+    Story & Titze 의 면적함수 실증 직교모드에서는 **2개 모드가 분산의 97% 이상**을
+    설명한다. 여기서는 시간에 따른 포먼트 편차 행렬의 상위 n_modes 밖 특이값
+    에너지 비율을 벌점으로 쓴다 (0 = 완전히 저차원, 1 = 완전히 독립).
+    """
+    d = freq - freq.mean(dim=1, keepdim=True)
+    d = d / d.abs().amax(dim=(1, 2), keepdim=True).clamp_min(eps)
+    total = torch.zeros((), device=freq.device, dtype=freq.dtype)
+    for b in range(d.shape[0]):
+        sv = torch.linalg.svdvals(d[b])
+        e = sv ** 2
+        total = total + e[n_modes:].sum() / e.sum().clamp_min(eps)
+    return total / d.shape[0]
+
+
 class VoiceLoss(torch.nn.Module):
     """전체 손실 = 크기 + 고역 + 위상 + 주기성 + 정규화.
 
@@ -195,14 +231,19 @@ class VoiceLoss(torch.nn.Module):
     rps        : 하모닉 상대위상 — 위상차 파라미터가 실제로 학습되게 하는 항.
     period     : 유성/무성 주기성 일치 — HNR 붕괴와 '주기적인 치찰음'을 동시에 막는다.
     noise      : 유성 구간 노이즈 게인 억제(보조). period 가 있으면 작게 둬도 된다.
+    rate       : 생리적 조음 속도 상한 초과분(hinge). 상한 아래 전이는 안 벌한다.
+    subspace   : 포먼트가 저차원 부분공간 밖으로 움직이는 성분.
     """
 
     def __init__(self, w_stft=1.0, w_band=1.0, w_phase=0.2, w_rps=0.3, w_mel=1.0,
                  w_period=1.0, w_smooth=1e-3, w_area=1e-3, w_noise=5e-3,
+                 w_rate=0.5, w_subspace=0.1, n_modes=3,
                  sample_rate: int = 24000, hop: int = 240):
         super().__init__()
         self.w = dict(stft=w_stft, band=w_band, phase=w_phase, rps=w_rps, mel=w_mel,
-                      period=w_period, smooth=w_smooth, area=w_area, noise=w_noise)
+                      period=w_period, smooth=w_smooth, area=w_area, noise=w_noise,
+                      rate=w_rate, subspace=w_subspace)
+        self.n_modes = n_modes
         self.sample_rate = sample_rate
         self.hop = hop
 
@@ -239,8 +280,19 @@ class VoiceLoss(torch.nn.Module):
                 reg = reg + area_smoothness(controls.area)
         out["reg"] = reg
 
+        # 조음 제약: 불가능한 속도와 불가능한 포먼트 조합
+        zero = pred_audio.new_zeros(())
+        out["rate"] = out["subspace"] = zero
+        if controls is not None:
+            fr = self.sample_rate / self.hop
+            out["rate"] = articulatory_rate_loss(controls.formant_freq, fr)
+            out["subspace"] = formant_subspace_loss(controls.formant_freq,
+                                                    self.n_modes)
+
         out["total"] = (self.w["stft"] * out["stft"] + self.w["band"] * out["band"]
                         + self.w["phase"] * out["phase"] + self.w["rps"] * out["rps"]
                         + self.w["mel"] * out["mel"] + self.w["period"] * out["period"]
-                        + self.w["smooth"] * out["reg"] + self.w["noise"] * out["noise"])
+                        + self.w["smooth"] * out["reg"] + self.w["noise"] * out["noise"]
+                        + self.w["rate"] * out["rate"]
+                        + self.w["subspace"] * out["subspace"])
         return out
