@@ -1,0 +1,125 @@
+{
+  "name": "me",
+  "sample_rate": 24000,
+  "f0_median": 126.36,
+  "f0_low": 123.9,
+  "f0_high": 128.82,
+  "rd_median": 1.538,
+  "rd_low": 1.294,
+  "rd_high": 1.78,
+  "jitter": 0.002,
+  "shimmer": 0.01599,
+  "passaggio": [],
+  "register_stats": {
+    "shr_median_db": -34.62,
+    "cpp_median_db": 1.46,
+    "h1h2_median_db": 6.16,
+    "steady_frames": 82,
+    "voiced_ratio": 0.11,
+    "source_fit_rmse_db": 6.234,
+    "measured_tilt_db_per_oct": -6.06,
+    "lpc_bandwidths": [
+      155.5,
+      705.1,
+      484.0,
+      205.5,
+      308.5,
+      174.1,
+      342.9,
+      766.1,
+      321.3
+    ]
+  },
+  "tilt": 8.747,
+  "formants": [
+    878.9,
+    1291.7,
+    2604.1,
+    4157.7,
+    4881.8,
+    5419.6,
+    8129.0,
+    9485.6,
+    10950.8
+  ],
+  "vowel_formants": {
+    "a": [
+      878.9,
+      1291.7,
+      2604.1,
+      4157.7,
+      4881.8,
+      5419.6,
+      8129.0,
+      9485.6,
+      10950.8
+    ]
+  },
+  "formant_gain": [
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0
+  ],
+  "bandwidths": [
+    74.2,
+    96.3,
+    211.7,
+    437.3,
+    575.5,
+    691.6,
+    1452.9,
+    1944.4,
+    2557.9
+  ],
+  "sibilant": {
+    "pole_f": 5273.8,
+    "pole_bw": 2542.4,
+    "zero_f": 1483.3,
+    "zero_bw": 3251.4,
+    "tilt": -5.184,
+    "slope_lo": 1.53,
+    "slope_hi": -12.43,
+    "teeth_f": 10015.2,
+    "teeth_bw": 912.6,
+    "floor_db": -25.61
+  },
+  "sibilant_moments": {
+    "centroid_hz": 7905.5,
+    "spread_hz": 2606.4,
+    "skew": -0.526,
+    "kurtosis": -0.639,
+    "peak_hz": 9867.2,
+    "n_frames": 140,
+    "fit_rmse_db": 1.073
+  },
+  "dispersion": {
+    "freq": [
+      587.2,
+      8603.3,
+      9961.6
+    ],
+    "radius": [
+      0.9118,
+      0.1226,
+      0.8444
+    ],
+    "residual_rad": 1.3404
+  },
+  "roughness": 0.14,
+  "fricative_level_db": -11.0,
+  "breathiness": 0.16,
+  "meta": {
+    "files": [
+      "whole.wav"
+    ],
+    "seconds": 8.6,
+    "source": "업로드 녹음(사x2 + 길게 치찰음x2), 44.1k->24k",
+    "note": "F0/포먼트/Rd/tilt/치찰음 실측 적합"
+  }
+}

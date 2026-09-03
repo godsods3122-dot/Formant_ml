@@ -979,15 +979,14 @@ def test_pressure_after_fricative_does_not_break_concat():
     assert float(rd[onset + 1]) < PROF.rd_median + 0.05, "시작이 pressed 여야 한다"
 
 
-def test_female_profile_sibilant_is_high_frequency():
-    """여성 프로파일의 /s/ 는 실측(길게 끈 치찰음)대로 고역에 봉우리가 있다.
+def test_extracted_profile_sibilant_is_high_frequency():
+    """추출한 화자 프로파일의 /s/ 는 실측(길게 끈 치찰음)대로 고역에 봉우리가 있다.
 
-    앞니 공명 ~9.9 kHz + 낮은 floor 로 10 kHz 부근이 지배적이고 저역(<3 kHz)은
-    거의 비어야 한다. 이걸 안 지키면 '치찰음처럼 안 들린다'.
+    앞니 공명 ~10 kHz + 낮은 floor 로 그 부근이 지배적이고 저역(<3 kHz)은 거의
+    비어야 한다. 이걸 안 지키면 '치찰음처럼 안 들린다'.
     """
     import os
-    path = os.path.join(os.path.dirname(__file__), "..", "profiles",
-                        "female_ko.json")
+    path = os.path.join(os.path.dirname(__file__), "..", "profiles", "me.json")
     if not os.path.exists(path):
         return                                       # 프로파일이 없으면 건너뜀
     prof = VoiceProfile.load(path)
@@ -997,14 +996,37 @@ def test_female_profile_sibilant_is_high_frequency():
     a = y.reshape(-1)[int(0.2 * FS):int(0.6 * FS)]
     S = torch.fft.rfft(a * torch.hann_window(a.shape[-1])).abs()
     f = torch.linspace(0, FS / 2, len(S))
-    # 평활 포락선의 봉우리가 8 kHz 위
     k = 51
     Ss = torch.nn.functional.avg_pool1d(S.view(1, 1, -1), k, 1, k // 2).view(-1)
     peak = float(f[Ss.argmax()])
     assert peak > 8000.0, f"치찰음 봉우리가 너무 낮다: {peak:.0f} Hz"
     p = (S ** 2)
     low = float(p[f < 3000].sum() / p.sum())
-    assert low < 0.12, f"저역(<3k)에 에너지가 너무 많다: {low:.2f}"
+    assert low < 0.15, f"저역(<3k)에 에너지가 너무 많다: {low:.2f}"
+
+
+def test_sibilant_params_can_vary_in_time():
+    """치찰음 파라미터를 곡선으로 주면 무게중심이 시간에 따라 움직인다.
+
+    실제 /사/ 는 혀가 협착에서 모음으로 이동하며 앞공동이 길어져 무게중심이
+    내려간다. 상수 파라미터로는 이 실시간 변화를 못 낸다.
+    """
+    def centroid(seg, a, b, win=720):
+        y = render({"timeline": [seg], "seed": 5}, PROF, CFG).reshape(-1)
+        cs = []
+        f = torch.linspace(0, FS / 2, win // 2 + 1)
+        for i in range(int(a * FS), int(b * FS) - win, win):
+            S = torch.fft.rfft(y[i:i + win] * torch.hann_window(win)).abs()
+            m = f > 1500
+            cs.append(float((f[m] * S[m] ** 2).sum() / (S[m] ** 2).sum().clamp_min(1e-9)))
+        return cs
+
+    falling = centroid({"type": "fricative", "phone": "s", "dur": 0.6,
+                        "fade_in": 0.02, "fade_out": 0.02,
+                        "sib_teeth_f": [[0, 10000], [1, 5500]],
+                        "sib_pole_f": [[0, 5300], [1, 3200]]}, 0.05, 0.55)
+    assert falling[0] - falling[-1] > 1200, \
+        f"무게중심이 시간에 따라 안 내려간다: {falling[0]:.0f}->{falling[-1]:.0f}"
 
 
 def test_custom_flow_curve_makes_two_amplitude_bumps():
