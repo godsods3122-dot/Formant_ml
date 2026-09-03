@@ -129,9 +129,58 @@ _PS_CGS = 8000.0    # 보통 발화 성문하압 [dyn/cm^2] ≈ 8 cmH2O (pressur
 #: 만든다(Shadle 1985/1990). /f/ /θ/ /h/ 는 장애물이 없어 훨씬 약하고 평평하다.
 OBSTACLE_SIBILANTS = {"s", "ss", "z", "sh"}
 
+#: 성문 기식의 게인 보정. fricative_gain 은 앞니 다이폴(+약 16 dB)을 상쇄하려고
+#: 낮춰 잡혀 있는데, 성문에는 장애물이 없어 그 부스트를 안 받는다. 되돌리는 값.
+ASPIRATION_GAIN = 6.3
+
 
 def wants_aero(seg: dict) -> bool:
     return any(k in seg for k in _AERO_KEYS)
+
+
+def aero_drive(seg: dict, t: int, frame_rate: float, glottal_area=None) -> dict:
+    """협착 면적 궤적 -> 공기역학 상태 전부. 전부 (1, T, 1).
+
+    반환 키: env(마찰음 진폭), cent(무게중심 배율), asp(성문 기식),
+             ps_norm(성대 구동압, 1.0=보통 발화), add(내전), pm_frac(구강내압 비율).
+
+    핵심은 **구강내압**이다. /s/ 는 협착이 좁아 협착 뒤에 압력이 쌓이고(Ps 의
+    60~70%), 그만큼 성대를 구동할 압력이 남지 않아 목소리가 눌린다. 협착을 풀면
+    그 압력이 시상수 τ=V/(c·Ac) 로 빠지는데, Ac 가 커질수록 τ 가 21 ms -> 0.6 ms
+    로 급락해서 **빠르고 부드럽게** 사라진다. 그 순간 (Ps-Pm) 이 발성 역치를 넘어
+    목소리가 붙는다 — VOT 를 손으로 박지 않아도 여기서 유도된다.
+    """
+    ac_area = aac.constriction_area(
+        t, frame_rate,
+        a_closed=float(seg.get("a_closed", 0.10)),
+        a_open=float(seg.get("a_open", 3.0)),
+        hold=float(seg.get("hold_ratio", 0.5)),
+        release=float(seg.get("release_s", 0.06)),
+        shape=seg.get("constriction_area"))
+    if glottal_area is None:
+        glottal_area = seg.get("glottal_area", 0.12)
+    ag_t = curve(glottal_area, t) if not isinstance(glottal_area, (int, float)) \
+        else torch.full((1, t, 1), float(glottal_area))
+    ps_cgs = _PS_CGS * float(seg.get("pressure_scale", 1.0))
+    ps_t = torch.full((1, t, 1), ps_cgs)
+    u = aac.series_flow(ps_t, ag_t, ac_area)
+
+    # 구강내압과 그 1차 감쇄(구강 컴플라이언스) -> 성대 구동압
+    pm = aac.relax_pressure(aac.intraoral_pressure(u, ac_area), ac_area, frame_rate)
+    drive = aac.transglottal_pressure(ps_t, pm)
+    ps_norm = drive / _PS_CGS                       # 1.0 = 보통 발화 구동압
+
+    # 내전: 성문 면적이 좁아질수록 1 에 가깝다(성문이 닫힌다).
+    ag_ref = float(seg.get("glottal_open_area", 0.12))
+    add = (1.0 - (ag_t / max(ag_ref, 1e-3)).clamp(0.0, 1.0)).clamp(0.02, 1.0)
+
+    amp = aac.frication_source_amp(u, ac_area)
+    env = amp / amp.amax().clamp_min(1e-9)
+    asp = aac.aspiration_source_amp(u, ag_t)
+    return {"env": env, "cent": aac.velocity_centroid_scale(u, ac_area),
+            "asp": asp / asp.amax().clamp_min(1e-9),
+            "ps_norm": ps_norm, "add": add,
+            "pm_frac": pm / _PS_CGS}
 
 
 def aero_frication(seg: dict, t: int, frame_rate: float,
@@ -292,11 +341,28 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
             # 꺼진 뒤 발성이 붙기까지 무음이 100 ms 넘게 생겨 '무음 + 급개시' 가
             # 폐쇄음으로 들렸다(/사/ 가 "스트라"). 한국어 평음 ㅅ 의 VOT 는 대략
             # 25~40 ms 다.
-            vot = float(seg.get("voice_onset_s", 0.03)) * a.frame_rate / max(t, 1)
-            ps = ramp(t, [(0.0, 0.55), (split, 0.7), (min(split + vot, 1.0), 1.0),
-                          (1.0, 0.95)])
-            add = ramp(t, [(0.0, 0.04), (split, 0.12),
-                           (min(split + vot * 1.2, 1.0), 1.0), (1.0, 1.0)])
+            drive = None
+            if wants_aero(seg):
+                # 공기역학 경로: 발성 구동압을 **구강내압에서 유도**한다.
+                # /s/ 동안은 협착 뒤 압력이 Ps 의 60~70% 를 잡아먹어 성대를 구동할
+                # 압력이 없다(목소리가 눌린다). 협착을 풀면 그 압력이 τ=V/(c·Ac) 로
+                # 빠지며 구동압이 살아나 발성이 붙는다 -> VOT 가 유도된다.
+                trans = float(seg.get("transition_s", 0.05)) * a.frame_rate / max(t, 1)
+                ag_curve = seg.get("glottal_area", [
+                    [0.0, 0.12], [split, 0.12], [min(split + trans, 1.0), 0.03],
+                    [1.0, 0.03]])
+                seg2 = dict(seg)
+                seg2.setdefault("a_open", 3.0)
+                seg2.setdefault("hold_ratio", split)
+                seg2.setdefault("release_s", float(seg.get("transition_s", 0.05)))
+                drive = aero_drive(seg2, t, a.frame_rate, glottal_area=ag_curve)
+                ps, add = drive["ps_norm"], drive["add"]
+            else:
+                vot = float(seg.get("voice_onset_s", 0.03)) * a.frame_rate / max(t, 1)
+                ps = ramp(t, [(0.0, 0.55), (split, 0.7),
+                              (min(split + vot, 1.0), 1.0), (1.0, 0.95)])
+                add = ramp(t, [(0.0, 0.04), (split, 0.12),
+                               (min(split + vot * 1.2, 1.0), 1.0), (1.0, 1.0)])
             asp = aero.apply(c, ps, add, rd_modal=prof.rd_median,
                              rd_breathy=min(2.6, prof.rd_high + 0.6),
                              route_noise=False)
@@ -305,23 +371,11 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
             # 달라진다)와 어긋나 음절마다 비율이 흔들린다(실측: 목표 +9.7 dB 인데
             # -6.2 dB 가 나왔다).
             nb = nb * float(c["harmonic_amp"].max().clamp_min(1e-3))
-            if wants_aero(seg):
-                # 공기음향 경로: 협착 면적이 열리며(release) 레이놀즈수가 임계
-                # 아래로 떨어져 마찰음이 저절로 꺼진다 = 물리적 fade-out. 무게중심도
-                # 함께 내려간다. 손으로 그린 게이트/치찰음 곡선이 필요 없다.
-                seg2 = dict(seg)
-                seg2.setdefault("a_open", 3.0)
-                seg2.setdefault("hold_ratio", split)
-                seg2.setdefault("release_s", float(seg.get("transition_s", 0.05)))
-                trans = float(seg.get("transition_s", 0.05)) * a.frame_rate / max(t, 1)
-                # 성문은 /s/ 동안 열려 있다가(무성) 발성이 시작되며 내전해 닫힌다.
-                # 성문이 닫히면 유량이 성문에서 막혀 구강 마찰음도 함께 꺼진다 —
-                # 그래서 마찰음 offset 이 발성 onset 과 물리적으로 맞물린다.
-                ag_curve = seg.get("glottal_area", [
-                    [0.0, 0.12], [split, 0.12], [min(split + trans, 1.0), 0.03],
-                    [1.0, 0.03]])
-                env, aero_cent, asp_env = aero_frication(
-                    seg2, t, a.frame_rate, glottal_area=ag_curve)
+            if drive is not None:
+                # 위에서 이미 같은 면적 궤적으로 계산했다(유량·압력·난류가 한
+                # 구동에서 나온다). 협착이 열리며 레이놀즈수가 임계 아래로 떨어져
+                # 마찰음이 저절로 꺼지고, 같은 순간 구강내압이 빠져 발성이 붙는다.
+                env, aero_cent, asp_env = drive["env"], drive["cent"], drive["asp"]
                 # 기식은 **기류는 있는데 아직 발성이 안 붙은** 동안에만 난다.
                 # 성대가 제대로 떨기 시작하면 성문이 주기적으로 닫혀 난류가 사라진다.
                 # 이 게이트가 있어야 기식이 정확히 '마찰음 꺼짐 ~ 발성 시작' 창을
@@ -335,7 +389,7 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
                 vamp = c["harmonic_amp"]
                 v_frac = (vamp / vamp.amax().clamp_min(1e-6)).clamp(0.0, 1.0)
                 asp = (asp_env * (1.0 - v_frac) * (1.0 - env).clamp(0.0, 1.0)
-                       * float(seg.get("aspiration", 1.0)))
+                       * float(seg.get("aspiration", 4.0)))
             else:
                 # 마찰음 게이트: 모음으로 넘어갈 때 빠르게 꺼진다(자연스러운 fade-out).
                 env = ramp(t, [(0.0, 1.0), (split, 1.0), (split + 0.1, 0.02),
@@ -348,16 +402,30 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
                     fin, float(seg.get("flow_exp", aero.FRICATION_FLOW_EXPONENT)))
             # 노이즈 경로가 하나뿐이라, 구강 협착(마찰음)에서 성문(기식)으로
             # 주입 위치를 옮기며 섞는다.
-            asp_n = band_shelf(NB, 900.0, fricative_gain(prof), a.sample_rate
-                               ).reshape(1, 1, -1) * float(
+            # 기식은 성문에서 나므로 **앞니 다이폴이 없다**. fricative_gain 은
+            # 다이폴 부스트를 상쇄하느라 -16 dB 쯤 내려가 있어서, 그걸 그대로 쓰면
+            # 기식이 30 배 작아져 전이 구간을 못 메운다. 그만큼 되돌린다.
+            asp_n = band_shelf(NB, 900.0,
+                               fricative_gain(prof) * ASPIRATION_GAIN,
+                               a.sample_rate).reshape(1, 1, -1) * float(
                                    c["harmonic_amp"].max().clamp_min(1e-3))
             # 주입 위치는 **부드럽게 미끄러뜨리면 안 된다**. 중간값은 캐스케이드의
             # 앞부분만 우회한 '반쪽 필터' 라 어떤 성도 형상에도 대응하지 않고,
             # 봉우리가 나이퀴스트 쪽으로 튄다(실측: /스/ 의 마찰음 피크가
             # 6.9 kHz 대신 11.9 kHz 로 나왔다). 지배적인 소스 쪽으로 빠르게 넘긴다.
-            w_asp = torch.sigmoid((asp - env) * 8.0)
-            c["noise_bands"] = (nb * env + asp_n * asp * 0.5).contiguous()
-            c["noise_entry"] = (1.0 - w_asp) * (float(K) + 6.0)
+            if drive is not None:
+                # 두 소스를 **각자의 경로**로 보낸다(합성기가 더한다).
+                #   구강 마찰음 -> 협착 하류 + 치찰음 필터 (noise_entry = K+6)
+                #   성문 기식   -> 성도 전체            (aspiration_bands)
+                # 예전에는 경로가 하나뿐이라 noise_entry 를 둘 사이에서 튕겼는데,
+                # 그 전환이 전이에 레벨 점프를 만들어 연결이 끊겼다.
+                c["noise_bands"] = (nb * env).contiguous()
+                c["noise_entry"] = torch.full((1, t, 1), float(K) + 6.0)
+                c["aspiration_bands"] = (asp_n * asp).contiguous()
+            else:
+                w_asp = torch.sigmoid((asp - env) * 8.0)
+                c["noise_bands"] = (nb * env + asp_n * asp * 0.5).contiguous()
+                c["noise_entry"] = (1.0 - w_asp) * (float(K) + 6.0)
             # 포먼트 궤적은 **로커스 이론**대로. 유성 구간을 /이/ 에서 시작해
             # 모음으로 미끄러뜨리면 그건 /j/ 활음이라 "사" 가 "야" 로 들린다.
             # 치경 로커스에서 출발해 짧은 전이(기본 50 ms)로 모음에 도달한다.

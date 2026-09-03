@@ -44,8 +44,7 @@ def main() -> None:
     # 1) '사' — 협착 면적에서 진폭·게이트·무게중심 하강이 전부 유도된다
     sa = {"type": "syllable", "onset": "s", "vowel": "a", "dur": 0.58,
           "onset_s": 0.14, "aero": True, "transition_s": 0.05,
-          "constriction_area": SA_AREA, "voice_onset_s": 0.03,
-          "aspiration": 1.0, "f0": [[0, 129], [1, 123]]}
+          "constriction_area": SA_AREA, "f0": [[0, 129], [1, 123]]}
     W("m01_sa.wav", {"timeline": [sa]})
     W("m02_sa_sa.wav", {"timeline": [sa, {"type": "silence", "dur": 0.3}, dict(sa)]})
 

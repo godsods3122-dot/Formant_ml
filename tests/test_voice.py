@@ -849,21 +849,26 @@ def test_syllable_uses_a_consonant_locus_not_a_glide():
     """/사/ 의 유성 구간은 자음 로커스에서 출발해야 한다.
 
     /이/ 포먼트에서 시작해 모음으로 미끄러뜨리면 그건 정의상 /j/ 활음이라
-    **"야"** 로 들린다(실제로 그렇게 들린다는 지적을 받았다). 치경 로커스는
-    F2 가 1750 Hz 부근이고, /a/(F2≈1090)로 갈 때 F2 가 **내려간다**.
-    /이/ 활음이면 반대로 2290 -> 1090 으로 훨씬 크게 내려온다.
+    **"야"** 로 들린다. 다만 /j/ 를 가르는 것은 **F1** 이지 F2 가 아니다:
+    /이/ 는 F1 이 270 으로 아주 낮다. /s/ 는 혀가 /이/ 보다도 높지만 발성이
+    시작될 때는 이미 협착이 풀려 **F1 이 열려 있다**(실측 873 Hz).
+    F2 는 오히려 높게 출발해 가파르게 떨어진다(실측 2253 -> 1050).
+    그래서 검사는 'F1 이 낮게 출발하지 않는가' 로 한다.
     """
     from formant_ml.score import build_controls
     c = build_controls({"timeline": [{"type": "syllable", "onset": "s",
                                       "vowel": "a", "dur": 0.55,
                                       "onset_s": 0.12}]}, PROF, CFG)
+    f1 = c.formant_freq[0, :, 0]
     f2 = c.formant_freq[0, :, 1]
     amp = c.harmonic_amp[0, :, 0]
     onset = int((amp > 0.05).float().argmax())
     assert onset > 0, "유성 시작을 못 찾았다"
-    start = float(f2[onset])
-    assert 1400.0 < start < 2000.0, f"유성 시작 F2 가 {start:.0f} Hz (치경 로커스는 ~1750)"
-    assert start < 2100.0, "/이/ 활음이다"
+    # /j/ 활음이면 F1 이 /이/ 처럼 낮게(<450) 출발한다.
+    assert float(f1[onset]) > 500.0, \
+        f"유성 시작 F1 이 {float(f1[onset]):.0f} Hz — /이/ 활음(야)처럼 들린다"
+    # F2 는 높게 출발해 **내려가야** 한다 (치찰음의 높은 혀 위치 -> /a/).
+    assert float(f2[onset]) > float(f2[-1]) + 400.0, "F2 가 내려가지 않는다"
     # 전이는 짧아야 한다 (60 ms 안팎). 길면 활음처럼 들린다.
     tgt = float(f2[-1])
     reached = int((((f2 - tgt).abs() < 40.0).float()).argmax())

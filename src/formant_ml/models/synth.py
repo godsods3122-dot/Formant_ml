@@ -65,6 +65,12 @@ class Controls:
     # 주기적 재여기도 없다. 유성음의 Q(F2 에서 25 까지)를 그대로 쓰면 잡음이
     # 공진에서 울려 속삭임·마찰음에 음조가 얹힌다.
     noise_bw_scale: torch.Tensor | None = None
+    # (B, T, n_bands) **두 번째 노이즈 경로**: 성문에서 나는 기식 난류.
+    # 구강 마찰음(협착 하류 + 치찰음 필터)과 성문 기식(성도 전체)은 위치가 달라
+    # 라우팅이 다르다. 경로가 하나뿐이면 noise_entry 를 둘 사이에서 튕겨야 하는데,
+    # 그 전환이 /s/ -> 모음 전이에 불연속(레벨 점프)을 만든다. 두 소스를 각자의
+    # 경로로 통과시켜 **더한다**(선형이므로 물리적으로도 이게 맞다).
+    aspiration_bands: torch.Tensor | None = None
     # --- 소스 스펙트럼/미세요동 --------------------------------------------
     tilt: torch.Tensor | None = None      # (B, T, 1) dB/oct @1 kHz — 고역 조절
     jitter: torch.Tensor | None = None    # (B, T, 1) 주기 요동 비율 (0.005 = 0.5%)
@@ -259,6 +265,23 @@ class PhysicalVoiceSynth(nn.Module):
         h_noise = h_noise * bands_to_response(
             c.noise_bands * self.noise.spectral_prior(), nf, min_phase=True)
 
+        # 성문 기식 경로: 치찰음 필터를 거치지 않고 성도 **전체**를 통과한다.
+        asp_out = None
+        if c.aspiration_bands is not None and float(c.aspiration_bands.abs().max()) > 1e-8:
+            bw_a = c.formant_bw
+            if c.noise_bw_scale is not None:
+                bw_a = bw_a * c.noise_bw_scale.clamp_min(1.0)
+            full = torch.ones_like(c.formant_freq)
+            h_asp = gated_cascade_response(c.formant_freq, bw_a, c.formant_gain,
+                                           full, fs, nf) * shared
+            h_asp = h_asp * bands_to_response(
+                c.aspiration_bands * self.noise.spectral_prior(), nf, min_phase=True)
+            asp_noise = self.noise(t, b, c.f0.device, c.f0.dtype,
+                                   am_depth=c.noise_am * voiced_gate,
+                                   glottal_phase=phase, roughness=c.noise_rough,
+                                   generator=generator)
+            asp_out = ltv_filter(asp_noise, h_asp, hop, ir)
+
         if state is None:
             voiced = ltv_filter(src, h_harm, hop, ir)
             unvoiced = ltv_filter(raw_noise, h_noise, hop, ir)
@@ -269,6 +292,8 @@ class PhysicalVoiceSynth(nn.Module):
                                       st.get("tail_n"), True)
             new_state = {"phase": phase[:, -1:], "tail_h": tv, "tail_n": tn}
             del phase_full
+        if asp_out is not None:
+            unvoiced = unvoiced + asp_out
         audio = voiced + unvoiced
         return {
             "state": new_state,

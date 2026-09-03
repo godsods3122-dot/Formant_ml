@@ -177,3 +177,62 @@ def obstacle_dipole_bands(n_bands: int, sample_rate: float = 24000.0,
     oct_ = torch.log2((f / f_ref).clamp_min(1.0))
     oct_ = torch.minimum(oct_, torch.log2(torch.tensor(f_max_boost / f_ref)))
     return 10.0 ** (db_per_oct * oct_ / 20.0)
+
+
+# --- 구강내압(intraoral pressure)과 발성 억제 ---------------------------------
+# /s/ 는 협착이 좁아서(≈0.1 cm²) 협착 **뒤**에 압력이 쌓인다. 그 압력 Pm 은
+# 성문을 가로지르는 압력차를 깎는다:
+#
+#     Ps = ΔP_glottis + ΔP_oral        (직렬 손실)
+#     Pm  = ΔP_oral = ½ρ(U/Ac)²        (협착 뒤에 남는 압력 = 구강내압)
+#     ΔP_glottis = Ps - Pm             (성대를 실제로 구동하는 압력)
+#
+# 발성 역치는 **Ps 가 아니라 (Ps-Pm)** 로 판정해야 한다. 협착이 좁으면 Pm 이 커져
+# 성대를 구동할 압력이 남지 않아 목소리가 나오다 만다 — 유성 마찰음이 어려운
+# 이유이고(Shadle 의 "puzzle of voiced fricatives"), /s/ 가 무성인 이유다.
+#
+# 그리고 협착을 풀면 Pm 이 **빠르고 부드럽게** 빠지면서 (Ps-Pm) 이 역치를 넘어
+# 발성이 붙는다. 그 감쇄 시간이 곧 VOT 다 — 손으로 박는 값이 아니라 유도되는 값.
+# 감쇄는 구강의 음향 컴플라이언스가 정한다: C = V/(ρc²), 시상수 τ = R·C.
+# V≈60 cm³, c=35000 cm/s 면 τ 는 수 ms 수준이라 '빠르고 부드럽게' 가 맞다.
+ORAL_VOLUME = 60.0        # 구강 체적 [cm^3] (협착 뒤 공동)
+SOUND_SPEED = 35000.0     # [cm/s]
+
+
+def intraoral_pressure(flow: torch.Tensor, oral_area: torch.Tensor) -> torch.Tensor:
+    """협착 뒤에 걸리는 구강내압 Pm [dyn/cm^2] = 협착에서의 압력강하."""
+    v = particle_velocity(flow, oral_area)
+    return 0.5 * RHO * v * v
+
+
+def oral_relax_tau(oral_area: torch.Tensor) -> torch.Tensor:
+    """구강내압의 감쇄 시상수 τ [s]. 협착이 열릴수록 빨리 빠진다.
+
+    음향 컴플라이언스 C = V/(ρc²), 협착의 (선형화) 저항 R ≈ ρc/Ac 로 두면
+    τ = R·C = V/(c·Ac). Ac=0.1 cm² -> τ≈17 ms(잘 안 빠짐),
+    Ac=3 cm²(모음) -> τ≈0.6 ms(즉시 빠짐). 해제가 빠르고 부드러운 이유다.
+    """
+    return ORAL_VOLUME / (SOUND_SPEED * oral_area.clamp_min(1e-3))
+
+
+def relax_pressure(pm: torch.Tensor, oral_area: torch.Tensor,
+                   frame_rate: float) -> torch.Tensor:
+    """구강내압에 1차 지연을 준다 (구강 컴plaiance). pm: (1,T,1).
+
+    정적 Pm 을 그대로 쓰면 협착이 열리는 순간 압력이 계단처럼 사라져 발성이
+    '탁' 켜진다. 실제로는 공동에 갇힌 공기가 τ 로 빠져나가므로 부드럽다.
+    """
+    dt = 1.0 / max(frame_rate, 1e-6)
+    tau = oral_relax_tau(oral_area)
+    a = (dt / (tau + dt)).clamp(0.0, 1.0)          # 프레임별 계수
+    out = torch.zeros_like(pm)
+    prev = pm[:, :1, :]
+    for i in range(pm.shape[1]):
+        prev = prev + a[:, i:i + 1, :] * (pm[:, i:i + 1, :] - prev)
+        out[:, i:i + 1, :] = prev
+    return out
+
+
+def transglottal_pressure(ps: torch.Tensor, pm: torch.Tensor) -> torch.Tensor:
+    """성대를 실제로 구동하는 압력 (Ps - Pm), 음수는 0 으로."""
+    return (ps - pm).clamp_min(0.0)

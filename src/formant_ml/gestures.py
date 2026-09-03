@@ -53,6 +53,9 @@ def base(t: int, prof: VoiceProfile, n_formants: int = 8, n_bands: int = 40,
         "formant_bw": prof.bandwidth_tensor(1, t, n_formants),
         "formant_gain": prof.gain_tensor(1, t, n_formants),
         "noise_bands": torch.full((1, t, n_bands), 1e-4),
+        # 성문 기식(두 번째 노이즈 경로). 모든 세그먼트가 키를 가져야 이어붙일 때
+        # 깨지지 않는다. 기본은 0 = 기식 경로 꺼짐.
+        "aspiration_bands": torch.zeros(1, t, n_bands),
         "noise_entry": _c(t, 0.0),
         "noise_am": _c(t, prof.breathiness),
         "noise_rough": _c(t, prof.roughness),
