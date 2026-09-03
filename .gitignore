@@ -5,7 +5,7 @@ venv/
 *.egg-info/
 out/
 runs/
-data/
+/data/
 *.wav
 !docs/**/*.wav
 .DS_Store

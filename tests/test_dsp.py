@@ -173,7 +173,7 @@ def test_noise_only_passes_downstream_of_constriction():
         c = Controls(
             f0=torch.full((1, T, 1), 120.0), harmonic_amp=torch.zeros(1, T, 1),
             rd=torch.full((1, T, 1), 1.2),
-            formant_freq=torch.tensor([300., 900., 2400., 3400., 4500., 5500.]
+            formant_freq=torch.tensor([300. + 700. * k for k in range(K)]
                                       ).reshape(1, 1, -1).expand(1, T, K).contiguous(),
             formant_bw=torch.full((1, T, K), 90.0),
             formant_gain=torch.ones(1, T, K),

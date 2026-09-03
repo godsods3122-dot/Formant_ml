@@ -39,11 +39,42 @@
 | [PINN for speech production (2025)](https://arxiv.org/abs/2511.00428) | 성대 진동/성도 음향의 지배방정식을 신경망으로 직접 풂. **충돌의 비미분성**을 미분가능 근사로 우회 |
 | [ARMAX-LF (2024)](https://arxiv.org/abs/2410.04704) | DNN으로 성문/성도 파라미터 동시 추정 |
 
+## 3.5 위상 — 상대위상과 위상왜곡
+
+- Degottex & Erro, *A uniform phase representation for the harmonic model* (2014) —
+  **위상왜곡편차(PDD)** 와 상대위상. 창 위치에 무관한 위상 기술자를 정의한다.
+  우리의 `analysis/phase.py::measure_rps` 가 이 계열이다.
+- Saratxaga et al., *Simple representation of signal phase for harmonic speech
+  models* (2009) — **상대위상 이동(RPS)** `∠X_k − k·∠X_1`. 화자/음질 판별에
+  실제로 쓰이는 양이라는 근거.
+
 ## 4. 노이즈(치찰음·기식음)
 
 - Stylianou, *Harmonic plus Noise Model* (IEEE TSAP 2001) — 하모닉/노이즈 분해의 고전. [PDF](https://www.ee.columbia.edu/~dpwe/e6820/papers/Styl01-hnm.pdf)
 - Klatt & Klatt (1990) — 기식성(breathiness)은 **성문 개방기에 동기화된 진폭변조 노이즈**로 모델링해야 자연스럽다. 이걸 안 하면 "하모닉 + 별개의 쉬익 소리" 두 층으로 들린다.
 - 마찰음의 스펙트럼은 협착부 **앞공동(front cavity) 길이**가 결정한다 → /s/(6~8 kHz)와 /ʃ/(2.5~4 kHz)의 차이. 우리 구조에서는 노이즈가 협착 하류 단만 통과하도록 강제해 이걸 학습 대상에서 제외했다.
+- Shadle, *The aerodynamics of speech* / Jongman, Wayland & Wong (2000),
+  *Acoustic characteristics of English fricatives* — 마찰음을 가르는 표준
+  기술자가 **스펙트럼 모멘트**(무게중심/폭/왜도/첨도)와 앞공동 극이라는 근거.
+  `dsp/sibilant.py` 의 극-영점 파라미터화와 `analysis/sibilant.py` 의 모멘트가 여기서 온다.
+- 난류는 정상 백색이 아니다. 제트의 자기유발 요동 때문에 진폭 변조 스펙트럼이
+  대략 1/f^β 이고, 이걸 넣지 않으면 합성 마찰음이 '테이프 히스' 처럼 들린다.
+  우리는 β 와 꺾임 주파수를 **학습 파라미터**로 두었다.
+
+## 4.5 성구·파사지오 측정
+
+- Hanson (1997), Klatt & Klatt (1990) — **H1-H2** 가 개방지수(open quotient)의
+  대용물이라는 근거. 우리는 대응표를 문헌 회귀식이 아니라 **LF 사전 자체**에서
+  만들어 분석과 합성이 어긋나지 않게 했다.
+- Iseli & Alwan (2004), *An improved correction formula for the estimation of
+  harmonic magnitudes* — H1*-H2* 성도 보정. 구현은 해 두었으나 프레임별 포먼트
+  정확도가 부족해 기본은 꺼 두었다(`docs/VOICE.md` §5 에 측정치).
+- Sun (2002), *Pitch determination and voice quality analysis using SHR* —
+  **서브하모닉 대 하모닉 비**. 이중음/프라이/거친 소리의 지표.
+- Hillenbrand et al. (1994) — **CPP**(켑스트럼 피크 현저도), 기식성 지표.
+- Titze (1988) 의 자가진동 조건과 Steinecke & Herzel (1995) 의 분기가
+  '성구 전환이 왜 계단처럼 일어나는가' 의 물리적 근거다. 우리는 그 계단을
+  F0 축에서 변화점으로 검출한다(`analysis/registers.passaggio_candidates`).
 
 ## 5. 위상 — "AI 특유의 잡음"의 진짜 정체
 

@@ -8,7 +8,6 @@
 from __future__ import annotations
 
 import argparse
-import math
 
 import torch
 
@@ -129,6 +128,61 @@ def main() -> None:
             cfg.audio.n_fft // 2 + 1).prod(dim=2)
         y = ltv_filter(exc, H, hop, cfg.filt.ir_size)
         save_wav(f"{args.out}/06_vocalfold_{tag}.wav", y, sr)
+
+    # ---------------------------------------------------------------- 새 손잡이들
+    # 아래는 전부 score.render 를 거친다 = 스크립트로 낼 수 있는 소리와 동일하다.
+    from .score import render
+    from .voice import VoiceProfile
+    prof = VoiceProfile()
+
+    def R(name, timeline, **kw):
+        y = render({"timeline": timeline, "seed": 7, **kw}, prof, cfg)
+        save_wav(f"{args.out}/{name}.wav", y, sr)
+
+    # 7) 스펙트럼 기울기(tilt) 스윕 — 같은 모음의 '고역' 만 -6 -> +8 dB/oct
+    R("07_tilt_sweep_dark_to_bright",
+      [{"type": "vowel", "vowel": "a", "dur": 2.4, "tilt": [-6, 8], "f0": 120}])
+
+    # 8) 웃음 3종 — 같은 함수, 파라미터만 다르다
+    R("08_laugh_belly", [{"type": "laugh", "dur": 1.6, "rate_hz": 4.2,
+                          "voiced": 0.95, "pitch_lift": 1.5, "tilt": 2.0}])
+    R("08_laugh_giggle", [{"type": "laugh", "dur": 1.4, "rate_hz": 8.0,
+                           "voiced": 0.35, "breathiness": 0.7, "f0": 200}])
+    R("08_laugh_breathy", [{"type": "laugh", "dur": 1.4, "rate_hz": 6.0,
+                            "voiced": 0.0, "breathiness": 0.9}])
+
+    # 9) 치찰음 지문: 극(앞공동 공진)만 옮겨서 /ㅅ/ -> /ㅅㅑ/ 로
+    R("09_sibilant_pole_sweep",
+      [{"type": "fricative", "phone": "s", "dur": 2.0,
+        "sib_pole_f": [[0, 8000], [1, 3000]], "sib_pole_bw": 700, "sib_tilt": 0}])
+
+    # 10) 위상차 파라미터 A/B — 크기 스펙트럼은 같고 하모닉 상대위상만 다르다
+    R("10_phase_dispersion_off",
+      [{"type": "vowel", "vowel": "a", "dur": 1.2, "f0": 110, "rd": 0.6}])
+    R("10_phase_dispersion_on",
+      [{"type": "vowel", "vowel": "a", "dur": 1.2, "f0": 110, "rd": 0.6,
+        "disp_freq": [900, 2600, 5200], "disp_radius": [0.9, 0.9, 0.88]}])
+
+    # 11) 성구 전환(파사지오) — 글리산도에서 Rd/tilt 가 계단처럼 꺾인다.
+    #     analysis.registers.passaggio_candidates 가 이걸 되찾아낼 수 있어야 한다.
+    R("11_glissando_with_passaggio",
+      [{"type": "vowel", "vowel": "a", "dur": 3.0,
+        "f0": [[0, 100], [1, 330]],
+        "rd": [[0, 0.7], [0.54, 0.8], [0.60, 1.9], [1, 2.1]],
+        "tilt": [[0, 2], [0.54, 2], [0.60, -3], [1, -4]]}])
+
+    # 12) 비언어 발성 모음 — 전부 같은 물리 손잡이의 다른 조합
+    R("12_nonverbal_suite",
+      [{"type": "sigh", "dur": 0.9}, {"type": "silence", "dur": 0.15},
+       {"type": "breath", "dur": 0.5, "inhale": True},
+       {"type": "silence", "dur": 0.15},
+       {"type": "throat_clear", "dur": 0.4},
+       {"type": "silence", "dur": 0.15},
+       {"type": "creak", "dur": 0.6, "rate_hz": 40},
+       {"type": "silence", "dur": 0.15},
+       {"type": "whisper", "dur": 0.7, "vowel": "i"},
+       {"type": "silence", "dur": 0.15},
+       {"type": "sob", "dur": 1.2}])
 
     print(f"WAV 파일을 {args.out}/ 에 저장했습니다.")
 

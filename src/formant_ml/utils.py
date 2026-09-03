@@ -57,3 +57,17 @@ def vibrato(t: int, f0: float, rate_hz: float = 5.0, depth_cents: float = 30.0,
     n = torch.arange(t, dtype=torch.float32) / frame_rate
     return (f0 * 2 ** (depth_cents / 1200 * torch.sin(2 * math.pi * rate_hz * n))
             ).reshape(1, t, 1)
+
+
+def band_shelf(n_bands: int, cutoff_hz: float, gain: float = 1.0,
+               sample_rate: int = 24000, slope_oct: float = 1.0,
+               floor: float = 1e-4) -> torch.Tensor:
+    """넓은 대역 난류 소스 (n_bands,). 협착부 제트 자체는 광대역이다.
+
+    마찰음의 스펙트럼 모양은 소스가 아니라 *앞공동 공진*(치찰음 필터)이 만든다.
+    소스 대역게인으로 모양까지 만들면 두 손잡이가 서로 싸워서, 치찰음 파라미터를
+    돌려도 소리가 안 바뀐다.
+    """
+    f = torch.linspace(0, sample_rate / 2, n_bands).clamp_min(20.0)
+    o = torch.log2(f / max(cutoff_hz, 20.0))
+    return gain * torch.sigmoid(o * 3.0 * slope_oct) + floor
