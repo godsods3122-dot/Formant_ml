@@ -192,6 +192,30 @@ def pole_zero_response(pole_f, pole_bw, zero_f, zero_bw, sample_rate: float,
     return ((Dpdc / Dp) * (Dz / Dzdc)).prod(dim=2)
 
 
+def skirt_response(peak_f, slope_lo, slope_hi, sample_rate: float, n_freq: int,
+                   floor_db: float = -60.0) -> torch.Tensor:
+    """봉우리를 중심으로 로그주파수에 대해 **직선 두 개**인 스커트 (B, T, n_freq).
+
+    극 하나로는 삼각형이 안 나온다. 2차 공명의 크기응답은 로렌치안이라 봉우리가
+    둥글고, 대역폭을 넓혀 음조를 없애면 그냥 **둥근 돔**이 된다(측정: 사람 /s/ 의
+    저역 스커트가 +20~40 dB/oct 인데 우리는 +7.7).
+
+    반면 실제 마찰음 스펙트럼은 봉우리 아래로 가파르게 떨어지는 삼각형에 가깝다.
+    그 가파름은 공진의 Q 가 아니라 **협착-앞공동 계의 고역통과 성질 + 소스
+    스펙트럼 + 방사**가 겹쳐 만든 것이라, 공진을 좁히지 않고도 만들 수 있다.
+    여기서는 로그주파수의 조각별 직선으로 직접 준다 — 공진이 없으므로 울리지
+    않고, 기울기를 원하는 대로 세울 수 있다.
+
+        dB(f) = slope_lo · log2(f/f_peak)   (f < f_peak, slope_lo > 0 이면 상승)
+        dB(f) = slope_hi · log2(f/f_peak)   (f > f_peak, slope_hi < 0 이면 하강)
+    """
+    f = freq_grid(n_freq, sample_rate, device=peak_f.device,
+                  dtype=peak_f.dtype).clamp_min(20.0).view(1, 1, -1)
+    o = torch.log2(f / peak_f.clamp_min(100.0))
+    db = torch.where(o < 0, slope_lo * o, slope_hi * o).clamp_min(floor_db)
+    return (10.0 ** (db / 20.0)).to(torch.complex64)
+
+
 def rms_normalize(H: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     """주파수축 RMS 를 1 로 맞춘다(피크 정규화보다 그래디언트가 안정적)."""
     rms = H.abs().pow(2).mean(dim=-1, keepdim=True).clamp_min(eps).sqrt()

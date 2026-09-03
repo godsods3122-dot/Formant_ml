@@ -36,7 +36,8 @@ from dataclasses import dataclass
 
 import torch
 
-from .filters import pole_zero_response, rms_normalize, tilt_response
+from .filters import (pole_zero_response, rms_normalize, skirt_response,
+                      tilt_response)
 
 
 @dataclass
@@ -47,18 +48,26 @@ class SibilantParams:
     #                             800 아래로 내리면 잡음이 그 공진에서 울려 음조가 들린다
     zero_f: torch.Tensor          # 반공진 [Hz]
     zero_bw: torch.Tensor
-    tilt: torch.Tensor            # 난류 기울기 [dB/oct]
+    tilt: torch.Tensor            # 난류 기울기 [dB/oct] (전체를 기울인다)
     mix: torch.Tensor             # 0=이 필터 미적용, 1=완전 적용
+    # 봉우리 양옆의 직선 스커트 [dB/oct]. 극 하나로는 둥근 돔밖에 안 나온다.
+    slope_lo: torch.Tensor | None = None    # 봉우리 아래 상승 기울기 (양수)
+    slope_hi: torch.Tensor | None = None    # 봉우리 위 하강 기울기 (음수)
     roughness: torch.Tensor | None = None   # 난류 시간변조 깊이(주기성 방지)
 
     @staticmethod
     def constant(shape, pole_f=6500.0, pole_bw=2200.0, zero_f=2600.0, zero_bw=2600.0,
-                 tilt=0.0, mix=1.0, roughness=0.12, device=None,
-                 dtype=torch.float32) -> "SibilantParams":
+                 tilt=0.0, mix=1.0, roughness=0.12, slope_lo=18.0, slope_hi=-4.0,
+                 device=None, dtype=torch.float32) -> "SibilantParams":
         def c(v):
             return torch.full(shape, float(v), device=device, dtype=dtype)
-        return SibilantParams(c(pole_f), c(pole_bw), c(zero_f), c(zero_bw),
-                              c(tilt), c(mix), c(roughness))
+        # **반드시 키워드로** 만든다. 위치인자로 만들면 나중에 필드를 중간에
+        # 하나 끼워 넣는 순간 값이 통째로 밀린다(실제로 slope 를 추가했을 때
+        # roughness 에 -5, slope_hi 에 22 가 들어갔고 아무도 알려주지 않았다).
+        return SibilantParams(
+            pole_f=c(pole_f), pole_bw=c(pole_bw), zero_f=c(zero_f),
+            zero_bw=c(zero_bw), tilt=c(tilt), mix=c(mix), roughness=c(roughness),
+            slope_lo=c(slope_lo), slope_hi=c(slope_hi))
 
     def to(self, device) -> "SibilantParams":
         f = {k: (v.to(device) if torch.is_tensor(v) else v)
@@ -68,22 +77,22 @@ class SibilantParams:
 
 # 관용적 출발점. 실제 화자 값은 analysis/sibilant.py 로 추출한다.
 PRESETS = {
-    #        pole_f  pole_bw  zero_f  zero_bw  tilt
-    "s":    (6600.0, 2200.0,  2900.0, 2600.0,  1.0),
-    "sh":   (3300.0, 1600.0,  1600.0, 1800.0,  0.0),
-    "z":    (6400.0, 2400.0,  2900.0, 2600.0,  0.0),
-    "f":    (7500.0, 3500.0,  1200.0, 2500.0,  1.5),
-    "th":   (7000.0, 4000.0,  1000.0, 2500.0,  1.0),
-    "h":    (1400.0, 2000.0,   400.0, 1200.0, -1.5),
-    "ss":   (7200.0, 1700.0,  3200.0, 2200.0,  2.0),   # 된소리 ㅆ: 더 높고 조금 좁게
+    #        pole_f  pole_bw  zero_f  zero_bw  tilt  slope_lo  slope_hi
+    "s":    (6600.0, 2400.0,  2900.0, 2600.0,  0.0,   14.0,   -3.0),
+    "sh":   (3300.0, 1800.0,  1600.0, 1800.0,  0.0,   11.0,   -4.0),
+    "z":    (6400.0, 2400.0,  2900.0, 2600.0,  0.0,   20.0,   -5.0),
+    "f":    (7500.0, 3500.0,  1200.0, 2500.0,  0.0,    8.0,   -4.0),   # 평평한 편
+    "th":   (7000.0, 4000.0,  1000.0, 2500.0,  0.0,    7.0,   -4.0),
+    "h":    (1400.0, 2000.0,   400.0, 1200.0,  0.0,    6.0,   -6.0),
+    "ss":   (7200.0, 1900.0,  3200.0, 2200.0,  0.0,   18.0,   -3.5),  # 된소리 ㅆ: 더 날카롭게
 }
 
 
 def preset(name: str, shape, device=None, dtype=torch.float32,
            mix: float = 1.0, roughness: float = 0.12) -> SibilantParams:
-    pf, pb, zf, zb, ti = PRESETS[name]
+    pf, pb, zf, zb, ti, slo, shi = PRESETS[name]
     return SibilantParams.constant(shape, pf, pb, zf, zb, ti, mix, roughness,
-                                   device=device, dtype=dtype)
+                                   slo, shi, device=device, dtype=dtype)
 
 
 def sibilant_response(p: SibilantParams, sample_rate: float,
@@ -95,6 +104,9 @@ def sibilant_response(p: SibilantParams, sample_rate: float,
     """
     H = pole_zero_response(p.pole_f, p.pole_bw, p.zero_f, p.zero_bw,
                            sample_rate, n_freq)
+    if p.slope_lo is not None and p.slope_hi is not None:
+        H = H * skirt_response(p.pole_f, p.slope_lo, p.slope_hi,
+                               sample_rate, n_freq)
     H = H * tilt_response(p.tilt, sample_rate, n_freq)
     H = rms_normalize(H)
     m = p.mix.clamp(0.0, 1.0).to(H.dtype)

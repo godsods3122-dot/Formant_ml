@@ -29,8 +29,11 @@ import os
 import torch
 
 from .config import Config
+from dataclasses import fields as dc_fields
+
 from .dsp.sibilant import PRESETS as SIB_PRESETS
 from .dsp.sibilant import SibilantParams
+from . import aerodynamics as aero
 from .gestures import GESTURES, base
 from .models.synth import Controls, PhysicalVoiceSynth
 from .presets import FRICATIVES, VOWELS
@@ -52,6 +55,8 @@ SCALAR_PARAMS = {
                       "공진에서 울려 음조가 들린다",
     "noise_back_leak": "구강 결합 0~1. 협착 뒤 공동까지 새어 통과하는 비율. "
                        "0 이면 마찰음이 입 밖에 얹힌 히스처럼 들린다",
+    "pressure": "성문하압 (1.0 = 보통 발화). 세기·F0·성문파 형상이 함께 따라온다",
+    "adduction": "성대 내전 0~1. 낮으면 기식, 높으면 모달. 발성 역치압을 정한다",
     "noise_gain": "난류 전체 세기",
     "noise_center": "난류 대역 중심 [Hz]",
     "noise_bw": "난류 대역폭 [Hz]",
@@ -60,6 +65,9 @@ SCALAR_PARAMS = {
     "sib_zero_f": "치찰음 반공진 [Hz]",
     "sib_zero_bw": "반공진 대역폭 [Hz]",
     "sib_tilt": "치찰음 기울기 [dB/oct]",
+    "sib_slope_lo": "치찰음 봉우리 아래 상승 기울기 [dB/oct]. 크면 삼각형, "
+                    "작으면 둥근 돔이 된다 (사람 /s/ 는 20~40)",
+    "sib_slope_hi": "치찰음 봉우리 위 하강 기울기 [dB/oct, 음수]",
     "sib_mix": "치찰음 필터 적용량 0~1",
 }
 FORMANT_PARAMS = {f"f{k + 1}": f"제{k + 1} 포먼트 [Hz]" for k in range(12)}
@@ -153,10 +161,21 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
             env = torch.ones(1, t, 1)
         else:
             split = float(seg.get("onset_ratio", 0.42))
-            c["harmonic_amp"] = ramp(t, [(0.0, 0.0), (split, 0.0),
-                                         (split + 0.08, 1.0), (1.0, 0.85)])
+            # 발성 시작을 **공기역학**으로 만든다. 세기만 램프로 올리면 녹음을
+            # 페이드인한 것처럼 들린다 — 실제로는 성문하압이 오르면서 세기·F0·
+            # 성문파 형상·기식 소음이 한꺼번에 따라 움직인다 (aerodynamics.py).
+            ps = ramp(t, [(0.0, 0.55), (split, 0.7), (split + 0.12, 1.0), (1.0, 0.95)])
+            add = ramp(t, [(0.0, 0.04), (split, 0.12), (split + 0.14, 1.0), (1.0, 1.0)])
+            asp = aero.apply(c, ps, add, rd_modal=prof.rd_median,
+                             rd_breathy=min(2.6, prof.rd_high + 0.6),
+                             route_noise=False)
             env = ramp(t, [(0.0, 1.0), (split, 1.0), (split + 0.1, 0.02), (1.0, 0.01)])
-            c["noise_bands"] = (nb * env).contiguous()
+            # 노이즈 경로가 하나뿐이라, 구강 협착(마찰음)에서 성문(기식)으로
+            # 주입 위치를 옮기며 섞는다.
+            asp_n = band_shelf(NB, 900.0, 1.0, a.sample_rate).reshape(1, 1, -1)
+            w_asp = (asp / (asp + env + 1e-6)).clamp(0.0, 1.0)
+            c["noise_bands"] = (nb * env + asp_n * asp * 0.35).contiguous()
+            c["noise_entry"] = (1.0 - w_asp) * (float(K) + 6.0)
             c["formant_freq"] = torch.cat([
                 ramp(t, [(0.0, _vowel_formants("i", prof, K)[k]),
                          (split, _vowel_formants("i", prof, K)[k]),
@@ -167,7 +186,8 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
         # 않는다. 앞공동 공진을 '캐스케이드의 마지막 포먼트' 와 '치찰음 극' 두
         # 군데서 모델링하면 이중 계산이 되어, 치찰음 파라미터를 돌려도 소리가
         # 안 바뀐다(캐스케이드의 고정된 극이 이긴다).
-        c["noise_entry"] = torch.full((1, t, 1), float(K) + 6.0)
+        if kind == "fricative":
+            c["noise_entry"] = torch.full((1, t, 1), float(K) + 6.0)
         # 음소가 *범주*(s 냐 ʃ 냐)를 정하고, 화자 프로파일이 그 안에서 *개인차*를
         # 준다. 프로파일만 쓰면 /s/ 와 /ʃ/ 가 똑같은 소리가 나고, 프리셋만 쓰면
         # 화자 지문이 사라진다. 프로파일의 표준 /s/ 대비 비율을 프리셋에 곱한다.
@@ -184,7 +204,7 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
             tilt = sp[4]
         sib = SibilantParams.constant(
             (1, t, 1), sp[0] * r_pole, sp[1] * r_pbw, sp[2] * r_zero,
-            sp[3] * r_zbw, tilt, 1.0, prof.roughness)
+            sp[3] * r_zbw, tilt, 1.0, prof.roughness, sp[5], sp[6])
         sib.mix = env.clamp(0.0, 1.0) if kind == "syllable" else torch.ones(1, t, 1)
         c["sib"] = sib
     else:
@@ -226,6 +246,10 @@ def apply_overrides(c: dict, spec: dict, t: int, cfg: Config) -> None:
         elif key in ("disp_freq", "disp_radius"):
             v = torch.tensor([float(x) for x in val], dtype=torch.float32)
             c[key] = v.reshape(1, 1, -1).expand(1, t, len(v)).contiguous()
+    if "pressure" in spec or "adduction" in spec:
+        # 압력/내전이 주어지면 세기·F0·Rd·기식을 거기서 일관되게 끌어낸다
+        aero.apply(c, curve(spec.get("pressure", 1.0), t),
+                   curve(spec.get("adduction", 1.0), t))
     if noise_shape:
         sr = cfg.audio.sample_rate
         g = noise_shape.get("noise_gain", 1.0)
@@ -275,9 +299,14 @@ def build_controls(score: dict, prof: VoiceProfile, cfg: Config) -> Controls:
         raise ValueError("timeline 이 비어 있습니다")
     keys = set().union(*[set(s) for s in segs]) - {"sib"}
     merged = {k: torch.cat([s[k] for s in segs], dim=1) for k in keys}
+    # 필드 목록을 **하드코딩하지 않는다**. 예전에는 7 개를 적어 두어서, 나중에
+    # 추가한 스커트 기울기가 이어붙이는 순간 조용히 사라졌다(합성에는 None 이
+    # 전달되고 아무도 알려주지 않았다).
     sib_fields = {}
-    for f in ("pole_f", "pole_bw", "zero_f", "zero_bw", "tilt", "mix", "roughness"):
-        sib_fields[f] = torch.cat([getattr(s["sib"], f) for s in segs], dim=1)
+    for f in dc_fields(SibilantParams):
+        vals = [getattr(s["sib"], f.name) for s in segs]
+        sib_fields[f.name] = (None if any(v is None for v in vals)
+                              else torch.cat(vals, dim=1))
     t = merged["f0"].shape[1]
 
     # 전역 오버라이드

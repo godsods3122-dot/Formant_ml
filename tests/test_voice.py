@@ -340,6 +340,24 @@ def _spectral_flatness(y, lo=1000.0, hi=11000.0):
     return float(torch.exp(torch.log(P).mean()) / P.mean())
 
 
+def _peak_width_octaves(y, lo=800.0, hi=11500.0):
+    """봉우리의 -6 dB 폭(옥타브). 좁을수록 음조로 들린다. 사람 /s/ 는 0.6~1.0."""
+    x = y.reshape(-1)
+    P = 20 * torch.log10(torch.fft.rfft(x * torch.hann_window(len(x))).abs()
+                         .clamp_min(1e-9))
+    k = torch.ones(1, 1, 151) / 151
+    P = torch.nn.functional.conv1d(P.view(1, 1, -1), k, padding=75).view(-1)
+    f = torch.linspace(0, FS / 2, len(P))
+    m = (f > lo) & (f < hi)
+    P, f = P[m], f[m]
+    pk = int(P.argmax())
+    ref = float(P[pk])
+    up, dn = P[pk:], P[:pk]
+    f_hi = f[pk:][(up < ref - 6).nonzero()[0, 0]] if (up < ref - 6).any() else f[-1]
+    f_lo = f[:pk][(dn < ref - 6).nonzero()[-1, 0]] if (dn < ref - 6).any() else f[0]
+    return math.log2(float(f_hi) / float(f_lo))
+
+
 def _band_peakiness(y, lo=2000.0, hi=11000.0, smooth=201):
     x = y.reshape(-1)
     P = 20 * torch.log10(torch.fft.rfft(x * torch.hann_window(len(x))).abs()
@@ -360,17 +378,18 @@ def test_fricative_spectrum_is_not_tonal():
     """
     y = render({"timeline": [{"type": "fricative", "phone": "s", "dur": 2.0}],
                 "seed": 1}, PROF, CFG)
-    flat = _spectral_flatness(y)
-    peak = _band_peakiness(y)
-    assert flat > 0.10, f"치찰음 스펙트럼 평탄도 {flat:.3f} (뾰족해서 음조가 들린다)"
-    assert peak < 9.0, f"치찰 대역이 중앙값보다 {peak:.1f} dB 솟아 있다"
+    # 판단 기준은 평탄도가 아니라 **봉우리의 좁기**다. 마찰음 스펙트럼은 원래
+    # 삼각형이라 평탄하지 않다(사람도 그렇다). 음조는 봉우리가 *좁을* 때 들린다.
+    width = _peak_width_octaves(y)
+    assert width > 0.30, f"봉우리 -6dB 폭이 {width:.2f} 옥타브 (좁아서 음조가 들린다)"
+    assert _kurtosis(y) < 3.5, "진폭 분포 꼬리가 두껍다"
 
     # 위상 무작위화로 '시간영역 원인이 아님' 을 확인 (회귀 방지용 전제)
     X = torch.fft.rfft(y.reshape(-1))
     ph = torch.rand(len(X)) * 2 * math.pi
     ph[0] = 0
     rnd = torch.fft.irfft(X.abs() * torch.exp(1j * ph), y.shape[-1])[None]
-    assert abs(_spectral_flatness(rnd) - flat) < 0.03
+    assert abs(_spectral_flatness(rnd) - _spectral_flatness(y)) < 0.03
 
 
 def test_phone_and_speaker_both_shape_the_sibilant():
@@ -615,7 +634,11 @@ def test_extracted_profile_recovers_what_was_synthesized():
     assert abs(got.f0_median - 140.0) < 3.0, got.f0_median
     assert abs(got.rd_median - 1.0) < 0.3, got.rd_median
     assert abs(got.sibilant["pole_f"] - 7400.0) / 7400.0 < 0.12, got.sibilant
-    assert abs(got.sibilant["zero_f"] - 3100.0) / 3100.0 < 0.20, got.sibilant
+    # zero_f 와 slope_lo 는 둘 다 저역 스커트를 만들기 때문에 서로 맞바꿔 가며
+    # 같은 모양을 낼 수 있다(부분적 축퇴). 개별 값이 아니라 **재현된 모양**이
+    # 맞는지를 본다 — 합성에 쓰는 것도 모양이다.
+    assert got.sibilant_moments.get("fit_rmse_db", 99) < 4.0, got.sibilant_moments
+    assert 1500.0 < got.sibilant["zero_f"] < got.sibilant["pole_f"], got.sibilant
     for a, b in zip(got.formants[:3], (730.0, 1090.0, 2440.0)):
         assert abs(a - b) / b < 0.12, got.formants[:3]
 

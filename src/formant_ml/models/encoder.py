@@ -58,7 +58,7 @@ class ControlEncoder(nn.Module):
         self.head_noise = nn.Linear(d, Nb + 5)
         self.head_allpass = nn.Linear(d, 2 * Na)       # 성도 군지연
         self.head_disp = nn.Linear(d, 2 * Nd)          # 하모닉 위상차(위상차 파라미터)
-        self.head_sib = nn.Linear(d, 6)                # 치찰음 극-영점 필터
+        self.head_sib = nn.Linear(d, 8)                # 치찰음 극-영점 + 스커트
         self.head_area = nn.Linear(d, Ns)
         self.K, self.Ka, self.Na, self.Nb, self.Ns, self.Nd = K, Ka, Na, Nb, Ns, Nd
 
@@ -116,7 +116,11 @@ class ControlEncoder(nn.Module):
         sz_bw = scale_sigmoid(sb[..., 3:4], 150.0, 4000.0)
         s_tilt = scale_sigmoid(sb[..., 4:5], -6.0, 6.0)
         s_mix = torch.sigmoid(sb[..., 5:6])
-        sib = SibilantParams(sp_f, sp_bw, sz_f, sz_bw, s_tilt, s_mix, rough)
+        # 봉우리 양옆 스커트 기울기 — 뾰족한 삼각형이냐 둥근 돔이냐를 정한다
+        s_lo = 45.0 * torch.sigmoid(sb[..., 6:7])
+        s_hi = -20.0 * torch.sigmoid(sb[..., 7:8])
+        sib = SibilantParams(sp_f, sp_bw, sz_f, sz_bw, s_tilt, s_mix, rough,
+                             s_lo, s_hi)
 
         ap = self.head_allpass(h)
         apf = scale_sigmoid(ap[..., : self.Na], 100.0, cfg.audio.sample_rate * 0.45)

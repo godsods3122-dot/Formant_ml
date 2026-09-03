@@ -65,7 +65,7 @@ class VoiceProfile:
     # --- 치찰음 지문 --------------------------------------------------------
     sibilant: dict = field(default_factory=lambda: {
         "pole_f": 6600.0, "pole_bw": 2200.0, "zero_f": 2900.0, "zero_bw": 2600.0,
-        "tilt": 1.0})
+        "tilt": 0.0})   # 모양은 스커트 기울기가 만든다 (dsp/sibilant.py)
     sibilant_moments: dict = field(default_factory=dict)
 
     # --- 위상차 -------------------------------------------------------------
