@@ -50,7 +50,7 @@ SCALAR_PARAMS = {
     "aspiration": "성문 기식 노이즈 (성도 전체를 통과). 0.01≈-25dB, 0.05≈-11dB",
     "level_db": "마찰음 레벨 [dB, 모음 기준]. /s/ 기본 -12, /f/ -26",
     "velum_open": "연구개 개도 0~1 (비음). 0 이면 비강 극-영점이 정확히 상쇄된다",
-    "noise_rough": "난류의 시간 변조 (0 = 정상 히스, 1 = 거친 난류)",
+    "noise_rough": "잡음의 거칠기 0=low-noise noise(포락선 평탄), 1=가우시안 백색",
     "noise_gain": "난류 전체 세기",
     "noise_center": "난류 대역 중심 [Hz]",
     "noise_bw": "난류 대역폭 [Hz]",

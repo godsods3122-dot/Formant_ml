@@ -31,6 +31,85 @@ import torch.nn.functional as F
 from .core import TWO_PI, upsample
 
 
+def analytic_envelope(x: torch.Tensor) -> torch.Tensor:
+    """힐베르트 해석신호의 크기 = 순시 포락선. (B, N)"""
+    n = x.shape[-1]
+    X = torch.fft.rfft(x)
+    A = torch.zeros(*x.shape[:-1], n, dtype=torch.complex64, device=x.device)
+    A[..., : X.shape[-1]] = X * 2.0
+    A[..., 0] = X[..., 0]
+    return torch.fft.ifft(A, dim=-1).abs().to(x.dtype)
+
+
+def low_noise_noise(shape, flatten: float = 1.0, iters: int = 8,
+                    device=None, dtype=torch.float32,
+                    generator: torch.Generator | None = None) -> torch.Tensor:
+    """포락선 요동이 작은 잡음 (Pumplin 1985 의 low-noise noise).
+
+    **가우시안 백색잡음은 주어진 스펙트럼에서 가장 '거친' 잡음이다.** 포락선이
+    레일리 분포라 변동계수가 0.523 이나 되고, 그 요동의 상당 부분이 20~150 Hz —
+    청각 거칠기(roughness)가 가장 예민한 대역 — 에 들어간다. 그래서 스펙트럼이
+    아무리 맞아도 '지글거리는' 소리가 난다.
+
+    Pumplin 의 방법: 목표 스펙트럼과 '포락선이 평평할 것'을 번갈아 강제한다.
+        (1) 순시 포락선으로 나눈다      -> 포락선이 평평해짐 (스펙트럼이 틀어짐)
+        (2) 크기 스펙트럼을 다시 씌운다  -> 스펙트럼 복원 (포락선이 조금 틀어짐)
+    몇 번 반복하면 둘 다 거의 만족하는 신호로 수렴한다.
+
+    `flatten` 으로 가우시안(0)과 완전 평탄(1) 사이를 연속적으로 오간다.
+    주의: 뒤에서 대역제한을 하면 요동이 일부 되살아난다(Kohlrausch et al.).
+    그래도 측정 가능한 만큼 줄어든다.
+    """
+    x = torch.randn(*shape, device=device, dtype=dtype, generator=generator)
+    if flatten <= 0.0:
+        return x
+    mag = torch.fft.rfft(x).abs()                    # 목표 크기 스펙트럼(백색)
+    for _ in range(iters):
+        e = analytic_envelope(x).clamp_min(1e-6)
+        x = x / e.pow(flatten)                       # (1) 포락선 평탄화
+        X = torch.fft.rfft(x)
+        X = mag * torch.exp(1j * torch.angle(X))     # (2) 스펙트럼 복원
+        x = torch.fft.irfft(X, x.shape[-1])
+    return x / x.std(-1, keepdim=True).clamp_min(1e-6)
+
+
+def flatten_fast_envelope(x: torch.Tensor, sample_rate: int, strength: float = 1.0,
+                          slow_hz: float = 15.0) -> torch.Tensor:
+    """빠른 포락선 요동만 눌러 잡음을 매끄럽게 만든다. 느린 포락선은 보존한다.
+
+    소스에서 low-noise noise 를 만들어도 **뒤에서 대역제한을 하면 요동이 되살아난다**
+    (Kohlrausch et al.). 그래서 색을 다 입힌 *다음* 한 번 더 평탄화한다.
+
+    `slow_hz` 아래(마찰음의 시작/끝 램프, 조음이 만드는 변화)는 건드리지 않고,
+    그 위(청각 거칠기 대역 20~150 Hz)만 눌러서 나눈다. 그래서 음절 포락선이
+    뭉개지지 않는다.
+    """
+    if strength <= 0.0:
+        return x
+    n = x.shape[-1]
+    e = analytic_envelope(x).clamp_min(1e-6)
+    E = torch.fft.rfft(e)
+    f = torch.linspace(0, sample_rate / 2, E.shape[-1], device=x.device)
+    lp = torch.exp(-0.5 * (f / slow_hz) ** 2)            # 가우시안 저역통과
+    slow = torch.fft.irfft(E * lp.to(E.dtype), n).clamp_min(1e-6)
+    ratio = (e / slow).clamp(0.2, 5.0)                   # 빠른 요동 성분만
+    y = x / ratio.pow(strength)
+
+    # 포락선을 평탄화하면 스펙트럼이 희어진다(측정: 9.2 dB rms). 치찰음의 정체가
+    # 그 스펙트럼이므로 그냥 두면 안 된다. 넓게 평활한 크기 비로 되돌린다
+    # (미세구조는 건드리지 않으므로 포락선 평탄화는 대부분 살아남는다:
+    #  거칠기 0.150 -> 0.034, 스펙트럼 오차 9.2 -> 0.4 dB).
+    w = 301
+    def _smooth_mag(z):
+        p = torch.fft.rfft(z, dim=-1).abs()
+        k = torch.ones(1, 1, w, device=z.device, dtype=z.dtype) / w
+        p = F.pad(p.reshape(-1, 1, p.shape[-1]), (w // 2, w // 2), mode="replicate")
+        return F.conv1d(p, k).reshape(*z.shape[:-1], -1)
+    corr = _smooth_mag(x) / _smooth_mag(y).clamp_min(1e-9)
+    Y = torch.fft.rfft(y, dim=-1)
+    return torch.fft.irfft(Y * corr.to(Y.dtype), n, dim=-1)
+
+
 class TurbulenceSource(nn.Module):
     """백색잡음 -> (학습된 변조 x 성문동기 AM) -> 난류 소스 파형.
 
@@ -38,8 +117,7 @@ class TurbulenceSource(nn.Module):
     """
 
     def __init__(self, sample_rate: int, hop_size: int, n_bands: int = 40,
-                 init_beta: float = 1.0, init_knee_hz: float = 120.0,
-                 mod_highpass_hz: float = 45.0):
+                 init_beta: float = 1.0, init_knee_hz: float = 6.0):
         super().__init__()
         self.sample_rate = sample_rate
         self.hop_size = hop_size
@@ -49,12 +127,7 @@ class TurbulenceSource(nn.Module):
         # 변조 스펙트럼: |M(f)| = (1 + (f/knee)^2)^(-beta/2)
         self.raw_beta = nn.Parameter(torch.tensor(float(init_beta)))
         self.raw_knee = nn.Parameter(torch.tensor(float(init_knee_hz)).log())
-        # 변조 포락선의 **느린 성분 제거**. 이게 없으면 0.1~10 Hz 변조가 그대로
-        # 남아 기름에 튀기는 듯한 '지글거림'이 된다.
-        # 물리적 근거: 협착부 난류의 상관시간은 밀리초 단위다. 100 ms 규모의
-        # 느린 진폭 변화는 난류가 아니라 **조음**이 만드는 것이고, 그건 이미
-        # noise_bands 궤적 + 조음 동역학이 따로 담당한다. 두 번 세면 안 된다.
-        self.mod_highpass_hz = float(mod_highpass_hz)
+
 
     # ------------------------------------------------------------------ 사전
     def spectral_prior(self) -> torch.Tensor:
@@ -71,10 +144,9 @@ class TurbulenceSource(nn.Module):
                            device=device, dtype=dtype)
         beta = F.softplus(self.raw_beta).clamp(0.05, 4.0)
         knee = self.raw_knee.exp().clamp(10.0, 4000.0)
+        # knee 는 이제 **수 Hz** 다. 20~150 Hz 변조는 청각 거칠기 대역이라
+        # 절대 넣으면 안 되고, 난류의 '살아 있음'은 조음 속도(<10 Hz)에서 온다.
         w = (1.0 + (f / knee) ** 2) ** (-beta / 2.0)
-        if self.mod_highpass_hz > 0:
-            r = f / self.mod_highpass_hz
-            w = w * (r / (1.0 + r * r).sqrt())          # 1차 고역통과
         e = torch.fft.irfft(M * w.to(M.dtype), n)
         e = e - e.mean(-1, keepdim=True)
         return e / e.std(-1, keepdim=True).clamp_min(1e-6)
@@ -84,25 +156,38 @@ class TurbulenceSource(nn.Module):
                 am_depth: torch.Tensor | None = None,
                 glottal_phase: torch.Tensor | None = None,
                 roughness: torch.Tensor | None = None,
+                voicing: torch.Tensor | None = None,
                 generator: torch.Generator | None = None) -> torch.Tensor:
-        """반환: 난류 소스 (B, N), N = n_frames * hop_size."""
+        """반환: 난류 소스 (B, N), N = n_frames * hop_size.
+
+        `roughness` 는 이제 **잡음 자체의 거칠기**다: 0 이면 포락선이 평평한
+        low-noise noise, 1 이면 보통의 가우시안 백색잡음. 예전처럼 가우시안 위에
+        변조를 *더하는* 게 아니라, 가우시안이 상한이 된다.
+        """
         n = n_frames * self.hop_size
-        w = torch.randn(batch, n, device=device, dtype=dtype, generator=generator)
+        r_mean = 0.0 if roughness is None else float(roughness.detach().mean())
+        w = low_noise_noise((batch, n), flatten=1.0 - min(max(r_mean, 0.0), 1.0),
+                            device=device, dtype=dtype, generator=generator)
 
         if roughness is not None:
+            # 느린(<10 Hz) 진폭 흔들림만 더한다. 학습 파라미터(beta, knee)가
+            # 그 모양을 정한다. 거칠기 대역에는 아무것도 넣지 않는다.
             env = self.modulation_envelope(batch, n, device, dtype, generator)
-            r = upsample(roughness, self.hop_size).squeeze(-1).clamp(0.0, 1.0)
-            r = r[..., :n]
-            # 1 + r*env 를 아래에서 잘라내면 평균이 올라가므로 다시 정규화한다.
-            g = (1.0 + r * env).clamp_min(0.0)
-            g = g / g.pow(2).mean(-1, keepdim=True).clamp_min(1e-6).sqrt()
-            w = w * g
+            r = upsample(roughness, self.hop_size).squeeze(-1).clamp(0.0, 1.0)[..., :n]
+            g = (1.0 + 0.6 * r * env).clamp_min(0.05)
+            w = w * g / g.pow(2).mean(-1, keepdim=True).clamp_min(1e-6).sqrt()
 
         if am_depth is not None and glottal_phase is not None:
             frac = torch.frac(glottal_phase[..., :n] / TWO_PI)
             # 성문 개방기(0..0.6)에 에너지가 몰리는 부드러운 창
             env = torch.sin(torch.pi * frac.clamp(0.0, 0.6) / 0.6) ** 2
             d = upsample(am_depth, self.hop_size).squeeze(-1).clamp(0.0, 1.0)[..., :n]
+            # **성대가 실제로 진동할 때만** 성문동기 변조가 있다. 무성 마찰음에
+            # 이걸 걸면 F0 주기의 진폭변조가 잡음에 얹혀 그대로 거칠기가 된다
+            # (실측: /s/ 의 변조 스펙트럼 최대가 정확히 F0=121 Hz 에 있었다).
+            if voicing is not None:
+                d = d * upsample(voicing, self.hop_size).squeeze(-1
+                                                                ).clamp(0.0, 1.0)[..., :n]
             w = w * ((1.0 - d) + d * 2.0 * env)
         return w
 

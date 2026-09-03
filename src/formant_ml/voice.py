@@ -81,11 +81,10 @@ class VoiceProfile:
     dispersion: dict = field(default_factory=lambda: {"freq": [], "radius": []})
 
     # --- 난류 ---------------------------------------------------------------
-    # 난류 시간변조 깊이. 0.35 는 너무 커서 /s/ 가 기름에 튀기는 듯한 '지글거림'이
-    # 된다(측정: 3~30 Hz 변조지수 0.043 -> 0.088, 즉 잡음 자체의 요동 대비 2배).
-    # 0.12 면 '살아 있는 난류' 느낌은 남으면서 지글거림이 안 들린다.
-    # 마찰음은 원래 꽤 정상적(steady)이고, 거친 느낌이 필요한 건 기식/성대프라이 쪽이다.
-    roughness: float = 0.12              # 난류 시간변조 깊이
+    # 잡음의 거칠기. **0 = low-noise noise(포락선이 평평), 1 = 가우시안 백색.**
+    # 예전 의미(가우시안 위에 변조를 더하는 깊이)에서 바뀌었다. 가우시안이 이제
+    # 상한이다 — 주어진 스펙트럼에서 가장 거친 잡음이 가우시안이기 때문이다.
+    roughness: float = 0.0
     breathiness: float = 0.15            # 유성 구간 기식 노이즈 세기
 
     # 이상와(piriform fossa) 반공진 [Hz]. 성도의 곁가지라 화자 고정값이다.
@@ -124,7 +123,7 @@ class VoiceProfile:
             sibilant={"pole_f": 7400.0, "pole_bw": 1400.0, "zero_f": 3300.0,
                       "zero_bw": 900.0, "tilt": 0.5},
             piriform={"freq": 4700.0, "bw": 650.0},
-            roughness=0.10, breathiness=0.20)
+            roughness=0.0, breathiness=0.20)
 
     def n_formants(self, sample_rate: int | None = None) -> int:
         """이 성도 길이에서 나이퀴스트 아래에 실제로 존재하는 극의 개수.

@@ -287,27 +287,68 @@ def test_glottal_opening_widens_f1():
     assert 30.0 < float(d[1]) < 130.0        # 문헌의 주기평균 50~100 Hz 범위
 
 
-def test_fricative_sizzle_is_bounded():
-    """/s/ 의 저속(3~30 Hz) 진폭 변조가 잡음 자체의 요동을 크게 넘지 않아야 한다."""
+def test_fricative_is_smoother_than_gaussian_noise():
+    """마찰음의 청각 거칠기 대역(20~150 Hz) 변조가 가우시안 잡음보다 작아야 한다.
+
+    **가우시안 백색잡음은 주어진 스펙트럼에서 가장 거친 잡음이다** (포락선이
+    레일리 분포, 변동계수 0.523). 그 요동의 상당 부분이 20~150 Hz — 청각
+    거칠기가 가장 예민한 대역 — 에 들어가 '지글거림'이 된다.
+    `noise_rough` 는 이제 0=low-noise noise(평평), 1=가우시안 이다.
+
+    주의: 예전 지표는 STFT(창 42 ms) 포락선이라 12 Hz 위를 못 봤다. 여기서는
+    힐베르트 포락선을 샘플률에서 잡는다.
+    """
     from formant_ml.config import Config as C
     from formant_ml.score import render
     from formant_ml.voice import VoiceProfile
 
-    def sizzle(rough):
-        y = render({"timeline": [{"type": "fricative", "phone": "s", "dur": 0.5,
+    def roughness_index(rough):
+        y = render({"timeline": [{"type": "fricative", "phone": "s", "dur": 0.6,
                                   "noise_rough": rough}], "seed": 3},
                    VoiceProfile(), C())[0]
-        X = torch.stft(y[None], 1024, 120, 1024, torch.hann_window(1024),
-                       return_complex=True, center=True).abs()[0]
-        f = torch.linspace(0, 12000, X.shape[0])
-        e = X[(f > 3000) & (f < 12000)].mean(0)
-        e = e / e.mean().clamp_min(1e-9) - 1.0
-        E = torch.fft.rfft(e * torch.hann_window(len(e))).abs()
-        mf = torch.linspace(0, 100.0, len(E))
-        return float((E[(mf > 3) & (mf < 30)] ** 2).sum().sqrt() / len(e) * 2)
+        y = y[int(0.08 * 24000): int(0.5 * 24000)]
+        n = len(y)
+        Y = torch.fft.rfft(y)
+        A = torch.zeros(n, dtype=torch.complex64)
+        A[: len(Y)] = Y * 2
+        A[0] = Y[0]
+        e = torch.fft.ifft(A).abs()
+        e = e / e.mean() - 1.0
+        E = torch.fft.rfft(e * torch.hann_window(n)).abs()
+        mf = torch.linspace(0, 12000, len(E))
+        return float((E[(mf > 20) & (mf < 150)] ** 2).sum().sqrt() / n * 2)
 
-    floor, now = sizzle(0.0), sizzle(0.12)
-    assert now < floor * 1.35, (floor, now)     # 이전 기본값 0.35 는 2배였다
+    smooth, gaussian = roughness_index(0.0), roughness_index(1.0)
+    assert smooth < gaussian * 0.6, (smooth, gaussian)   # 실측 0.022 vs 0.104
+    assert roughness_index(0.5) > smooth                  # 단조
+
+
+def test_envelope_flattening_preserves_the_spectrum():
+    """포락선 평탄화가 치찰음 스펙트럼을 희게 만들면 안 된다.
+
+    (평탄화만 하면 9.2 dB rms 로 희어진다 — 치찰음의 정체가 그 스펙트럼인데.
+     넓게 평활한 크기 비로 되돌려 0.4 dB 로 줄인다.)
+    """
+    from formant_ml.dsp.noise import flatten_fast_envelope
+    from formant_ml.dsp.sibilant import SibilantParams, sibilant_response
+    n = 1 << 15
+    H = sibilant_response(SibilantParams.constant((1, 1, 1), 7000., 900., 3000.,
+                                                  900., 0.5, 1.0, 0.), 24000,
+                          n // 2 + 1)[0, 0]
+    torch.manual_seed(0)
+    x = torch.fft.irfft(torch.fft.rfft(torch.randn(n)) * H, n)[None]
+    y = flatten_fast_envelope(x, 24000, 1.0)
+
+    def smooth_lts(z):
+        P = torch.fft.rfft(z[0] * torch.hann_window(n)).abs()
+        k = torch.ones(1, 1, 201) / 201
+        return torch.nn.functional.conv1d(P[None, None], k, padding=100)[0, 0]
+
+    f = torch.linspace(0, 12000, n // 2 + 1)
+    d = 20 * torch.log10(smooth_lts(y).clamp_min(1e-9) / smooth_lts(x).clamp_min(1e-9))
+    err = float(d[(f > 1000) & (f < 12000)].pow(2).mean().sqrt())
+    assert err < 1.5, err
+
 
 
 # ------------------------------------------------------------------ 마찰음 레벨/모양
@@ -355,6 +396,56 @@ def test_sibilant_spectrum_is_broad_not_a_single_hump():
         low = float(P[f < 2000].sum() / P.sum())
         assert width >= 4000.0, width
         assert low < 0.02, low
+
+
+# ------------------------------------------------------- z축 다질량 성대 모델
+def test_multimass_folds_oscillate_and_close_completely():
+    """수직 적층 모델이 자가진동하고 **모든 층이 닿는 완전폐쇄**에 도달한다.
+
+    2질량 모델은 질량이 둘뿐이라 '아래 한 번, 위 한 번' 으로만 닿는다.
+    접촉면이 자라는 과정도, 지퍼 닫힘도 표현할 수 없다.
+    """
+    from formant_ml.dsp.vocalfold import (MultiMassParams, contact_progression,
+                                          cycle_rate, simulate_multi)
+    p = MultiMassParams()
+    flow, traj, _ = simulate_multi(p, 7200, 24000, oversample=4)
+    seg = slice(2400, None)
+    f0 = cycle_rate(flow[seg])
+    assert 80.0 < f0 < 400.0, f0
+    d = contact_progression(traj[seg], p)
+    assert d["max_contact"] > 0.99, d["max_contact"]      # 8개 층이 전부 닿는다
+    closed = float((flow[seg] == 0).to(flow.dtype).mean())
+    assert closed > 0.25, closed
+
+
+def test_multimass_f0_does_not_depend_on_layer_count():
+    """층 수는 해상도이지 물리가 아니다 — F0 가 N 에 따라 변하면 안 된다.
+
+    질량 M/N, 횡강성 K/N 로 나눠야 고유진동수가 보존된다. (나누지 않으면
+    F0 가 sqrt(N) 로 올라간다: 실측 N=2 175 Hz -> N=16 425 Hz.)
+    """
+    from formant_ml.dsp.vocalfold import MultiMassParams, cycle_rate, simulate_multi
+    f0s = []
+    for n in (4, 8, 12):
+        flow, _, _ = simulate_multi(MultiMassParams(n_masses=n), 6000, 24000,
+                                    oversample=4)
+        f0s.append(cycle_rate(flow[2400:]))
+    assert max(f0s) / min(f0s) < 1.6, f0s
+
+
+def test_mucosal_wave_speed_controls_self_oscillation():
+    """점막파가 빠르면 층들이 한 덩어리로 움직여 진동이 죽는다.
+
+    수렴/발산 형상의 교대가 자가진동의 에너지원이므로, 층간 위상차가 없으면
+    에너지가 들어오지 않는다. 이건 2질량 모델에서는 파라미터로 볼 수 없는 것이다.
+    """
+    from formant_ml.dsp.vocalfold import MultiMassParams, simulate_multi
+    def amp(c):
+        _, traj, _ = simulate_multi(
+            MultiMassParams(mucosal_wave_speed=c), 6000, 24000, oversample=4)
+        return float(traj[2400:].std())
+    slow, fast = amp(40.0), amp(400.0)
+    assert slow > fast * 3.0, (slow, fast)
 
 
 if __name__ == "__main__":

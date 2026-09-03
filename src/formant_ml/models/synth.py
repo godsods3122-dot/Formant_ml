@@ -29,7 +29,7 @@ from ..dsp.filters import (allpass_response, antiresonator_response,
                            resonator_stage_responses)
 from ..dsp.glottal import GlottalSource, glottal_f1_damping
 from ..dsp.nasal import f1_bandwidth_factor, nasal_response
-from ..dsp.noise import TurbulenceSource
+from ..dsp.noise import TurbulenceSource, flatten_fast_envelope
 from ..dsp.sibilant import SibilantParams, sibilant_response
 from ..dsp.tract import tract_response
 
@@ -192,9 +192,11 @@ class PhysicalVoiceSynth(nn.Module):
             c.f0, c.rd, c.harmonic_amp, tilt=c.tilt,
             disp_freq=c.disp_freq, disp_radius=c.disp_radius,
             jitter=c.jitter, shimmer=c.shimmer, generator=generator)
+        voicing = c.harmonic_amp.clamp(0.0, 1.0)
         raw_noise = self.noise(t, b, c.f0.device, c.f0.dtype,
                                am_depth=c.noise_am, glottal_phase=phase,
-                               roughness=c.noise_rough, generator=generator)
+                               roughness=c.noise_rough, voicing=voicing,
+                               generator=generator)
 
         if self.tract_mode == "formant":
             h_harm, h_noise = self._formant_paths(c)
@@ -212,6 +214,10 @@ class PhysicalVoiceSynth(nn.Module):
 
         voiced = ltv_filter(src, h_harm, hop, ir)
         unvoiced = ltv_filter(raw_noise, h_noise, hop, ir)
+        # 색을 입힌 뒤 되살아난 빠른 포락선 요동을 한 번 더 누른다.
+        smooth = 1.0 - (float(c.noise_rough.detach().mean())
+                        if c.noise_rough is not None else 0.0)
+        unvoiced = flatten_fast_envelope(unvoiced, fs, max(smooth, 0.0))
 
         # 기식 노이즈: 성문에서 나 성도 전체를 통과한다. 마찰 노이즈와 별개의
         # 난수를 쓴다(같은 신호를 두 경로로 보내면 콤필터가 생긴다).
@@ -219,7 +225,8 @@ class PhysicalVoiceSynth(nn.Module):
         if c.aspiration is not None and float(c.aspiration.abs().max()) > 0:
             asp_src = self.noise(t, b, c.f0.device, c.f0.dtype,
                                  am_depth=c.noise_am, glottal_phase=phase,
-                                 roughness=c.noise_rough, generator=generator)
+                                 roughness=c.noise_rough, voicing=voicing,
+                                 generator=generator)
             g = upsample(c.aspiration.clamp_min(0.0), hop).squeeze(-1)
             n = min(g.shape[1], asp_src.shape[1])
             aspirated = ltv_filter(asp_src[:, :n] * g[:, :n],

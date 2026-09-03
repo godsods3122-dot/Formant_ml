@@ -46,7 +46,7 @@ class SibilantParams:
 
     @staticmethod
     def constant(shape, pole_f=6500.0, pole_bw=900.0, zero_f=2600.0, zero_bw=800.0,
-                 tilt=0.0, mix=1.0, roughness=0.3, device=None,
+                 tilt=0.0, mix=1.0, roughness=0.0, device=None,
                  dtype=torch.float32) -> "SibilantParams":
         def c(v):
             return torch.full(shape, float(v), device=device, dtype=dtype)
@@ -76,7 +76,7 @@ PRESETS = {
 
 
 def preset(name: str, shape, device=None, dtype=torch.float32,
-           mix: float = 1.0, roughness: float = 0.3) -> SibilantParams:
+           mix: float = 1.0, roughness: float = 0.0) -> SibilantParams:
     pf, pb, zf, zb, ti = PRESETS[name]
     return SibilantParams.constant(shape, pf, pb, zf, zb, ti, mix, roughness,
                                    device=device, dtype=dtype)
