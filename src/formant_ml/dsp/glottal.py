@@ -14,6 +14,7 @@ import torch
 import torch.nn as nn
 
 from .core import TWO_PI, upsample
+from .phase import allpass_phase
 
 
 # ----------------------------------------------------------------------------- LF
@@ -103,10 +104,48 @@ class LFTableBank(nn.Module):
 
 
 # ---------------------------------------------------------------------- 오실레이터
-class GlottalSource(nn.Module):
-    """대역제한 가산합성으로 성문 유량미분 신호를 만든다."""
+def _interp_frames(c: torch.Tensor, t0: int, t1: int, hop: int) -> torch.Tensor:
+    """프레임률 (B, T, K) 의 [t0, t1) 구간만 샘플률로 선형보간 -> (B, (t1-t0)*hop, K).
 
-    def __init__(self, sample_rate: int, hop_size: int, n_harmonics: int = 180,
+    전체를 한 번에 upsample 하면 (B, N, K) 텐서가 통째로 메모리에 올라간다
+    (24 kHz, 1.5 초, K=240 이면 배치당 ~35 MB). 블록 단위로 하면 상한이 고정되고,
+    경계에서는 *진짜 다음 프레임* 을 써서 전역 보간과 정확히 같은 값이 나온다.
+    """
+    t = c.shape[1]
+    nxt = c[:, min(t1, t - 1): min(t1, t - 1) + 1]
+    seg = torch.cat([c[:, t0:t1], nxt], dim=1)                 # (B, tb+1, K)
+    tb = t1 - t0
+    pos = torch.arange(tb * hop, device=c.device, dtype=c.dtype) / hop
+    i0 = pos.floor().long().clamp(max=tb)
+    frac = (pos - i0).view(1, -1, 1)
+    return seg[:, i0] * (1 - frac) + seg[:, (i0 + 1).clamp(max=tb)] * frac
+
+
+def _smooth_noise(shape, hop_frames: int, device, dtype, generator=None,
+                  smooth: int = 3) -> torch.Tensor:
+    """저역통과된 단위분산 난수 (지터/시머의 느린 요동)."""
+    z = torch.randn(shape, device=device, dtype=dtype, generator=generator)
+    if smooth > 1:
+        k = torch.ones(1, 1, smooth, device=device, dtype=dtype) / smooth
+        z = torch.nn.functional.conv1d(
+            z.transpose(1, 2), k, padding=smooth // 2).transpose(1, 2)[:, :shape[1]]
+        z = z / z.std().clamp_min(1e-6)
+    return z
+
+
+class GlottalSource(nn.Module):
+    """대역제한 가산합성으로 성문 유량미분 신호를 만든다.
+
+    Rd 외에 세 가지 손잡이가 더 있다.
+
+    * `tilt`      : 옥타브당 dB 기울기. LF 의 Rd 만으로는 고역 감쇠 모양이 고정이라
+                    6~12 kHz 를 원하는 만큼 살릴 수 없다(이전 샘플의 '고역 부족').
+    * `disp_*`    : **위상차 파라미터**. 하모닉의 상대 위상만 바꾸고 크기응답은
+                    건드리지 않는다(올패스). dsp/phase.py 참고.
+    * `jitter/shimmer` : 주기/진폭의 미세 요동. 없으면 '부저 같은' 완전 주기성이 남는다.
+    """
+
+    def __init__(self, sample_rate: int, hop_size: int, n_harmonics: int = 240,
                  n_tables: int = 16, table_size: int = 2048,
                  rd_min: float = 0.3, rd_max: float = 2.7, chunk: int = 12000):
         super().__init__()
@@ -117,13 +156,42 @@ class GlottalSource(nn.Module):
         self.register_buffer("k", torch.arange(1, n_harmonics + 1).float())
 
     def forward(self, f0: torch.Tensor, rd: torch.Tensor, amp: torch.Tensor,
-                phase0: torch.Tensor | None = None):
-        """f0/rd/amp: (B, T, 1) 프레임률. 반환: (source (B,N), phase (B,N))."""
+                phase0: torch.Tensor | None = None,
+                tilt: torch.Tensor | None = None,
+                disp_freq: torch.Tensor | None = None,
+                disp_radius: torch.Tensor | None = None,
+                jitter: torch.Tensor | None = None,
+                shimmer: torch.Tensor | None = None,
+                generator: torch.Generator | None = None):
+        """f0/rd/amp/tilt/jitter/shimmer: (B, T, 1), disp_*: (B, T, S) 프레임률.
+
+        반환: (source (B, N), glottal_phase (B, N)).
+        """
         b, t, _ = f0.shape
         n = t * self.hop_size
+        dev, dt = f0.device, f0.dtype
+
+        if jitter is not None:
+            z = _smooth_noise((b, t, 1), self.hop_size, dev, dt, generator)
+            f0 = f0 * (1.0 + jitter.clamp(0.0, 0.2) * z)
+        if shimmer is not None:
+            z = _smooth_noise((b, t, 1), self.hop_size, dev, dt, generator)
+            amp = amp * (1.0 + shimmer.clamp(0.0, 0.9) * z).clamp_min(0.0)
+
         coef = self.bank.interpolate(rd)                       # (B, T, K) complex
-        cr = upsample(coef.real, self.hop_size)                # (B, N, K)
-        ci = upsample(coef.imag, self.hop_size)
+        fk = f0 * self.k.view(1, 1, -1)                        # (B, T, K) 하모닉 주파수
+
+        # 스펙트럼 기울기: 1 kHz 를 축으로 옥타브당 tilt dB
+        if tilt is not None:
+            oct_ = torch.log2(fk.clamp_min(20.0) / 1000.0)
+            g = 10.0 ** ((tilt * oct_).clamp(-40.0, 40.0) / 20.0)
+            coef = coef * g.to(coef.dtype)
+
+        # 위상차(올패스) — 크기는 그대로, 하모닉 간 상대위상만 바뀐다
+        if disp_freq is not None and disp_radius is not None:
+            ph = allpass_phase(fk, disp_freq, disp_radius, self.sample_rate)
+            coef = coef * torch.polar(torch.ones_like(ph), ph).to(coef.dtype)
+
         f0_s = upsample(f0, self.hop_size).squeeze(-1)          # (B, N)
         amp_s = upsample(amp, self.hop_size).squeeze(-1)
 
@@ -134,16 +202,20 @@ class GlottalSource(nn.Module):
             phase = phase + phase0
 
         nyq = self.sample_rate * 0.5
-        out = torch.zeros(b, n, device=f0.device, dtype=f0.dtype)
-        for s in range(0, n, self.chunk):                       # 메모리 상한 유지
-            e = min(s + self.chunk, n)
-            ph = phase[:, s:e, None] * self.k                   # (B, C, K)
-            mag = torch.sqrt(cr[:, s:e] ** 2 + ci[:, s:e] ** 2 + 1e-20)
-            ang = torch.atan2(ci[:, s:e], cr[:, s:e])
+        out = torch.zeros(b, n, device=dev, dtype=dt)
+        frames_per_chunk = max(1, self.chunk // self.hop_size)
+        for t0 in range(0, t, frames_per_chunk):
+            t1 = min(t0 + frames_per_chunk, t)
+            s, e = t0 * self.hop_size, t1 * self.hop_size
+            cr = _interp_frames(coef.real, t0, t1, self.hop_size)   # (B, C, K)
+            ci = _interp_frames(coef.imag, t0, t1, self.hop_size)
+            ph = phase[:, s:e, None] * self.k                       # (B, C, K)
+            mag = torch.sqrt(cr ** 2 + ci ** 2 + 1e-20)
+            ang = torch.atan2(ci, cr)
             # 나이퀴스트에서 '정확히 0' 이 되는 smoothstep 마스크.
             # 시그모이드로 하면 나이퀴스트 바로 위 하모닉이 7% 정도 남아 접힌다.
-            fk = f0_s[:, s:e, None] * self.k
-            u = ((nyq - fk) / (nyq * 0.08)).clamp(0.0, 1.0)
+            fks = f0_s[:, s:e, None] * self.k
+            u = ((nyq - fks) / (nyq * 0.08)).clamp(0.0, 1.0)
             mask = u * u * (3.0 - 2.0 * u)
             out[:, s:e] = 2.0 * (mag * mask * torch.cos(ph + ang)).sum(-1)
         return out * amp_s, phase

@@ -1,0 +1,36 @@
+# 물리 파라미터 스크립트 예제 — 모든 값이 물리량이고, 전부 여기서 바꾼다.
+#   PYTHONPATH=src python -m formant_ml.render examples/laugh_and_speech.yaml -o out/line.wav
+name: 웃음 섞인 한 줄
+# voice: profiles/me.json      # analysis.extract 로 만든 화자 프로파일
+sample_rate: 24000
+seed: 7
+smooth_frames: 3               # 세그먼트 경계 평활(프레임)
+
+timeline:
+  # /사/ — 무성 마찰에서 유성 모음으로. 치찰음 극/영점을 직접 지정한다.
+  - {type: syllable, onset: s, vowel: a, dur: 0.5, f0: [150, 128],
+     sib_pole_f: 6800, sib_zero_f: 2900, sib_pole_bw: 700}
+
+  # 아 -> 이 -> 우 활음. Rd 를 긴장에서 기식으로 풀면서.
+  - {type: glide, vowels: [a, i, u], dur: 0.55, f0: [[0, 132], [0.5, 142], [1, 108]],
+     rd: [[0, 0.6], [1, 1.7]]}
+
+  - {type: silence, dur: 0.12}
+
+  # 웃음: 펄스 5.5 Hz, 유성 85%, 고역을 3 dB/oct 살려서 '밝게'
+  - {type: laugh, dur: 1.2, rate_hz: 5.5, voiced: 0.85, breathiness: 0.45,
+     pitch_lift: 1.45, tilt: 3.0}
+
+  # 웃음 끝의 들숨
+  - {type: breath, dur: 0.35, inhale: true, strength: 0.45}
+
+  - {type: silence, dur: 0.1}
+
+  # 속삭임 -> 프라이로. 성구를 바꾸는 것도 같은 손잡이다.
+  - {type: whisper, vowel: eo, dur: 0.45, strength: 0.55}
+  - {type: creak, dur: 0.35, rate_hz: 42}
+
+params:
+  # 발화 전체에 걸리는 값. 화자 프로파일이 없을 때의 기본 미세요동.
+  jitter: 0.005
+  shimmer: 0.05

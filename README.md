@@ -10,8 +10,8 @@
 
 ```
  [ 성문 소스 ]        [ 난류 노이즈 ]           [ 성도 공명 ]        [ 위상 정형 ]
- LF 파형 가산합성  +  백색잡음 × 성문동기AM  →  포먼트 캐스케이드  →  올패스 필터  →  음성
- (또는 2질량 ODE)     (협착 하류만 통과)        또는 KL 도파관        (군지연만 변경)
+ LF 파형 가산합성  +  학습된 난류 × 성문동기AM →  포먼트 캐스케이드  →  올패스 필터  →  음성
+ (또는 2질량 ODE)     (협착 하류 + 치찰음필터)   또는 KL 도파관        (군지연만 변경)
         ↑                    ↑                       ↑                   ↑
         └────────── 신경망은 이 파라미터들만 예측한다 ──────────────────┘
 ```
@@ -19,36 +19,54 @@
 - 설계와 로드맵: [`docs/PLAN.md`](docs/PLAN.md)
 - 구현된 방정식: [`docs/THEORY.md`](docs/THEORY.md)
 - 선행연구 정리: [`docs/LITERATURE.md`](docs/LITERATURE.md)
+- **목소리를 만들고 조종하는 법: [`docs/VOICE.md`](docs/VOICE.md)**
 
 ## 빠른 시작
 
 ```bash
-pip install torch numpy scipy soundfile
+pip install torch numpy scipy soundfile pyyaml
 export PYTHONPATH=src
 
 # 1) 학습 없이, 방정식만으로 소리를 만들어 본다 (out/*.wav)
 python -m formant_ml.demo --out out
 
-# 2) 물리 엔진 검증 (균일관 공진, 포먼트 정확도, 에일리어싱, 미분가능성 …)
+# 2) 검증 (물리 엔진 11종 + 목소리 제어 26종)
 python tests/test_dsp.py
+python tests/test_voice.py
 
-# 3) 합성 결과 분석 (포먼트/무게중심/HNR)
-python scripts/analyze.py out/*.wav
+# 3) 스크립트로 원하는 소리를 만든다 (웃음·숨·프라이·속삭임 포함)
+python -m formant_ml.render examples/laugh_and_speech.yaml -o out/line.wav
+python -m formant_ml.render --list-params      # 조종 가능한 모든 파라미터
 
-# 4) 복사합성 학습 (24 kHz 모노 wav 폴더)
+# 4) 실제 녹음에서 '그 사람의 목소리'를 뽑아낸다
+python -m formant_ml.analysis.extract \
+    --wav data/me/*.wav --vowel-wav data/me/vowel_a.wav \
+    --sibilant-wav data/me/s.wav --glissando-wav data/me/gliss.wav \
+    --out profiles/me.json --name me
+
+# 5) 복사합성 학습 (24 kHz 모노 wav 폴더)
 python -m formant_ml.train --data data/wavs --steps 20000 --out runs/exp1
 ```
 
-`demo` 가 만드는 것 — 전부 신경망 없이 방정식만으로:
+## 목소리를 조종한다는 것
 
-| 파일 | 내용 |
-|---|---|
-| `01_vowel_a_pressed_to_breathy.wav` | /아/ 지속음. 비브라토 + Rd 를 긴장→기식으로 스윕 |
-| `02_diphthong_a_i_u.wav` | 아→이→우 포먼트 활음 |
-| `03_fricative_s.wav` | /ㅅ/ — 성대 진동 없이 협착부 난류만 |
-| `04_syllable_sa.wav` | /사/ — 무성 마찰에서 유성 모음으로 전이 |
-| `05_waveguide_area_function.wav` | 포먼트가 아니라 **성도 단면적**으로 제어 |
-| `06_vocalfold_{modal,tense,diplophonic}.wav` | 2질량 성대 ODE의 진동 모드 3종 |
+모든 소리 — 모음, 치찰음, 웃음, 한숨, 성대 프라이, 속삭임 — 가 **같은 물리
+손잡이의 다른 조합**이다. 특별 취급하는 코드 경로가 없다. 그래서 전부 한 장의
+스크립트에서 연속적으로 섞을 수 있다.
+
+```yaml
+timeline:
+  - {type: syllable, onset: s, vowel: a, dur: 0.5, f0: [150, 128],
+     sib_pole_f: 6800, sib_zero_f: 2900}          # 치찰음 지문을 직접 지정
+  - {type: laugh, dur: 1.2, rate_hz: 5.5, voiced: 0.85, tilt: 3.0}
+  - {type: breath, dur: 0.35, inhale: true}
+  - {type: whisper, vowel: eo, dur: 0.45}
+  - {type: creak, dur: 0.35, rate_hz: 42}
+```
+
+값은 상수 `1.2`, 시작-끝 `[0.5, 2.2]`, 브레이크포인트 `[[0, 0.5], [1, 2.2]]`
+중 아무 형식이나 쓸 수 있고, **모든 파라미터에 같은 규칙**이 적용된다.
+전체 목록은 `--list-params` 또는 [`docs/VOICE.md`](docs/VOICE.md).
 
 ## 저장소 구조
 
@@ -56,29 +74,42 @@ python -m formant_ml.train --data data/wavs --steps 20000 --out runs/exp1
 src/formant_ml/
   config.py          설정 (샘플레이트, 파라미터 물리 범위)
   presets.py         모음 포먼트 / 마찰음 / 면적함수 프리셋
+  voice.py           VoiceProfile — 한 화자를 이루는 숫자들 (JSON)
+  gestures.py        웃음·숨·한숨·프라이·속삭임·흐느낌·헛기침
+  score.py           스크립트(YAML/JSON) -> 제어 파라미터
+  render.py          스크립트 -> wav (CLI)
   demo.py            학습 없는 물리 합성 데모
   train.py           복사합성 학습 루프
   dsp/
     core.py          LTV 필터, FFT 컨볼루션, 보간 (재귀 없음 = 길이에 병렬)
-    glottal.py       LF 파형 사전 + 대역제한 가산합성
+    glottal.py       LF 파형 사전 + 대역제한 가산합성 (+ tilt / 위상차 / 지터)
     vocalfold.py     비대칭 2질량 자가진동 모델 (분기/성구/이중음)
-    filters.py       공명·반공명·올패스 (설계상 항상 안정)
+    filters.py       공명·반공명·올패스·기울기·부분 캐스케이드 (설계상 항상 안정)
     tract.py         Kelly-Lochbaum 도파관 전달함수 (래티스 재귀)
-    noise.py         난류 소스 + 성문동기 진폭변조
+    noise.py         학습되는 난류 소스 (스펙트럼 사전 + 변조 스펙트럼)
+    sibilant.py      치찰음 극-영점 필터 (화자 지문 6개 숫자)
+    phase.py         위상차 파라미터: 하모닉 상대위상(RPS), 임의 주파수 위상 평가
   models/
     synth.py         전체 합성기 (하모닉 경로 / 노이즈 경로 분리)
-    encoder.py       mel + F0 → 물리 파라미터 (포먼트 순서 구조적 보장)
-    losses.py        멀티해상도 STFT + **위상 미분(IF/GD)** + 물리 정규화
+    encoder.py       mel + F0 -> 물리 파라미터 (포먼트 순서 구조적 보장)
+    losses.py        멀티해상도 STFT + 대역 + 위상(IF/GD) + 상대위상 + 주기성
+  analysis/
+    registers.py     성대 진동 모드: H1-H2 -> Rd, 서브하모닉, 성구, **파사지오**
+    sibilant.py      치찰음 지문 경사하강 추정
+    phase.py         상대위상 측정 -> 위상차 올패스 적합
+    extract.py       위 전부를 묶어 VoiceProfile 을 만드는 CLI
   data/
-    features.py      멜, STFT, YIN F0
+    features.py      STFT, 멜, 로그대역 에너지, YIN F0
     dataset.py       wav 폴더 로더
 tests/test_dsp.py    물리 엔진 검증 11종
+tests/test_voice.py  목소리 제어/분석 검증 26종
+examples/            스크립트 예제
 scripts/analyze.py   포먼트/무게중심/HNR 분석
 ```
 
-## 현재 상태 (Phase 0 완료)
+## 현재 상태
 
-물리 엔진이 검증된 수치를 낸다:
+**물리 엔진** (`tests/test_dsp.py`)
 
 | 검증 항목 | 결과 |
 |---|---|
@@ -87,11 +118,37 @@ scripts/analyze.py   포먼트/무게중심/HNR 분석
 | 성문 소스 F0 | 오차 **< 0.05 Hz** (90/200/400 Hz) |
 | 에일리어싱 | 비하모닉 성분 **-50 dB 이하** |
 | 도파관 안정성 | 임의 면적함수에 대해 모든 극점 \|z\| < 1 |
-| 성대 자가진동 | q=1 → 170 Hz, q=2 → 247 Hz (긴장도로 F0 제어) |
+| 성대 자가진동 | 긴장도 q 로 폐쇄 주기율 제어 (q=1 → 170 Hz, q=2 → 247 Hz) |
 | end-to-end 미분 | 인코더 → 물리모델 → 손실 전 구간 그래디언트 흐름 |
 | LTV 필터 항등성 | 오차 7e-7 |
 
-다음 단계는 실제 음성으로 복사합성(Phase 1). 로드맵은 [`docs/PLAN.md`](docs/PLAN.md) §4.
+**목소리 제어와 역추정** (`tests/test_voice.py`)
+
+| 손잡이 | 소리에서 되찾는가 |
+|---|---|
+| 소스 기울기 `tilt` | ±8 dB/oct 를 돌리면 5 kHz 위 에너지가 16 dB 단조 변화 |
+| 위상차 `disp_*` | 크기 스펙트럼 변화 0.5% 이내, 파형은 175% 변화. 1800 Hz/r=0.85 → **1805 Hz/0.849 로 복원** (잔차 0.006 rad) |
+| 치찰음 극 | 설정 3200/5000/7000/9000 Hz → 재추출 3165/4893/6913/8913 Hz |
+| 개방지수 → `Rd` | 합성 Rd → H1-H2 → Rd 왕복 오차 **0.05 이내** (열린 모음) |
+| **파사지오** | 224 Hz 에 넣은 성구 전환을 **221 Hz 에서 검출** (매끄러운 글리산도에서는 오검출 없음) |
+| 프로파일 전체 | 합성 목소리를 추출하면 F0 140→140, Rd 1.0→1.1, 치찰음 극 7400→7387 Hz |
+| 난류 | `roughness` 로 비정상성 제어, 스펙트럼 사전/변조 지수가 학습 파라미터 |
+| 경계 클릭 | 평활 정도와 무관하게 순간 피크가 본체의 2배 이내 |
+
+## 최근에 고친 것 (그리고 왜 중요한가)
+
+1. **고역이 비던 문제.** 포먼트를 6개만 두면 최상단 극 위에서 캐스케이드가
+   극당 -12 dB/oct 씩 겹쳐 떨어진다. F0=60 Hz 화자의 8~11 kHz 에너지가
+   상대적으로 8e-7 이었다. 나이퀴스트까지 1 kHz 당 1 개(12 개)로 늘리자
+   5e-3 이 되었다 — **76 dB 개선**. 여기에 소스 기울기 `tilt`(옥타브당 dB)를
+   따로 두어 6~12 kHz 를 직접 조절한다. 하모닉 수도 180 → 240 (F0=50 Hz 에서도
+   나이퀴스트까지 채운다).
+2. **무음 → 마찰음 전이의 클릭.** 두 가지 원인이 겹쳐 있었다.
+   (a) 모음 프리셋이 5개뿐인데 12단까지 마지막 값을 반복해 **극이 겹쳤다**(Q⁴).
+   (b) 노이즈 경로의 부분 캐스케이드를 `Π(1−w+wH)` 로 보간해 감쇠가 사라졌다.
+   로그 영역 보간 + peak 정규화 + 협착 위치는 보간하지 않기로 바꿔 해결.
+3. **`data/` 패키지가 커밋되어 있지 않았다.** `.gitignore` 의 `data/` 가
+   소스 디렉터리까지 먹어서 `train.py` 와 `losses.py` 가 임포트조차 되지 않았다.
 
 ## 이 접근의 한계 (미리 밝힘)
 
@@ -99,4 +156,7 @@ scripts/analyze.py   포먼트/무게중심/HNR 분석
 히스/지직이 아니라 *부저 같은 과도한 주기성*과 *모델이 표현 못 하는 소리에서의
 뭉개짐*이다. 그래서 로드맵의 Phase 4에 잔차(residual) 보정 단계를 두되,
 잔차 에너지에 페널티를 걸어 "신경망이 결국 다 해버리는" 붕괴를 막는 설계로 간다.
-자세한 내용은 [`docs/PLAN.md`](docs/PLAN.md) §0.
+
+역추정 쪽 한계는 [`docs/VOICE.md`](docs/VOICE.md) §5 에 측정치와 함께 적어 두었다
+(요약: Rd 는 열린 모음에서만 믿을 만하고, 소스 tilt 추정에 아직 ~2 dB/oct 오차가
+남는다). 자세한 내용은 [`docs/PLAN.md`](docs/PLAN.md) §0.
