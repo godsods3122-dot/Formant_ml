@@ -294,7 +294,8 @@ def extract_profile(paths: list[str], name: str = "voice", sample_rate: int = 24
             fit = sb.fit_sibilant(x_sib, sample_rate, hop, mask=mask, steps=500)
             prof.sibilant = {k: fit[k] for k in
                              ("pole_f", "pole_bw", "zero_f", "zero_bw", "tilt",
-                              "slope_lo", "slope_hi")}
+                              "slope_lo", "slope_hi", "teeth_f", "teeth_bw",
+                              "floor_db")}
             prof.sibilant_moments = sb.measure(x_sib, sample_rate, hop, mask)
             prof.sibilant_moments["fit_rmse_db"] = fit["rmse_db"]
         elif verbose:

@@ -64,8 +64,9 @@ class VoiceProfile:
 
     # --- 치찰음 지문 --------------------------------------------------------
     sibilant: dict = field(default_factory=lambda: {
-        "pole_f": 6600.0, "pole_bw": 2200.0, "zero_f": 2900.0, "zero_bw": 2600.0,
-        "tilt": 0.0})   # 모양은 스커트 기울기가 만든다 (dsp/sibilant.py)
+        "pole_f": 3750.0, "pole_bw": 3800.0, "zero_f": 2030.0, "zero_bw": 1150.0,
+        "tilt": -5.0, "slope_lo": 3.5, "slope_hi": -13.5,
+        "teeth_f": 7200.0, "teeth_bw": 1020.0, "floor_db": -11.0})
     sibilant_moments: dict = field(default_factory=dict)
 
     # --- 위상차 -------------------------------------------------------------
@@ -75,6 +76,9 @@ class VoiceProfile:
     # 난류의 느린 세기 변동. 크게 두면 진폭 분포의 꼬리가 두꺼워져 지글거린다
     # (핑크 노이즈의 첨도 2.97 이 기준선; docs/VOICE.md §3 참고).
     roughness: float = 0.12
+    # 마찰음이 유성음보다 얼마나 조용한가 [dB]. 실측(한국어 "스"): 모음이 5.4 dB 크다.
+    # 이걸 안 맞추면 치찰음만 튀어나와 들린다.
+    fricative_level_db: float = -5.4
     breathiness: float = 0.15            # 유성 구간 기식 노이즈 세기
 
     meta: dict = field(default_factory=dict)
@@ -97,12 +101,13 @@ class VoiceProfile:
     # -------------------------------------------------------------- 합성 보조
     def sibilant_params(self, shape, mix: float = 1.0, roughness: float | None = None,
                         device=None, dtype=torch.float32):
-        from .dsp.sibilant import SibilantParams
-        s = self.sibilant
+        """이 화자의 치찰음 파라미터. 프로파일에 있는 항목만 프리셋 위에 덮는다."""
+        from .dsp.sibilant import PRESETS, SibilantParams
+        over = {k: v for k, v in self.sibilant.items() if k in PRESETS["s"]}
         return SibilantParams.constant(
-            shape, s["pole_f"], s["pole_bw"], s["zero_f"], s["zero_bw"], s["tilt"],
-            mix, self.roughness if roughness is None else roughness,
-            device=device, dtype=dtype)
+            shape, mix=mix,
+            roughness=self.roughness if roughness is None else roughness,
+            device=device, dtype=dtype, **over)
 
     def dispersion_tensors(self, batch: int, n_frames: int, device=None,
                            dtype=torch.float32):

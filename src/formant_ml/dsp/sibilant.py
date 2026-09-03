@@ -36,8 +36,44 @@ from dataclasses import dataclass
 
 import torch
 
-from .filters import (pole_zero_response, rms_normalize, skirt_response,
-                      tilt_response)
+from .filters import (pole_zero_response, resonator_response, rms_normalize,
+                      skirt_response, tilt_response)
+
+
+# 실측 기반 출발점. /s/ 값은 실제 녹음(한국어 "스" 2회)의 장기 스펙트럼에
+# 이 모형을 경사하강으로 맞춰 얻었다(rmse 2.25 dB). 손으로 찍은 값이 아니다.
+#
+# 그 결과가 알려 준 것:
+#   * 저역 스커트는 거의 평평하다(+3.4 dB/oct). 가파른 삼각형이 아니다.
+#   * 고역은 가파르게 떨어진다(-13.5 dB/oct).
+#   * 봉우리의 주역은 앞공동 극이 아니라 **앞니 공명 7.2 kHz** 다.
+#   * 바닥이 피크 대비 -11 dB 밖에 안 된다 -> 스펙트럼이 전역적으로 깔린다.
+#
+# **dict 로 둔다.** 튜플 위치로 두었더니 항목을 추가할 때마다 값이 밀리는 사고가
+# 반복됐다(roughness 에 -5 가 들어가는 식으로).
+PRESETS = {
+    "s":  dict(pole_f=3750.0, pole_bw=3800.0, zero_f=2030.0, zero_bw=1150.0,
+               tilt=-5.0, slope_lo=3.5, slope_hi=-13.5,
+               teeth_f=7200.0, teeth_bw=1020.0, floor_db=-11.0),
+    "ss": dict(pole_f=4100.0, pole_bw=3400.0, zero_f=2200.0, zero_bw=1000.0,
+               tilt=-4.0, slope_lo=5.0, slope_hi=-15.0,
+               teeth_f=7800.0, teeth_bw=800.0, floor_db=-13.0),   # 된소리: 더 날카롭게
+    "z":  dict(pole_f=3750.0, pole_bw=3800.0, zero_f=2030.0, zero_bw=1150.0,
+               tilt=-5.0, slope_lo=3.5, slope_hi=-13.5,
+               teeth_f=7100.0, teeth_bw=1100.0, floor_db=-10.0),
+    "sh": dict(pole_f=2300.0, pole_bw=2600.0, zero_f=1250.0, zero_bw=1000.0,
+               tilt=-4.0, slope_lo=4.0, slope_hi=-11.0,
+               teeth_f=3900.0, teeth_bw=1300.0, floor_db=-12.0),
+    "f":  dict(pole_f=5000.0, pole_bw=4000.0, zero_f=1500.0, zero_bw=2000.0,
+               tilt=-3.0, slope_lo=2.0, slope_hi=-8.0,
+               teeth_f=8000.0, teeth_bw=3000.0, floor_db=-8.0),   # 순치음: 공진이 약하다
+    "th": dict(pole_f=5500.0, pole_bw=4500.0, zero_f=1500.0, zero_bw=2200.0,
+               tilt=-3.0, slope_lo=2.0, slope_hi=-7.0,
+               teeth_f=8500.0, teeth_bw=3500.0, floor_db=-8.0),
+    "h":  dict(pole_f=1400.0, pole_bw=2500.0, zero_f=500.0, zero_bw=1200.0,
+               tilt=-4.0, slope_lo=2.0, slope_hi=-6.0,
+               teeth_f=3000.0, teeth_bw=3000.0, floor_db=-6.0),   # 성문 마찰: 거의 평평
+}
 
 
 @dataclass
@@ -53,21 +89,37 @@ class SibilantParams:
     # 봉우리 양옆의 직선 스커트 [dB/oct]. 극 하나로는 둥근 돔밖에 안 나온다.
     slope_lo: torch.Tensor | None = None    # 봉우리 아래 상승 기울기 (양수)
     slope_hi: torch.Tensor | None = None    # 봉우리 위 하강 기울기 (음수)
+    # 앞니 사이 좁은 틈의 공명. 실제 /s/ 를 재 보면 앞공동 봉우리(6.5 kHz) 말고도
+    # 8.5 kHz 부근에 봉우리가 하나 더 있다(측정: 추세 대비 +7.4 dB). 혀끝-앞니
+    # 사이로 얕게 빠져나가는 제트가 만드는 휘파람 같은 성분이다.
+    teeth_f: torch.Tensor | None = None
+    teeth_bw: torch.Tensor | None = None
+    # 직접 방사 바닥 [dB, 피크 대비]. 난류원은 앞공동 공진만 통해 나오는 게
+    # 아니라 입 구멍에서 그대로도 방사된다(단극 방사). 이게 없으면 봉우리 밖이
+    # 통째로 비어서, 실제 녹음처럼 **스펙트럼이 전역적으로** 깔리지 않는다.
+    floor_db: torch.Tensor | None = None
     roughness: torch.Tensor | None = None   # 난류 시간변조 깊이(주기성 방지)
 
     @staticmethod
-    def constant(shape, pole_f=6500.0, pole_bw=2200.0, zero_f=2600.0, zero_bw=2600.0,
-                 tilt=0.0, mix=1.0, roughness=0.12, slope_lo=18.0, slope_hi=-4.0,
-                 device=None, dtype=torch.float32) -> "SibilantParams":
+    @staticmethod
+    def constant(shape, mix: float = 1.0, roughness: float = 0.12,
+                 device=None, dtype=torch.float32, **overrides) -> "SibilantParams":
+        """상수 파라미터 묶음. 기본값은 실측 /s/ 프리셋에서 가져온다.
+
+        시그니처에 기본값을 또 적어 두지 않는다 — 프리셋과 어긋나기 시작하면
+        어느 쪽이 진짜인지 알 수 없게 된다(실제로 그렇게 됐었다).
+        """
+        vals = dict(PRESETS["s"])
+        unknown = set(overrides) - set(vals)
+        if unknown:
+            raise TypeError(f"모르는 치찰음 파라미터: {sorted(unknown)}")
+        vals.update(overrides)
+
         def c(v):
             return torch.full(shape, float(v), device=device, dtype=dtype)
-        # **반드시 키워드로** 만든다. 위치인자로 만들면 나중에 필드를 중간에
-        # 하나 끼워 넣는 순간 값이 통째로 밀린다(실제로 slope 를 추가했을 때
-        # roughness 에 -5, slope_hi 에 22 가 들어갔고 아무도 알려주지 않았다).
-        return SibilantParams(
-            pole_f=c(pole_f), pole_bw=c(pole_bw), zero_f=c(zero_f),
-            zero_bw=c(zero_bw), tilt=c(tilt), mix=c(mix), roughness=c(roughness),
-            slope_lo=c(slope_lo), slope_hi=c(slope_hi))
+        # 반드시 키워드로 만든다(위치인자면 필드를 끼워 넣을 때 값이 밀린다).
+        return SibilantParams(mix=c(mix), roughness=c(roughness),
+                              **{k: c(v) for k, v in vals.items()})
 
     def to(self, device) -> "SibilantParams":
         f = {k: (v.to(device) if torch.is_tensor(v) else v)
@@ -75,24 +127,10 @@ class SibilantParams:
         return SibilantParams(**f)
 
 
-# 관용적 출발점. 실제 화자 값은 analysis/sibilant.py 로 추출한다.
-PRESETS = {
-    #        pole_f  pole_bw  zero_f  zero_bw  tilt  slope_lo  slope_hi
-    "s":    (6600.0, 2400.0,  2900.0, 2600.0,  0.0,   14.0,   -3.0),
-    "sh":   (3300.0, 1800.0,  1600.0, 1800.0,  0.0,   11.0,   -4.0),
-    "z":    (6400.0, 2400.0,  2900.0, 2600.0,  0.0,   20.0,   -5.0),
-    "f":    (7500.0, 3500.0,  1200.0, 2500.0,  0.0,    8.0,   -4.0),   # 평평한 편
-    "th":   (7000.0, 4000.0,  1000.0, 2500.0,  0.0,    7.0,   -4.0),
-    "h":    (1400.0, 2000.0,   400.0, 1200.0,  0.0,    6.0,   -6.0),
-    "ss":   (7200.0, 1900.0,  3200.0, 2200.0,  0.0,   18.0,   -3.5),  # 된소리 ㅆ: 더 날카롭게
-}
-
-
 def preset(name: str, shape, device=None, dtype=torch.float32,
            mix: float = 1.0, roughness: float = 0.12) -> SibilantParams:
-    pf, pb, zf, zb, ti, slo, shi = PRESETS[name]
-    return SibilantParams.constant(shape, pf, pb, zf, zb, ti, mix, roughness,
-                                   slo, shi, device=device, dtype=dtype)
+    return SibilantParams.constant(shape, mix=mix, roughness=roughness,
+                                   device=device, dtype=dtype, **PRESETS[name])
 
 
 def sibilant_response(p: SibilantParams, sample_rate: float,
@@ -108,6 +146,17 @@ def sibilant_response(p: SibilantParams, sample_rate: float,
         H = H * skirt_response(p.pole_f, p.slope_lo, p.slope_hi,
                                sample_rate, n_freq)
     H = H * tilt_response(p.tilt, sample_rate, n_freq)
+    if p.teeth_f is not None and p.teeth_bw is not None:
+        # resonator_response 는 단(stage)축을 남긴 (B,T,K,F) 를 돌려준다. 곱해서 접는다.
+        H = H * resonator_response(p.teeth_f, p.teeth_bw,
+                                   torch.ones_like(p.teeth_f), sample_rate,
+                                   n_freq).prod(dim=2)
+    if p.floor_db is not None:
+        # 입 구멍에서 직접 방사되는 광대역 성분을 **병렬로** 더한다.
+        # (max 로 자르지 않는다 — 병렬 경로의 합이 물리적으로 맞고 미분도 매끄럽다.)
+        peak = H.abs().amax(dim=-1, keepdim=True).clamp_min(1e-9)
+        H = H / peak.to(H.dtype)
+        H = H + (10.0 ** (p.floor_db.clamp(-60.0, -3.0) / 20.0)).to(H.dtype)
     H = rms_normalize(H)
     m = p.mix.clamp(0.0, 1.0).to(H.dtype)
     return (1.0 - m) + m * H

@@ -123,11 +123,16 @@ def fit_sibilant(x, sample_rate: int = 24000, hop: int = 240, mask=None,
 
     # 합성 모형과 **같은** 자유도를 준다. 스커트 기울기를 빼고 적합하면 극이
     # 그 역할을 대신하려고 비정상적으로 좁아진다(측정: BW 336 Hz 로 수렴).
-    ranges = {"pole_f": (1500.0, 11000.0), "pole_bw": (400.0, 4000.0),
-              "zero_bw": (150.0, 4000.0), "tilt": (-8.0, 8.0),
-              "slope_lo": (0.0, 45.0), "slope_hi": (-20.0, 0.0)}
-    init = {"pole_f": 6000.0, "pole_bw": 2000.0, "zero_bw": 2000.0, "tilt": 0.0,
-            "slope_lo": 14.0, "slope_hi": -4.0}
+    # 합성 모형과 **같은** 자유도. 빠뜨린 자유도는 남은 파라미터가 억지로 흉내내며
+    # 비물리적인 값으로 수렴한다(스커트를 빼면 극이 BW 336 Hz 까지 좁아졌다).
+    ranges = {"pole_f": (1500.0, 11000.0), "pole_bw": (400.0, 5000.0),
+              "zero_bw": (150.0, 5000.0), "tilt": (-8.0, 8.0),
+              "slope_lo": (0.0, 30.0), "slope_hi": (-25.0, 0.0),
+              "teeth_f": (2500.0, 11000.0), "teeth_bw": (300.0, 4000.0),
+              "floor_db": (-45.0, -5.0)}
+    init = {"pole_f": 4000.0, "pole_bw": 3500.0, "zero_bw": 1500.0, "tilt": -4.0,
+            "slope_lo": 4.0, "slope_hi": -12.0, "teeth_f": 7200.0,
+            "teeth_bw": 1100.0, "floor_db": -12.0}
     u = {k: torch.tensor(_inv_sigmoid_range(v, *ranges[k]), requires_grad=True)
          for k, v in init.items()}
     u["zero_ratio"] = torch.tensor(0.0, requires_grad=True)   # zero_f = pole_f * ratio
@@ -140,11 +145,12 @@ def fit_sibilant(x, sample_rate: int = 24000, hop: int = 240, mask=None,
         zf = pf * (0.12 + 0.76 * torch.sigmoid(u["zero_ratio"]))
         zb = _sigmoid_range(u["zero_bw"], *ranges["zero_bw"]).view(1, 1, 1)
         ti = _sigmoid_range(u["tilt"], *ranges["tilt"]).view(1, 1, 1)
-        lo = _sigmoid_range(u["slope_lo"], *ranges["slope_lo"]).view(1, 1, 1)
-        hi = _sigmoid_range(u["slope_hi"], *ranges["slope_hi"]).view(1, 1, 1)
+        g_ = lambda k: _sigmoid_range(u[k], *ranges[k]).view(1, 1, 1)  # noqa: E731
         return SibilantParams(pole_f=pf, pole_bw=pb, zero_f=zf, zero_bw=zb,
                               tilt=ti, mix=torch.ones(1, 1, 1),
-                              slope_lo=lo, slope_hi=hi)
+                              slope_lo=g_("slope_lo"), slope_hi=g_("slope_hi"),
+                              teeth_f=g_("teeth_f"), teeth_bw=g_("teeth_bw"),
+                              floor_db=g_("floor_db"))
 
     last = float("nan")
     for i in range(steps):
@@ -166,6 +172,9 @@ def fit_sibilant(x, sample_rate: int = 24000, hop: int = 240, mask=None,
                "tilt": round(float(p.tilt), 3),
                "slope_lo": round(float(p.slope_lo), 2),
                "slope_hi": round(float(p.slope_hi), 2),
+               "teeth_f": round(float(p.teeth_f), 1),
+               "teeth_bw": round(float(p.teeth_bw), 1),
+               "floor_db": round(float(p.floor_db), 2),
                "rmse_db": round(last ** 0.5, 3), "n_frames": int(mask.sum())}
     return out
 

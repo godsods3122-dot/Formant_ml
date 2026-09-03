@@ -181,9 +181,15 @@ class GlottalSource(nn.Module):
         coef = self.bank.interpolate(rd)                       # (B, T, K) complex
         fk = f0 * self.k.view(1, 1, -1)                        # (B, T, K) 하모닉 주파수
 
-        # 스펙트럼 기울기: 1 kHz 를 축으로 옥타브당 tilt dB
+        # 스펙트럼 기울기: **기본파(H1)를 축으로** 옥타브당 tilt dB.
+        #
+        # 1 kHz 를 축으로 두면 안 된다. F0=120 Hz 면 H1 이 축보다 3.3 옥타브
+        # 아래라, tilt = -6 dB/oct 만 줘도 기본파가 10 배로 뻥튀기된다
+        # (실측: 추출한 프로파일로 합성했더니 모음이 20 dB 폭발했다).
+        # 음성학에서 스펙트럼 기울기를 H1 기준(H1-H2, H1-A3 …)으로 재는 것과도
+        # 이쪽이 일치한다 — tilt 는 '상대적인 모양' 이지 전체 레벨이 아니다.
         if tilt is not None:
-            oct_ = torch.log2(fk.clamp_min(20.0) / 1000.0)
+            oct_ = torch.log2(self.k.view(1, 1, -1))       # log2(k) = H1 기준 옥타브
             g = 10.0 ** ((tilt * oct_).clamp(-40.0, 40.0) / 20.0)
             coef = coef * g.to(coef.dtype)
 

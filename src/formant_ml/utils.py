@@ -8,10 +8,21 @@ import torch
 
 
 def save_wav(path: str, x: torch.Tensor, sample_rate: int = 24000,
-             normalize: bool = True) -> None:
+             normalize: bool = True, target_rms: float | None = None) -> None:
+    """wav 저장.
+
+    `target_rms` 를 주면 **피크가 아니라 RMS** 로 맞춘다. 피크 정규화는 파일마다
+    다른 이득을 붙여서 파일 간 상대 레벨(마찰음이 모음보다 조용하다 같은 것)을
+    지워 버린다. 여러 소리를 비교해 들을 때는 target_rms 를 쓸 것.
+    """
     import soundfile as sf
     y = x.detach().squeeze().to(torch.float32).cpu()
-    if normalize:
+    if target_rms is not None:
+        y = y * (target_rms / y.pow(2).mean().clamp_min(1e-12).sqrt())
+        peak = y.abs().max()
+        if peak > 0.99:
+            y = y * (0.99 / peak)
+    elif normalize:
         y = y / y.abs().max().clamp_min(1e-6) * 0.9
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     sf.write(path, y.numpy(), sample_rate)

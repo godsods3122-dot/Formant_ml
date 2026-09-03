@@ -106,6 +106,116 @@ def simulate(params: FoldParams, n_samples: int, sample_rate: int = 24000,
     return flow, tr1, tr2
 
 
+# ---------------------------------------------------------------- 다중 질량
+def simulate_stack(params: FoldParams, n_masses: int = 5, n_samples: int = 9600,
+                   sample_rate: int = 24000, oversample: int = 4,
+                   coupling: float = 0.25, device=None, dtype=torch.float64):
+    """성대의 **수직 방향**을 n 개 질량으로 쌓은 모델. 반환 (flow, x (n_samples, n)).
+
+    왜 2 개로는 부족한가
+    --------------------
+    2질량 모델은 성대의 하연(lower margin)과 상연(upper margin)을 각각 하나의
+    점으로 본다. 그것만으로도 수직 위상차(하연이 먼저 열리고 먼저 닫힌다)와
+    자가진동은 나오지만, 성문 통로의 **모양**은 두 점을 잇는 직선뿐이다.
+    실제로는 통로가 열릴 때 수렴형(convergent), 닫힐 때 발산형(divergent)으로
+    바뀌고 그 형상 변화가 에너지 전달을 지배한다 — 이것이 점막파(mucosal wave)다.
+
+    질량을 n 개로 쌓으면 통로 모양이 n 개의 마디를 가질 수 있어, 점막파가
+    아래에서 위로 전파하는 것이 궤적에 그대로 나타난다. 강성을 수직으로 분포시키면
+    (아래가 단단하고 위가 무름) 전파 속도도 생긴다.
+
+    압력 분포는 2질량 모델의 규칙을 일반화한다: 최소 단면(협착)의 상류는 Ps,
+    하류는 대기압. 유량은 최소 단면이 정한다.
+
+    `coupling` 은 수직 결합 강성의 배율이다. 크면 전체가 한 덩어리처럼 움직여
+    점막파가 사라지고, 작으면 마디가 따로 놀아 비현실적으로 커진다.
+    기본 0.25 에서 하연이 상연을 약 10~15% 주기만큼 앞선다(사람 0.5~1.5 ms).
+    """
+    p = params
+    dt = 1.0 / (sample_rate * oversample)
+    q = p.q
+    n = n_masses
+    idx = torch.arange(n, dtype=dtype, device=device)
+    frac = idx / max(n - 1, 1)                     # 0 = 하연, 1 = 상연
+
+    # 수직 분포: 아래가 무겁고 단단하다 (body 에 가깝다), 위로 갈수록 무르다.
+    #
+    # 분할 규칙이 중요하다. 성대를 n 조각으로 나누면 각 조각의 질량도 강성도
+    # 1/n 로 준다 -> ω = sqrt(k/m) 는 n 과 무관해야 한다. (처음에 m 을 n 배,
+    # k 를 1/n 배로 두었더니 F0 가 질량 수에 따라 130 -> 45 Hz 로 흘렀다.)
+    # 반면 이웃 결합 kc 는 이산 라플라시안의 Δz² 를 상쇄해야 파동 속도가
+    # 유지되므로 n 에 비례해서 커진다.
+    scale = 2.0 / n_masses
+    m = (p.m1 + (p.m2 - p.m1) * frac) * scale / q
+    k = (p.k1 + (p.k2 - p.k1) * frac) * q * scale
+    kc = p.kc * q * (n_masses / 2.0) * coupling
+    kl = k * p.asym                                # 좌우 비대칭
+    c = 2.0 * p.r1 * (m * k).sqrt()
+    a0 = p.a01 + (p.a02 - p.a01) * frac
+    d = (p.d1 + (p.d2 - p.d1) * frac) * scale      # 각 질량의 수직 두께
+    two_l = 2.0 * p.length
+    sqrt_2ps_rho = (2.0 * p.ps / p.rho) ** 0.5
+
+    x = torch.zeros(n, device=device, dtype=dtype)
+    x[0] = 0.01
+    v = torch.zeros(n, device=device, dtype=dtype)
+    flow = torch.zeros(n_samples, device=device, dtype=dtype)
+    traj = torch.zeros(n_samples, n, device=device, dtype=dtype)
+
+    out = 0
+    for step in range(n_samples * oversample):
+        a = a0 + two_l * x
+        amin, imin = a.min(0)
+        open_ = (amin > 0).to(dtype)
+        # 협착 상류는 Ps, 하류는 0 (2질량 모델의 베르누이 규칙을 일반화)
+        upstream = (idx <= imin).to(dtype)
+        press = p.ps * upstream * (1.0 - open_ * (amin / a.abs().clamp_min(1e-6)) ** 2)
+        press = press * (a > 0).to(dtype)
+        coll = torch.where(a < 0, p.collision * k * (a / two_l),
+                           torch.zeros_like(a))
+        # 수직 결합 (라플라시안) — 이것이 점막파를 전파시킨다
+        xl = torch.cat([x[:1], x[:-1]])
+        xr = torch.cat([x[1:], x[-1:]])
+        f = (-c * v - 0.5 * (k + kl) * x - kc * (2.0 * x - xl - xr) - coll
+             + p.length * d * press)
+        v = v + dt * f / m
+        x = x + dt * v
+        if step % oversample == 0:
+            flow[out] = torch.clamp(amin, min=0.0) * sqrt_2ps_rho
+            traj[out] = x
+            out += 1
+    return flow, traj
+
+
+def mucosal_wave_delay(traj: torch.Tensor, sample_rate: int = 24000) -> float:
+    """점막파 지연 [ms]. **양수면 하연이 상연을 앞선다**(생리적으로 맞는 방향).
+
+    사람은 대략 0.5~1.5 ms (주기의 5~15%). 성대의 아래쪽이 먼저 열리고 먼저
+    닫히면서 그 변형이 위로 전파하는 것이 점막파이고, 이 위상차가 있어야
+    성문이 열릴 때 수렴형·닫힐 때 발산형이 되어 기류에서 에너지를 받는다.
+    위상차가 0 이면 자가진동의 동력 자체가 없다.
+    """
+    a = traj[:, 0] - traj[:, 0].mean()
+    b = traj[:, -1] - traj[:, -1].mean()
+    n = len(a)
+    A = torch.fft.rfft(a, 2 * n)
+    B = torch.fft.rfft(b, 2 * n)
+    cc = torch.fft.irfft(A * B.conj(), 2 * n)
+    # 탐색 범위를 **반주기 이내**로 묶는다. 안 그러면 상호상관이 한 주기 건너뛴
+    # 봉우리를 잡아 108% 같은 값이 나온다(주기 신호에서는 τ 와 τ±T 가 구별되지 않는다).
+    aa = torch.fft.irfft(A * A.conj(), 2 * n)[: n // 2]
+    lo = max(int(sample_rate / 500), 2)
+    period = int(aa[lo:min(int(sample_rate / 60), n // 2)].argmax()) + lo
+    half = max(period // 2, 2)
+    pos = cc[:half]
+    neg = cc[-half:]
+    lag = (int(pos.argmax()) if float(pos.max()) >= float(neg.max())
+           else int(neg.argmax()) - half)
+    # r(τ)=Σ a(t+τ)b(t) 의 최대가 양수 τ 면 a(하연)가 뒤진다는 뜻이므로 부호를 뒤집어,
+    # **양수 = 하연이 앞선다** 로 맞춘다.
+    return -lag * 1000.0 / sample_rate
+
+
 def cycle_rate(flow: torch.Tensor, sample_rate: int = 24000) -> float:
     """성문 폐쇄 주기의 발생률(Hz). 진동이 완전 주기적이 아닐 때도 안정적이다.
 

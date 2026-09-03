@@ -53,6 +53,7 @@ SCALAR_PARAMS = {
     "noise_rough": "난류의 시간 변조 (0 = 정상 히스, 1 = 거친 난류)",
     "noise_bw_scale": "노이즈 경로 포먼트 대역폭 배율 (1~6). 낮으면 잡음이 "
                       "공진에서 울려 음조가 들린다",
+    "level_db": "이 구간 전체 레벨 [dB]. 유성·무성 성분을 함께 키우고 줄인다",
     "noise_back_leak": "구강 결합 0~1. 협착 뒤 공동까지 새어 통과하는 비율. "
                        "0 이면 마찰음이 입 밖에 얹힌 히스처럼 들린다",
     "pressure": "성문하압 (1.0 = 보통 발화). 세기·F0·성문파 형상이 함께 따라온다",
@@ -68,6 +69,11 @@ SCALAR_PARAMS = {
     "sib_slope_lo": "치찰음 봉우리 아래 상승 기울기 [dB/oct]. 크면 삼각형, "
                     "작으면 둥근 돔이 된다 (사람 /s/ 는 20~40)",
     "sib_slope_hi": "치찰음 봉우리 위 하강 기울기 [dB/oct, 음수]",
+    "sib_teeth_f": "앞니 공명 [Hz]. 혀끝-앞니 틈으로 빠지는 휘파람 성분 "
+                   "(실측: 7.2 kHz)",
+    "sib_teeth_bw": "앞니 공명 대역폭 [Hz]",
+    "sib_floor_db": "직접 방사 바닥 [dB, 피크 대비]. 높을수록 스펙트럼이 "
+                    "전역적으로 깔린다 (실측: -11)",
     "sib_mix": "치찰음 필터 적용량 0~1",
 }
 FORMANT_PARAMS = {f"f{k + 1}": f"제{k + 1} 포먼트 [Hz]" for k in range(12)}
@@ -98,6 +104,18 @@ def curve(spec, t: int) -> torch.Tensor:
         return torch.full((1, t, 1), vals[0])
     pos = [i / (len(vals) - 1) for i in range(len(vals))]
     return ramp(t, list(zip(pos, vals)))
+
+
+#: 마찰음 노이즈 게인 1.0 일 때 측정된 "모음 - 마찰음" RMS 차 [dB].
+#: 합성 경로(소스 스펙트럼 사전, 치찰음 필터, 성도)가 바뀌면 이 값도 다시 재야 한다.
+#: tests/test_voice.py::test_fricative_level_matches_profile 가 드리프트를 잡는다.
+FRICATIVE_CAL_DB = -2.1
+
+
+def fricative_gain(prof: VoiceProfile) -> float:
+    """프로파일의 `fricative_level_db` 를 실제 노이즈 게인으로 바꾼다."""
+    want = -float(prof.fricative_level_db)          # 모음이 이만큼 커야 한다
+    return float(10.0 ** ((FRICATIVE_CAL_DB - want) / 20.0))
 
 
 def _vowel_formants(name: str, prof: VoiceProfile, n: int) -> list[float]:
@@ -154,7 +172,10 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
         c = base(t, prof, K, NB, vowel)
         cf, bw, pos, g = FRICATIVES.get(phone, FRICATIVES["s"])
         # 소스는 광대역, 모양은 치찰음 필터가 만든다(둘이 겹치면 손잡이가 죽는다).
-        nb = band_shelf(NB, 500.0, g, a.sample_rate).reshape(1, 1, -1)
+        # 레벨: 마찰음이 유성음보다 얼마나 조용한지는 화자 프로파일이 정한다.
+        # 안 맞추면 치찰음만 튀어나와 들린다(실측 한국어 "스": 모음이 5.4 dB 큼).
+        nb = band_shelf(NB, 500.0, g * fricative_gain(prof),
+                        a.sample_rate).reshape(1, 1, -1)
         if kind == "fricative":
             c["harmonic_amp"] = torch.zeros(1, t, 1)
             c["noise_bands"] = nb.expand(1, t, NB).contiguous()
@@ -172,9 +193,14 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
             env = ramp(t, [(0.0, 1.0), (split, 1.0), (split + 0.1, 0.02), (1.0, 0.01)])
             # 노이즈 경로가 하나뿐이라, 구강 협착(마찰음)에서 성문(기식)으로
             # 주입 위치를 옮기며 섞는다.
-            asp_n = band_shelf(NB, 900.0, 1.0, a.sample_rate).reshape(1, 1, -1)
-            w_asp = (asp / (asp + env + 1e-6)).clamp(0.0, 1.0)
-            c["noise_bands"] = (nb * env + asp_n * asp * 0.35).contiguous()
+            asp_n = band_shelf(NB, 900.0, fricative_gain(prof), a.sample_rate
+                               ).reshape(1, 1, -1)
+            # 주입 위치는 **부드럽게 미끄러뜨리면 안 된다**. 중간값은 캐스케이드의
+            # 앞부분만 우회한 '반쪽 필터' 라 어떤 성도 형상에도 대응하지 않고,
+            # 봉우리가 나이퀴스트 쪽으로 튄다(실측: /스/ 의 마찰음 피크가
+            # 6.9 kHz 대신 11.9 kHz 로 나왔다). 지배적인 소스 쪽으로 빠르게 넘긴다.
+            w_asp = torch.sigmoid((asp - env) * 8.0)
+            c["noise_bands"] = (nb * env + asp_n * asp * 0.5).contiguous()
             c["noise_entry"] = (1.0 - w_asp) * (float(K) + 6.0)
             c["formant_freq"] = torch.cat([
                 ramp(t, [(0.0, _vowel_formants("i", prof, K)[k]),
@@ -191,21 +217,18 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
         # 음소가 *범주*(s 냐 ʃ 냐)를 정하고, 화자 프로파일이 그 안에서 *개인차*를
         # 준다. 프로파일만 쓰면 /s/ 와 /ʃ/ 가 똑같은 소리가 나고, 프리셋만 쓰면
         # 화자 지문이 사라진다. 프로파일의 표준 /s/ 대비 비율을 프리셋에 곱한다.
-        sp = SIB_PRESETS.get(phone, SIB_PRESETS["s"])
+        base_p = dict(SIB_PRESETS.get(phone, SIB_PRESETS["s"]))
         ref = SIB_PRESETS["s"]
         if seg.get("use_profile_sibilant", True):
-            r_pole = prof.sibilant["pole_f"] / ref[0]
-            r_pbw = prof.sibilant["pole_bw"] / ref[1]
-            r_zero = prof.sibilant["zero_f"] / ref[2]
-            r_zbw = prof.sibilant["zero_bw"] / ref[3]
-            tilt = sp[4] + (prof.sibilant["tilt"] - ref[4])
-        else:
-            r_pole = r_pbw = r_zero = r_zbw = 1.0
-            tilt = sp[4]
-        sib = SibilantParams.constant(
-            (1, t, 1), sp[0] * r_pole, sp[1] * r_pbw, sp[2] * r_zero,
-            sp[3] * r_zbw, tilt, 1.0, prof.roughness, sp[5], sp[6])
-        sib.mix = env.clamp(0.0, 1.0) if kind == "syllable" else torch.ones(1, t, 1)
+            for key in ("pole_f", "pole_bw", "zero_f", "zero_bw", "teeth_f",
+                        "teeth_bw"):
+                if key in prof.sibilant and ref.get(key):
+                    base_p[key] = base_p[key] * (prof.sibilant[key] / ref[key])
+            for key in ("tilt", "slope_lo", "slope_hi", "floor_db"):
+                if key in prof.sibilant:
+                    base_p[key] = base_p[key] + (prof.sibilant[key] - ref[key])
+        sib = SibilantParams.constant((1, t, 1), mix=1.0,
+                                      roughness=prof.roughness, **base_p)
         c["sib"] = sib
     else:
         raise ValueError(f"모르는 세그먼트 type: {kind!r}. "
@@ -228,6 +251,10 @@ def apply_overrides(c: dict, spec: dict, t: int, cfg: Config) -> None:
         elif key.startswith("sib_"):
             field = key[4:]
             setattr(c["sib"], field, curve(val, t))
+        elif key == "level_db":
+            g = 10.0 ** (curve(val, t) / 20.0)
+            c["harmonic_amp"] = c["harmonic_amp"] * g
+            c["noise_bands"] = c["noise_bands"] * g
         elif key in SCALAR_PARAMS:
             c[key] = curve(val, t)
         elif key in FORMANT_PARAMS:

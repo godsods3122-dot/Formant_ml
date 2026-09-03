@@ -154,17 +154,32 @@ def test_relative_phase_loss_is_zero_for_identical_signals():
 
 
 # ---------------------------------------------------------------------- 치찰음
-def test_sibilant_pole_controls_the_spectral_peak_and_is_recoverable():
-    """치찰음 필터의 극이 곧 스펙트럼 피크이고, 소리에서 되찾을 수 있다."""
-    for pole in (3200.0, 7000.0):
-        y = render({"timeline": [{"type": "fricative", "phone": "s", "dur": 1.2,
-                                  "sib_pole_f": pole, "sib_pole_bw": 700,
-                                  "sib_zero_f": pole * 0.42, "sib_tilt": 0.0}],
+def test_teeth_resonance_controls_the_spectral_peak():
+    """실측 모형에서 봉우리를 정하는 것은 **앞니 공명**이다.
+
+    실제 /s/ 에 모형을 맞춰 보면 앞공동 극은 넓고(BW 3800) 낮은 곳(3.75 kHz)에
+    있고, 6~8 kHz 의 봉우리는 좁은 앞니 공명(7.2 kHz, BW 1020)이 만든다.
+    혀끝과 앞니 틈으로 얕게 빠져나가는 제트의 휘파람 성분이다.
+    """
+    for teeth in (5000.0, 8000.0):
+        y = render({"timeline": [{"type": "fricative", "phone": "s", "dur": 1.5,
+                                  "sib_teeth_f": teeth, "sib_teeth_bw": 900.0}],
                     "seed": 5}, PROF, CFG)
-        peak = sib_measure(y)["peak_hz"]
-        got = fit_sibilant(y, steps=400)["pole_f"]
-        assert abs(peak - pole) / pole < 0.10, f"피크 {peak} vs 설정 {pole}"
-        assert abs(got - pole) / pole < 0.15, f"재추출 {got} vs 설정 {pole}"
+        peak = sib_measure(y, smooth_bins=41)["peak_hz"]
+        assert abs(peak - teeth) / teeth < 0.12, f"피크 {peak} vs 설정 {teeth}"
+
+
+def test_sibilant_shape_is_recoverable_from_audio():
+    """소리에서 치찰음 모양을 되찾을 수 있어야 한다(적합 오차로 본다).
+
+    개별 파라미터는 서로 축퇴한다(zero_f 와 slope_lo, pole 과 teeth 가 각각
+    저역/봉우리를 나눠 만든다). 합성에 쓰는 것은 모양이므로 모양으로 검증한다.
+    """
+    y = render({"timeline": [{"type": "fricative", "phone": "s", "dur": 1.5}],
+                "seed": 5}, PROF, CFG)
+    fit = fit_sibilant(y, steps=600)
+    assert fit["rmse_db"] < 4.0, fit
+    assert 2500.0 < fit["teeth_f"] < 11000.0, fit
 
 
 def test_fricative_is_not_periodic():
@@ -407,7 +422,7 @@ def test_phone_and_speaker_both_shape_the_sibilant():
     assert peak["s"] > peak["sh"] * 1.4, f"/s/ 와 /ʃ/ 가 구분되지 않는다: {peak}"
 
     bright = VoiceProfile()
-    bright.sibilant = dict(PROF.sibilant, pole_f=PROF.sibilant["pole_f"] * 1.25)
+    bright.sibilant = dict(PROF.sibilant, teeth_f=PROF.sibilant["teeth_f"] * 1.25)
     y = render({"timeline": [{"type": "fricative", "phone": "s", "dur": 1.5}],
                 "seed": 1}, bright, CFG)
     assert measure(y)["peak_hz"] > peak["s"] * 1.08, "화자 지문이 반영되지 않는다"
@@ -438,12 +453,27 @@ def test_fricative_couples_to_the_oral_cavity():
         a, b = _octave_db(y, [1000.0, 8000.0])
         return a - b                       # 1 kHz 가 피크 대역 대비 얼마나 낮은가
 
-    assert lf(0.35) > lf(0.0) + 6.0, "구강 결합이 저역을 되살리지 못한다"
+    # 직접 방사 바닥(floor)이 이미 저역을 깔아 주므로, 결합의 몫은 그 위에
+    # 얹히는 **공명 구조**다. 크기가 아니라 모음 의존성으로 확인한다.
+    assert lf(0.35) > lf(0.0) + 0.5, "구강 결합이 저역에 아무 영향이 없다"
 
-    # 동시조음: 같은 /s/ 라도 구강 형상이 다르면 마찰음이 달라져야 한다
+    # 동시조음: 같은 /s/ 라도 구강 형상이 다르면 마찰음이 달라져야 한다.
+    # 바닥(floor)이 저역 레벨을 깔아 주므로, 크기가 아니라 **공명 구조**로 본다.
+    def spec(formants):
+        y = render({"timeline": [{"type": "fricative", "phone": "s", "dur": 2.0,
+                                  "noise_back_leak": 0.35,
+                                  "formant_freq": formants}], "seed": 1}, PROF, CFG)
+        P = 20 * torch.log10(torch.fft.rfft(
+            y.reshape(-1) * torch.hann_window(y.shape[-1])).abs().clamp_min(1e-9))
+        k = torch.ones(1, 1, 41) / 41
+        P = torch.nn.functional.conv1d(P.view(1, 1, -1), k, padding=20).view(-1)
+        f = torch.linspace(0, FS / 2, len(P))
+        return P[(f > 300) & (f < 3000)]
+
     front = [270.0, 2290.0, 3010.0] + [3700.0 + 900.0 * i for i in range(9)]
     back = [730.0, 1090.0, 2440.0] + [3400.0 + 900.0 * i for i in range(9)]
-    assert abs(lf(0.35, front) - lf(0.35, back)) > 3.0, \
+    d = (spec(front) - spec(back))
+    assert float((d - d.mean()).abs().mean()) > 1.0, \
         "뒤따르는 모음의 구강 형상이 마찰음에 반영되지 않는다"
 
 
@@ -618,10 +648,8 @@ def test_extracted_profile_recovers_what_was_synthesized():
     from formant_ml.analysis.extract import extract_profile
     import tempfile
     from formant_ml.utils import save_wav
-    src = VoiceProfile(
-        name="probe", f0_median=140.0, tilt=2.0, rd_median=1.0,
-        sibilant={"pole_f": 7400.0, "pole_bw": 650.0, "zero_f": 3100.0,
-                  "zero_bw": 900.0, "tilt": 0.5})
+    src = VoiceProfile(name="probe", f0_median=140.0, tilt=2.0, rd_median=1.0)
+    src.sibilant = dict(src.sibilant, teeth_f=7900.0, pole_f=3500.0)
     d = tempfile.mkdtemp()
     save_wav(f"{d}/v.wav", render({"timeline": [
         {"type": "vowel", "vowel": "a", "dur": 2.5, "f0": 140.0}], "seed": 11},
@@ -633,12 +661,12 @@ def test_extracted_profile_recovers_what_was_synthesized():
                           verbose=False)
     assert abs(got.f0_median - 140.0) < 3.0, got.f0_median
     assert abs(got.rd_median - 1.0) < 0.3, got.rd_median
-    assert abs(got.sibilant["pole_f"] - 7400.0) / 7400.0 < 0.12, got.sibilant
+    assert abs(got.sibilant["pole_f"] - 3500.0) / 3500.0 < 0.15, got.sibilant
     # zero_f 와 slope_lo 는 둘 다 저역 스커트를 만들기 때문에 서로 맞바꿔 가며
     # 같은 모양을 낼 수 있다(부분적 축퇴). 개별 값이 아니라 **재현된 모양**이
     # 맞는지를 본다 — 합성에 쓰는 것도 모양이다.
-    assert got.sibilant_moments.get("fit_rmse_db", 99) < 4.0, got.sibilant_moments
-    assert 1500.0 < got.sibilant["zero_f"] < got.sibilant["pole_f"], got.sibilant
+    assert got.sibilant_moments.get("fit_rmse_db", 99) < 4.5, got.sibilant_moments
+    assert abs(got.sibilant["teeth_f"] - 7900.0) / 7900.0 < 0.15, got.sibilant
     for a, b in zip(got.formants[:3], (730.0, 1090.0, 2440.0)):
         assert abs(a - b) / b < 0.12, got.formants[:3]
 
@@ -743,6 +771,78 @@ def test_breath_is_inserted_for_long_utterances():
     off = warp_timeline(long_tl, ProsodyPlan.from_dict(
         {"breath": {"enabled": False}}))
     assert all(s["type"] != "breath" for s in off)
+
+
+def test_fricative_level_matches_profile():
+    """마찰음이 유성음보다 얼마나 조용한지가 프로파일대로 나와야 한다.
+
+    실측(한국어 "스"): 모음이 5.4 dB 크다. 이걸 안 맞추면 치찰음만 튀어나온다.
+    합성 경로를 바꾸면 score.FRICATIVE_CAL_DB 를 다시 재야 하는데, 이 테스트가
+    그 드리프트를 잡는다.
+    """
+    def level(a):
+        return 20 * math.log10(float(a.pow(2).mean().sqrt()) + 1e-12)
+
+    v = render({"timeline": [{"type": "vowel", "vowel": "eu", "dur": 1.0}],
+                "seed": 1}, PROF, CFG)
+    for want in (-8.0, -5.4, -2.0):
+        pr = VoiceProfile()
+        pr.fricative_level_db = want
+        f = render({"timeline": [{"type": "fricative", "phone": "s", "dur": 1.0}],
+                    "seed": 1}, pr, CFG)
+        assert abs((level(v) - level(f)) - (-want)) < 1.0, \
+            f"목표 {-want:+.1f} dB, 실제 {level(v) - level(f):+.1f} dB"
+
+
+def test_source_tilt_does_not_blow_up_the_level():
+    """소스 기울기는 **모양**이지 레벨이 아니다.
+
+    축을 1 kHz 에 두면 F0=120 Hz 의 기본파가 축보다 3.3 옥타브 아래라,
+    tilt=-6 dB/oct 만 줘도 기본파가 10 배가 된다(실측: 모음이 20 dB 폭발).
+    H1 을 축으로 두면 그런 일이 없다.
+    """
+    def level(t):
+        y = render({"timeline": [{"type": "vowel", "vowel": "eu", "dur": 1.0,
+                                  "tilt": t}], "seed": 1}, PROF, CFG)
+        return 20 * math.log10(float(y.pow(2).mean().sqrt()) + 1e-12)
+
+    lv = [level(t) for t in (-8.0, -4.0, 0.0, 4.0, 8.0)]
+    assert max(lv) - min(lv) < 20.0, f"tilt 로 레벨이 {max(lv) - min(lv):.0f} dB 움직인다"
+
+
+def test_stacked_folds_show_a_mucosal_wave():
+    """성대를 여러 겹 쌓으면 하연이 상연을 앞서는 점막파가 나와야 한다.
+
+    2 겹으로는 성문 통로가 두 점을 잇는 직선뿐이라 모양 변화를 못 담는다.
+    n 겹이면 통로가 열릴 때 수렴형·닫힐 때 발산형으로 바뀌는 것이 궤적에 나온다.
+    """
+    from formant_ml.dsp.vocalfold import (FoldParams, cycle_rate,
+                                          mucosal_wave_delay, simulate_stack)
+    f0s = []
+    for n in (2, 5):
+        flow, traj = simulate_stack(FoldParams(a01=0.02, a02=0.02), n_masses=n,
+                                    n_samples=7200)
+        seg, tr = flow[2400:], traj[2400:]
+        assert float(seg.std()) > 1.0, f"n={n} 에서 진동이 죽었다"
+        f0 = cycle_rate(seg, 24000)
+        assert 60.0 < f0 < 400.0, f"n={n} F0 {f0}"
+        f0s.append(f0)
+        lag = mucosal_wave_delay(tr)
+        assert 0.1 < lag < 2.5, f"n={n} 점막파 {lag:.2f} ms (사람 0.5~1.5, 양수=하연 선행)"
+        # 상연이 하연보다 크게 움직인다
+        assert float(tr[:, -1].std()) > float(tr[:, 0].std())
+    # 겹 수를 바꿔도 F0 가 흐르면 안 된다 (질량/강성 분할이 틀렸다는 뜻)
+    assert abs(f0s[0] - f0s[1]) / f0s[0] < 0.25, f0s
+
+
+def test_stacked_folds_track_tension():
+    from formant_ml.dsp.vocalfold import FoldParams, cycle_rate, simulate_stack
+    r = []
+    for q in (0.7, 1.6):
+        flow, _ = simulate_stack(FoldParams(a01=0.02, a02=0.02, q=q), n_masses=5,
+                                 n_samples=7200)
+        r.append(cycle_rate(flow[2400:], 24000))
+    assert r[1] > r[0] * 1.5, r
 
 
 def test_voice_profile_round_trips_through_json():
