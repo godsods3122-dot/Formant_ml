@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "formant-ml"
+version = "0.1.0"
+description = "물리 기반(성문 소스 + 성도 공명 + 난류 노이즈) 미분가능 음성 합성"
+requires-python = ">=3.10"
+dependencies = ["torch>=2.0", "numpy>=1.24", "scipy>=1.10", "soundfile>=0.12"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 90
