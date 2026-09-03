@@ -1,0 +1,16 @@
+# 여성 화자 기본 프리셋. voice: female 한 줄이면 성도 길이(14.1cm), 포먼트 표,
+# 포먼트 개수(9), 도파관 단면(19), F0, Rd/tilt, 치찰음 극이 전부 바뀐다.
+name: 여성 한 줄
+voice: female
+sample_rate: 24000
+seed: 5
+timeline:
+  - {type: syllable, onset: s, vowel: a, dur: 0.55, f0: [230, 195]}
+  - {type: silence, dur: 0.1}
+  - {type: glide, vowels: [a, i, u], dur: 0.6, f0: [[0, 210], [0.5, 225], [1, 175]]}
+  - {type: silence, dur: 0.1}
+  - {type: syllable, onset: sh, vowel: i, dur: 0.5, f0: [215, 190]}
+  - {type: silence, dur: 0.1}
+  # 비음화: 연구개를 열면 4~5 kHz 이상와 노치와 별개로 저역에 극-영점이 생긴다
+  - {type: vowel, vowel: a, dur: 0.55, f0: 200,
+     velum_open: [[0, 0], [0.4, 0], [0.7, 1], [1, 1]]}

@@ -38,7 +38,8 @@ class TurbulenceSource(nn.Module):
     """
 
     def __init__(self, sample_rate: int, hop_size: int, n_bands: int = 40,
-                 init_beta: float = 1.0, init_knee_hz: float = 120.0):
+                 init_beta: float = 1.0, init_knee_hz: float = 120.0,
+                 mod_highpass_hz: float = 45.0):
         super().__init__()
         self.sample_rate = sample_rate
         self.hop_size = hop_size
@@ -48,6 +49,12 @@ class TurbulenceSource(nn.Module):
         # 변조 스펙트럼: |M(f)| = (1 + (f/knee)^2)^(-beta/2)
         self.raw_beta = nn.Parameter(torch.tensor(float(init_beta)))
         self.raw_knee = nn.Parameter(torch.tensor(float(init_knee_hz)).log())
+        # 변조 포락선의 **느린 성분 제거**. 이게 없으면 0.1~10 Hz 변조가 그대로
+        # 남아 기름에 튀기는 듯한 '지글거림'이 된다.
+        # 물리적 근거: 협착부 난류의 상관시간은 밀리초 단위다. 100 ms 규모의
+        # 느린 진폭 변화는 난류가 아니라 **조음**이 만드는 것이고, 그건 이미
+        # noise_bands 궤적 + 조음 동역학이 따로 담당한다. 두 번 세면 안 된다.
+        self.mod_highpass_hz = float(mod_highpass_hz)
 
     # ------------------------------------------------------------------ 사전
     def spectral_prior(self) -> torch.Tensor:
@@ -65,6 +72,9 @@ class TurbulenceSource(nn.Module):
         beta = F.softplus(self.raw_beta).clamp(0.05, 4.0)
         knee = self.raw_knee.exp().clamp(10.0, 4000.0)
         w = (1.0 + (f / knee) ** 2) ** (-beta / 2.0)
+        if self.mod_highpass_hz > 0:
+            r = f / self.mod_highpass_hz
+            w = w * (r / (1.0 + r * r).sqrt())          # 1차 고역통과
         e = torch.fft.irfft(M * w.to(M.dtype), n)
         e = e - e.mean(-1, keepdim=True)
         return e / e.std(-1, keepdim=True).clamp_min(1e-6)

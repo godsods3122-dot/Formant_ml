@@ -25,8 +25,9 @@ from ..config import Config, DEFAULT
 from ..dsp.core import ltv_filter, upsample
 from ..dsp.filters import (allpass_response, antiresonator_response,
                            bands_to_response, gated_cascade_response,
-                           lip_radiation_response, resonator_stage_responses)
-from ..dsp.glottal import GlottalSource
+                           lip_radiation_response, notch_response,
+                           resonator_stage_responses)
+from ..dsp.glottal import GlottalSource, glottal_f1_damping
 from ..dsp.nasal import f1_bandwidth_factor, nasal_response
 from ..dsp.noise import TurbulenceSource
 from ..dsp.sibilant import SibilantParams, sibilant_response
@@ -71,6 +72,9 @@ class Controls:
     # --- 그 밖 ------------------------------------------------------------
     #   연구개 개도 0~1. 0 이면 비강 극-영점이 정확히 상쇄되어 아무 일도 없다.
     velum_open: torch.Tensor | None = None       # (B, T, 1)
+    #   곁가지 공동 노치 (이상와 등). 홈 밖에서는 응답이 1 로 돌아온다.
+    notch_freq: torch.Tensor | None = None       # (B, T, Kn)
+    notch_bw: torch.Tensor | None = None
     antiformant_freq: torch.Tensor | None = None   # (B, T, Ka)
     antiformant_bw: torch.Tensor | None = None
     sib: SibilantParams | None = None     # 치찰음 극-영점 필터(화자 지문)
@@ -106,8 +110,10 @@ class Controls:
 
 
 class PhysicalVoiceSynth(nn.Module):
-    def __init__(self, cfg: Config = DEFAULT, tract_mode: str = "formant"):
+    def __init__(self, cfg: Config = DEFAULT, tract_mode: str = "formant",
+                 glottal_f1_loss_hz: float = 130.0):
         super().__init__()
+        self.glottal_f1_loss_hz = float(glottal_f1_loss_hz)
         assert tract_mode in ("formant", "waveguide")
         self.cfg = cfg
         self.tract_mode = tract_mode
@@ -130,6 +136,10 @@ class PhysicalVoiceSynth(nn.Module):
         """(H_harm, H_noise) 복소응답. 노이즈는 협착 하류 단만 통과한다."""
         fs, nf = self.cfg.audio.sample_rate, self.n_freq
         bw = c.formant_bw
+        # 소스-성도 상호작용 1차: 성문이 열려 있는 동안 F1 이 손실을 본다.
+        if self.glottal_f1_loss_hz > 0:
+            d = glottal_f1_damping(c.rd, self.glottal_f1_loss_hz) * c.harmonic_amp.clamp(0, 1)
+            bw = torch.cat([bw[..., :1] + d, bw[..., 1:]], dim=-1)
         if c.velum_open is not None:
             # 곁가지로 에너지가 새면서 F1 이 넓어지고 약해진다 (비음화의 핵심 단서)
             bw = torch.cat([bw[..., :1] * f1_bandwidth_factor(c.velum_open),
@@ -163,6 +173,8 @@ class PhysicalVoiceSynth(nn.Module):
         h = torch.ones_like(ref)
         if c.velum_open is not None:
             h = h * nasal_response(c.velum_open, fs, nf)
+        if c.notch_freq is not None:
+            h = h * notch_response(c.notch_freq, c.notch_bw, fs, nf)
         if c.antiformant_freq is not None:
             h = h * antiresonator_response(c.antiformant_freq, c.antiformant_bw, fs, nf)
         if c.allpass_freq is not None:

@@ -32,7 +32,7 @@ from .dsp.sibilant import PRESETS as SIB_PRESETS
 from .dsp.sibilant import SibilantParams
 from .gestures import GESTURES, base
 from .models.synth import Controls, PhysicalVoiceSynth
-from .presets import FRICATIVES, LOCUS, SIB_POLE_RELEASE_HZ, VOWELS
+from .presets import FRICATIVES, LOCUS, SIB_POLE_RELEASE_HZ, VOWELS, vowel_table
 from .utils import band_bump, band_shelf, ramp
 from .voice import VoiceProfile, extend_formants
 
@@ -90,9 +90,14 @@ def curve(spec, t: int) -> torch.Tensor:
 
 
 def _vowel_formants(name: str, prof: VoiceProfile, n: int) -> list[float]:
-    """모음 프리셋을 화자 성도 규모로 스케일."""
-    scale = (prof.formants[0] / VOWELS["a"][0]) if prof.formants else 1.0
-    f = [v * scale for v in VOWELS.get(name, VOWELS["a"])]
+    """모음 프리셋을 화자 성도 규모로 스케일.
+
+    성별에 따라 아예 다른 표를 쓴다. 남성 표에 상수를 곱하면 안 된다 —
+    여성 성도는 인두가 구강보다 더 많이 짧아져서 모음마다 배율이 다르다.
+    """
+    tbl = vowel_table(getattr(prof, "vowel_set", "male"))
+    scale = (prof.formants[0] / tbl["a"][0]) if prof.formants else 1.0
+    f = [v * scale for v in tbl.get(name, tbl["a"])]
     return extend_formants(f + list(prof.formants[len(f):]), n)
 
 
@@ -121,7 +126,9 @@ def _locus_track(phone: str, vowel: str, prof: VoiceProfile, k: int, t: int,
 def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
     """세그먼트 하나 -> 프레임률 제어 dict (+ 'sib' 하위 dict)."""
     a = cfg.audio
-    K, NB = cfg.filt.n_formants, cfg.noise.n_bands
+    # 포먼트 개수는 화자의 성도 길이가 정한다(간격 = c/2L). 설정값은 상한.
+    K = min(cfg.filt.n_formants, prof.n_formants(a.sample_rate))
+    NB = cfg.noise.n_bands
     t = max(1, int(round(float(seg.get("dur", 0.3)) * a.frame_rate)))
     kind = seg.get("type", "vowel")
 
@@ -208,13 +215,15 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
                          f"가능한 값: {', '.join(SEGMENT_TYPES)}")
 
     c.setdefault("sib", prof.sibilant_params((1, t, 1), mix=0.0))
-    apply_overrides(c, seg, t, cfg)
+    apply_overrides(c, seg, t, cfg, K)
     return c
 
 
-def apply_overrides(c: dict, spec: dict, t: int, cfg: Config) -> None:
+def apply_overrides(c: dict, spec: dict, t: int, cfg: Config,
+                    n_formants: int | None = None) -> None:
     """스크립트에 적힌 파라미터로 제어 dict 를 덮어쓴다."""
-    K, NB = cfg.filt.n_formants, cfg.noise.n_bands
+    K = n_formants or cfg.filt.n_formants
+    NB = cfg.noise.n_bands
     noise_shape = {}
     for key, val in spec.items():
         if key in ("type", "dur"):
@@ -280,6 +289,7 @@ def _smooth(x: torch.Tensor, n: int) -> torch.Tensor:
 
 def build_controls(score: dict, prof: VoiceProfile, cfg: Config) -> Controls:
     """스크립트 전체 -> 하나의 Controls (위상은 발화 전체에서 연속이다)."""
+    K = min(cfg.filt.n_formants, prof.n_formants(cfg.audio.sample_rate))
     segs = [build_segment(s, prof, cfg) for s in score.get("timeline", [])]
     if not segs:
         raise ValueError("timeline 이 비어 있습니다")
@@ -305,7 +315,7 @@ def build_controls(score: dict, prof: VoiceProfile, cfg: Config) -> Controls:
     # 전역 오버라이드
     if score.get("params"):
         apply_overrides(merged | {"sib": SibilantParams(**sib_fields)},
-                        score["params"], t, cfg)
+                        score["params"], t, cfg, K)
 
     # 경계 평활. `noise_entry` 는 **일부러 빼 둔다**: 협착 위치는 연속적으로
     # 미끄러지는 양이 아니라 조음 상태다. 무음(성문 주입)에서 /s/(입술쪽 주입)로
@@ -332,6 +342,12 @@ def build_controls(score: dict, prof: VoiceProfile, cfg: Config) -> Controls:
         sib_fields = {k[4:]: v for k, v in moved.items() if k.startswith("sib_")}
 
     merged["formant_freq"] = enforce_formant_spacing(merged["formant_freq"])
+
+    # 이상와(piriform fossa): 성도의 곁가지라 화자 고정. 4~5 kHz 에 골을 만든다.
+    pf = getattr(prof, "piriform", None)
+    if pf and merged.get("notch_freq") is None:
+        merged["notch_freq"] = torch.full((1, t, 1), float(pf["freq"]))
+        merged["notch_bw"] = torch.full((1, t, 1), float(pf["bw"]))
 
     df, dr = prof.dispersion_tensors(1, t)
     merged.setdefault("disp_freq", df)
@@ -372,9 +388,15 @@ def load_score(path: str) -> dict:
     return json.loads(text)
 
 
+PRESET_PROFILES = {"female": VoiceProfile.female, "male": VoiceProfile}
+
+
 def load_profile(score: dict, base_dir: str = ".") -> VoiceProfile:
+    """`voice:` 는 프로파일 JSON 경로이거나 프리셋 이름("female" / "male")."""
     p = score.get("voice")
     if not p:
         return VoiceProfile()
+    if p in PRESET_PROFILES:
+        return PRESET_PROFILES[p]()
     path = p if os.path.isabs(p) else os.path.join(base_dir, p)
     return VoiceProfile.load(path if os.path.exists(path) else p)

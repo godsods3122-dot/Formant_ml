@@ -106,6 +106,25 @@ def antiresonator_response(freq, bw, sample_rate: float, n_freq: int) -> torch.T
     return (D / Ddc).prod(dim=2)
 
 
+def notch_response(freq, bw_zero, sample_rate: float, n_freq: int,
+                    pole_ratio: float = 3.0) -> torch.Tensor:
+    """국소 노치 (극-영점 쌍). 홈 밖에서는 응답이 1 로 돌아온다.
+
+    곁가지 공동(이상와 등)을 모델링할 때 **반공명만 쓰면 안 된다**: DC 정규화된
+    반공명은 영점 위에서 이득이 계속 커져서 나이퀴스트에서 +7 dB 가 되고,
+    /s/ 처럼 고역이 평평한 소리에서는 스펙트럼 피크를 나이퀴스트로 옮겨 버린다
+    (실측: 치찰음 피크 3200 Hz -> 11719 Hz). 물리적으로도 1/4 파장 곁가지는
+    영점만이 아니라 자기 공진(극)도 함께 갖는다.
+
+    같은 주파수에 좁은 영점과 넓은 극을 두고 주파수축 RMS 로 정규화한다.
+    """
+    D_z, Ddc_z = _pole_pair(freq, bw_zero, sample_rate, n_freq)
+    D_p, Ddc_p = _pole_pair(freq, bw_zero * pole_ratio, sample_rate, n_freq)
+    h = ((D_z / Ddc_z) * (Ddc_p / D_p)).prod(dim=2)
+    rms = (h.abs() ** 2).mean(dim=-1, keepdim=True).clamp_min(1e-9).sqrt()
+    return h / rms
+
+
 def allpass_response(freq, radius, sample_rate: float, n_freq: int) -> torch.Tensor:
     """2차 올패스 캐스케이드: 크기응답은 1, 군지연(위상차)만 바꾼다.
 

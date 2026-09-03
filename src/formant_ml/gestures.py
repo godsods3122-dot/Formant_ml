@@ -20,7 +20,7 @@ import math
 
 import torch
 
-from .presets import FRICATIVES, VOWELS
+from .presets import FRICATIVES, VOWELS, vowel_table
 from .utils import band_bump, ramp
 from .voice import VoiceProfile, extend_formants
 
@@ -38,8 +38,9 @@ def base(t: int, prof: VoiceProfile, n_formants: int = 8, n_bands: int = 40,
          vowel: str = "a") -> dict:
     """프로파일의 기본 상태(중립 모음, 말하는 F0)."""
     # 화자 포먼트로 스케일: 모음의 상대 형태는 유지하고 전체 규모만 화자에 맞춘다
-    scale = (prof.formants[0] / VOWELS["a"][0]) if prof.formants else 1.0
-    f = [v * scale for v in VOWELS.get(vowel, VOWELS["a"])]
+    tbl = vowel_table(getattr(prof, "vowel_set", "male"))
+    scale = (prof.formants[0] / tbl["a"][0]) if prof.formants else 1.0
+    f = [v * scale for v in tbl.get(vowel, tbl["a"])]
     ff = extend_formants(f + list(prof.formants[len(f):]), n_formants)
     return {
         "f0": _c(t, prof.f0_median),

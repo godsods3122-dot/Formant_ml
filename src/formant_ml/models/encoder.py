@@ -107,7 +107,14 @@ class ControlEncoder(nn.Module):
         fo = self.head_formant(h)
         if self.basis_dim > 0:
             z = self.head_formant_z(h)                          # (B, T, d)
-            logits = self.formant_mean + z @ self.formant_basis.T
+            moving = z @ self.formant_basis.T
+            # 상위 포먼트는 화자 상수 — 혀가 아니라 고정 해부가 정한다.
+            fixed_from = int(getattr(cfg.filt, "formant_fixed_from", 0) or 0)
+            if 0 < fixed_from < self.K:
+                mask = torch.ones(self.K, device=moving.device, dtype=moving.dtype)
+                mask[fixed_from:] = 0.0
+                moving = moving * mask
+            logits = self.formant_mean + moving
             bw_raw, gain_raw = fo[..., : self.K], fo[..., self.K:]
         else:
             logits = fo[..., : self.K]

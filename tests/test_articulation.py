@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import math
 import os
 import sys
 
@@ -229,6 +230,84 @@ def test_pressure_drives_source_parameters_together():
     # 압력 2배당 약 7 dB
     db = 20 * torch.log10(r["amp"][2] / r["amp"][1])
     assert 5.0 < float(db) < 9.0, float(db)
+
+
+# ---------------------------------------------------------------- 여성 성도 / 곁가지
+def test_formant_count_follows_tract_length():
+    """성도가 짧으면 나이퀴스트 아래 극의 개수가 준다. 억지로 채우면 응답이 접힌다."""
+    from formant_ml.voice import VoiceProfile
+    m, f = VoiceProfile(), VoiceProfile.female()
+    assert m.n_formants() == 12 and f.n_formants() == 9, (m.n_formants(), f.n_formants())
+    assert max(f.formants) < 12000.0
+    assert f.n_tract_sections() == 19        # 14.1 cm @ 24 kHz
+
+
+def test_female_render_is_not_high_frequency_blown_up():
+    """여성 프로파일 합성의 스펙트럼 무게중심이 정상 범위여야 한다.
+
+    (포먼트 12 개를 짧은 성도에 억지로 끼우면 나이퀴스트 위에 극이 생겨
+     무게중심이 1.3 kHz 에서 10.5 kHz 로 튀었다 — 실제로 겪은 버그.)
+    """
+    from formant_ml.config import Config as C
+    from formant_ml.score import render
+    from formant_ml.voice import VoiceProfile
+    sc = {"timeline": [{"type": "vowel", "vowel": "a", "dur": 0.5, "f0": 200}],
+          "seed": 5}
+    y = render(sc, VoiceProfile.female(), C())[0]
+    Y = torch.fft.rfft(y * torch.hann_window(len(y))).abs()
+    fq = torch.linspace(0, 12000, len(Y))
+    centroid = float((fq * Y).sum() / Y.sum())
+    assert 400 < centroid < 3000, centroid
+
+
+def test_side_cavity_notch_is_local():
+    """곁가지 노치는 홈만 파고 그 밖에서는 응답이 1 로 돌아와야 한다.
+
+    반공명만 쓰면 영점 위에서 이득이 계속 커져 나이퀴스트에서 +7 dB 가 되고,
+    /s/ 의 스펙트럼 피크를 나이퀴스트로 옮겨 버린다.
+    """
+    from formant_ml.dsp.filters import notch_response
+    H = notch_response(torch.full((1, 1, 1), 4500.), torch.full((1, 1, 1), 600.),
+                       24000, 1025)
+    m = H.abs()[0, 0]
+    fq = freq_grid(len(m), 24000)
+    notch = float(m[(fq > 4200) & (fq < 4800)].min())
+    dc = float(m[fq < 200].mean())
+    nyq = float(m[fq > 11000].mean())
+    assert notch < 0.6, notch
+    assert abs(20 * math.log10(dc)) < 2.0 and abs(20 * math.log10(nyq)) < 2.0
+
+
+def test_glottal_opening_widens_f1():
+    """소스-성도 상호작용 1차: 개방지수가 클수록 F1 대역폭이 넓어진다."""
+    from formant_ml.dsp.glottal import glottal_f1_damping, open_quotient
+    assert open_quotient(0.4) < open_quotient(1.2) < open_quotient(2.4)
+    d = glottal_f1_damping(torch.tensor([[[0.4]], [[1.2]], [[2.4]]]))
+    assert float(d[0]) < float(d[1]) < float(d[2])
+    assert 30.0 < float(d[1]) < 130.0        # 문헌의 주기평균 50~100 Hz 범위
+
+
+def test_fricative_sizzle_is_bounded():
+    """/s/ 의 저속(3~30 Hz) 진폭 변조가 잡음 자체의 요동을 크게 넘지 않아야 한다."""
+    from formant_ml.config import Config as C
+    from formant_ml.score import render
+    from formant_ml.voice import VoiceProfile
+
+    def sizzle(rough):
+        y = render({"timeline": [{"type": "fricative", "phone": "s", "dur": 0.5,
+                                  "noise_rough": rough}], "seed": 3},
+                   VoiceProfile(), C())[0]
+        X = torch.stft(y[None], 1024, 120, 1024, torch.hann_window(1024),
+                       return_complex=True, center=True).abs()[0]
+        f = torch.linspace(0, 12000, X.shape[0])
+        e = X[(f > 3000) & (f < 12000)].mean(0)
+        e = e / e.mean().clamp_min(1e-9) - 1.0
+        E = torch.fft.rfft(e * torch.hann_window(len(e))).abs()
+        mf = torch.linspace(0, 100.0, len(E))
+        return float((E[(mf > 3) & (mf < 30)] ** 2).sum().sqrt() / len(e) * 2)
+
+    floor, now = sizzle(0.0), sizzle(0.12)
+    assert now < floor * 1.35, (floor, now)     # 이전 기본값 0.35 는 2배였다
 
 
 if __name__ == "__main__":

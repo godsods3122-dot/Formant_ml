@@ -75,6 +75,40 @@ def _lf_waveform(rd: float, n: int) -> torch.Tensor:
     return wave / wave.abs().max().clamp_min(1e-6)
 
 
+def open_quotient(rd: float) -> float:
+    """Rd -> 개방지수 OQ (한 주기 중 성문이 열려 있는 비율).
+
+    LF 타이밍에서 직접 얻는다 (te + 복귀상 ta). 문헌의 회귀식을 베끼지 않고
+    우리 사전에서 계산하므로 분석/합성이 어긋나지 않는다.
+    """
+    tp, te, ta, tc = _rd_to_timing(rd)
+    return min(te + ta, 0.99)
+
+
+def glottal_f1_damping(rd: torch.Tensor, max_hz: float = 130.0) -> torch.Tensor:
+    """성문 개방에 의한 F1 대역폭 증가분 [Hz]. (B, T, 1) -> (B, T, 1)
+
+    **소스-성도 상호작용의 1차 효과.** 성문이 열려 있는 동안 성문하 계통이
+    성도에 연결되어 F1 이 손실을 본다. 주기 평균하면 F1 대역폭이 OQ 에 비례해
+    넓어진다(폐쇄기 대비 개방기에 100~200 Hz 증가, 평균 50~100 Hz).
+
+    완전한 상호작용(성도 입력 임피던스가 성대 진동에 되먹임)은 시간영역
+    연립을 요구하지만, **들리는 것의 대부분은 이 F1 감쇠**다. 그래서 느린 ODE
+    없이도 1차 효과를 정확히 같은 자리에 넣을 수 있다.
+
+    부수 효과: 여성처럼 F0 가 높아 하모닉이 성길 때 F1 봉우리를 하모닉이 못 짚어
+    'F0 만 튀어나오는' 문제가 완화된다 — 넓어진 F1 이 더 많은 하모닉을 덮는다.
+    """
+    grid = torch.linspace(0.3, 2.7, 25, device=rd.device, dtype=rd.dtype)
+    oq = torch.tensor([open_quotient(float(v)) for v in grid],
+                      device=rd.device, dtype=rd.dtype)
+    pos = ((rd - grid[0]) / (grid[-1] - grid[0]) * (len(grid) - 1)).clamp(0, len(grid) - 1.001)
+    i = pos.floor().long()
+    frac = pos - i
+    q = oq[i] * (1 - frac) + oq[(i + 1).clamp(max=len(grid) - 1)] * frac
+    return max_hz * q
+
+
 class LFTableBank(nn.Module):
     """Rd 그리드 위의 LF 파형 스펙트럼 사전."""
 
