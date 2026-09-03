@@ -69,9 +69,12 @@ class VoiceProfile:
                                                       380., 450., 530., 620.])
 
     # --- 치찰음 지문 --------------------------------------------------------
+    # 앞공동은 짧고 슬릿·치열의 손실이 커서 Q 가 낮다(대역폭 1000~1500 Hz).
+    # 800 Hz 로 좁게 두면 -10 dB 폭이 3.0 kHz 밖에 안 되어 실제 /s/(4 kHz 이상)보다
+    # 좁은 단봉이 되고, 넓은 '쉬~' 가 아니라 좁은 '삐~' 에 가깝게 들린다.
     sibilant: dict = field(default_factory=lambda: {
-        "pole_f": 6600.0, "pole_bw": 800.0, "zero_f": 2900.0, "zero_bw": 900.0,
-        "tilt": 1.0})
+        "pole_f": 6600.0, "pole_bw": 1200.0, "zero_f": 2900.0, "zero_bw": 900.0,
+        "tilt": 0.5})
     sibilant_moments: dict = field(default_factory=dict)
 
     # --- 위상차 -------------------------------------------------------------
@@ -116,8 +119,10 @@ class VoiceProfile:
             formants=f,
             bandwidths=[80., 110., 140., 180., 220., 270., 310., 350.,
                         410., 480.][:len(f)],
-            sibilant={"pole_f": 8000.0, "pole_bw": 900.0, "zero_f": 3400.0,
-                      "zero_bw": 1000.0, "tilt": 1.5},
+            # 앞공동이 짧아 극이 남성보다 높지만, 8 kHz 로 두면 에너지의 70% 가
+            # 8~12 kHz 로 몰려 '얇고 바람 새는' 소리가 된다(실측). 7.4 kHz + 넓은 Q.
+            sibilant={"pole_f": 7400.0, "pole_bw": 1400.0, "zero_f": 3300.0,
+                      "zero_bw": 900.0, "tilt": 0.5},
             piriform={"freq": 4700.0, "bw": 650.0},
             roughness=0.10, breathiness=0.20)
 

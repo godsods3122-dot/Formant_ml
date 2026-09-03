@@ -310,6 +310,53 @@ def test_fricative_sizzle_is_bounded():
     assert now < floor * 1.35, (floor, now)     # 이전 기본값 0.35 는 2배였다
 
 
+# ------------------------------------------------------------------ 마찰음 레벨/모양
+def _rms(y):
+    return float(y.pow(2).mean().sqrt())
+
+
+def test_fricative_level_is_below_the_vowel():
+    """/s/ 는 모음보다 낮아야 한다. 같거나 크면 자음이 아니라 잡음 버스트로 들린다.
+
+    (측정 이력: 노이즈 게인과 유성 진폭이 한 번도 서로 맞춰진 적이 없어서
+     /s/ 가 모음보다 +4 dB 였다. 실제 음성은 -8~-20 dB.)
+    """
+    from formant_ml.config import Config as C
+    from formant_ml.score import render
+    from formant_ml.voice import VoiceProfile
+    for prof in (VoiceProfile(), VoiceProfile.female()):
+        v = render({"timeline": [{"type": "vowel", "vowel": "a", "dur": 0.4}],
+                    "seed": 1}, prof, C())[0]
+        s = render({"timeline": [{"type": "fricative", "phone": "s", "dur": 0.4}],
+                    "seed": 1}, prof, C())[0]
+        db = 20 * math.log10(_rms(s) / _rms(v))
+        assert -20.0 < db < -6.0, db
+        # 비치찰음은 훨씬 더 작다
+        fq = render({"timeline": [{"type": "fricative", "phone": "f", "dur": 0.4}],
+                     "seed": 1}, prof, C())[0]
+        assert 20 * math.log10(_rms(fq) / _rms(s)) < -8.0
+
+
+def test_sibilant_spectrum_is_broad_not_a_single_hump():
+    """/s/ 의 -10 dB 폭이 4 kHz 이상이고 2 kHz 아래는 비어 있어야 한다."""
+    from formant_ml.config import Config as C
+    from formant_ml.score import render
+    from formant_ml.voice import VoiceProfile
+    for prof in (VoiceProfile(), VoiceProfile.female()):
+        y = render({"timeline": [{"type": "fricative", "phone": "s", "dur": 0.5}],
+                    "seed": 3}, prof, C())[0]
+        S = torch.stft(y[None], 2048, 512, 2048, torch.hann_window(2048),
+                       return_complex=True, center=True).abs()[0]
+        P = (S ** 2).mean(-1)
+        f = torch.linspace(0, 12000, len(P))
+        P = P / P.max()
+        idx = (P >= 0.1).nonzero().flatten()
+        width = float(f[idx[-1]] - f[idx[0]])
+        low = float(P[f < 2000].sum() / P.sum())
+        assert width >= 4000.0, width
+        assert low < 0.02, low
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

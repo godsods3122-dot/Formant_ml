@@ -51,6 +51,29 @@ def vowel_table(which: str = "male") -> dict:
     return VOWEL_TABLES.get(which, VOWELS)
 
 
+# --- 마찰음의 절대 레벨 ------------------------------------------------------
+# 지금까지 난류 게인과 유성 진폭이 **한 번도 서로 맞춰진 적이 없었다.**
+# 측정: harmonic_amp=1.0 인 모음 대비 noise_gain=1.0 인 /s/ 가 +4.1 dB(남),
+# +3.3 dB(여). 실제 음성에서 /s/ 는 뒤따르는 모음보다 8~20 dB **낮다**.
+# 즉 15~20 dB 과다였고, 모음보다 큰 고역 잡음은 자음이 아니라 '지글거리는
+# 잡음 버스트'로 들린다. 이것이 치찰음이 치찰음으로 안 들린 주된 이유다.
+#
+# NOISE_UNITY_GAIN 은 "노이즈 경로 = 유성 경로와 같은 레벨" 이 되는 게인이다.
+# 이걸 기준으로 음소별 레벨을 dB 로 적는다(Jongman et al. 2000 의 normalized
+# amplitude: 치찰음 /s ʃ z/ 가 크고 /f θ/ 는 훨씬 작다).
+NOISE_UNITY_GAIN = 0.654
+FRICATIVE_LEVEL_DB = {
+    "s": -12.0, "ss": -10.0, "sh": -10.0, "z": -14.0,
+    "f": -26.0, "th": -28.0, "h": -20.0,
+}
+
+
+def fricative_gain(phone: str, level_db: float | None = None) -> float:
+    """음소별 난류 게인. 모음(harmonic_amp=1) 대비 dB 로 지정한다."""
+    db = level_db if level_db is not None else FRICATIVE_LEVEL_DB.get(phone, -14.0)
+    return NOISE_UNITY_GAIN * 10.0 ** (db / 20.0)
+
+
 BANDWIDTHS = (60, 90, 120, 160, 200)
 
 # 자음 협착 상태의 포먼트 목표 (F1, F2, F3) [Hz] — 이른바 'locus'.

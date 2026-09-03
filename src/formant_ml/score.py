@@ -32,7 +32,8 @@ from .dsp.sibilant import PRESETS as SIB_PRESETS
 from .dsp.sibilant import SibilantParams
 from .gestures import GESTURES, base
 from .models.synth import Controls, PhysicalVoiceSynth
-from .presets import FRICATIVES, LOCUS, SIB_POLE_RELEASE_HZ, VOWELS, vowel_table
+from .presets import (FRICATIVES, LOCUS, SIB_POLE_RELEASE_HZ, VOWELS,
+                      fricative_gain, vowel_table)
 from .utils import band_bump, band_shelf, ramp
 from .voice import VoiceProfile, extend_formants
 
@@ -47,6 +48,7 @@ SCALAR_PARAMS = {
     "noise_entry": "난류 주입 위치 0=성문 … K=입술 … K+6=성도 완전 우회",
     "noise_am": "성문동기 노이즈 변조 깊이 (기식성)",
     "aspiration": "성문 기식 노이즈 (성도 전체를 통과). 0.01≈-25dB, 0.05≈-11dB",
+    "level_db": "마찰음 레벨 [dB, 모음 기준]. /s/ 기본 -12, /f/ -26",
     "velum_open": "연구개 개도 0~1 (비음). 0 이면 비강 극-영점이 정확히 상쇄된다",
     "noise_rough": "난류의 시간 변조 (0 = 정상 히스, 1 = 거친 난류)",
     "noise_gain": "난류 전체 세기",
@@ -163,7 +165,9 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
         phone = seg.get("onset", seg.get("phone", "s"))
         vowel = seg.get("vowel", "a")
         c = base(t, prof, K, NB, vowel)
-        cf, bw, pos, g = FRICATIVES.get(phone, FRICATIVES["s"])
+        cf, bw, pos, _ = FRICATIVES.get(phone, FRICATIVES["s"])
+        # 레벨은 모음 대비 dB 로 지정한다 (presets.FRICATIVE_LEVEL_DB).
+        g = fricative_gain(phone, seg.get("level_db"))
         # 소스는 광대역, 모양은 치찰음 필터가 만든다(둘이 겹치면 손잡이가 죽는다).
         nb = band_shelf(NB, 500.0, g, a.sample_rate).reshape(1, 1, -1)
         sp = SIB_PRESETS.get(phone)
