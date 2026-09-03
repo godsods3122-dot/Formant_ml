@@ -312,14 +312,104 @@ def test_fricatives_are_as_smooth_as_pink_noise():
     k_ref, cv_ref = _kurtosis(pink), _envelope_cv(pink)
     assert 2.5 < k_ref < 3.5, k_ref                      # 전제 확인
 
+    # 첨도가 지글거림의 지표다. 포락선 CV 는 **색칠 정도에도** 반응하므로
+    # (대역제한이 강할수록 포락선이 더 요동친다 — 백색 0.07 < 핑크 0.14) 상한을
+    # 느슨하게 두고, 꼬리 두께는 첨도로 엄격히 본다.
     for tl in ([{"type": "fricative", "phone": "s", "dur": 2.0}],
                [{"type": "fricative", "phone": "sh", "dur": 2.0}],
                [{"type": "whisper", "dur": 2.0}],
                [{"type": "whisper", "vowel": "i", "dur": 2.0}]):
         y = render({"timeline": tl, "seed": 1}, PROF, CFG)
         k, cv = _kurtosis(y), _envelope_cv(y)
-        assert k < k_ref + 0.6, f"{tl[0]['type']} 첨도 {k:.2f} (핑크 {k_ref:.2f})"
-        assert cv < cv_ref * 1.6, f"{tl[0]['type']} 포락선 CV {cv:.3f} (핑크 {cv_ref:.3f})"
+        assert k < k_ref + 0.4, f"{tl[0]['type']} 첨도 {k:.2f} (핑크 {k_ref:.2f})"
+        assert cv < cv_ref * 2.0, f"{tl[0]['type']} 포락선 CV {cv:.3f} (핑크 {cv_ref:.3f})"
+
+
+def _spectral_flatness(y, lo=1000.0, hi=11000.0):
+    x = y.reshape(-1) - y.reshape(-1).mean()
+    P = torch.fft.rfft(x * torch.hann_window(len(x))).abs() ** 2
+    f = torch.linspace(0, FS / 2, len(P))
+    P = P[(f > lo) & (f < hi)].clamp_min(1e-20)
+    return float(torch.exp(torch.log(P).mean()) / P.mean())
+
+
+def _band_peakiness(y, lo=2000.0, hi=11000.0, smooth=201):
+    x = y.reshape(-1)
+    P = 20 * torch.log10(torch.fft.rfft(x * torch.hann_window(len(x))).abs()
+                         .clamp_min(1e-9))
+    k = torch.ones(1, 1, smooth) / smooth
+    P = torch.nn.functional.conv1d(P.view(1, 1, -1), k, padding=smooth // 2).view(-1)
+    f = torch.linspace(0, FS / 2, len(P))
+    P = P[(f > lo) & (f < hi)]
+    return float(P.max() - P.median())
+
+
+def test_fricative_spectrum_is_not_tonal():
+    """마찰음 스펙트럼이 뾰족하면 잡음이 그 공진에서 울려 음조가 들린다.
+
+    이건 시간영역 아티팩트가 아니다 — 위상을 무작위로 돌려도 같은 소리가 난다
+    (측정으로 확인). 순전히 스펙트럼이 뾰족해서 생기므로 감쇠로만 고칠 수 있다.
+    사람의 /s/ 는 4~10 kHz 의 넓은 고원이고 1~11 kHz 평탄도가 대략 0.2~0.4 다.
+    """
+    y = render({"timeline": [{"type": "fricative", "phone": "s", "dur": 2.0}],
+                "seed": 1}, PROF, CFG)
+    flat = _spectral_flatness(y)
+    peak = _band_peakiness(y)
+    assert flat > 0.10, f"치찰음 스펙트럼 평탄도 {flat:.3f} (뾰족해서 음조가 들린다)"
+    assert peak < 9.0, f"치찰 대역이 중앙값보다 {peak:.1f} dB 솟아 있다"
+
+    # 위상 무작위화로 '시간영역 원인이 아님' 을 확인 (회귀 방지용 전제)
+    X = torch.fft.rfft(y.reshape(-1))
+    ph = torch.rand(len(X)) * 2 * math.pi
+    ph[0] = 0
+    rnd = torch.fft.irfft(X.abs() * torch.exp(1j * ph), y.shape[-1])[None]
+    assert abs(_spectral_flatness(rnd) - flat) < 0.03
+
+
+def test_phone_and_speaker_both_shape_the_sibilant():
+    """음소가 범주(s/ʃ)를, 화자 프로파일이 개인차를 정해야 한다.
+
+    프로파일만 쓰면 /s/ 와 /ʃ/ 가 같은 소리가 나고, 프리셋만 쓰면 화자 지문이
+    사라진다. 둘 다 반영되어야 한다.
+    """
+    from formant_ml.analysis.sibilant import measure
+    peak = {}
+    for ph in ("s", "sh"):
+        y = render({"timeline": [{"type": "fricative", "phone": ph, "dur": 1.5}],
+                    "seed": 1}, PROF, CFG)
+        peak[ph] = measure(y)["peak_hz"]
+    assert peak["s"] > peak["sh"] * 1.4, f"/s/ 와 /ʃ/ 가 구분되지 않는다: {peak}"
+
+    bright = VoiceProfile()
+    bright.sibilant = dict(PROF.sibilant, pole_f=PROF.sibilant["pole_f"] * 1.25)
+    y = render({"timeline": [{"type": "fricative", "phone": "s", "dur": 1.5}],
+                "seed": 1}, bright, CFG)
+    assert measure(y)["peak_hz"] > peak["s"] * 1.08, "화자 지문이 반영되지 않는다"
+
+
+def test_noise_bandwidth_scale_reduces_ringing():
+    """noise_bw_scale 을 올리면 노이즈 경로의 공진 울림이 줄어야 한다."""
+    def ring(k):
+        y = render({"timeline": [{"type": "whisper", "vowel": "i", "dur": 2.0,
+                                  "noise_bw_scale": k}], "seed": 1}, PROF, CFG)
+        x = y.reshape(-1) - y.reshape(-1).mean()
+        n = len(x)
+        S = torch.fft.rfft(x, 2 * n)
+        ac = torch.fft.irfft(S.real ** 2 + S.imag ** 2, 2 * n)[:n]
+        return float((ac / ac[0])[3:400].abs().max())
+    assert ring(6) < ring(1) - 0.05, (ring(1), ring(6))
+
+
+def test_unknown_segment_option_is_rejected():
+    """오타 난 옵션이 조용히 무시되면 안 된다 (예전에는 세그먼트 옵션이 통째로 사라졌다)."""
+    from formant_ml.score import build_controls
+    try:
+        build_controls({"timeline": [{"type": "whisper", "dur": 0.5,
+                                      "strenght": 0.5}]}, PROF, CFG)
+    except ValueError as e:
+        assert "strenght" in str(e)
+    else:
+        raise AssertionError("오타를 잡지 못했다")
 
 
 def test_roughness_knob_never_sizzles():

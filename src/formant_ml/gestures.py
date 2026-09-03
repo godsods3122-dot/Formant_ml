@@ -56,6 +56,8 @@ def base(t: int, prof: VoiceProfile, n_formants: int = 8, n_bands: int = 40,
         "noise_entry": _c(t, 0.0),
         "noise_am": _c(t, prof.breathiness),
         "noise_rough": _c(t, prof.roughness),
+        # 난류가 성도를 울릴 때는 감쇠가 크다 (Controls.noise_bw_scale 주석 참고)
+        "noise_bw_scale": _c(t, 3.0),
     }
 
 

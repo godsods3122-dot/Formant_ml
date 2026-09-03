@@ -64,7 +64,7 @@ class VoiceProfile:
 
     # --- 치찰음 지문 --------------------------------------------------------
     sibilant: dict = field(default_factory=lambda: {
-        "pole_f": 6600.0, "pole_bw": 800.0, "zero_f": 2900.0, "zero_bw": 900.0,
+        "pole_f": 6600.0, "pole_bw": 2200.0, "zero_f": 2900.0, "zero_bw": 2600.0,
         "tilt": 1.0})
     sibilant_moments: dict = field(default_factory=dict)
 

@@ -11,6 +11,12 @@
 
 * 협착 앞쪽 공동(front cavity)의 1/4 파장 공진 -> **극(pole)**.
   /s/ 는 앞공동이 1.5 cm 안팎이라 5~8 kHz, /ʃ/ 는 2.5~4 kHz.
+  **대역폭이 넓다.** 앞공동은 짧고, 입술로 열려 있어 방사 손실이 크고, 난류원이
+  한 점이 아니라 협착 하류에 퍼져 있다. 그래서 사람의 /s/ 는 뾰족한 봉우리가
+  아니라 4~10 kHz 의 **넓은 고원**이다(1~11 kHz 스펙트럼 평탄도 대략 0.2~0.4).
+  Q 를 8 쯤으로 두면(대역폭 800 Hz) 잡음이 그 공진에서 울려 **음조가 들린다** —
+  측정: 평탄도 0.059, 위상을 무작위로 돌려도 같은 값이므로 시간영역 아티팩트가
+  아니라 순전히 스펙트럼이 뾰족해서 생기는 소리다.
 * 협착 뒤쪽 공동과 설하공(sublingual cavity)의 반공진 -> **영점(zero)**.
 * 난류 소스 자체의 기울기 -> **tilt** (dB/oct).
 
@@ -37,7 +43,8 @@ from .filters import pole_zero_response, rms_normalize, tilt_response
 class SibilantParams:
     """모두 (B, T, 1) 텐서 또는 float. 화자 지문이자 스크립트 손잡이."""
     pole_f: torch.Tensor          # 앞공동 공진 [Hz]  (/s/ 5~8k, /ʃ/ 2.5~4k)
-    pole_bw: torch.Tensor         # 그 대역폭 [Hz]    (좁으면 '쨍한' s)
+    pole_bw: torch.Tensor         # 그 대역폭 [Hz]. 사람은 1500~3500 이 보통이고,
+    #                             800 아래로 내리면 잡음이 그 공진에서 울려 음조가 들린다
     zero_f: torch.Tensor          # 반공진 [Hz]
     zero_bw: torch.Tensor
     tilt: torch.Tensor            # 난류 기울기 [dB/oct]
@@ -45,7 +52,7 @@ class SibilantParams:
     roughness: torch.Tensor | None = None   # 난류 시간변조 깊이(주기성 방지)
 
     @staticmethod
-    def constant(shape, pole_f=6500.0, pole_bw=900.0, zero_f=2600.0, zero_bw=800.0,
+    def constant(shape, pole_f=6500.0, pole_bw=2200.0, zero_f=2600.0, zero_bw=2600.0,
                  tilt=0.0, mix=1.0, roughness=0.12, device=None,
                  dtype=torch.float32) -> "SibilantParams":
         def c(v):
@@ -62,13 +69,13 @@ class SibilantParams:
 # 관용적 출발점. 실제 화자 값은 analysis/sibilant.py 로 추출한다.
 PRESETS = {
     #        pole_f  pole_bw  zero_f  zero_bw  tilt
-    "s":    (6600.0,  800.0,  2900.0,  900.0,  1.0),
-    "sh":   (3300.0,  700.0,  1600.0,  700.0,  0.0),
-    "z":    (6400.0,  900.0,  2900.0,  900.0,  0.0),
-    "f":    (7500.0, 3000.0,  1200.0, 1500.0,  1.5),
-    "th":   (7000.0, 4000.0,  1000.0, 1500.0,  1.0),
-    "h":    (1400.0, 1200.0,   400.0,  600.0, -1.5),
-    "ss":   (7200.0,  600.0,  3200.0,  800.0,  2.0),   # 된소리 ㅆ: 더 높고 더 좁게
+    "s":    (6600.0, 2200.0,  2900.0, 2600.0,  1.0),
+    "sh":   (3300.0, 1600.0,  1600.0, 1800.0,  0.0),
+    "z":    (6400.0, 2400.0,  2900.0, 2600.0,  0.0),
+    "f":    (7500.0, 3500.0,  1200.0, 2500.0,  1.5),
+    "th":   (7000.0, 4000.0,  1000.0, 2500.0,  1.0),
+    "h":    (1400.0, 2000.0,   400.0, 1200.0, -1.5),
+    "ss":   (7200.0, 1700.0,  3200.0, 2200.0,  2.0),   # 된소리 ㅆ: 더 높고 조금 좁게
 }
 
 

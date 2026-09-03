@@ -53,6 +53,12 @@ class Controls:
     #   게이트가 부드러워서 K 에서 마지막 단이 19%, K+3 에서도 35% 잔물결이 남는다.
     noise_am: torch.Tensor                # (B, T, 1) 성문동기 변조 깊이 (기식성)
     noise_rough: torch.Tensor | None = None      # (B, T, 1) 난류 시간변조(비정상성)
+    # (B, T, 1) 노이즈 경로에서만 포먼트 대역폭에 곱하는 배율(>=1).
+    # 성문 펄스가 아니라 난류가 성도를 울릴 때는 감쇠가 훨씬 크다: 여기소가 한 점이
+    # 아니라 협착 하류에 퍼져 있어 공진이 뭉개지고, 마찰 구간에는 성문 폐쇄에 의한
+    # 주기적 재여기도 없다. 유성음의 Q(F2 에서 25 까지)를 그대로 쓰면 잡음이
+    # 공진에서 울려 속삭임·마찰음에 음조가 얹힌다.
+    noise_bw_scale: torch.Tensor | None = None
     # --- 소스 스펙트럼/미세요동 --------------------------------------------
     tilt: torch.Tensor | None = None      # (B, T, 1) dB/oct @1 kHz — 고역 조절
     jitter: torch.Tensor | None = None    # (B, T, 1) 주기 요동 비율 (0.005 = 0.5%)
@@ -140,9 +146,15 @@ class PhysicalVoiceSynth(nn.Module):
         k = stages.shape[2]
         idx = torch.arange(k, device=stages.device, dtype=stages.real.dtype)
         # w_i = 1 이면 그 단이 노이즈에도 적용됨(= 협착 하류)
-        w = torch.sigmoid((idx.view(1, 1, k) - c.noise_entry) / 0.7)
+        # entry=0 이 '모든 포먼트 통과' 가 되도록 3 단 offset 을 준다.
+        # offset 이 없으면 sigmoid((0-0)/0.7)=0.5 라 entry=0 인데도 F1 이 절반만
+        # 걸린다(속삭임처럼 성문에서 주입하는 소리가 실제보다 밝아진다).
+        w = torch.sigmoid((idx.view(1, 1, k) - c.noise_entry + 3.0) / 0.7)
+        bw_n = c.formant_bw
+        if c.noise_bw_scale is not None:
+            bw_n = bw_n * c.noise_bw_scale.clamp_min(1.0)
         # 로그 영역 보간 (filters.gated_cascade_response 의 주석 참고).
-        h_noise = gated_cascade_response(c.formant_freq, c.formant_bw,
+        h_noise = gated_cascade_response(c.formant_freq, bw_n,
                                          c.formant_gain, w, fs, nf)
         return h_harm, h_noise
 

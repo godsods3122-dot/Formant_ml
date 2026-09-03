@@ -22,6 +22,7 @@
 """
 from __future__ import annotations
 
+import inspect
 import json
 import os
 
@@ -47,6 +48,8 @@ SCALAR_PARAMS = {
     "noise_entry": "난류 주입 위치 0=성문 … K=입술 … K+6=성도 완전 우회",
     "noise_am": "성문동기 노이즈 변조 깊이 (기식성)",
     "noise_rough": "난류의 시간 변조 (0 = 정상 히스, 1 = 거친 난류)",
+    "noise_bw_scale": "노이즈 경로 포먼트 대역폭 배율 (1~6). 낮으면 잡음이 "
+                      "공진에서 울려 음조가 들린다",
     "noise_gain": "난류 전체 세기",
     "noise_center": "난류 대역 중심 [Hz]",
     "noise_bw": "난류 대역폭 [Hz]",
@@ -103,14 +106,20 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
     kind = seg.get("type", "vowel")
 
     if kind in GESTURES:
+        fn = GESTURES[kind]
+        # 제스처 함수가 실제로 받는 인자만 넘긴다. 예전에는 TypeError 를 잡아
+        # **인자 없이 다시 호출**했는데, 오타 하나가 세그먼트의 모든 옵션을
+        # 조용히 삼켜 버렸다(무엇이 무시됐는지 알 수도 없었다).
+        accepted = set(inspect.signature(fn).parameters)
         opts = {k: v for k, v in seg.items()
                 if k not in PARAM_HELP and k not in ("type", "dur", "sib")}
-        opts.pop("vowel", None) if kind not in ("laugh", "whisper") else None
-        fn = GESTURES[kind]
-        try:
-            c = fn(t, prof, n_formants=K, n_bands=NB, **opts)
-        except TypeError:
-            c = fn(t, prof, n_formants=K, n_bands=NB)
+        unknown = set(opts) - accepted
+        if unknown:
+            raise ValueError(
+                f"'{kind}' 세그먼트가 모르는 옵션: {sorted(unknown)}. "
+                f"가능한 옵션: {sorted(accepted - {'t', 'prof', 'n_formants', 'n_bands'})} "
+                f"또는 파라미터 이름: {sorted(PARAM_HELP)[:6]} …")
+        c = fn(t, prof, n_formants=K, n_bands=NB, **opts)
     elif kind == "silence":
         c = base(t, prof, K, NB)
         c["harmonic_amp"] = torch.zeros(1, t, 1)
@@ -157,11 +166,23 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
         # 군데서 모델링하면 이중 계산이 되어, 치찰음 파라미터를 돌려도 소리가
         # 안 바뀐다(캐스케이드의 고정된 극이 이긴다).
         c["noise_entry"] = torch.full((1, t, 1), float(K) + 6.0)
-        # 화자의 치찰음 지문을 이 구간에만 켠다
-        sp = SIB_PRESETS.get(phone)
-        sib = prof.sibilant_params((1, t, 1))
-        if sp is not None and seg.get("use_profile_sibilant", True) is False:
-            sib = SibilantParams.constant((1, t, 1), *sp, 1.0, prof.roughness)
+        # 음소가 *범주*(s 냐 ʃ 냐)를 정하고, 화자 프로파일이 그 안에서 *개인차*를
+        # 준다. 프로파일만 쓰면 /s/ 와 /ʃ/ 가 똑같은 소리가 나고, 프리셋만 쓰면
+        # 화자 지문이 사라진다. 프로파일의 표준 /s/ 대비 비율을 프리셋에 곱한다.
+        sp = SIB_PRESETS.get(phone, SIB_PRESETS["s"])
+        ref = SIB_PRESETS["s"]
+        if seg.get("use_profile_sibilant", True):
+            r_pole = prof.sibilant["pole_f"] / ref[0]
+            r_pbw = prof.sibilant["pole_bw"] / ref[1]
+            r_zero = prof.sibilant["zero_f"] / ref[2]
+            r_zbw = prof.sibilant["zero_bw"] / ref[3]
+            tilt = sp[4] + (prof.sibilant["tilt"] - ref[4])
+        else:
+            r_pole = r_pbw = r_zero = r_zbw = 1.0
+            tilt = sp[4]
+        sib = SibilantParams.constant(
+            (1, t, 1), sp[0] * r_pole, sp[1] * r_pbw, sp[2] * r_zero,
+            sp[3] * r_zbw, tilt, 1.0, prof.roughness)
         sib.mix = env.clamp(0.0, 1.0) if kind == "syllable" else torch.ones(1, t, 1)
         c["sib"] = sib
     else:
