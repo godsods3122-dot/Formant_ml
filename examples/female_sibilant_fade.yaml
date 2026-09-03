@@ -1,0 +1,33 @@
+# 여성 화자의 치찰음 페이드 인/아웃 예제.
+#
+# 치찰음의 음량은 협착부를 지나는 부피속도(유량)를 따라간다. 협착이 형성되며
+# 기류가 붙고 해제되며 빠지므로, 마찰음은 스위치처럼 '탁' 켜지지 않고 부드럽게
+# 들고 난다. 그 유량 포락선을 fade_in / fade_out (초) 으로 지정한다.
+# 난류 파워는 유량에 대해 초선형(∝U^flow_exp)이라, 진폭 곡선은 유량보다 더
+# 가파르게 휘어 물리적으로 맞는 세기 변화가 된다.
+#
+#   PYTHONPATH=src python -m formant_ml.render \
+#       examples/female_sibilant_fade.yaml -o out/female_sibilant_fade.wav
+name: 여성 치찰음 페이드
+voice: ../profiles/female_ko.json
+seed: 5
+
+timeline:
+  # 1) '스' — 유량이 천천히 붙었다 천천히 빠진다 (긴 fade in/out)
+  - {type: fricative, phone: s, dur: 0.9, fade_in: 0.28, fade_out: 0.30}
+  - {type: silence, dur: 0.18}
+
+  # 2) '스' — 같은 소리를 날카롭게 (거의 게이트, 짧은 페이드)
+  - {type: fricative, phone: s, dur: 0.55, fade_in: 0.02, fade_out: 0.03}
+  - {type: silence, dur: 0.18}
+
+  # 3) 된소리 'ㅆ' — 기류가 확 붙는 빠른 fade in, 여운 있는 fade out
+  - {type: fricative, phone: ss, dur: 0.6, fade_in: 0.015, fade_out: 0.22}
+  - {type: silence, dur: 0.18}
+
+  # 4) 음절 '사' — 마찰음이 유량과 함께 부드럽게 들어와 모음으로 넘어간다
+  - {type: syllable, onset: s, vowel: a, dur: 0.55, f0: [232, 200], fade_in: 0.05}
+  - {type: silence, dur: 0.1}
+
+  # 5) 음절 '시' — 구개음화된 치찰음(후치경)
+  - {type: syllable, onset: sh, vowel: i, dur: 0.55, f0: [238, 205], fade_in: 0.04}

@@ -187,8 +187,18 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
                         a.sample_rate).reshape(1, 1, -1)
         if kind == "fricative":
             c["harmonic_amp"] = torch.zeros(1, t, 1)
-            c["noise_bands"] = nb.expand(1, t, NB).contiguous()
-            env = torch.ones(1, t, 1)
+            # 유량(부피속도) 포락선 -> 난류 진폭. 협착이 형성/해제되며 기류가
+            # 붙고 빠지므로 마찰음도 페이드 인/아웃 한다. 상수(env=ones)로 두면
+            # 히스가 스위치처럼 탁 켜졌다 꺼진다. fade_in/fade_out(초),
+            # flow([(위치,값),...]), flow_exp(유량->진폭 지수) 로 조종한다.
+            flow = aero.frication_flow(
+                t, a.frame_rate,
+                fade_in=float(seg.get("fade_in", 0.03)),
+                fade_out=float(seg.get("fade_out", 0.04)),
+                shape=seg.get("flow"))
+            env = aero.flow_to_noise_amp(
+                flow, float(seg.get("flow_exp", aero.FRICATION_FLOW_EXPONENT)))
+            c["noise_bands"] = (nb.expand(1, t, NB) * env).contiguous()
         else:
             # 실측("사"): /s/ 120 ms, 전이 60 ms, 모음 360 ms.
             # 비율이 아니라 절대 시간이 음성학적으로 맞다 — 자음 길이는 음절
@@ -209,7 +219,16 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
             # 달라진다)와 어긋나 음절마다 비율이 흔들린다(실측: 목표 +9.7 dB 인데
             # -6.2 dB 가 나왔다).
             nb = nb * float(c["harmonic_amp"].max().clamp_min(1e-3))
+            # 마찰음 게이트: 모음으로 넘어갈 때 빠르게 꺼진다(=자연스러운 fade-out).
             env = ramp(t, [(0.0, 1.0), (split, 1.0), (split + 0.1, 0.02), (1.0, 0.01)])
+            # 그 위에 협착 형성 구간의 유량 fade-in 을 곱한다. 시작부터 최대
+            # 히스로 켜지지 않고 기류가 붙으면서 소리가 든다. fade-out 은 위 게이트가
+            # 담당하므로 여기선 상승만(fade_out=0). fade_in(초)/flow_exp 로 조종.
+            fin = aero.frication_flow(
+                t, a.frame_rate, fade_in=float(seg.get("fade_in", 0.025)),
+                fade_out=0.0, shape=seg.get("flow"))
+            env = env * aero.flow_to_noise_amp(
+                fin, float(seg.get("flow_exp", aero.FRICATION_FLOW_EXPONENT)))
             # 노이즈 경로가 하나뿐이라, 구강 협착(마찰음)에서 성문(기식)으로
             # 주입 위치를 옮기며 섞는다.
             asp_n = band_shelf(NB, 900.0, fricative_gain(prof), a.sample_rate

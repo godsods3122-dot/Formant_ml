@@ -913,6 +913,64 @@ def test_yin_reports_noise_as_unvoiced():
     assert float(voi.mean()) < 0.1
 
 
+def _frame_rms(y, win=1200):
+    y = y.reshape(-1)
+    n = y.shape[0] // win
+    return torch.stack([y[i * win:(i + 1) * win].pow(2).mean().sqrt()
+                        for i in range(n)])
+
+
+def test_sibilant_fade_shapes_the_flow_envelope():
+    """치찰음이 유량 포락선을 따라 페이드 인/아웃 한다.
+
+    게이트(fade=0)는 상수 히스, 페이드는 시작·끝이 눌리고 가운데가 크다.
+    """
+    gate = render({"timeline": [{"type": "fricative", "phone": "s", "dur": 0.9,
+                                 "fade_in": 0.0, "fade_out": 0.0}], "seed": 1},
+                  PROF, CFG)
+    fade = render({"timeline": [{"type": "fricative", "phone": "s", "dur": 0.9,
+                                 "fade_in": 0.28, "fade_out": 0.28}], "seed": 1},
+                  PROF, CFG)
+    g, f = _frame_rms(gate), _frame_rms(fade)
+    # 게이트: 시작/끝이 가운데와 비슷 (변동 작다)
+    assert g[1] > 0.6 * g[len(g) // 2], "게이트인데 시작이 눌렸다"
+    assert g[-2] > 0.6 * g[len(g) // 2], "게이트인데 끝이 눌렸다"
+    # 페이드: 시작·끝이 가운데보다 훨씬 작다
+    mid = f[len(f) // 2]
+    assert f[0] < 0.2 * mid, f"fade-in 이 안 눌렸다: {float(f[0])} vs {float(mid)}"
+    assert f[-1] < 0.2 * mid, f"fade-out 이 안 눌렸다: {float(f[-1])} vs {float(mid)}"
+
+
+def test_flow_to_noise_amp_is_superlinear():
+    """유량->진폭 매핑이 초선형이다 (파워 ∝ U^n, 진폭 ∝ U^(n/2), n>2).
+
+    반쯤 열린 유량(0.5)에서 진폭이 0.5 보다 작아야 한다 — 즉 낮은 유량에서
+    소리가 더 많이 죽어 부드러운 시작을 만든다.
+    """
+    from formant_ml import aerodynamics as aero
+    half = aero.flow_to_noise_amp(torch.tensor(0.5))
+    assert float(half) < 0.5, f"초선형이 아니다: {float(half)}"
+    # 단조 증가
+    u = torch.linspace(0, 1, 20)
+    a = aero.flow_to_noise_amp(u)
+    assert bool((a[1:] >= a[:-1]).all()), "유량-진폭이 단조가 아니다"
+
+
+def test_custom_flow_curve_makes_two_amplitude_bumps():
+    """flow 곡선을 직접 주면 마찰음 세기가 그 곡선을 따라 두 번 부푼다."""
+    y = render({"timeline": [{"type": "fricative", "phone": "s", "dur": 1.2,
+                              "flow": [[0, 0.0], [0.2, 1.0], [0.5, 0.1],
+                                       [0.8, 1.0], [1.0, 0.0]]}], "seed": 1},
+               PROF, CFG)
+    r = _frame_rms(y, win=1200)
+    valley = int(len(r) * 0.5)
+    peak_a = r[:valley].max()
+    peak_b = r[valley:].max()
+    # 두 봉우리가 있고, 그 사이 골이 두 봉우리보다 뚜렷이 낮다
+    assert r[valley] < 0.5 * min(float(peak_a), float(peak_b)), \
+        f"두 봉우리 사이에 골이 없다: valley={float(r[valley])}"
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0
