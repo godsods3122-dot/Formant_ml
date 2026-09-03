@@ -90,6 +90,7 @@ src/formant_ml/
     sibilant.py      치찰음 극-영점 필터 (화자 지문 6개 숫자)
     phase.py         위상차 파라미터: 하모닉 상대위상(RPS), 임의 주파수 위상 평가
   models/
+    residual.py      잔차 보정망 (물리모델이 설명 못 하는 부분만, 구조적 상한)
     synth.py         전체 합성기 (하모닉 경로 / 노이즈 경로 분리)
     encoder.py       mel + F0 -> 물리 파라미터 (포먼트 순서 구조적 보장)
     losses.py        멀티해상도 STFT + 대역 + 위상(IF/GD) + 상대위상 + 주기성

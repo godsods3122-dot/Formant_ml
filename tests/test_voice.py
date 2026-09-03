@@ -468,6 +468,42 @@ def test_extracted_profile_recovers_what_was_synthesized():
         assert abs(a - b) / b < 0.12, got.formants[:3]
 
 
+def test_residual_starts_as_identity_and_stays_bounded():
+    """잔차망은 (a) 처음에 아무것도 안 고치고 (b) 어떤 가중치에서도 물리모델을
+    대체할 수 없어야 한다. 이게 'AI 가 결국 다 해버리는' 붕괴에 대한 구조적 방어다.
+    """
+    from formant_ml.models.losses import residual_energy_db
+    from formant_ml.models.residual import ResidualCorrector
+    torch.manual_seed(0)
+    res = ResidualCorrector(CFG)
+    mel = torch.randn(2, 50, CFG.audio.n_mels)
+    f0, v = torch.full((2, 50), 150.0), torch.ones(2, 50)
+    a = torch.randn(2, 50 * CFG.audio.hop_size)
+
+    y = res.apply(a, res(mel, mel, f0, v))
+    assert residual_energy_db(y, a) < -30.0, "초기화 상태에서 이미 소리를 바꾼다"
+
+    # 가중치를 크게 흔들어도 보정량이 상한 안에 머문다
+    with torch.no_grad():
+        for prm in res.parameters():
+            prm.mul_(0).add_(torch.randn_like(prm) * 3.0)
+    r = res(mel, mel, f0, v)
+    assert float(r["filter_db"].abs().max()) <= res.max_db + 1e-4
+    assert float(r["noise_gain"].max()) <= res.max_noise + 1e-4
+    assert residual_energy_db(res.apply(a, r), a) < 3.0, "잔차가 원신호를 넘어선다"
+
+
+def test_residual_gradients_flow():
+    from formant_ml.models.residual import ResidualCorrector
+    res = ResidualCorrector(CFG)
+    mel = torch.randn(1, 40, CFG.audio.n_mels)
+    a = torch.randn(1, 40 * CFG.audio.hop_size, requires_grad=True)
+    res.apply(a, res(mel, mel, torch.full((1, 40), 150.0),
+                     torch.ones(1, 40))).pow(2).mean().backward()
+    g = sum(float(p.grad.abs().sum()) for p in res.parameters() if p.grad is not None)
+    assert g > 0 and math.isfinite(g)
+
+
 def test_voice_profile_round_trips_through_json():
     import tempfile
     p = VoiceProfile(name="t", f0_median=143.0, tilt=2.5)

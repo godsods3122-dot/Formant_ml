@@ -160,6 +160,22 @@ def relative_phase_loss(pred, target, f0, sample_rate: int = 24000, hop: int = 2
     return ((1.0 - torch.cos(rp - rt)) * w).mean()
 
 
+def residual_energy_ratio(corrected, physics, eps: float = 1e-9) -> torch.Tensor:
+    """잔차 에너지 / 물리모델 에너지. **물리모델이 얼마나 설명했는가**의 지표.
+
+    이 값이 커지면 신경망이 물리모델을 대체하기 시작한 것이다(PLAN §4 의 붕괴).
+    학습 중에 이 항에 페널티를 걸어 −20 dB 아래로 눌러 둔다.
+    """
+    n = min(corrected.shape[-1], physics.shape[-1])
+    d = corrected[..., :n] - physics[..., :n]
+    return d.pow(2).mean() / physics[..., :n].pow(2).mean().clamp_min(eps)
+
+
+def residual_energy_db(corrected, physics) -> float:
+    return float(10.0 * torch.log10(
+        residual_energy_ratio(corrected, physics).clamp_min(1e-12)).detach())
+
+
 def mel_loss(x, y, **kw):
     return F.l1_loss(log_mel(x, **kw), log_mel(y, **kw))
 
@@ -199,16 +215,18 @@ class VoiceLoss(torch.nn.Module):
 
     def __init__(self, w_stft=1.0, w_band=1.0, w_phase=0.2, w_rps=0.3, w_mel=1.0,
                  w_period=1.0, w_smooth=1e-3, w_area=1e-3, w_noise=5e-3,
-                 sample_rate: int = 24000, hop: int = 240):
+                 w_residual=0.3, sample_rate: int = 24000, hop: int = 240):
         super().__init__()
         self.w = dict(stft=w_stft, band=w_band, phase=w_phase, rps=w_rps, mel=w_mel,
-                      period=w_period, smooth=w_smooth, area=w_area, noise=w_noise)
+                      period=w_period, smooth=w_smooth, area=w_area, noise=w_noise,
+                      residual=w_residual)
         self.sample_rate = sample_rate
         self.hop = hop
 
     def forward(self, pred_audio, target_audio, controls=None,
                 voicing: torch.Tensor | None = None,
-                f0: torch.Tensor | None = None) -> dict:
+                f0: torch.Tensor | None = None,
+                physics_audio: torch.Tensor | None = None) -> dict:
         sr, hop = self.sample_rate, self.hop
         out = {
             "stft": multi_resolution_stft_loss(pred_audio, target_audio),
@@ -239,8 +257,13 @@ class VoiceLoss(torch.nn.Module):
                 reg = reg + area_smoothness(controls.area)
         out["reg"] = reg
 
+        # 잔차망을 쓸 때: 물리모델을 대체하지 못하게 누른다.
+        out["residual"] = (residual_energy_ratio(pred_audio, physics_audio)
+                           if physics_audio is not None else pred_audio.new_zeros(()))
+
         out["total"] = (self.w["stft"] * out["stft"] + self.w["band"] * out["band"]
                         + self.w["phase"] * out["phase"] + self.w["rps"] * out["rps"]
                         + self.w["mel"] * out["mel"] + self.w["period"] * out["period"]
-                        + self.w["smooth"] * out["reg"] + self.w["noise"] * out["noise"])
+                        + self.w["smooth"] * out["reg"] + self.w["noise"] * out["noise"]
+                        + self.w["residual"] * out["residual"])
         return out

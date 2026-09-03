@@ -17,8 +17,10 @@ from torch.utils.data import DataLoader
 
 from .config import Config
 from .data.dataset import AudioFolder, compute_features
+from .data.features import log_mel
 from .models.encoder import ControlEncoder
-from .models.losses import VoiceLoss
+from .models.losses import VoiceLoss, residual_energy_db
+from .models.residual import ResidualCorrector
 from .models.synth import PhysicalVoiceSynth
 from .utils import save_wav
 
@@ -45,6 +47,13 @@ def main() -> None:
                     help="로그 대역별 동등 가중 — 고역이 학습되게 하는 항")
     ap.add_argument("--w-period", type=float, default=1.0,
                     help="주기성 일치 — HNR 붕괴와 '주기적인 치찰음'을 동시에 막는다")
+    ap.add_argument("--residual", action="store_true",
+                    help="잔차 보정망을 붙인다 (Phase 4). 물리모델이 설명 못 하는 "
+                         "비강 공명·혀 접촉 노이즈 등을 학습한다")
+    ap.add_argument("--freeze-encoder", action="store_true",
+                    help="잔차망만 학습(2단계). 물리 파라미터는 그대로 둔다")
+    ap.add_argument("--w-residual", type=float, default=0.3,
+                    help="잔차 에너지 페널티. 낮추면 신경망이 물리모델을 대체하기 시작한다")
     ap.add_argument("--w-noise", type=float, default=5e-3,
                     help="유성 구간 노이즈 억제(보조). --w-period 가 주 방어선이다")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -64,9 +73,16 @@ def main() -> None:
     enc, syn = build(cfg, args.tract, args.device)
     loss_fn = VoiceLoss(w_phase=args.w_phase, w_rps=args.w_rps, w_band=args.w_band,
                         w_period=args.w_period, w_noise=args.w_noise,
+                        w_residual=args.w_residual,
                         sample_rate=cfg.audio.sample_rate, hop=cfg.audio.hop_size)
+    res = ResidualCorrector(cfg).to(args.device) if args.residual else None
     # 난류 소스의 학습 파라미터(스펙트럼 사전 / 변조 스펙트럼)도 함께 최적화한다.
-    params = list(enc.parameters()) + list(syn.noise.parameters())
+    params = [] if args.freeze_encoder else (list(enc.parameters())
+                                             + list(syn.noise.parameters()))
+    if res is not None:
+        params += list(res.parameters())
+    if not params:
+        raise SystemExit("--freeze-encoder 는 --residual 과 함께 써야 합니다")
     opt = torch.optim.AdamW(params, lr=args.lr, betas=(0.9, 0.99))
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, args.steps, args.lr * 0.05)
 
@@ -79,10 +95,21 @@ def main() -> None:
             with torch.no_grad():
                 feat = compute_features(x, cfg)
             ctrl = enc(feat["mel"], feat["f0"], feat["voicing"])
-            y = syn(ctrl)["audio"]
+            phys = syn(ctrl)["audio"]
+            y, phys_ref = phys, None
+            if res is not None:
+                # 물리 출력의 멜은 *조건*이지 경로가 아니다 -> detach.
+                mel_phys = log_mel(phys.detach(), cfg.audio.sample_rate,
+                                   cfg.audio.n_fft, cfg.audio.hop_size,
+                                   cfg.audio.n_mels, cfg.audio.fmin, cfg.audio.fmax)
+                t = feat["mel"].shape[1]
+                r = res(feat["mel"], mel_phys[:, :t], feat["f0"], feat["voicing"])
+                y = res.apply(phys, r)
+                phys_ref = phys.detach()
             n = min(y.shape[-1], x.shape[-1])
             losses = loss_fn(y[..., :n], x[..., :n], ctrl, feat["voicing"],
-                             feat["f0"])
+                             feat["f0"],
+                             None if phys_ref is None else phys_ref[..., :n])
 
             opt.zero_grad(set_to_none=True)
             losses["total"].backward()
@@ -93,11 +120,14 @@ def main() -> None:
 
             if step % args.log_every == 0:
                 msg = "  ".join(f"{k}={float(v.detach()):.3f}" for k, v in losses.items())
+                if res is not None:
+                    msg += f"  resid={residual_energy_db(y[..., :n], phys_ref):.1f}dB"
                 print(f"[{step:6d}/{args.steps}] {msg}  "
                       f"({(time.time() - t0) / step:.2f}s/step)", flush=True)
             if step % args.ckpt_every == 0:
                 torch.save({"encoder": enc.state_dict(),
                             "turbulence": syn.noise.state_dict(),
+                            "residual": None if res is None else res.state_dict(),
                             "cfg": cfg, "step": step, "tract_mode": args.tract},
                            os.path.join(args.out, "encoder.pt"))
                 save_wav(os.path.join(args.out, f"recon_{step}.wav"),

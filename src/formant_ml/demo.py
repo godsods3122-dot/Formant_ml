@@ -13,7 +13,7 @@ import torch
 
 from .config import Config
 from .models.synth import Controls, PhysicalVoiceSynth
-from .presets import BANDWIDTHS, FRICATIVES, VOWELS
+from .presets import BANDWIDTHS, VOWELS
 from .utils import band_bump, n_frames, ramp, save_wav, vibrato
 
 
@@ -76,13 +76,20 @@ def main() -> None:
         t, [(0.0, "a"), (0.5, "i"), (1.0, "u")], K)
     save_wav(f"{args.out}/02_diphthong_a_i_u.wav", synth(Controls(**c))["audio"], sr)
 
-    # 3) 치찰음 /ㅅ/ — 성대 진동 없이 협착부 난류만
+    # 3) 치찰음 /ㅅ/ — 성대 진동 없이 협착부 난류만.
+    #    앞공동 공진은 치찰음 극-영점 필터가 만들고, 노이즈는 포먼트 캐스케이드를
+    #    우회한다(noise_entry = K+6). 협착 위치를 중간값으로 두면 캐스케이드의
+    #    앞부분만 우회한 '반쪽 필터' 가 되는데, 그 응답은 어떤 성도 형상에도
+    #    대응하지 않고 좁은 공진이 남아 쇳소리처럼 들린다.
+    from .dsp.sibilant import preset as sib_preset
+    from .utils import band_shelf
     c = base_controls(cfg, t, K)
     c["harmonic_amp"] = torch.zeros(1, t, 1)
-    cf, bw, pos, g = FRICATIVES["s"]
-    c["noise_bands"] = band_bump(cfg.noise.n_bands, cf, bw, g, sr
-                                 ).reshape(1, 1, -1).expand(1, t, -1).contiguous()
-    c["noise_entry"] = torch.full((1, t, 1), pos * K)
+    c["noise_bands"] = band_shelf(cfg.noise.n_bands, 500.0, 1.0, sr
+                                  ).reshape(1, 1, -1).expand(1, t, -1).contiguous()
+    c["noise_entry"] = torch.full((1, t, 1), float(K) + 6.0)
+    c["noise_rough"] = torch.full((1, t, 1), 0.12)
+    c["sib"] = sib_preset("s", (1, t, 1))
     c["formant_freq"] = _formant_track(t, [(0.0, "i"), (1.0, "i")], K)
     save_wav(f"{args.out}/03_fricative_s.wav", synth(Controls(**c))["audio"], sr)
 
