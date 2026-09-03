@@ -16,7 +16,7 @@ import torch
 
 
 def extend_formants(values, n: int, step: float = 1000.0,
-                    min_gap: float = 300.0) -> list[float]:
+                    min_gap: float = 60.0) -> list[float]:
     """포먼트 목록을 n 개로 늘린다. 마지막 값을 *반복하지 않는다*.
 
     반복하면 같은 주파수에 극이 겹쳐 캐스케이드 이득이 Q^m 으로 폭발하고,
@@ -26,7 +26,10 @@ def extend_formants(values, n: int, step: float = 1000.0,
     out = [float(v) for v in values[:n]]
     while len(out) < n:
         out.append((out[-1] if out else 700.0) + step)
-    for i in range(1, len(out)):                 # 단조 + 최소 간격 보장
+    # 단조 + 최소 간격. 간격은 극이 겹치는 것만 막을 만큼만 둔다(인코더와 같은
+    # 60 Hz). 300 Hz 로 두었더니 실측 /아/ 의 F2(1226, F1 과 232 Hz 차이)가
+    # 1294 로 밀려났다 — 진짜 화자 값을 왜곡하면 안 된다.
+    for i in range(1, len(out)):
         out[i] = max(out[i], out[i - 1] + min_gap)
     return out
 
@@ -58,6 +61,13 @@ class VoiceProfile:
     formants: list = field(default_factory=lambda: [730., 1090., 2440., 3400.,
                                                     4500., 5400., 6300., 7200.,
                                                     8200., 9200., 10200., 11200.])
+    # 측정된 모음별 포먼트 {"a": [F1..Fn], ...}. 있으면 프리셋을 스케일하는 대신
+    # 이 값을 그대로 쓴다. 균일 스케일은 F1 과 F2 를 같은 비율로 옮기는데,
+    # 실제 화자는 그렇지 않다(실측: F1 1063 인데 F2 는 1587 이 아니라 1217).
+    vowel_formants: dict = field(default_factory=dict)
+    # 측정된 포먼트 개수만큼의 게인. 그 위(패딩된 포먼트)는 자동으로 감쇠시킨다 —
+    # 측정되지 않은 상단 포먼트를 게인 1 로 두면 8~10 kHz 가 10 dB 넘게 부푼다.
+    formant_gain: list = field(default_factory=list)
     bandwidths: list = field(default_factory=lambda: [60., 90., 120., 160.,
                                                       200., 240., 280., 320.,
                                                       380., 450., 530., 620.])
@@ -76,9 +86,9 @@ class VoiceProfile:
     # 난류의 느린 세기 변동. 크게 두면 진폭 분포의 꼬리가 두꺼워져 지글거린다
     # (핑크 노이즈의 첨도 2.97 이 기준선; docs/VOICE.md §3 참고).
     roughness: float = 0.12
-    # 마찰음이 유성음보다 얼마나 조용한가 [dB]. 실측(한국어 "스"): 모음이 5.4 dB 크다.
+    # 마찰음이 유성음보다 얼마나 조용한가 [dB]. 실측(한국어 "사"): 모음이 9.7 dB 크다.
     # 이걸 안 맞추면 치찰음만 튀어나와 들린다.
-    fricative_level_db: float = -5.4
+    fricative_level_db: float = -9.7
     breathiness: float = 0.15            # 유성 구간 기식 노이즈 세기
 
     meta: dict = field(default_factory=dict)
@@ -124,6 +134,16 @@ class VoiceProfile:
                        device=None, dtype=torch.float32):
         f = extend_formants(self.formants, n_formants)
         return torch.tensor(f[:n_formants], device=device, dtype=dtype
+                            ).view(1, 1, -1).expand(batch, n_frames, n_formants
+                                                    ).contiguous()
+
+    def gain_tensor(self, batch: int, n_frames: int, n_formants: int,
+                    device=None, dtype=torch.float32, taper: float = 0.65):
+        """포먼트 게인. 측정된 것은 1, 그 위는 기하급수적으로 줄인다."""
+        g = list(self.formant_gain) or [1.0] * min(len(self.formants), n_formants)
+        while len(g) < n_formants:
+            g.append(g[-1] * taper)
+        return torch.tensor(g[:n_formants], device=device, dtype=dtype
                             ).view(1, 1, -1).expand(batch, n_frames, n_formants
                                                     ).contiguous()
 

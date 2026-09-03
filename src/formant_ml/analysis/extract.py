@@ -159,8 +159,9 @@ def mean_voiced_log_spectrum(x, mask, hop: int = 240, n_fft: int = 1024,
 
 
 def fit_source_rd_tilt(target_db: torch.Tensor, f0: float, formants, bandwidths,
-                       sample_rate: int = 24000, hop: int = 240, n_grid: int = 13,
-                       fmin: float = 300.0, fmax: float = 9000.0):
+                       sample_rate: int = 24000, hop: int = 240, n_grid: int = 9,
+                       fmin: float = 300.0, fmax: float = 9000.0,
+                       rd_prior: float | None = None, rd_span: float = 0.45):
     """Rd 와 소스 tilt 를 **스펙트럼 포락선 전체에** 맞춰 함께 추정. (rd, tilt, rmse)
 
     왜 함께 풀어야 하나
@@ -186,8 +187,14 @@ def fit_source_rd_tilt(target_db: torch.Tensor, f0: float, formants, bandwidths,
     oc = oct_ - oct_.mean()
     tgt = target_db[band]
 
-    best = (float("inf"), 1.0, 0.0)
-    for rd in torch.linspace(0.35, 2.6, n_grid).tolist():
+    # Rd 는 **H1-H2 측정값을 중심으로 좁게만** 탐색한다.
+    # 포락선 전체를 자유롭게 맞추면 Rd 와 tilt 가 축퇴해서 격자 끝으로 튄다
+    # (실측: H1-H2 가 6.2 dB(=Rd 1.2)인데 자유 적합은 0.35 를 골랐다).
+    # H1-H2 는 소스를 직접 재는 양이고 열린 모음에서 왕복 오차가 0.05 다.
+    lo, hi = (0.35, 2.6) if rd_prior is None else (
+        max(0.35, rd_prior - rd_span), min(2.6, rd_prior + rd_span))
+    best = (float("inf"), rd_prior or 1.0, 0.0)
+    for rd in torch.linspace(lo, hi, n_grid).tolist():
         y = _probe(f0, rd, 0.0, formants, bandwidths, sample_rate)
         pdb = mean_voiced_log_spectrum(y, torch.ones(y.shape[-1] // hop + 1,
                                                      dtype=torch.bool), hop)[band]
@@ -199,6 +206,15 @@ def fit_source_rd_tilt(target_db: torch.Tensor, f0: float, formants, bandwidths,
         if rmse < best[0]:
             best = (rmse, rd, t)
     return round(best[1], 3), round(best[2], 3), round(best[0], 3)
+
+
+def fant_bandwidth(f: float) -> float:
+    """포먼트 주파수 -> 대역폭 [Hz] (Fant 의 경험식 근사).
+
+    F1 ~ 60, F3 ~ 120, F5 ~ 250 정도가 되도록 잡았다. 벽 손실·점성 손실·방사
+    손실이 모두 주파수에 따라 커지는 것을 한 줄로 요약한 것이다.
+    """
+    return 50.0 + 20.0 * (f / 1000.0) ** 2 + 10.0 * (f / 1000.0)
 
 
 def cycle_jitter_shimmer(feat: dict) -> tuple[float, float]:
@@ -221,7 +237,8 @@ def extract_profile(paths: list[str], name: str = "voice", sample_rate: int = 24
                     hop: int = 240, n_stages: int = 3, verbose: bool = True,
                     vowel_paths: list[str] | None = None,
                     sibilant_paths: list[str] | None = None,
-                    glissando_paths: list[str] | None = None) -> VoiceProfile:
+                    glissando_paths: list[str] | None = None,
+                    vowel_name: str | None = None) -> VoiceProfile:
     """녹음 -> VoiceProfile.
 
     측정마다 필요한 녹음이 다르다. 역할별 파일을 따로 주면 훨씬 정확해진다.
@@ -242,10 +259,16 @@ def extract_profile(paths: list[str], name: str = "voice", sample_rate: int = 24
     # 1) 먼저 화자 평균 포먼트를 구한다 (H1-H2 성도 보정과 위상 기준선에 필요).
     from ..data.features import yin_f0
     _, voi_pre = yin_f0(x_vowel, sample_rate, hop)
-    formants, bws = lpc_formants(x_vowel, voi_pre[0], sample_rate, hop)
+    formants, lpc_bw = lpc_formants(x_vowel, voi_pre[0], sample_rate, hop)
     if len(formants) < 4:                                # LPC 가 실패하면 켑스트럼
         formants = mean_formants(x_vowel, voi_pre[0], sample_rate, hop)
-        bws = [max(50.0, 0.06 * f + 40.0) for f in formants]
+        lpc_bw = []
+    # 대역폭은 LPC 근에서 읽지 않고 **Fant 근사식**을 쓴다. 짧고 잡음 있는 녹음에서
+    # LPC 는 대역폭을 크게 과대추정한다(실측 /아/: F1 이 631 Hz 로 나왔는데
+    # 사람은 60~90 이다). 과대추정된 대역폭으로 합성하면 포먼트가 뭉개져
+    # 1~4 kHz 가 10 dB 넘게 주저앉는다.
+    bws = [fant_bandwidth(f) for f in formants]
+    prof_lpc_bw = [round(b, 1) for b in lpc_bw[:len(formants)]]
 
     # 2) 그 포먼트로 보정한 성대 지표
     # H1-H2 는 보정 없이 잰다(위 h1_h2_db 주석 참고: 평균 포먼트로 보정하면 더 나빠진다).
@@ -277,6 +300,7 @@ def extract_profile(paths: list[str], name: str = "voice", sample_rate: int = 24
         jitter=jit, shimmer=shim,
         tilt=0.0,   # 아래에서 모델 기준선을 빼고 채운다
         formants=formants, bandwidths=[round(b, 1) for b in bws],
+        formant_gain=[1.0] * len(formants),
         passaggio=rg.passaggio_candidates(feat_gliss),
         register_stats={
             "shr_median_db": round(float(feat["shr"][v].median()), 2),
@@ -324,7 +348,8 @@ def extract_profile(paths: list[str], name: str = "voice", sample_rate: int = 24
     try:
         target_db = mean_voiced_log_spectrum(x_vowel, steady, hop)
         rd_fit, tilt_fit, rmse = fit_source_rd_tilt(
-            target_db, prof.f0_median, ff_pad, bw_pad, sample_rate, hop)
+            target_db, prof.f0_median, ff_pad, bw_pad, sample_rate, hop,
+            rd_prior=prof.rd_median)
         prof.register_stats["source_fit_rmse_db"] = rmse
         shift = rd_fit - prof.rd_median
         prof.rd_median = rd_fit
@@ -335,7 +360,10 @@ def extract_profile(paths: list[str], name: str = "voice", sample_rate: int = 24
         if verbose:
             print(f"  ! Rd/tilt 동시추정 실패: {e}")
     prof.register_stats["measured_tilt_db_per_oct"] = round(measured_tilt, 2)
+    prof.register_stats["lpc_bandwidths"] = prof_lpc_bw
 
+    if vowel_name:
+        prof.vowel_formants[vowel_name] = [round(x, 1) for x in formants]
     prof.meta = {"files": [os.path.basename(p) for p in paths],
                  "seconds": round(x.shape[-1] / sample_rate, 2)}
     return prof
@@ -350,6 +378,8 @@ def main() -> None:
     ap.add_argument("--stages", type=int, default=3, help="위상차 올패스 단수")
     ap.add_argument("--vowel-wav", nargs="*", help="지속 모음 (포먼트/Rd/위상차)")
     ap.add_argument("--sibilant-wav", nargs="*", help="/스ㅡ/ /슈/ (치찰음 지문)")
+    ap.add_argument("--vowel-name", help="--vowel-wav 가 어떤 모음인지 (예: a). "
+                    "주면 그 모음의 포먼트를 측정값으로 저장한다")
     ap.add_argument("--glissando-wav", nargs="*",
                     help="낮은음->높은음 글리산도 (파사지오). 이걸 주면 검출이 크게 좋아진다")
     args = ap.parse_args()
@@ -368,7 +398,8 @@ def main() -> None:
                            n_stages=args.stages,
                            vowel_paths=expand(args.vowel_wav),
                            sibilant_paths=expand(args.sibilant_wav),
-                           glissando_paths=expand(args.glissando_wav))
+                           glissando_paths=expand(args.glissando_wav),
+                           vowel_name=args.vowel_name)
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     prof.save(args.out)
 

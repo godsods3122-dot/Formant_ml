@@ -51,7 +51,7 @@ def base(t: int, prof: VoiceProfile, n_formants: int = 8, n_bands: int = 40,
         "formant_freq": torch.tensor(ff).reshape(1, 1, -1).expand(1, t, n_formants
                                                                  ).contiguous(),
         "formant_bw": prof.bandwidth_tensor(1, t, n_formants),
-        "formant_gain": torch.ones(1, t, n_formants),
+        "formant_gain": prof.gain_tensor(1, t, n_formants),
         "noise_bands": torch.full((1, t, n_bands), 1e-4),
         "noise_entry": _c(t, 0.0),
         "noise_am": _c(t, prof.breathiness),

@@ -845,6 +845,44 @@ def test_stacked_folds_track_tension():
     assert r[1] > r[0] * 1.5, r
 
 
+def test_syllable_uses_a_consonant_locus_not_a_glide():
+    """/사/ 의 유성 구간은 자음 로커스에서 출발해야 한다.
+
+    /이/ 포먼트에서 시작해 모음으로 미끄러뜨리면 그건 정의상 /j/ 활음이라
+    **"야"** 로 들린다(실제로 그렇게 들린다는 지적을 받았다). 치경 로커스는
+    F2 가 1750 Hz 부근이고, /a/(F2≈1090)로 갈 때 F2 가 **내려간다**.
+    /이/ 활음이면 반대로 2290 -> 1090 으로 훨씬 크게 내려온다.
+    """
+    from formant_ml.score import build_controls
+    c = build_controls({"timeline": [{"type": "syllable", "onset": "s",
+                                      "vowel": "a", "dur": 0.55,
+                                      "onset_s": 0.12}]}, PROF, CFG)
+    f2 = c.formant_freq[0, :, 1]
+    amp = c.harmonic_amp[0, :, 0]
+    onset = int((amp > 0.05).float().argmax())
+    assert onset > 0, "유성 시작을 못 찾았다"
+    start = float(f2[onset])
+    assert 1400.0 < start < 2000.0, f"유성 시작 F2 가 {start:.0f} Hz (치경 로커스는 ~1750)"
+    assert start < 2100.0, "/이/ 활음이다"
+    # 전이는 짧아야 한다 (60 ms 안팎). 길면 활음처럼 들린다.
+    tgt = float(f2[-1])
+    reached = int((((f2 - tgt).abs() < 40.0).float()).argmax())
+    assert (reached - onset) < 12, f"전이가 {(reached - onset) * 10} ms 로 너무 길다"
+
+
+def test_measured_formant_values_are_used_directly():
+    """프로파일에 측정 포먼트가 있으면 프리셋을 스케일하지 않고 그대로 쓴다.
+
+    균일 스케일은 F1 과 F2 를 같은 비율로 옮기는데 실제 화자는 그렇지 않다
+    (실측: F1 994 인데 F2 는 1485 가 아니라 1226).
+    """
+    from formant_ml.score import _vowel_formants
+    p = VoiceProfile()
+    p.vowel_formants = {"a": [994.0, 1226.0, 3144.0, 4457.0]}
+    got = _vowel_formants("a", p, CFG.filt.n_formants)
+    assert abs(got[0] - 994.0) < 1.0 and abs(got[1] - 1226.0) < 1.0, got[:3]
+
+
 def test_voice_profile_round_trips_through_json():
     import tempfile
     p = VoiceProfile(name="t", f0_median=143.0, tilt=2.5)

@@ -36,7 +36,7 @@ from .dsp.sibilant import SibilantParams
 from . import aerodynamics as aero
 from .gestures import GESTURES, base
 from .models.synth import Controls, PhysicalVoiceSynth
-from .presets import FRICATIVES, VOWELS
+from .presets import FRICATIVES, LOCUS, VOWELS
 from .utils import band_bump, band_shelf, ramp
 from .voice import VoiceProfile, extend_formants
 
@@ -119,7 +119,15 @@ def fricative_gain(prof: VoiceProfile) -> float:
 
 
 def _vowel_formants(name: str, prof: VoiceProfile, n: int) -> list[float]:
-    """모음 프리셋을 화자 성도 규모로 스케일."""
+    """이 화자의 해당 모음 포먼트.
+
+    측정값이 있으면 그대로 쓰고, 없으면 프리셋을 화자 성도 규모로 스케일한다.
+    (균일 스케일은 근사다 — F1 과 F2 를 같은 비율로 옮기는데 실제 화자는
+     그렇지 않다. 그래서 측정값이 있으면 항상 그쪽이 우선이다.)
+    """
+    measured = prof.vowel_formants.get(name)
+    if measured:
+        return extend_formants(list(measured), n)
     scale = (prof.formants[0] / VOWELS["a"][0]) if prof.formants else 1.0
     f = [v * scale for v in VOWELS.get(name, VOWELS["a"])]
     return extend_formants(f + list(prof.formants[len(f):]), n)
@@ -130,7 +138,8 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
     """세그먼트 하나 -> 프레임률 제어 dict (+ 'sib' 하위 dict)."""
     a = cfg.audio
     K, NB = cfg.filt.n_formants, cfg.noise.n_bands
-    t = max(1, int(round(float(seg.get("dur", 0.3)) * a.frame_rate)))
+    dur = float(seg.get("dur", 0.3))
+    t = max(1, int(round(dur * a.frame_rate)))
     kind = seg.get("type", "vowel")
 
     if kind in GESTURES:
@@ -181,7 +190,12 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
             c["noise_bands"] = nb.expand(1, t, NB).contiguous()
             env = torch.ones(1, t, 1)
         else:
-            split = float(seg.get("onset_ratio", 0.42))
+            # 실측("사"): /s/ 120 ms, 전이 60 ms, 모음 360 ms.
+            # 비율이 아니라 절대 시간이 음성학적으로 맞다 — 자음 길이는 음절
+            # 길이에 비례해 늘어나지 않는다.
+            onset_s = float(seg.get("onset_s", 0.12))
+            split = float(seg.get("onset_ratio", onset_s / max(dur, 1e-3)))
+            split = min(max(split, 0.05), 0.8)
             # 발성 시작을 **공기역학**으로 만든다. 세기만 램프로 올리면 녹음을
             # 페이드인한 것처럼 들린다 — 실제로는 성문하압이 오르면서 세기·F0·
             # 성문파 형상·기식 소음이 한꺼번에 따라 움직인다 (aerodynamics.py).
@@ -190,11 +204,17 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
             asp = aero.apply(c, ps, add, rd_modal=prof.rd_median,
                              rd_breathy=min(2.6, prof.rd_high + 0.6),
                              route_noise=False)
+            # 마찰음 레벨은 **같은 음절의 유성 세기**를 기준으로 맞춘다.
+            # 전역 상수로 맞추면, 공기역학 모형이 내는 모음 세기(압력·Rd 에 따라
+            # 달라진다)와 어긋나 음절마다 비율이 흔들린다(실측: 목표 +9.7 dB 인데
+            # -6.2 dB 가 나왔다).
+            nb = nb * float(c["harmonic_amp"].max().clamp_min(1e-3))
             env = ramp(t, [(0.0, 1.0), (split, 1.0), (split + 0.1, 0.02), (1.0, 0.01)])
             # 노이즈 경로가 하나뿐이라, 구강 협착(마찰음)에서 성문(기식)으로
             # 주입 위치를 옮기며 섞는다.
             asp_n = band_shelf(NB, 900.0, fricative_gain(prof), a.sample_rate
-                               ).reshape(1, 1, -1)
+                               ).reshape(1, 1, -1) * float(
+                                   c["harmonic_amp"].max().clamp_min(1e-3))
             # 주입 위치는 **부드럽게 미끄러뜨리면 안 된다**. 중간값은 캐스케이드의
             # 앞부분만 우회한 '반쪽 필터' 라 어떤 성도 형상에도 대응하지 않고,
             # 봉우리가 나이퀴스트 쪽으로 튄다(실측: /스/ 의 마찰음 피크가
@@ -202,12 +222,24 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
             w_asp = torch.sigmoid((asp - env) * 8.0)
             c["noise_bands"] = (nb * env + asp_n * asp * 0.5).contiguous()
             c["noise_entry"] = (1.0 - w_asp) * (float(K) + 6.0)
-            c["formant_freq"] = torch.cat([
-                ramp(t, [(0.0, _vowel_formants("i", prof, K)[k]),
-                         (split, _vowel_formants("i", prof, K)[k]),
-                         (split + 0.15, _vowel_formants(vowel, prof, K)[k]),
-                         (1.0, _vowel_formants(vowel, prof, K)[k])])
-                for k in range(K)], dim=-1)
+            # 포먼트 궤적은 **로커스 이론**대로. 유성 구간을 /이/ 에서 시작해
+            # 모음으로 미끄러뜨리면 그건 /j/ 활음이라 "사" 가 "야" 로 들린다.
+            # 치경 로커스에서 출발해 짧은 전이(기본 50 ms)로 모음에 도달한다.
+            tgt = _vowel_formants(vowel, prof, K)
+            loc = LOCUS.get(phone, LOCUS["s"])
+            trans = float(seg.get("transition_s", 0.05)) * a.frame_rate / max(t, 1)
+            # 전이는 **실제 유성이 시작하는 순간**부터다. 그 전에 시작하면 포먼트가
+            # 이미 모음 쪽으로 움직인 뒤에 소리가 나서 활음처럼 들린다.
+            amp = c["harmonic_amp"][0, :, 0]
+            voiced = (amp > 0.05 * float(amp.max().clamp_min(1e-6))).nonzero()
+            onset = (float(voiced[0]) / max(t - 1, 1)) if len(voiced) else split
+            tracks = []
+            for k in range(K):
+                start = tgt[k] if k >= 3 or loc[k] is None else float(loc[k])
+                tracks.append(ramp(t, [(0.0, start), (onset, start),
+                                       (min(onset + trans, 1.0), tgt[k]),
+                                       (1.0, tgt[k])]))
+            c["formant_freq"] = torch.cat(tracks, dim=-1)
         # 치찰음 필터를 쓰는 동안에는 노이즈를 포먼트 캐스케이드에 통과시키지
         # 않는다. 앞공동 공진을 '캐스케이드의 마지막 포먼트' 와 '치찰음 극' 두
         # 군데서 모델링하면 이중 계산이 되어, 치찰음 파라미터를 돌려도 소리가
