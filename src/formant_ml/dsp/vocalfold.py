@@ -132,6 +132,8 @@ def simulate(params: FoldParams, n_samples: int, sample_rate: int = 24000,
 def simulate_stack(params: FoldParams, n_masses: int = 5, n_samples: int = 9600,
                    sample_rate: int = 24000, oversample: int = 4,
                    coupling: float = 0.25, device=None, dtype=torch.float64):
+    # n_masses 기본 5: 성구(흉성/두성)를 '어느 층이 접지를 잃는가' 로 구분하려면
+    # 상·하연에 수직 해상도가 필요하다. contact_quotient 주석의 측정 참고.
     """성대의 **수직 방향**을 n 개 질량으로 쌓은 모델. 반환 (flow, x (n_samples, n)).
 
     왜 2 개로는 부족한가
@@ -277,6 +279,28 @@ def simulate_body_cover(params: FoldParams, n_samples: int = 9600,
             traj[out] = torch.stack([x1, x2, xb])
             out += 1
     return flow, traj
+
+
+def contact_quotient(traj: torch.Tensor, params: FoldParams,
+                     skip: int = 2000) -> torch.Tensor:
+    """수직 질량별 **접지율**(성문이 닫혀 있는 시간 비율). 반환 (n,) 하연->상연.
+
+    성구(register)를 가르는 것이 이것이다. 측정(수직 5질량, ps=8000):
+
+        q=1.0 내전 0.02 -> F0 151 Hz, 접지 [0.25 0.28 0.32 0.31 0.38], 점막파 0.58 ms
+        q=2.4 내전 0.08 -> F0 326 Hz, 접지 [0.00 0.09 0.21 0.25 0.28], 점막파 0.17 ms
+
+    즉 **흉성은 하연까지 접지하고, 두성은 하연이 접지를 잃는다**(0.00). 동시에
+    점막파가 붕괴한다 — 하연이 닿지 않으면 아래에서 위로 전달할 변형이 없다.
+    이 축을 표현하려면 상·하연을 여러 겹으로 쌓아야 한다: 2질량은 '위상차가
+    있다/없다' 만, 3질량은 body/cover 배분만 말할 수 있고, '어느 층이 접지를
+    잃는가' 는 수직 해상도가 있어야 나온다. 그래서 `simulate_stack` 의 기본이 5 다.
+    """
+    n = traj.shape[1]
+    frac = torch.arange(n, dtype=traj.dtype, device=traj.device) / max(n - 1, 1)
+    a0 = params.a01 + (params.a02 - params.a01) * frac
+    area = a0 + 2.0 * params.length * traj
+    return (area[skip:] < 0).to(torch.float32).mean(0)
 
 
 def glottal_flow_to_modulation(flow: torch.Tensor, sample_rate: int = 24000,

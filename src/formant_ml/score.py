@@ -110,7 +110,7 @@ def curve(spec, t: int) -> torch.Tensor:
 #: 마찰음 노이즈 게인 1.0 일 때 측정된 "모음 - 마찰음" RMS 차 [dB].
 #: 합성 경로(소스 스펙트럼 사전, 치찰음 필터, 성도)가 바뀌면 이 값도 다시 재야 한다.
 #: tests/test_voice.py::test_fricative_level_matches_profile 가 드리프트를 잡는다.
-FRICATIVE_CAL_DB = -2.1
+FRICATIVE_CAL_DB = -18.5   # 앞니 다이폴 도입으로 재측정(고역이 크게 살아남)
 
 
 def fricative_gain(prof: VoiceProfile) -> float:
@@ -124,6 +124,10 @@ def fricative_gain(prof: VoiceProfile) -> float:
 _AERO_KEYS = ("constriction_area", "a_open", "a_closed", "release_s", "hold_ratio",
               "glottal_area", "aero")
 _PS_CGS = 8000.0    # 보통 발화 성문하압 [dyn/cm^2] ≈ 8 cmH2O (pressure=1.0 기준)
+
+#: 앞니라는 **장애물**이 있는 음소(치찰음). 제트가 앞니에 부딪혀 다이폴 소스를
+#: 만든다(Shadle 1985/1990). /f/ /θ/ /h/ 는 장애물이 없어 훨씬 약하고 평평하다.
+OBSTACLE_SIBILANTS = {"s", "ss", "z", "sh"}
 
 
 def wants_aero(seg: dict) -> bool:
@@ -161,7 +165,13 @@ def aero_frication(seg: dict, t: int, frame_rate: float,
     amp = aac.frication_source_amp(u, ac_area)
     env = amp / amp.amax().clamp_min(1e-9)          # 피크 1 로 정규화(레벨은 nb 가)
     cent = aac.velocity_centroid_scale(u, ac_area)
-    return env, cent
+    # 성문에서의 난류(기식). 성문이 내전하며 좁아지는 **도중**에 유속이 올라 최대가
+    # 된다 — 그래서 구강 마찰음이 꺼지고 발성이 아직 안 붙은 전이 구간을 이 기식이
+    # 메운다. 이게 없으면 그 자리에 무음이 생겨 '무음 + 급개시' = 폐쇄음(/t/)으로
+    # 들린다(실측: /사/ 에서 120 ms 무음 -> "스트라" 처럼 들림).
+    asp = aac.aspiration_source_amp(u, ag_t)
+    asp_env = asp / asp.amax().clamp_min(1e-9)
+    return env, cent, asp_env
 
 
 def _scale_sib_center(sib: SibilantParams, cent: torch.Tensor) -> None:
@@ -243,12 +253,19 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
         # 안 맞추면 치찰음만 튀어나와 들린다(실측 한국어 "스": 모음이 5.4 dB 큼).
         nb = band_shelf(NB, 500.0, g * fricative_gain(prof),
                         a.sample_rate).reshape(1, 1, -1)
+        # 앞니 다이폴: 치찰음의 지배적 소스다. 이게 없으면 난류 소스의 -6 dB/oct
+        # 롤오프가 그대로 남아 9~12 kHz 가 반토막 나고 5~6 kHz 에 없는 혹이 생겨
+        # '스' 로 안 들린다(실측 대조: 고역 79% vs 합성 38%).
+        if phone in OBSTACLE_SIBILANTS and seg.get("obstacle_dipole", True):
+            nb = nb * aac.obstacle_dipole_bands(
+                NB, a.sample_rate,
+                float(seg.get("dipole_db_oct", 10.0))).reshape(1, 1, -1)
         aero_env = aero_cent = None
         if kind == "fricative":
             c["harmonic_amp"] = torch.zeros(1, t, 1)
             if wants_aero(seg):
                 # 공기음향 경로: 협착 면적에서 진폭·무게중심을 유도(권장).
-                aero_env, aero_cent = aero_frication(seg, t, a.frame_rate)
+                aero_env, aero_cent, _asp = aero_frication(seg, t, a.frame_rate)
                 env = aero_env
             else:
                 # 단순 경로: 유량 포락선을 직접 준다(페이드 인/아웃, 초).
@@ -270,8 +287,16 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
             # 발성 시작을 **공기역학**으로 만든다. 세기만 램프로 올리면 녹음을
             # 페이드인한 것처럼 들린다 — 실제로는 성문하압이 오르면서 세기·F0·
             # 성문파 형상·기식 소음이 한꺼번에 따라 움직인다 (aerodynamics.py).
-            ps = ramp(t, [(0.0, 0.55), (split, 0.7), (split + 0.12, 1.0), (1.0, 0.95)])
-            add = ramp(t, [(0.0, 0.04), (split, 0.12), (split + 0.14, 1.0), (1.0, 1.0)])
+            # 발성 개시 시간(VOT)은 **초** 로 잡는다. 예전에는 세그먼트 길이의
+            # 12~14% 로 두어서, 0.58 s 음절이면 내전에 81 ms 가 걸렸다 — 마찰음이
+            # 꺼진 뒤 발성이 붙기까지 무음이 100 ms 넘게 생겨 '무음 + 급개시' 가
+            # 폐쇄음으로 들렸다(/사/ 가 "스트라"). 한국어 평음 ㅅ 의 VOT 는 대략
+            # 25~40 ms 다.
+            vot = float(seg.get("voice_onset_s", 0.03)) * a.frame_rate / max(t, 1)
+            ps = ramp(t, [(0.0, 0.55), (split, 0.7), (min(split + vot, 1.0), 1.0),
+                          (1.0, 0.95)])
+            add = ramp(t, [(0.0, 0.04), (split, 0.12),
+                           (min(split + vot * 1.2, 1.0), 1.0), (1.0, 1.0)])
             asp = aero.apply(c, ps, add, rd_modal=prof.rd_median,
                              rd_breathy=min(2.6, prof.rd_high + 0.6),
                              route_noise=False)
@@ -295,8 +320,22 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
                 ag_curve = seg.get("glottal_area", [
                     [0.0, 0.12], [split, 0.12], [min(split + trans, 1.0), 0.03],
                     [1.0, 0.03]])
-                env, aero_cent = aero_frication(seg2, t, a.frame_rate,
-                                                glottal_area=ag_curve)
+                env, aero_cent, asp_env = aero_frication(
+                    seg2, t, a.frame_rate, glottal_area=ag_curve)
+                # 기식은 **기류는 있는데 아직 발성이 안 붙은** 동안에만 난다.
+                # 성대가 제대로 떨기 시작하면 성문이 주기적으로 닫혀 난류가 사라진다.
+                # 이 게이트가 있어야 기식이 정확히 '마찰음 꺼짐 ~ 발성 시작' 창을
+                # 메운다. 안 그러면 그 자리가 무음이 되어 무음+급개시 = /t/ 로
+                # 들린다(실측 /사/ 가 "스트라" 로 들리던 원인).
+                # 게이트가 둘이다. (1-v_frac): 발성이 붙으면 성문이 주기적으로 닫혀
+                # 난류가 사라진다. (1-env): 구강 협착이 좁을 때는 압력강하가 입에
+                # 몰려 성문 유속이 낮다 — 협착이 열려야 압력강하가 성문으로 옮겨와
+                # 기식이 난다. 둘을 곱하면 기식이 정확히 '마찰음 꺼짐 ~ 발성 시작'
+                # 창에만 남아, 그 자리의 무음(=/t/ 지각)을 메운다.
+                vamp = c["harmonic_amp"]
+                v_frac = (vamp / vamp.amax().clamp_min(1e-6)).clamp(0.0, 1.0)
+                asp = (asp_env * (1.0 - v_frac) * (1.0 - env).clamp(0.0, 1.0)
+                       * float(seg.get("aspiration", 1.0)))
             else:
                 # 마찰음 게이트: 모음으로 넘어갈 때 빠르게 꺼진다(자연스러운 fade-out).
                 env = ramp(t, [(0.0, 1.0), (split, 1.0), (split + 0.1, 0.02),

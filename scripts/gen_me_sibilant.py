@@ -18,8 +18,10 @@ from formant_ml.utils import save_wav
 from formant_ml.voice import VoiceProfile
 
 # 실측 /사/: 협착이 프리케이션 동안 서서히 열려 무게중심이 6500->3900 으로 내려간다.
-SA_AREA = [[0, 0.20], [0.06, 0.13], [0.16, 0.20], [0.24, 0.26],
-           [0.28, 1.2], [0.36, 3.0], [1, 3.0]]
+# 협착 해제를 발성 개시와 **겹치게** 맞춘다. 예전엔 마찰음이 꺼진 뒤 발성까지
+# 120 ms 무음이 생겨 '무음 + 급개시' = 폐쇄음으로 들렸다(/사/ 가 "스트라").
+SA_AREA = [[0, 0.20], [0.06, 0.13], [0.24, 0.18], [0.30, 0.26],
+           [0.34, 1.0], [0.44, 3.0], [1, 3.0]]
 
 
 def main() -> None:
@@ -41,8 +43,9 @@ def main() -> None:
 
     # 1) '사' — 협착 면적에서 진폭·게이트·무게중심 하강이 전부 유도된다
     sa = {"type": "syllable", "onset": "s", "vowel": "a", "dur": 0.58,
-          "onset_s": 0.14, "aero": True, "transition_s": 0.06,
-          "constriction_area": SA_AREA, "f0": [[0, 129], [1, 123]]}
+          "onset_s": 0.14, "aero": True, "transition_s": 0.05,
+          "constriction_area": SA_AREA, "voice_onset_s": 0.03,
+          "aspiration": 1.0, "f0": [[0, 129], [1, 123]]}
     W("m01_sa.wav", {"timeline": [sa]})
     W("m02_sa_sa.wav", {"timeline": [sa, {"type": "silence", "dur": 0.3}, dict(sa)]})
 

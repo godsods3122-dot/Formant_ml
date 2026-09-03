@@ -145,3 +145,35 @@ def aspiration_source_amp(flow: torch.Tensor, glottal_area: torch.Tensor,
     (기식·/h/) 난류가 난다. 성도 전체를 통과하므로 합성기에서 noise_entry=0.
     """
     return frication_source_amp(flow, glottal_area, re_c)
+
+
+# --- 이빨(장애물) 다이폴 소스 ------------------------------------------------
+# 치찰음(/s/ /ʃ/)이 비치찰음(/f/ /θ/)보다 20 dB 넘게 큰 이유는 소스의 종류가
+# 다르기 때문이다(Shadle 1985, 1990). 혀끝 협착에서 나온 제트가 **앞니라는
+# 장애물에 부딪히며** 다이폴 소스를 만든다. 채널 안에 퍼진 약한 소스가 아니라
+# 장애물에 국한된 강한 다이폴이다.
+#
+# 다이폴은 단극(monopole)보다 방사 효율이 주파수에 비례해 커진다 -> 진폭 스펙트럼이
+# **+6 dB/oct 로 상승**한다. 난류 소스 자체는 에디 크기 때문에 코너 위에서
+# -6 dB/oct 로 떨어지는데(noise.TurbulenceSource 의 사전), 장애물 다이폴이 그것을
+# 상쇄해 고역이 살아난다.
+#
+# 이게 빠지면 어떻게 되나 (실측 대조): 실측 /s/ 는 에너지의 79% 가 9~12 kHz 에
+# 있고 4 kHz 아래는 1.4% 뿐인데, 다이폴 없이 합성하면 9~12 kHz 가 38% 로 줄고
+# 5~6 kHz 에 없는 혹이 생기며 저역이 4.8 배 많아진다 -> '스' 로 안 들린다.
+#: 실효 기울기 기본 10 dB/oct. 이론적 다이폴은 +6 dB/oct 인데, 합성 경로에는
+#: 난류 소스 사전(TurbulenceSource.log_prior)의 -6 dB/oct 롤오프가 **또** 걸린다.
+#: 치찰음 지문은 실제 출력 스펙트럼에 맞춰 적합했으므로 그 롤오프를 이미 품고
+#: 있어서, 사전의 롤오프가 이중으로 세어진다. +6(다이폴) + 이중계상 상쇄 = 약 10.
+#: 실측 대조 L1 오차: 6 dB/oct 0.355, 8 -> 0.219, 10 -> 0.119 (최적).
+def obstacle_dipole_bands(n_bands: int, sample_rate: float = 24000.0,
+                          db_per_oct: float = 10.0, f_ref: float = 2000.0,
+                          f_max_boost: float = 11000.0) -> torch.Tensor:
+    """앞니 다이폴의 대역게인 (n_bands,). f_ref 위로 +db_per_oct 로 상승.
+
+    `f_max_boost` 위에서는 더 올리지 않는다(나이퀴스트 근처에서 발산 방지).
+    """
+    f = torch.linspace(0.0, sample_rate / 2, n_bands).clamp_min(50.0)
+    oct_ = torch.log2((f / f_ref).clamp_min(1.0))
+    oct_ = torch.minimum(oct_, torch.log2(torch.tensor(f_max_boost / f_ref)))
+    return 10.0 ** (db_per_oct * oct_ / 20.0)
