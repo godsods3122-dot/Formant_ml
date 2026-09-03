@@ -240,8 +240,14 @@ def _smooth(x: torch.Tensor, n: int) -> torch.Tensor:
 
 
 def build_controls(score: dict, prof: VoiceProfile, cfg: Config) -> Controls:
-    """스크립트 전체 -> 하나의 Controls (위상은 발화 전체에서 연속이다)."""
-    segs = [build_segment(s, prof, cfg) for s in score.get("timeline", [])]
+    """스크립트 전체 -> 하나의 Controls (위상은 발화 전체에서 연속이다).
+
+    `score["prosody"]` 가 있으면 운율 계획을 적용한다 (prosody.py).
+    """
+    from .prosody import ProsodyPlan, apply_to_controls, warp_timeline
+    plan = ProsodyPlan.from_dict(score.get("prosody"))
+    timeline = warp_timeline(score.get("timeline", []), plan)
+    segs = [build_segment(s, prof, cfg) for s in timeline]
     if not segs:
         raise ValueError("timeline 이 비어 있습니다")
     keys = set().union(*[set(s) for s in segs]) - {"sib"}
@@ -278,7 +284,9 @@ def build_controls(score: dict, prof: VoiceProfile, cfg: Config) -> Controls:
     merged["sib"] = SibilantParams(**sib_fields)
     merged["noise_rough"] = merged.get("noise_rough")
     valid = {f for f in Controls.__dataclass_fields__}
-    return Controls(**{k: v for k, v in merged.items() if k in valid})
+    ctrl = Controls(**{k: v for k, v in merged.items() if k in valid})
+    return apply_to_controls(ctrl, plan, cfg.audio.frame_rate,
+                             cfg.source.f0_min, cfg.source.f0_max)
 
 
 def render(score: dict, prof: VoiceProfile | None = None, cfg: Config | None = None,

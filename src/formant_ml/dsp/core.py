@@ -63,11 +63,18 @@ def ltv_filter(
     H: torch.Tensor,
     hop_size: int,
     ir_size: int = 512,
-) -> torch.Tensor:
+    tail: torch.Tensor | None = None,
+    return_tail: bool = False,
+):
     """시변 필터링. x: (B, N), H: (B, T, n_freq) 복소응답. 반환 (B, N).
 
     x를 hop_size 길이의 비중첩 프레임으로 자르고, 각 프레임을 해당 프레임의
     임펄스응답과 컨볼루션한 뒤 overlap-add 한다.
+
+    스트리밍(`return_tail=True`): 지연 보정을 하지 않고 OLA 꼬리를 그대로
+    돌려준다. 다음 청크의 앞에 그 꼬리를 더하면 결과가 오프라인 합성과
+    **정확히 같다**. 대신 스트림 전체에 `ir_size//2` 샘플의 고정 지연이 남는다
+    (한 번만 생기는 상수 지연이라 실시간 제어에는 문제가 없다).
     """
     b, n = x.shape
     t = H.shape[1]
@@ -90,6 +97,11 @@ def ltv_filter(
         wet,
         accumulate=True,
     )
+    if tail is not None:
+        m = tail.shape[-1]
+        out = torch.cat([out[:, :m] + tail, out[:, m:]], dim=-1)
+    if return_tail:
+        return out[:, :n_pad], out[:, n_pad:]
     delay = ir_size // 2
     return out[:, delay : delay + n]
 

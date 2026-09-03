@@ -20,8 +20,11 @@ class AudioFolder(Dataset):
     """
 
     def __init__(self, root: str, cfg: Config = DEFAULT, seconds: float = 1.5,
-                 repeat: int = 1, extensions=(".wav", ".flac")):
+                 repeat: int = 1, extensions=(".wav", ".flac"),
+                 target_rms: float = 0.05):
         self.cfg = cfg
+        self.target_rms = target_rms
+        self._gains: dict[str, float] = {}
         self.seconds = seconds
         self.repeat = max(1, repeat)
         self.files = sorted(
@@ -45,8 +48,23 @@ class AudioFolder(Dataset):
         else:
             s = random.randint(0, len(y) - n)
             y = y[s:s + n]
-        peak = y.abs().max().clamp_min(1e-5)
-        return {"audio": y / peak * 0.95, "path": path}
+        return {"audio": y * self._gain(path), "path": path}
+
+    def _gain(self, path: str) -> float:
+        """**파일 단위** RMS 정규화 (크롭 단위 피크 정규화가 아니다).
+
+        크롭마다 피크를 0.95 로 맞추면 조용한 구간이 큰 소리로 부풀려지고, 모델은
+        그 들쭉날쭉한 레벨을 설명하려고 성문 세기를 엉뚱하게 흔든다. 1~10 초짜리
+        조각을 짜깁기해 쓸 때 특히 문제가 된다 — 조각마다 다른 이득이 붙으면
+        화자의 다이내믹이 통째로 사라진다. 파일 하나당 하나의 이득을 캐시한다.
+        """
+        if path not in self._gains:
+            y = load_wav(path, self.cfg.audio.sample_rate)
+            rms = y.pow(2).mean().clamp_min(1e-10).sqrt()
+            g = float(self.target_rms / rms)
+            peak = float(y.abs().max()) * g
+            self._gains[path] = g if peak <= 0.99 else g * 0.99 / peak
+        return self._gains[path]
 
 
 def compute_features(x: torch.Tensor, cfg: Config = DEFAULT) -> dict:

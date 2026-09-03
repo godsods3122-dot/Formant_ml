@@ -97,6 +97,24 @@ class Controls:
         return Controls(**out)
 
 
+def cat_controls(parts: list[Controls]) -> Controls:
+    """프레임축으로 Controls 를 이어붙인다 (스트리밍/스크립트 합성용)."""
+    if len(parts) == 1:
+        return parts[0]
+    out = {}
+    for f in fields(Controls):
+        vals = [getattr(p, f.name) for p in parts]
+        if torch.is_tensor(vals[0]):
+            out[f.name] = torch.cat(vals, dim=1)
+        elif isinstance(vals[0], SibilantParams):
+            out[f.name] = SibilantParams(**{
+                k: torch.cat([getattr(v, k) for v in vals], dim=1)
+                for k in vals[0].__dict__})
+        else:
+            out[f.name] = vals[0]
+    return Controls(**out)
+
+
 class PhysicalVoiceSynth(nn.Module):
     def __init__(self, cfg: Config = DEFAULT, tract_mode: str = "formant"):
         super().__init__()
@@ -149,19 +167,38 @@ class PhysicalVoiceSynth(nn.Module):
         return h
 
     # -------------------------------------------------------------------- 합성
-    def forward(self, c: Controls, generator: torch.Generator | None = None) -> dict:
+    def forward(self, c: Controls, generator: torch.Generator | None = None,
+                state: dict | None = None, emit_frames: int | None = None) -> dict:
+        """`state` 를 주면 청크 단위 스트리밍이 된다.
+
+        이어지는 청크 사이에서 (a) 성문 순시위상과 (b) LTV 필터의 OLA 꼬리를
+        넘겨받는다. 반환 dict 의 "state" 를 다음 호출에 그대로 넣으면 된다.
+
+        `emit_frames=T` 는 T+1 프레임의 제어를 받아 **T 프레임만** 낸다. 마지막
+        프레임은 보간 기준점으로만 쓴다. 이 1 프레임(10 ms) 선행이 없으면 청크의
+        마지막 hop 에서 F0 보간이 다음 프레임을 못 봐서 위상 오차가 누적된다.
+        """
         cfg = self.cfg
         hop, ir = cfg.audio.hop_size, cfg.filt.ir_size
         fs, nf = cfg.audio.sample_rate, self.n_freq
-        b, t, _ = c.f0.shape
+        b, t_all, _ = c.f0.shape
+        t = t_all if emit_frames is None else int(emit_frames)
 
+        st = state or {}
         src, phase = self.source(
-            c.f0, c.rd, c.harmonic_amp, tilt=c.tilt,
+            c.f0, c.rd, c.harmonic_amp, phase0=st.get("phase"), tilt=c.tilt,
             disp_freq=c.disp_freq, disp_radius=c.disp_radius,
             jitter=c.jitter, shimmer=c.shimmer, generator=generator)
         # 성문동기 AM 은 성대가 실제로 떨 때만 존재한다. 무성음(속삭임, 마찰음)에
         # 이걸 걸면 F0 로 노이즈를 써는 셈이라 없는 주기성이 생긴다.
         voiced_gate = c.harmonic_amp / (c.harmonic_amp.abs() + 0.02)
+        if t != t_all:                       # 선행 프레임은 보간 기준점일 뿐이다
+            src, phase_full = src[:, : t * hop], phase
+            phase = phase[:, : t * hop]
+            c = c.slice(0, t)
+            voiced_gate = voiced_gate[:, :t]
+        else:
+            phase_full = phase
         raw_noise = self.noise(t, b, c.f0.device, c.f0.dtype,
                                am_depth=c.noise_am * voiced_gate,
                                glottal_phase=phase,
@@ -181,10 +218,19 @@ class PhysicalVoiceSynth(nn.Module):
         if c.sib is not None:
             h_noise = h_noise * sibilant_response(c.sib, fs, nf)
 
-        voiced = ltv_filter(src, h_harm, hop, ir)
-        unvoiced = ltv_filter(raw_noise, h_noise, hop, ir)
+        if state is None:
+            voiced = ltv_filter(src, h_harm, hop, ir)
+            unvoiced = ltv_filter(raw_noise, h_noise, hop, ir)
+            new_state = None
+        else:
+            voiced, tv = ltv_filter(src, h_harm, hop, ir, st.get("tail_h"), True)
+            unvoiced, tn = ltv_filter(raw_noise, h_noise, hop, ir,
+                                      st.get("tail_n"), True)
+            new_state = {"phase": phase[:, -1:], "tail_h": tv, "tail_n": tn}
+            del phase_full
         audio = voiced + unvoiced
         return {
+            "state": new_state,
             "audio": audio,
             "voiced": voiced,
             "unvoiced": unvoiced,

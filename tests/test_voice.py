@@ -504,6 +504,72 @@ def test_residual_gradients_flow():
     assert g > 0 and math.isfinite(g)
 
 
+def test_streaming_matches_offline_synthesis():
+    """청크로 나눠 만들어도 한 번에 만든 것과 같아야 한다 (실시간 제어의 근거)."""
+    from formant_ml.score import build_controls
+    from formant_ml.streaming import StreamingSynth
+    c = build_controls({"timeline": [{"type": "vowel", "vowel": "a", "dur": 1.5,
+                                      "f0": [[0, 150], [0.5, 190], [1, 110]],
+                                      "jitter": 0.0, "shimmer": 0.0}]}, PROF, CFG)
+    c.noise_bands = c.noise_bands * 0           # 노이즈는 난수라 청크마다 다르다
+    syn = PhysicalVoiceSynth(CFG)
+    with torch.no_grad():
+        full = syn(c)["audio"]
+    d = CFG.filt.ir_size // 2
+    for chunk in (2, 10, 25):
+        st = StreamingSynth(CFG, synth=syn)
+        parts = [st.step(c.slice(t0, min(t0 + chunk, c.n_frames)))
+                 for t0 in range(0, c.n_frames, chunk)]
+        parts.append(st.flush())
+        stream = torch.cat([p for p in parts if p.shape[-1]], dim=-1)
+        n = min(full.shape[-1], stream.shape[-1] - d)
+        err = float((full[:, :n] - stream[:, d:d + n]).abs().max()
+                    / full.abs().max())
+        assert err < 5e-3, f"청크 {chunk} 프레임에서 오차 {err:.2e}"
+    assert StreamingSynth(CFG).latency_ms < 30.0
+
+
+def test_prosody_rate_and_pitch_are_controllable():
+    """조음 속도와 피치 엔벨로프가 의도대로 반영되어야 한다 (LLM 제어면)."""
+    from formant_ml.score import build_controls
+    tl = [{"type": "syllable", "onset": "s", "vowel": "a", "dur": 0.5},
+          {"type": "vowel", "vowel": "i", "dur": 0.5}] * 3
+    base = build_controls({"timeline": tl}, PROF, CFG).n_frames
+    fast = build_controls({"timeline": tl, "prosody": {"rate": 1.5}},
+                          PROF, CFG).n_frames
+    slow = build_controls({"timeline": tl, "prosody": {"rate": 0.7}},
+                          PROF, CFG).n_frames
+    assert fast < base < slow, (fast, base, slow)
+    assert 0.6 < (fast / base) / (1 / 1.5) < 1.7, "속도 배율이 길이에 반영되지 않는다"
+
+    c = build_controls({"timeline": tl, "prosody": {
+        "pitch_shift": 3.0, "contour": [[0, 0], [0.5, 4], [1, -4]],
+        "declination": -2.0, "pitch_range": 1.5}}, PROF, CFG)
+    f0 = c.f0[0, :, 0]
+    assert CFG.source.f0_min <= float(f0.min()), "음역을 벗어났다"
+    assert float(f0.max()) <= CFG.source.f0_max
+    flat = build_controls({"timeline": tl, "prosody": {"pitch_range": 0.0,
+                                                       "declination": 0.0}},
+                          PROF, CFG).f0[0, :, 0]
+    assert float(flat.std()) < float(f0.std()), "억양 폭 제어가 안 먹는다"
+
+
+def test_breath_is_inserted_for_long_utterances():
+    """길게 말하면 숨을 쉬어야 한다. 짧으면 안 쉬어야 한다."""
+    from formant_ml.prosody import ProsodyPlan, warp_timeline
+    long_tl = [{"type": "vowel", "vowel": "a", "dur": 0.6}] * 12
+    n = sum(1 for s in warp_timeline(
+        long_tl, ProsodyPlan.from_dict({"breath": {"capacity_s": 2.0}}))
+        if s["type"] == "breath")
+    assert n >= 2, f"7 초 발화에 들숨이 {n} 회"
+    short = warp_timeline(long_tl[:2],
+                          ProsodyPlan.from_dict({"breath": {"capacity_s": 4.5}}))
+    assert all(s["type"] != "breath" for s in short), "1.2 초인데 숨을 쉰다"
+    off = warp_timeline(long_tl, ProsodyPlan.from_dict(
+        {"breath": {"enabled": False}}))
+    assert all(s["type"] != "breath" for s in off)
+
+
 def test_voice_profile_round_trips_through_json():
     import tempfile
     p = VoiceProfile(name="t", f0_median=143.0, tilt=2.5)
