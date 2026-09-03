@@ -1,17 +1,39 @@
-"""성대 자가진동 물리모델 (2-mass / body-cover 계열).
+"""성대 자가진동 물리모델과 그 유량이 난류를 구동하는 방식.
 
-Steinecke & Herzel (1995) 의 비대칭 2질량 모델을 기반으로 한다. 이 모델은
-소스를 '주기파형 사전'이 아니라 진짜 미분방정식의 극한주기해로 만들기 때문에
-다음이 자동으로 따라온다.
+성대 모형이 '왜 이 모양이냐'
+----------------------------
+자가진동은 성대의 **수직 위상차**(mucosal wave)가 있어야 생긴다. 성문이 열릴 때는
+수렴형(convergent), 닫힐 때는 발산형(divergent)이 되어야 기류에서 순(net) 에너지를
+받는다(Titze 1988, surface-wave model; Titze 2006, myoelastic-aerodynamic theory).
+한 점 질량으로는 이 위상차가 없어 절대 떨지 않는다. 그래서 최소 두 개가 필요하다:
 
-* 진동 모드(mode) 제어 : 강성 파라미터 q 와 좌우 비대칭 a 를 움직이면
-  1:1 모드락 -> 서브하모닉(2:1, 3:1) -> 비주기(biphonic) 로 분기(bifurcation)가 생긴다.
-  성구(chest/falsetto), 성대 결절성 음성, 이중음(diplophonia)이 같은 방정식에서 나온다.
-* 지터/시머 : 인위적 난수 없이 방정식 자체의 과도상태에서 자연스럽게 생긴다.
+* **2질량**(Ishizaka & Flanagan 1972; 여기서는 Steinecke & Herzel 1995 축약):
+  성대의 하연(lower margin)·상연(upper margin)을 각각 한 점으로. 수직 위상차와
+  자가진동, 그리고 분기(성구/이중음)까지 나온다. `simulate`.
+* **수직 다질량**(`simulate_stack`): 2질량을 위-아래로 n 개 쌓은 것. "2질량 여러 개
+  위아래로" 가 바로 이것이고, **쓸모없는 게 아니라** mucosal wave 를 공간적으로
+  이산화한 것이다 — 통로 모양이 n 개 마디를 가질 수 있어 점막파가 아래에서 위로
+  전파하는 것이 궤적에 그대로 나타난다(2질량은 위상차만, 다질량은 파형까지).
+* **body-cover 3질량**(Story & Titze 1995; `simulate_body_cover`): 갑상피열근(body)과
+  점막(cover)을 분리한 표준 모형. 성구(chest/falsetto)를 body/cover 강성비로 낸다.
+
+치찰음과 '연결'되는 지점
+------------------------
+핵심은 **하나의 기류(U)가 발성과 난류를 동시에 만든다**는 것이다(Titze 의
+myoelastic-aerodynamic + Stevens 의 aeroacoustic). 성대가 만드는 성문 유량 U(t) 는:
+
+1. 유량미분 dU/dt 이 성도를 여기해 **유성음**이 되고(`flow_to_excitation`),
+2. 성문이 덜 닫혀 있으면 성문에서 **난류(기식)** 를 내고(`aeroacoustic.aspiration_*`),
+3. 그 맥동이 구강 협착의 **마찰음을 성문동기로 변조**한다(Jackson & Shadle 2000).
+
+즉 성대 모형은 난류의 *구동원* 이다. `glottal_flow_to_modulation` 이 이 유량을
+합성기의 노이즈 변조 신호로 바꿔, 성대와 치찰음을 한 기류로 잇는다. 그래서
+유성 마찰음 /z/ 이 자동으로 성문주기로 변조되고, 학습 시 소스와 노이즈가 같은
+물리량으로 묶인다(따로 노는 게 아니다).
 
 주의: 샘플 단위 시간루프이므로 느리다. 기본 학습 경로는 LF 사전(glottal.py)이고,
 이 모듈은 (a) 데이터 증강/사전학습용 시뮬레이터, (b) LF 파라미터의 물리적 해석,
-(c) 짧은 구간의 truncated BPTT 미세조정에 쓰도록 설계했다.
+(c) 소스-난류 결합 검증, (d) 짧은 구간 truncated BPTT 미세조정에 쓴다.
 """
 from __future__ import annotations
 
@@ -185,6 +207,102 @@ def simulate_stack(params: FoldParams, n_masses: int = 5, n_samples: int = 9600,
             traj[out] = x
             out += 1
     return flow, traj
+
+
+def simulate_body_cover(params: FoldParams, n_samples: int = 9600,
+                        sample_rate: int = 24000, oversample: int = 4,
+                        body_mass: float = 0.5, body_stiff: float = 40_000.0,
+                        body_damp: float = 0.1, device=None,
+                        dtype=torch.float64):
+    """Story & Titze(1995) body-cover 3질량. 반환 (flow, x (n_samples, 3)).
+
+    2질량(cover: 하연 m1·상연 m2)에 **body 질량**을 하나 더 붙인다. body 는
+    갑상피열근(TA)이고 cover 는 그 위를 덮은 점막이다. cover 두 질량이 body 에
+    스프링으로 매달리고, body 는 고정벽에 매달린다.
+
+    이 분리가 필요한 이유: 성구(register)는 TA(body)와 CT 의 긴장 배분으로
+    바뀐다. body 가 단단하고 cover 가 무르면 점막파가 잘 실려 chest, body 까지
+    긴장하면 falsetto 다. 2질량만으로는 이 배분을 표현할 축이 없다.
+
+    x = [x1(하연 cover), x2(상연 cover), xb(body)]. 유량은 cover 최소 단면이 정한다.
+    """
+    p = params
+    dt = 1.0 / (sample_rate * oversample)
+    q = p.q
+    m1, m2, mb = p.m1 / q, p.m2 / q, body_mass / q
+    k1, k2, kc = p.k1 * q, p.k2 * q, p.kc * q
+    kb = body_stiff * q
+    k1l = k1 * p.asym
+    c1 = 2.0 * p.r1 * (m1 * k1) ** 0.5
+    c2 = 2.0 * p.r2 * (m2 * k2) ** 0.5
+    cb = 2.0 * body_damp * (mb * kb) ** 0.5
+    two_l = 2.0 * p.length
+    sqrt_2ps_rho = (2.0 * p.ps / p.rho) ** 0.5
+
+    x1 = torch.tensor(0.01, device=device, dtype=dtype)
+    x2 = torch.zeros((), device=device, dtype=dtype)
+    xb = torch.zeros((), device=device, dtype=dtype)
+    v1 = torch.zeros((), device=device, dtype=dtype)
+    v2 = torch.zeros((), device=device, dtype=dtype)
+    vb = torch.zeros((), device=device, dtype=dtype)
+    flow = torch.zeros(n_samples, device=device, dtype=dtype)
+    traj = torch.zeros(n_samples, 3, device=device, dtype=dtype)
+
+    out = 0
+    for n in range(n_samples * oversample):
+        # cover 변위는 body 변위에 상대적이다(cover 가 body 위에 얹혀 있다)
+        a1 = p.a01 + two_l * (x1 + xb)
+        a2 = p.a02 + two_l * (x2 + xb)
+        amin = torch.minimum(a1, a2)
+        open_ = (amin > 0).to(dtype)
+        p1 = p.ps * (1.0 - open_ * (amin / a1.abs().clamp_min(1e-6)) ** 2) \
+            * (a1 > 0).to(dtype)
+        col1 = torch.where(a1 < 0, p.collision * k1 * (a1 / two_l), torch.zeros_like(a1))
+        col2 = torch.where(a2 < 0, p.collision * k2 * (a2 / two_l), torch.zeros_like(a2))
+        # cover 두 질량: body 에 대해 매달림(k1,k2), 서로 결합(kc)
+        f1 = -c1 * v1 - 0.5 * (k1 + k1l) * x1 - kc * (x1 - x2) - col1 \
+            + p.length * p.d1 * p1
+        f2 = -c2 * v2 - 0.5 * k2 * x2 - kc * (x2 - x1) - col2
+        # body: 고정벽에 매달리고, cover 의 반작용을 받는다
+        fb = (-cb * vb - kb * xb + 0.5 * (k1 * x1 + k2 * x2)
+              + kc * 0.0)
+        v1 = v1 + dt * f1 / m1
+        v2 = v2 + dt * f2 / m2
+        vb = vb + dt * fb / mb
+        x1 = x1 + dt * v1
+        x2 = x2 + dt * v2
+        xb = xb + dt * vb
+        if n % oversample == 0:
+            flow[out] = torch.clamp(amin, min=0.0) * sqrt_2ps_rho
+            traj[out] = torch.stack([x1, x2, xb])
+            out += 1
+    return flow, traj
+
+
+def glottal_flow_to_modulation(flow: torch.Tensor, sample_rate: int = 24000,
+                               hop: int = 240):
+    """성문 유량 U(t) -> 프레임률 (성문개방 포락선, 맥동 변조 깊이).
+
+    성대와 난류를 잇는 다리다. 반환:
+      * `open_env` (1,T,1): 각 프레임의 평균 성문 개방(≈유량). 성문이 열려 있을 때
+        기식/마찰 난류가 세다.
+      * `mod_depth` (1,T,1): 유량의 주기적 맥동 깊이(AC/DC). 유성 마찰음에서
+        마찰음이 성문주기로 변조되는 정도(Jackson & Shadle 2000).
+
+    이 두 신호를 합성기의 `noise_bands`·`noise_am` 에 그대로 넣으면, 성대 모형이
+    낸 유량이 난류(치찰음)를 실제로 구동/변조한다.
+    """
+    u = flow.detach().to(torch.float32)
+    if u.dim() == 1:
+        u = u[None]
+    n = u.shape[-1]
+    t = n // hop
+    u = u[..., :t * hop].reshape(u.shape[0], t, hop)
+    dc = u.mean(-1)                                    # 프레임 평균(개방도)
+    ac = u.std(-1)                                     # 프레임 내 맥동
+    open_env = (dc / dc.amax().clamp_min(1e-9)).unsqueeze(-1)
+    mod = (ac / dc.clamp_min(1e-6)).clamp(0.0, 1.0).unsqueeze(-1)
+    return open_env, mod
 
 
 def mucosal_wave_delay(traj: torch.Tensor, sample_rate: int = 24000) -> float:

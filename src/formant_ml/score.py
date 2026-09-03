@@ -34,6 +34,7 @@ from dataclasses import fields as dc_fields
 from .dsp.sibilant import PRESETS as SIB_PRESETS
 from .dsp.sibilant import SibilantParams
 from . import aerodynamics as aero
+from . import aeroacoustic as aac
 from .gestures import GESTURES, base
 from .models.synth import Controls, PhysicalVoiceSynth
 from .presets import FRICATIVES, LOCUS, VOWELS
@@ -118,6 +119,63 @@ def fricative_gain(prof: VoiceProfile) -> float:
     return float(10.0 ** ((FRICATIVE_CAL_DB - want) / 20.0))
 
 
+#: 공기음향 마찰음을 요청하는 키들. 하나라도 있으면 임의 페이드 대신 협착 면적
+#: 궤적에서 유량·레이놀즈 게이트·무게중심을 **유도**한다(aeroacoustic.py).
+_AERO_KEYS = ("constriction_area", "a_open", "a_closed", "release_s", "hold_ratio",
+              "glottal_area", "aero")
+_PS_CGS = 8000.0    # 보통 발화 성문하압 [dyn/cm^2] ≈ 8 cmH2O (pressure=1.0 기준)
+
+
+def wants_aero(seg: dict) -> bool:
+    return any(k in seg for k in _AERO_KEYS)
+
+
+def aero_frication(seg: dict, t: int, frame_rate: float,
+                   glottal_area=None):
+    """협착 면적 궤적 -> (진폭 포락선, 무게중심 배율). 둘 다 (1, T, 1).
+
+    물리(aeroacoustic.py): 폐압이 성문·구강 협착을 직렬로 지나며 유량 U 를 만들고,
+    협착부 레이놀즈수가 임계값을 넘을 때만 난류(마찰음)가 난다. 협착이 열리거나
+    (모음) 성문이 닫히면(발성) 유량이 줄어 저절로 꺼지고, 입자속도가 떨어지면
+    무게중심도 내려간다. 손으로 그린 페이드/치찰음 곡선이 아니라 **면적에서 전부
+    유도**된다.
+
+    `glottal_area` 로 성문 면적 궤적(스칼라/곡선)을 줄 수 있다. 안 주면 seg 에서
+    읽고, 그것도 없으면 무성 마찰음 기본값(0.12, 열림)을 쓴다.
+    """
+    ac_area = aac.constriction_area(
+        t, frame_rate,
+        a_closed=float(seg.get("a_closed", 0.10)),
+        a_open=float(seg.get("a_open", 3.0)),
+        hold=float(seg.get("hold_ratio", 0.5)),
+        release=float(seg.get("release_s", 0.06)),
+        shape=seg.get("constriction_area"))
+    # 성문 면적: 무성 마찰음은 열려 있고(기류 셈), 발성으로 가며 내전해 닫힌다.
+    if glottal_area is None:
+        glottal_area = seg.get("glottal_area", 0.12)
+    ag_t = curve(glottal_area, t) if not isinstance(glottal_area, (int, float)) \
+        else torch.full((1, t, 1), float(glottal_area))
+    ps = _PS_CGS * float(seg.get("pressure_scale", 1.0))
+    ps_t = torch.full((1, t, 1), ps)
+    u = aac.series_flow(ps_t, ag_t, ac_area)
+    amp = aac.frication_source_amp(u, ac_area)
+    env = amp / amp.amax().clamp_min(1e-9)          # 피크 1 로 정규화(레벨은 nb 가)
+    cent = aac.velocity_centroid_scale(u, ac_area)
+    return env, cent
+
+
+def _scale_sib_center(sib: SibilantParams, cent: torch.Tensor) -> None:
+    """무게중심 배율(1,T,1)을 치찰음 공진 주파수들에 곱한다(제자리).
+
+    입자속도가 떨어지면(협착이 열리면) 앞공동 공진·앞니 공명·반공진이 함께
+    내려간다 = 스펙트럼 전체가 아래로 미끄러진다(Stevens 1971).
+    """
+    for k in ("pole_f", "zero_f", "teeth_f"):
+        v = getattr(sib, k)
+        if v is not None:
+            setattr(sib, k, v * cent)
+
+
 def _vowel_formants(name: str, prof: VoiceProfile, n: int) -> list[float]:
     """이 화자의 해당 모음 포먼트.
 
@@ -185,19 +243,22 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
         # 안 맞추면 치찰음만 튀어나와 들린다(실측 한국어 "스": 모음이 5.4 dB 큼).
         nb = band_shelf(NB, 500.0, g * fricative_gain(prof),
                         a.sample_rate).reshape(1, 1, -1)
+        aero_env = aero_cent = None
         if kind == "fricative":
             c["harmonic_amp"] = torch.zeros(1, t, 1)
-            # 유량(부피속도) 포락선 -> 난류 진폭. 협착이 형성/해제되며 기류가
-            # 붙고 빠지므로 마찰음도 페이드 인/아웃 한다. 상수(env=ones)로 두면
-            # 히스가 스위치처럼 탁 켜졌다 꺼진다. fade_in/fade_out(초),
-            # flow([(위치,값),...]), flow_exp(유량->진폭 지수) 로 조종한다.
-            flow = aero.frication_flow(
-                t, a.frame_rate,
-                fade_in=float(seg.get("fade_in", 0.03)),
-                fade_out=float(seg.get("fade_out", 0.04)),
-                shape=seg.get("flow"))
-            env = aero.flow_to_noise_amp(
-                flow, float(seg.get("flow_exp", aero.FRICATION_FLOW_EXPONENT)))
+            if wants_aero(seg):
+                # 공기음향 경로: 협착 면적에서 진폭·무게중심을 유도(권장).
+                aero_env, aero_cent = aero_frication(seg, t, a.frame_rate)
+                env = aero_env
+            else:
+                # 단순 경로: 유량 포락선을 직접 준다(페이드 인/아웃, 초).
+                flow = aero.frication_flow(
+                    t, a.frame_rate,
+                    fade_in=float(seg.get("fade_in", 0.03)),
+                    fade_out=float(seg.get("fade_out", 0.04)),
+                    shape=seg.get("flow"))
+                env = aero.flow_to_noise_amp(
+                    flow, float(seg.get("flow_exp", aero.FRICATION_FLOW_EXPONENT)))
             c["noise_bands"] = (nb.expand(1, t, NB) * env).contiguous()
         else:
             # 실측("사"): /s/ 120 ms, 전이 60 ms, 모음 360 ms.
@@ -219,16 +280,33 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
             # 달라진다)와 어긋나 음절마다 비율이 흔들린다(실측: 목표 +9.7 dB 인데
             # -6.2 dB 가 나왔다).
             nb = nb * float(c["harmonic_amp"].max().clamp_min(1e-3))
-            # 마찰음 게이트: 모음으로 넘어갈 때 빠르게 꺼진다(=자연스러운 fade-out).
-            env = ramp(t, [(0.0, 1.0), (split, 1.0), (split + 0.1, 0.02), (1.0, 0.01)])
-            # 그 위에 협착 형성 구간의 유량 fade-in 을 곱한다. 시작부터 최대
-            # 히스로 켜지지 않고 기류가 붙으면서 소리가 든다. fade-out 은 위 게이트가
-            # 담당하므로 여기선 상승만(fade_out=0). fade_in(초)/flow_exp 로 조종.
-            fin = aero.frication_flow(
-                t, a.frame_rate, fade_in=float(seg.get("fade_in", 0.025)),
-                fade_out=0.0, shape=seg.get("flow"))
-            env = env * aero.flow_to_noise_amp(
-                fin, float(seg.get("flow_exp", aero.FRICATION_FLOW_EXPONENT)))
+            if wants_aero(seg):
+                # 공기음향 경로: 협착 면적이 열리며(release) 레이놀즈수가 임계
+                # 아래로 떨어져 마찰음이 저절로 꺼진다 = 물리적 fade-out. 무게중심도
+                # 함께 내려간다. 손으로 그린 게이트/치찰음 곡선이 필요 없다.
+                seg2 = dict(seg)
+                seg2.setdefault("a_open", 3.0)
+                seg2.setdefault("hold_ratio", split)
+                seg2.setdefault("release_s", float(seg.get("transition_s", 0.05)))
+                trans = float(seg.get("transition_s", 0.05)) * a.frame_rate / max(t, 1)
+                # 성문은 /s/ 동안 열려 있다가(무성) 발성이 시작되며 내전해 닫힌다.
+                # 성문이 닫히면 유량이 성문에서 막혀 구강 마찰음도 함께 꺼진다 —
+                # 그래서 마찰음 offset 이 발성 onset 과 물리적으로 맞물린다.
+                ag_curve = seg.get("glottal_area", [
+                    [0.0, 0.12], [split, 0.12], [min(split + trans, 1.0), 0.03],
+                    [1.0, 0.03]])
+                env, aero_cent = aero_frication(seg2, t, a.frame_rate,
+                                                glottal_area=ag_curve)
+            else:
+                # 마찰음 게이트: 모음으로 넘어갈 때 빠르게 꺼진다(자연스러운 fade-out).
+                env = ramp(t, [(0.0, 1.0), (split, 1.0), (split + 0.1, 0.02),
+                               (1.0, 0.01)])
+                # 협착 형성 구간의 유량 fade-in 을 곱한다(fade-out 은 위 게이트가 담당).
+                fin = aero.frication_flow(
+                    t, a.frame_rate, fade_in=float(seg.get("fade_in", 0.025)),
+                    fade_out=0.0, shape=seg.get("flow"))
+                env = env * aero.flow_to_noise_amp(
+                    fin, float(seg.get("flow_exp", aero.FRICATION_FLOW_EXPONENT)))
             # 노이즈 경로가 하나뿐이라, 구강 협착(마찰음)에서 성문(기식)으로
             # 주입 위치를 옮기며 섞는다.
             asp_n = band_shelf(NB, 900.0, fricative_gain(prof), a.sample_rate
@@ -280,6 +358,11 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
                     base_p[key] = base_p[key] + (prof.sibilant[key] - ref[key])
         sib = SibilantParams.constant((1, t, 1), mix=1.0,
                                       roughness=prof.roughness, **base_p)
+        # 공기음향 경로: 입자속도에서 유도한 무게중심 배율로 치찰음 공진을 시변화.
+        # 협착이 열리며 속도가 떨어지면 봉우리가 내려간다(Stevens 1971). 실측 /사/
+        # 의 무게중심 하강(6700->3900)이 손 곡선 없이 여기서 나온다.
+        if aero_cent is not None:
+            _scale_sib_center(sib, aero_cent)
         c["sib"] = sib
     else:
         raise ValueError(f"모르는 세그먼트 type: {kind!r}. "
