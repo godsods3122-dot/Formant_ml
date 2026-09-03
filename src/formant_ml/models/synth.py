@@ -111,9 +111,10 @@ class Controls:
 
 class PhysicalVoiceSynth(nn.Module):
     def __init__(self, cfg: Config = DEFAULT, tract_mode: str = "formant",
-                 glottal_f1_loss_hz: float = 130.0):
+                 glottal_f1_loss_hz: float = 130.0, noise_smoothing: float = 0.0):
         super().__init__()
         self.glottal_f1_loss_hz = float(glottal_f1_loss_hz)
+        self.noise_smoothing = float(noise_smoothing)
         assert tract_mode in ("formant", "waveguide")
         self.cfg = cfg
         self.tract_mode = tract_mode
@@ -214,10 +215,10 @@ class PhysicalVoiceSynth(nn.Module):
 
         voiced = ltv_filter(src, h_harm, hop, ir)
         unvoiced = ltv_filter(raw_noise, h_noise, hop, ir)
-        # 색을 입힌 뒤 되살아난 빠른 포락선 요동을 한 번 더 누른다.
-        smooth = 1.0 - (float(c.noise_rough.detach().mean())
-                        if c.noise_rough is not None else 0.0)
-        unvoiced = flatten_fast_envelope(unvoiced, fs, max(smooth, 0.0))
+        # 포락선 평탄화는 **기본으로 끈다**. 켜면 신호 통계가 잡음(첨도 3)에서
+        # 사인파(첨도 1.5) 쪽으로 이동해 '기계음'이 된다. 연구용으로만 쓴다.
+        if self.noise_smoothing > 0:
+            unvoiced = flatten_fast_envelope(unvoiced, fs, self.noise_smoothing)
 
         # 기식 노이즈: 성문에서 나 성도 전체를 통과한다. 마찰 노이즈와 별개의
         # 난수를 쓴다(같은 신호를 두 경로로 보내면 콤필터가 생긴다).

@@ -117,7 +117,8 @@ class TurbulenceSource(nn.Module):
     """
 
     def __init__(self, sample_rate: int, hop_size: int, n_bands: int = 40,
-                 init_beta: float = 1.0, init_knee_hz: float = 6.0):
+                 init_beta: float = 1.0, init_knee_hz: float = 6.0,
+                 smoothness: float = 0.0):
         super().__init__()
         self.sample_rate = sample_rate
         self.hop_size = hop_size
@@ -127,6 +128,8 @@ class TurbulenceSource(nn.Module):
         # 변조 스펙트럼: |M(f)| = (1 + (f/knee)^2)^(-beta/2)
         self.raw_beta = nn.Parameter(torch.tensor(float(init_beta)))
         self.raw_knee = nn.Parameter(torch.tensor(float(init_knee_hz)).log())
+        # 0 = 가우시안(기본, 실제 난류), 1 = low-noise noise. 연구용 손잡이다.
+        self.smoothness = float(smoothness)
 
 
     # ------------------------------------------------------------------ 사전
@@ -160,14 +163,19 @@ class TurbulenceSource(nn.Module):
                 generator: torch.Generator | None = None) -> torch.Tensor:
         """반환: 난류 소스 (B, N), N = n_frames * hop_size.
 
-        `roughness` 는 이제 **잡음 자체의 거칠기**다: 0 이면 포락선이 평평한
-        low-noise noise, 1 이면 보통의 가우시안 백색잡음. 예전처럼 가우시안 위에
-        변조를 *더하는* 게 아니라, 가우시안이 상한이 된다.
+        `roughness` 는 가우시안 잡음 위에 얹는 **느린(<10 Hz) 진폭 흔들림**이다.
+        0 = 그냥 가우시안(실제 난류의 통계). 거친 목소리/프라이에서만 올린다.
         """
         n = n_frames * self.hop_size
-        r_mean = 0.0 if roughness is None else float(roughness.detach().mean())
-        w = low_noise_noise((batch, n), flatten=1.0 - min(max(r_mean, 0.0), 1.0),
-                            device=device, dtype=dtype, generator=generator)
+        # **가우시안이 기본이다.** 실제 난류의 통계가 가우시안이고(첨도 3),
+        # 포락선을 평평하게 만들면 통계가 사인파 쪽(첨도 1.5)으로 가서
+        # 잡음이 아니라 '기계음'이 된다. 실측: 평탄화한 /s/ 의 첨도 1.61,
+        # crest factor 1.85 — 소리로는 20~30 Hz 로 맥동하는 톤처럼 들린다.
+        # `smoothness` 를 명시적으로 켤 때만 평탄화한다(기본 0 = 끔).
+        w = torch.randn(batch, n, device=device, dtype=dtype, generator=generator)
+        if self.smoothness > 0:
+            w = low_noise_noise((batch, n), flatten=self.smoothness,
+                                device=device, dtype=dtype, generator=generator)
 
         if roughness is not None:
             # 느린(<10 Hz) 진폭 흔들림만 더한다. 학습 파라미터(beta, knee)가

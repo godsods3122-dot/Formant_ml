@@ -287,40 +287,40 @@ def test_glottal_opening_widens_f1():
     assert 30.0 < float(d[1]) < 130.0        # 문헌의 주기평균 50~100 Hz 범위
 
 
-def test_fricative_is_smoother_than_gaussian_noise():
-    """마찰음의 청각 거칠기 대역(20~150 Hz) 변조가 가우시안 잡음보다 작아야 한다.
+def test_fricative_noise_has_gaussian_statistics():
+    """마찰음은 **가우시안 잡음의 통계**를 가져야 한다 (첨도 3, crest ~4.3).
 
-    **가우시안 백색잡음은 주어진 스펙트럼에서 가장 거친 잡음이다** (포락선이
-    레일리 분포, 변동계수 0.523). 그 요동의 상당 부분이 20~150 Hz — 청각
-    거칠기가 가장 예민한 대역 — 에 들어가 '지글거림'이 된다.
-    `noise_rough` 는 이제 0=low-noise noise(평평), 1=가우시안 이다.
+    실제 난류가 가우시안이다. 포락선을 평평하게 만들면 통계가 사인파 쪽
+    (첨도 1.5, crest 1.41)으로 이동하고, 그러면 잡음이 아니라 20~30 Hz 로
+    맥동하는 '기계음'처럼 들린다 — 실제로 겪은 실패다(첨도 1.61, crest 1.85).
 
-    주의: 예전 지표는 STFT(창 42 ms) 포락선이라 12 Hz 위를 못 봤다. 여기서는
-    힐베르트 포락선을 샘플률에서 잡는다.
+    스펙트럼만 보는 지표로는 이 실패를 절대 못 잡는다. 그래서 이 테스트가 있다.
     """
     from formant_ml.config import Config as C
     from formant_ml.score import render
     from formant_ml.voice import VoiceProfile
+    for prof in (VoiceProfile(), VoiceProfile.female()):
+        y = render({"timeline": [{"type": "fricative", "phone": "s", "dur": 0.5}],
+                    "seed": 3}, prof, C())[0]
+        x = y[int(0.08 * 24000): int(0.45 * 24000)]
+        x = x - x.mean()
+        sd = x.std()
+        kurt = float((x ** 4).mean() / sd ** 4)
+        crest = float(x.abs().max() / sd)
+        assert 2.5 < kurt < 3.6, kurt          # 가우시안 3.0
+        assert 3.3 < crest < 5.5, crest        # 가우시안 ~4.3
 
-    def roughness_index(rough):
-        y = render({"timeline": [{"type": "fricative", "phone": "s", "dur": 0.6,
-                                  "noise_rough": rough}], "seed": 3},
-                   VoiceProfile(), C())[0]
-        y = y[int(0.08 * 24000): int(0.5 * 24000)]
-        n = len(y)
-        Y = torch.fft.rfft(y)
-        A = torch.zeros(n, dtype=torch.complex64)
-        A[: len(Y)] = Y * 2
-        A[0] = Y[0]
-        e = torch.fft.ifft(A).abs()
-        e = e / e.mean() - 1.0
-        E = torch.fft.rfft(e * torch.hann_window(n)).abs()
-        mf = torch.linspace(0, 12000, len(E))
-        return float((E[(mf > 20) & (mf < 150)] ** 2).sum().sqrt() / n * 2)
 
-    smooth, gaussian = roughness_index(0.0), roughness_index(1.0)
-    assert smooth < gaussian * 0.6, (smooth, gaussian)   # 실측 0.022 vs 0.104
-    assert roughness_index(0.5) > smooth                  # 단조
+def test_low_noise_noise_is_available_but_off_by_default():
+    """평탄화 도구는 남겨 두되 기본은 꺼져 있어야 한다."""
+    from formant_ml.config import Config as C
+    from formant_ml.dsp.noise import low_noise_noise
+    from formant_ml.models.synth import PhysicalVoiceSynth
+    assert PhysicalVoiceSynth(C()).noise_smoothing == 0.0
+    x = low_noise_noise((1, 1 << 14), flatten=1.0)
+    e = x[0]
+    k = float((e ** 4).mean() / e.std() ** 4)
+    assert k < 2.2, k                          # 평탄화하면 사인파 쪽으로 간다
 
 
 def test_envelope_flattening_preserves_the_spectrum():
