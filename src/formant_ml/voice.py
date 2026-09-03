@@ -72,7 +72,9 @@ class VoiceProfile:
     dispersion: dict = field(default_factory=lambda: {"freq": [], "radius": []})
 
     # --- 난류 ---------------------------------------------------------------
-    roughness: float = 0.35              # 난류 시간변조 깊이
+    # 난류의 느린 세기 변동. 크게 두면 진폭 분포의 꼬리가 두꺼워져 지글거린다
+    # (핑크 노이즈의 첨도 2.97 이 기준선; docs/VOICE.md §3 참고).
+    roughness: float = 0.12
     breathiness: float = 0.15            # 유성 구간 기식 노이즈 세기
 
     meta: dict = field(default_factory=dict)

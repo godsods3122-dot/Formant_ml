@@ -85,7 +85,7 @@ def laugh(t: int, prof: VoiceProfile, frame_rate: float = 100.0, rate_hz: float 
     # 짧고 눌린 성문 펄스 -> 뒤로 갈수록 기식적으로
     c["rd"] = ramp(t, [(0.0, max(prof.rd_low, 0.45)), (1.0, prof.rd_high)])
     c["noise_am"] = _c(t, 0.8)
-    c["noise_rough"] = _c(t, min(1.0, prof.roughness + 0.3))
+    c["noise_rough"] = _c(t, min(1.0, prof.roughness + 0.10))
     # 성문 마찰(/ㅎ/): 노이즈가 성도 전체를 통과한다
     c["noise_entry"] = _c(t, 0.0)
     nb = band_bump(n_bands, 1400.0, 3500.0, breathiness, sample_rate)
@@ -107,7 +107,7 @@ def breath(t: int, prof: VoiceProfile, inhale: bool = False, strength: float = 0
                                   strength, sample_rate).reshape(1, 1, -1)
                         * env).contiguous()
     c["noise_entry"] = _c(t, 0.0)
-    c["noise_rough"] = _c(t, 0.6)
+    c["noise_rough"] = _c(t, 0.20)
     return c
 
 
@@ -150,7 +150,7 @@ def whisper(t: int, prof: VoiceProfile, vowel: str = "a", strength: float = 0.6,
     c["noise_bands"] = band_bump(n_bands, 1600.0, 5000.0, strength, sample_rate
                                  ).reshape(1, 1, -1).expand(1, t, -1).contiguous()
     c["noise_entry"] = _c(t, 0.0)
-    c["noise_rough"] = _c(t, 0.45)
+    c["noise_rough"] = _c(t, 0.15)
     return c
 
 
@@ -176,7 +176,7 @@ def throat_clear(t: int, prof: VoiceProfile, n_formants: int = 8, n_bands: int =
                                   ).reshape(1, 1, -1)
                         * ramp(t, [(0.0, 0.2), (0.2, 1.0), (1.0, 0.15)])).contiguous()
     c["noise_entry"] = _c(t, 0.0)
-    c["noise_rough"] = _c(t, 0.8)
+    c["noise_rough"] = _c(t, 0.25)
     return c
 
 

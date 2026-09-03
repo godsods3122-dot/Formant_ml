@@ -285,6 +285,66 @@ def test_every_segment_type_renders():
             assert float(y.abs().max()) > 1e-5, f"{kind} 가 무음이다"
 
 
+def _kurtosis(y):
+    x = y.reshape(-1)
+    x = x - x.mean()
+    return float((x ** 4).mean() / (x ** 2).mean().clamp_min(1e-12) ** 2)
+
+
+def _envelope_cv(y):
+    e = y.reshape(-1).abs()
+    k = torch.ones(1, 1, 121) / 121
+    e = torch.nn.functional.conv1d(e.view(1, 1, -1), k, padding=60).view(-1)
+    return float(e.std() / e.mean().clamp_min(1e-9))
+
+
+def test_fricatives_are_as_smooth_as_pink_noise():
+    """치찰음/속삭임이 지글거리면 안 된다.
+
+    '지글거림' 은 진폭 분포의 두꺼운 꼬리다. 백색 소스는 이미 빠른 난류 요동을
+    담고 있어서, 그 위에 광대역 곱셈 변조를 얹으면 두 잡음 과정의 곱이 되어
+    첨도가 올라간다(측정: 2.97 -> 4.35). 변조를 느린 대역으로 제한해서 고쳤다.
+    """
+    ref = torch.randn(1, 48000)
+    X = torch.fft.rfft(ref)
+    f = torch.linspace(0, FS / 2, X.shape[-1])
+    pink = torch.fft.irfft(X / (1 + f / 100).sqrt(), 48000)
+    k_ref, cv_ref = _kurtosis(pink), _envelope_cv(pink)
+    assert 2.5 < k_ref < 3.5, k_ref                      # 전제 확인
+
+    for tl in ([{"type": "fricative", "phone": "s", "dur": 2.0}],
+               [{"type": "fricative", "phone": "sh", "dur": 2.0}],
+               [{"type": "whisper", "dur": 2.0}],
+               [{"type": "whisper", "vowel": "i", "dur": 2.0}]):
+        y = render({"timeline": tl, "seed": 1}, PROF, CFG)
+        k, cv = _kurtosis(y), _envelope_cv(y)
+        assert k < k_ref + 0.6, f"{tl[0]['type']} 첨도 {k:.2f} (핑크 {k_ref:.2f})"
+        assert cv < cv_ref * 1.6, f"{tl[0]['type']} 포락선 CV {cv:.3f} (핑크 {cv_ref:.3f})"
+
+
+def test_roughness_knob_never_sizzles():
+    """난류 거칠기를 끝까지 올려도 진폭 분포가 무너지지 않아야 한다.
+
+    손잡이의 어떤 값도 비물리적 아티팩트를 못 내게 하는 것이 이 레포의 규약이다.
+    """
+    prev = 0.0
+    for r in (0.0, 0.3, 0.6, 1.0):
+        y = render({"timeline": [{"type": "fricative", "phone": "s", "dur": 2.0,
+                                  "noise_rough": r}], "seed": 1}, PROF, CFG)
+        k = _kurtosis(y)
+        assert k < 4.6, f"noise_rough={r} 에서 첨도 {k:.2f}"
+        assert k >= prev - 0.15, "거칠기를 올렸는데 오히려 매끄러워졌다"
+        prev = k
+
+
+def test_unvoiced_sounds_get_no_glottal_am():
+    """성대가 안 떨면 성문동기 변조도 없어야 한다 (속삭임에 F0 주기성 금지)."""
+    y = render({"timeline": [{"type": "whisper", "dur": 2.0, "noise_am": 1.0}],
+                "seed": 1}, PROF, CFG)
+    assert float(periodicity(y, FS, 240).mean()) < 0.3, \
+        "무성음인데 F0 주기성이 보인다"
+
+
 def test_no_transient_at_segment_boundaries():
     """세그먼트 경계에서 클릭이 생기면 안 된다 (평활 정도와 무관해야 한다).
 

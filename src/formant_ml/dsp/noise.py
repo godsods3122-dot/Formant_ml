@@ -3,11 +3,17 @@
 기존 구현은 `white noise x 대역게인` 이었다. 그건 정상(stationary) 백색잡음이라
 실제 마찰음/기식음과 두 가지가 다르다.
 
-1. **진짜 난류는 정상적이지 않다.** 협착부 제트는 스스로 요동해서 진폭이 계속
-   흔들린다. 그 변조 스펙트럼은 대략 1/f^β (β≈1) 로, 백색이 아니다. 이 변조가
-   없으면 합성음이 '테이프 히스' 처럼 죽은 소리가 되고, 반대로 모델이 크기
-   스펙트럼만 맞추다 보면 프레임마다 같은 벡터를 반복해 **미세하게 주기적인**
-   텍스처가 생긴다.
+1. **진짜 난류는 정상적이지 않다.** 협착부 제트는 스스로 요동해서 세기가 천천히
+   흔들린다(제트 사행, 조음 미세변동). 이 느린 비정상성이 없으면 합성음이
+   '테이프 히스' 처럼 죽은 소리가 되고, 모델이 크기 스펙트럼만 맞추다 보면
+   프레임마다 같은 벡터를 반복해 **미세하게 주기적인** 텍스처가 생긴다.
+
+   **단, 느린 성분만이다.** 백색 소스 자체가 이미 빠른 난류 요동을 담고 있다.
+   그 위에 광대역 곱셈 변조를 또 얹으면 같은 것을 두 번 세는 셈이고, 두 잡음
+   과정의 곱은 꼬리가 두꺼운(K-분포) 진폭 분포가 되어 **지글거리는 소리**로
+   들린다. 측정: 광대역 변조(에너지의 65%가 50 Hz 위)를 넣었더니 진폭 첨도가
+   2.97(핑크 노이즈) → 4.35 로 올라갔다. 그래서 변조는 수 Hz~수십 Hz 대역으로
+   제한하고 깊이도 작게 둔다.
 2. **소스의 색(color)은 화자/조음에 공통인 부분이 있다.** 그 공통 부분을 매
    프레임 다시 예측하게 하면 낭비이고 불안정하다.
 
@@ -38,14 +44,16 @@ class TurbulenceSource(nn.Module):
     """
 
     def __init__(self, sample_rate: int, hop_size: int, n_bands: int = 40,
-                 init_beta: float = 1.0, init_knee_hz: float = 120.0):
+                 init_beta: float = 2.0, init_knee_hz: float = 8.0):
         super().__init__()
         self.sample_rate = sample_rate
         self.hop_size = hop_size
         self.n_bands = n_bands
         # 난류 소스의 스펙트럼 사전 (평균 0 으로 초기화 = 백색에서 시작)
         self.log_prior = nn.Parameter(torch.zeros(n_bands))
-        # 변조 스펙트럼: |M(f)| = (1 + (f/knee)^2)^(-beta/2)
+        # 변조 스펙트럼: |M(f)| = (1 + (f/knee)^2)^(-beta/2).
+        # knee 를 수 Hz 대로 두고 beta>=2 (>= -12 dB/oct) 로 떨어뜨려, 변조가
+        # '느린 흔들림' 에 머물고 빠른 알갱이 소리가 되지 않게 한다.
         self.raw_beta = nn.Parameter(torch.tensor(float(init_beta)))
         self.raw_knee = nn.Parameter(torch.tensor(float(init_knee_hz)).log())
 
@@ -57,13 +65,18 @@ class TurbulenceSource(nn.Module):
 
     def modulation_envelope(self, b: int, n: int, device, dtype,
                             generator: torch.Generator | None = None) -> torch.Tensor:
-        """1/f^beta 변조 포락선 (B, N), 평균 1 / 표준편차 1 로 정규화."""
+        """느린 변조 신호 (B, N). 평균 0 / 표준편차 1.
+
+        차단주파수를 수 Hz 대로 잡는 것이 핵심이다. 변조를 광대역으로 두면
+        백색 소스의 빠른 요동과 곱해져 진폭 분포의 꼬리가 두꺼워지고, 그게
+        귀에는 지글거림으로 들린다 (모듈 상단 주석의 측정치 참고).
+        """
         m = torch.randn(b, n, device=device, dtype=dtype, generator=generator)
         M = torch.fft.rfft(m)
         f = torch.linspace(0, self.sample_rate / 2, M.shape[-1],
                            device=device, dtype=dtype)
-        beta = F.softplus(self.raw_beta).clamp(0.05, 4.0)
-        knee = self.raw_knee.exp().clamp(10.0, 4000.0)
+        beta = F.softplus(self.raw_beta).clamp(1.0, 4.0)
+        knee = self.raw_knee.exp().clamp(1.0, 60.0)
         w = (1.0 + (f / knee) ** 2) ** (-beta / 2.0)
         e = torch.fft.irfft(M * w.to(M.dtype), n)
         e = e - e.mean(-1, keepdim=True)
@@ -83,8 +96,13 @@ class TurbulenceSource(nn.Module):
             env = self.modulation_envelope(batch, n, device, dtype, generator)
             r = upsample(roughness, self.hop_size).squeeze(-1).clamp(0.0, 1.0)
             r = r[..., :n]
-            # 1 + r*env 를 아래에서 잘라내면 평균이 올라가므로 다시 정규화한다.
-            g = (1.0 + r * env).clamp_min(0.0)
+            # 지수 형태라 항상 양수다. `1 + r·env` 를 0 에서 잘라내는 방식은
+            # 0.4% 의 샘플에서 포락선이 납작하게 끊겨 그 자체가 딱딱 끊기는
+            # 소리를 만든다. r 이 작으면 exp(r·env) ≈ 1 + r·env 로 같다.
+            # 계수 0.30 은 손잡이를 끝까지(r=1) 올려도 진폭 첨도가 4.3 을 넘지 않고
+            # 게인이 0.46 아래로 안 내려가도록 잡은 값이다. 즉 이 손잡이의 어떤
+            # 값에서도 지글거림이 나오지 않는다.
+            g = torch.exp(0.30 * r * env.clamp(-3.0, 3.0))
             g = g / g.pow(2).mean(-1, keepdim=True).clamp_min(1e-6).sqrt()
             w = w * g
 

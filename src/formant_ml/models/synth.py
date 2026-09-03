@@ -159,8 +159,12 @@ class PhysicalVoiceSynth(nn.Module):
             c.f0, c.rd, c.harmonic_amp, tilt=c.tilt,
             disp_freq=c.disp_freq, disp_radius=c.disp_radius,
             jitter=c.jitter, shimmer=c.shimmer, generator=generator)
+        # 성문동기 AM 은 성대가 실제로 떨 때만 존재한다. 무성음(속삭임, 마찰음)에
+        # 이걸 걸면 F0 로 노이즈를 써는 셈이라 없는 주기성이 생긴다.
+        voiced_gate = c.harmonic_amp / (c.harmonic_amp.abs() + 0.02)
         raw_noise = self.noise(t, b, c.f0.device, c.f0.dtype,
-                               am_depth=c.noise_am, glottal_phase=phase,
+                               am_depth=c.noise_am * voiced_gate,
+                               glottal_phase=phase,
                                roughness=c.noise_rough, generator=generator)
 
         if self.tract_mode == "formant":
