@@ -297,6 +297,12 @@ def apply_overrides(c: dict, spec: dict, t: int, cfg: Config) -> None:
     for key, val in spec.items():
         if key in ("type", "dur"):
             continue
+        # pressure/adduction 은 *파생* 손잡이다 — 아래 aero.apply 가 spec 에서 직접
+        # 읽어 세기·F0·Rd·기식을 만든다. 제어 dict 에 곡선으로 저장하면 안 된다:
+        # Controls 필드도 아니고, 일부 세그먼트에만 있으면 이어붙이기(torch.cat)가
+        # 깨진다(치찰음+압력모음 타임라인에서 실제로 터졌다).
+        if key in ("pressure", "adduction"):
+            continue
         if key in ("noise_gain", "noise_center", "noise_bw"):
             noise_shape[key] = val
         elif key.startswith("sib_"):

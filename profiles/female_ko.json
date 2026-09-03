@@ -93,18 +93,23 @@
     620.0
   ],
   "sibilant": {
-    "pole_f": 4300.0,
-    "pole_bw": 3600.0,
-    "zero_f": 2300.0,
-    "zero_bw": 1150.0,
-    "tilt": -4.5,
-    "slope_lo": 4.0,
-    "slope_hi": -13.0,
-    "teeth_f": 8100.0,
-    "teeth_bw": 1000.0,
-    "floor_db": -11.0
+    "pole_f": 5174.0,
+    "pole_bw": 4032.0,
+    "zero_f": 1501.0,
+    "zero_bw": 3096.0,
+    "tilt": -4.6,
+    "slope_lo": 3.8,
+    "slope_hi": -12.5,
+    "teeth_f": 9911.0,
+    "teeth_bw": 879.0,
+    "floor_db": -27.6
   },
-  "sibilant_moments": {},
+  "sibilant_moments": {
+    "centroid_hz": 8200.0,
+    "peak_hz": 9900.0,
+    "spread_hz": 2480.0,
+    "note": "실측: 길게 끈 /s/ 두 번, 44.1k->24k 리샘플 후 적합"
+  },
   "dispersion": {
     "freq": [],
     "radius": []

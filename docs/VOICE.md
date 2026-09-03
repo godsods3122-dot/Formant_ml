@@ -201,6 +201,24 @@ rd: [[0, 0.5], [0.7, 0.5], [1, 2.2]]     # 브레이크포인트 (위치 0~1)
 `test_sibilant_fade_shapes_the_flow_envelope` 등이 동작을 잠근다. 여성 화자 예제는
 `examples/female_sibilant_fade.yaml`, 음원 생성은 `scripts/gen_female_sibilant.py`.
 
+**치찰음을 풀면 첫 모음이 눌린다(pressed).** 길게 끈 /s/ 는 협착 뒤에서 성문하압을
+쌓는다. 협착을 풀면 그 압력이 남아 있어 첫 모음('스으아' 의 '으')이 세고, F0 가
+오르고, 성문이 완전히 닫혀 Rd 가 작아진다 — 이게 pressed 성구다. 세기·F0·Rd 를
+따로 만들 필요 없이 `pressure` 하나로 끌어낸다(§3.6). 한 타임라인에 치찰음(압력
+없음)과 압력 실린 모음을 섞을 수 있다:
+
+```yaml
+- {type: fricative, phone: s, dur: 0.9, fade_in: 0.24, fade_out: 0.03, level_db: 4}
+- {type: glide, vowels: [eu, a], dur: 0.62,        # '으'(눌림) -> '아'(이완)
+   pressure: [[0, 1.5], [0.2, 1.25], [1, 0.82]], adduction: 0.95,
+   f0: [[0, 203], [1, 182]]}
+```
+
+치찰음 지문 자체는 실제 녹음에서 뽑는다(`analysis/sibilant.fit_sibilant`, §4). 실측
+/s/ 는 앞니 공명이 ~9.9 kHz 라 10 kHz 부근이 지배적이고 저역이 거의 비는데, 이걸
+안 맞추면 봉우리가 낮아 '치찰음처럼 안 들린다'. `profiles/female_ko.json` 의
+`sibilant` 이 그렇게 적합된 값이다.
+
 ### 봉우리는 삼각형이어야 한다 — 극 하나로는 둥근 돔밖에 안 나온다
 
 음조를 없애려고 극의 대역폭을 넓혔더니(BW 2200) 이번엔 **모양을 잃었다**.

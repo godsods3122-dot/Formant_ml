@@ -956,6 +956,57 @@ def test_flow_to_noise_amp_is_superlinear():
     assert bool((a[1:] >= a[:-1]).all()), "유량-진폭이 단조가 아니다"
 
 
+def test_pressure_after_fricative_does_not_break_concat():
+    """치찰음(압력 없음) + 압력 실린 모음을 한 타임라인에 섞어도 이어붙는다.
+
+    pressure/adduction 은 파생 손잡이라 제어 dict 에 곡선으로 남으면 안 된다 —
+    일부 세그먼트에만 있으면 torch.cat 이 KeyError 로 터졌다(회귀 방지).
+    그리고 압력이 실린 모음은 더 세고(amp↑) 성문이 닫혀 pressed(Rd↓) 여야 한다.
+    """
+    from formant_ml.score import build_controls
+    score = {"smooth_frames": 2, "timeline": [
+        {"type": "fricative", "phone": "s", "dur": 0.4, "fade_in": 0.05},
+        {"type": "glide", "vowels": ["eu", "a"], "dur": 0.5,
+         "pressure": [[0, 1.8], [1, 0.85]], "adduction": 0.95,
+         "f0": [[0, 200], [1, 180]]}]}
+    ctrl = build_controls(score, PROF, CFG)          # 터지면 여기서 예외
+    amp = ctrl.harmonic_amp[0, :, 0]
+    rd = ctrl.rd[0, :, 0]
+    v = (amp > 1e-3).nonzero().squeeze(-1)
+    assert len(v) > 0, "유성 구간이 없다"
+    onset, tail = int(v[0]), int(v[-1])
+    assert float(amp[onset + 1]) > float(amp[tail]), "압력 실린 시작이 더 세야 한다"
+    assert float(rd[onset + 1]) < PROF.rd_median + 0.05, "시작이 pressed 여야 한다"
+
+
+def test_female_profile_sibilant_is_high_frequency():
+    """여성 프로파일의 /s/ 는 실측(길게 끈 치찰음)대로 고역에 봉우리가 있다.
+
+    앞니 공명 ~9.9 kHz + 낮은 floor 로 10 kHz 부근이 지배적이고 저역(<3 kHz)은
+    거의 비어야 한다. 이걸 안 지키면 '치찰음처럼 안 들린다'.
+    """
+    import os
+    path = os.path.join(os.path.dirname(__file__), "..", "profiles",
+                        "female_ko.json")
+    if not os.path.exists(path):
+        return                                       # 프로파일이 없으면 건너뜀
+    prof = VoiceProfile.load(path)
+    y = render({"timeline": [{"type": "fricative", "phone": "s", "dur": 0.7,
+                              "fade_in": 0.05, "fade_out": 0.05}], "seed": 5},
+               prof, CFG)
+    a = y.reshape(-1)[int(0.2 * FS):int(0.6 * FS)]
+    S = torch.fft.rfft(a * torch.hann_window(a.shape[-1])).abs()
+    f = torch.linspace(0, FS / 2, len(S))
+    # 평활 포락선의 봉우리가 8 kHz 위
+    k = 51
+    Ss = torch.nn.functional.avg_pool1d(S.view(1, 1, -1), k, 1, k // 2).view(-1)
+    peak = float(f[Ss.argmax()])
+    assert peak > 8000.0, f"치찰음 봉우리가 너무 낮다: {peak:.0f} Hz"
+    p = (S ** 2)
+    low = float(p[f < 3000].sum() / p.sum())
+    assert low < 0.12, f"저역(<3k)에 에너지가 너무 많다: {low:.2f}"
+
+
 def test_custom_flow_curve_makes_two_amplitude_bumps():
     """flow 곡선을 직접 주면 마찰음 세기가 그 곡선을 따라 두 번 부푼다."""
     y = render({"timeline": [{"type": "fricative", "phone": "s", "dur": 1.2,
