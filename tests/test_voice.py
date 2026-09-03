@@ -199,8 +199,15 @@ def test_noise_can_fully_bypass_the_tract():
             noise_bands=torch.ones(1, T, CFG.noise.n_bands),
             noise_entry=torch.full((1, T, 1), entry),
             noise_am=torch.zeros(1, T, 1))
+        from formant_ml.dsp.filters import bands_to_response
         H = syn(c)["h_noise"][0, 0].abs().detach()
-        return float(H.max() / H.mean())
+        # 난류 소스의 색(스펙트럼 사전)은 h_noise 에 정당하게 들어 있다.
+        # 여기서 보려는 건 *성도가* 남긴 구조뿐이므로 소스 항을 나눠 준다.
+        src = bands_to_response(
+            c.noise_bands * syn.noise.spectral_prior(), syn.n_freq,
+            min_phase=True)[0, 0].abs().detach()
+        R = H / src.clamp_min(1e-9)
+        return float(R.max() / R.mean())
 
     assert peak(float(K) + 6.0) < 1.05, "완전 우회인데 아직 공진이 남아 있다"
     assert peak(0.0) > 3.0, "성문 주입인데 포먼트가 안 보인다"
@@ -385,6 +392,61 @@ def test_phone_and_speaker_both_shape_the_sibilant():
     y = render({"timeline": [{"type": "fricative", "phone": "s", "dur": 1.5}],
                 "seed": 1}, bright, CFG)
     assert measure(y)["peak_hz"] > peak["s"] * 1.08, "화자 지문이 반영되지 않는다"
+
+
+def _octave_db(y, freqs):
+    x = y.reshape(-1)
+    P = 20 * torch.log10(torch.fft.rfft(x * torch.hann_window(len(x))).abs()
+                         .clamp_min(1e-9))
+    k = torch.ones(1, 1, 151) / 151
+    P = torch.nn.functional.conv1d(P.view(1, 1, -1), k, padding=75).view(-1)
+    return [float(P[int(f / (FS / 2) * (len(P) - 1))]) for f in freqs]
+
+
+def test_fricative_couples_to_the_oral_cavity():
+    """마찰음이 구강과 결합해야 한다.
+
+    협착은 음향적으로 완전한 벽이 아니다. 결합이 0 이면 마찰음이 입 안에서 난
+    소리가 아니라 위에 얹은 히스처럼 들리고(저·중역이 통째로 빈다), 뒤따르는
+    모음이 무엇이든 똑같은 소리가 난다(동시조음이 없다).
+    """
+    def lf(leak, formants=None):
+        seg = {"type": "fricative", "phone": "s", "dur": 2.0,
+               "noise_back_leak": leak}
+        if formants:
+            seg["formant_freq"] = formants
+        y = render({"timeline": [seg], "seed": 1}, PROF, CFG)
+        a, b = _octave_db(y, [1000.0, 8000.0])
+        return a - b                       # 1 kHz 가 피크 대역 대비 얼마나 낮은가
+
+    assert lf(0.35) > lf(0.0) + 6.0, "구강 결합이 저역을 되살리지 못한다"
+
+    # 동시조음: 같은 /s/ 라도 구강 형상이 다르면 마찰음이 달라져야 한다
+    front = [270.0, 2290.0, 3010.0] + [3700.0 + 900.0 * i for i in range(9)]
+    back = [730.0, 1090.0, 2440.0] + [3400.0 + 900.0 * i for i in range(9)]
+    assert abs(lf(0.35, front) - lf(0.35, back)) > 3.0, \
+        "뒤따르는 모음의 구강 형상이 마찰음에 반영되지 않는다"
+
+
+def test_turbulence_source_rolls_off_at_high_frequency():
+    """난류원은 나이퀴스트까지 평평하지 않다.
+
+    협착부 제트의 에디에는 특징적 크기가 있어 모서리 주파수 위로 떨어지고,
+    성도 벽의 점성·열 손실도 주파수를 따라 커진다. 평평하게 두면 6~12 kHz 가
+    고원처럼 남아 마찰음이 '쨍하게' 들린다.
+    """
+    from formant_ml.dsp.noise import TurbulenceSource
+    ts = TurbulenceSource(FS, CFG.audio.hop_size, CFG.noise.n_bands)
+    prior = ts.spectral_prior().detach()
+    f = torch.linspace(0, FS / 2, len(prior))
+    lo = float(prior[(f > 2000) & (f < 4000)].mean())
+    hi = float(prior[f > 10000].mean())
+    assert hi < lo * 0.7, "난류 소스 사전이 고역에서 떨어지지 않는다"
+
+    y = render({"timeline": [{"type": "fricative", "phone": "s", "dur": 2.0}],
+                "seed": 1}, PROF, CFG)
+    a, b = _octave_db(y, [8000.0, 11000.0])
+    assert 2.0 < a - b < 12.0, f"8k->11k 감쇠가 {a - b:.1f} dB (사람은 4~8 dB)"
 
 
 def test_noise_bandwidth_scale_reduces_ringing():

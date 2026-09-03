@@ -54,8 +54,8 @@ class ControlEncoder(nn.Module):
         self.head_source = nn.Linear(d, 6)
         self.head_formant = nn.Linear(d, 3 * K)        # dfreq, bw, gain
         self.head_anti = nn.Linear(d, 2 * Ka)
-        # 대역 + entry + am + roughness + 대역폭 배율
-        self.head_noise = nn.Linear(d, Nb + 4)
+        # 대역 + entry + am + roughness + 대역폭 배율 + 구강 결합
+        self.head_noise = nn.Linear(d, Nb + 5)
         self.head_allpass = nn.Linear(d, 2 * Na)       # 성도 군지연
         self.head_disp = nn.Linear(d, 2 * Nd)          # 하모닉 위상차(위상차 파라미터)
         self.head_sib = nn.Linear(d, 6)                # 치찰음 극-영점 필터
@@ -104,6 +104,8 @@ class ControlEncoder(nn.Module):
         # 노이즈 경로 대역폭 배율 1~6. 데이터가 "이 화자의 마찰음은 얼마나
         # 뭉개져 있는가" 를 직접 알려 준다.
         bw_scale = 1.0 + 5.0 * torch.sigmoid(nz[..., self.Nb + 3: self.Nb + 4])
+        # 구강 결합(협착 뒤로 새는 비율). 데이터가 화자/음소마다 정해 준다.
+        back_leak = 0.6 * torch.sigmoid(nz[..., self.Nb + 4: self.Nb + 5])
 
         # 치찰음 필터: 앞공동 극 > 뒤공동 영점 이 되도록 구조적으로 강제한다
         # (포먼트 순서 보장과 같은 이유 — 학습 중 극/영점이 뒤바뀌면 회복이 안 된다).
@@ -134,7 +136,7 @@ class ControlEncoder(nn.Module):
             f0=f0_out, harmonic_amp=harmonic_amp, rd=rd,
             formant_freq=freq, formant_bw=bw, formant_gain=gain,
             noise_bands=bands, noise_entry=entry, noise_am=am, noise_rough=rough,
-            noise_bw_scale=bw_scale,
+            noise_bw_scale=bw_scale, noise_back_leak=back_leak,
             tilt=tilt, jitter=jitter, shimmer=shimmer,
             disp_freq=dpf, disp_radius=dpr,
             antiformant_freq=af, antiformant_bw=ab,

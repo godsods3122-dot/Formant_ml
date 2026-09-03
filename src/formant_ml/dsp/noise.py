@@ -30,6 +30,8 @@ LTV 필터로 적용한다 (IR 절단 오차를 두 번 겪지 않기 위해서)
 """
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -44,13 +46,24 @@ class TurbulenceSource(nn.Module):
     """
 
     def __init__(self, sample_rate: int, hop_size: int, n_bands: int = 40,
-                 init_beta: float = 2.0, init_knee_hz: float = 8.0):
+                 init_beta: float = 2.0, init_knee_hz: float = 8.0,
+                 init_corner_hz: float = 5000.0, init_slope_db_oct: float = 6.0):
         super().__init__()
         self.sample_rate = sample_rate
         self.hop_size = hop_size
         self.n_bands = n_bands
-        # 난류 소스의 스펙트럼 사전 (평균 0 으로 초기화 = 백색에서 시작)
-        self.log_prior = nn.Parameter(torch.zeros(n_bands))
+        # 난류 소스의 스펙트럼 사전.
+        #
+        # 백색(전부 0)으로 두면 안 된다. 난류원은 나이퀴스트까지 평평하지 않다 —
+        # 협착부 제트의 에디에는 특징적인 크기가 있어서, 그에 대응하는 모서리
+        # 주파수 위로는 스펙트럼이 떨어진다(Stevens, Shadle 의 마찰음 소스 모형).
+        # 여기에 성도 벽의 점성·열 손실도 주파수에 따라 커진다.
+        # 평평하게 두면 6~12 kHz 가 고원처럼 남아 마찰음이 '쨍하게' 들린다
+        # (측정: 8 kHz 대비 11 kHz 가 2 dB 밖에 안 떨어졌다).
+        f = torch.linspace(0.0, sample_rate / 2, n_bands).clamp_min(50.0)
+        db = -init_slope_db_oct * torch.log2((f / init_corner_hz).clamp_min(1.0))
+        lp = db * (math.log(10.0) / 20.0)
+        self.log_prior = nn.Parameter(lp - lp.mean())
         # 변조 스펙트럼: |M(f)| = (1 + (f/knee)^2)^(-beta/2).
         # knee 를 수 Hz 대로 두고 beta>=2 (>= -12 dB/oct) 로 떨어뜨려, 변조가
         # '느린 흔들림' 에 머물고 빠른 알갱이 소리가 되지 않게 한다.

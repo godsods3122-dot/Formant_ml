@@ -53,6 +53,12 @@ class Controls:
     #   게이트가 부드러워서 K 에서 마지막 단이 19%, K+3 에서도 35% 잔물결이 남는다.
     noise_am: torch.Tensor                # (B, T, 1) 성문동기 변조 깊이 (기식성)
     noise_rough: torch.Tensor | None = None      # (B, T, 1) 난류 시간변조(비정상성)
+    # (B, T, 1) 구강 결합. 협착은 음향적으로 완전한 벽이 아니다 — 난류음의 일부는
+    # 협착을 통해/돌아 뒤공동까지 닿았다가 성도 전체를 거쳐 나온다.
+    # 0 이면 앞공동(치찰음 필터)만 통과해서, 마찰음이 입 안에서 난 소리가 아니라
+    # 위에 얹은 히스처럼 들린다(저·중역이 통째로 비고 고역만 평평하게 남는다).
+    # 이 값이 있어야 /사/ 와 /시/ 의 마찰음이 서로 달라진다(동시조음).
+    noise_back_leak: torch.Tensor | None = None
     # (B, T, 1) 노이즈 경로에서만 포먼트 대역폭에 곱하는 배율(>=1).
     # 성문 펄스가 아니라 난류가 성도를 울릴 때는 감쇠가 훨씬 크다: 여기소가 한 점이
     # 아니라 협착 하류에 퍼져 있어 공진이 뭉개지고, 마찰 구간에는 성문 폐쇄에 의한
@@ -158,6 +164,27 @@ class PhysicalVoiceSynth(nn.Module):
                                          c.formant_gain, w, fs, nf)
         return h_harm, h_noise
 
+    def _oral_leak(self, c: Controls, h_front: torch.Tensor) -> torch.Tensor:
+        """앞공동 경로 + 구강 전체 경로의 **병렬 합**.
+
+        두 경로가 같은 난류원에 걸려 있으므로 신호를 섞는 것과 응답을 더하는 것이
+        같다(선형). 뒤로 새는 경로는 치찰음 필터(=앞공동)를 거치지 않고 성도
+        전체를 지난다.
+        """
+        if c.noise_back_leak is None:
+            return h_front
+        fs, nf = self.cfg.audio.sample_rate, self.n_freq
+        bw_n = c.formant_bw
+        if c.noise_bw_scale is not None:
+            bw_n = bw_n * c.noise_bw_scale.clamp_min(1.0)
+        k = c.formant_freq.shape[-1]
+        full = torch.ones(1, 1, k, device=c.formant_freq.device,
+                          dtype=c.formant_freq.dtype)
+        h_full = gated_cascade_response(c.formant_freq, bw_n, c.formant_gain,
+                                        full.expand_as(c.formant_freq), fs, nf)
+        g = c.noise_back_leak.clamp(0.0, 1.0).to(h_front.dtype)  # (B,T,1) 로 방송된다
+        return (1.0 - g) * h_front + g * h_full
+
     def _waveguide_paths(self, c: Controls):
         fs, nf = self.cfg.audio.sample_rate, self.n_freq
         area = c.area
@@ -225,10 +252,12 @@ class PhysicalVoiceSynth(nn.Module):
 
         # 난류 색칠: 학습된 소스 사전 x 프레임별 대역게인 x 치찰음 필터 x 성도
         h_noise = h_noise * shared
-        h_noise = h_noise * bands_to_response(
-            c.noise_bands * self.noise.spectral_prior(), nf, min_phase=True)
         if c.sib is not None:
             h_noise = h_noise * sibilant_response(c.sib, fs, nf)
+        # 협착을 지나 뒤공동까지 닿는 경로를 병렬로 더한다(구강 결합)
+        h_noise = self._oral_leak(c, h_noise)
+        h_noise = h_noise * bands_to_response(
+            c.noise_bands * self.noise.spectral_prior(), nf, min_phase=True)
 
         if state is None:
             voiced = ltv_filter(src, h_harm, hop, ir)
