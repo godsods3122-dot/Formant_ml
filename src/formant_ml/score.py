@@ -411,32 +411,32 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
             # 치경 로커스에서 출발해 짧은 전이(기본 50 ms)로 모음에 도달한다.
             tgt = _vowel_formants(vowel, prof, K)
             loc = LOCUS.get(phone, LOCUS["s"])
-            trans = float(seg.get("transition_s", 0.10)) * a.frame_rate / max(t, 1)
-            # 전이는 **실제 유성이 시작하는 순간**부터다. 그 전에 시작하면 포먼트가
-            # 이미 모음 쪽으로 움직인 뒤에 소리가 나서 활음처럼 들린다.
+            trans = float(seg.get("transition_s", 0.045)) * a.frame_rate / max(t, 1)
             amp = c["harmonic_amp"][0, :, 0]
             voiced = (amp > 0.05 * float(amp.max().clamp_min(1e-6))).nonzero()
             onset = (float(voiced[0]) / max(t - 1, 1)) if len(voiced) else split
             # 혀는 **협착을 푸는 순간**부터 움직인다. 발성은 그보다 늦게 붙는다
-            # (구강내압이 빠져야 성대가 떨 수 있으므로). 그래서 전이를 발성
-            # 시작이 아니라 해제 시점에서 출발시켜야 한다. 발성 시작에 맞추면
-            # /s/ 자세의 낮은 F1 이 유성 구간까지 남아 활음(/j/, "야")이 된다.
-            # F1 은 협착 해제와 함께, F2/F3 는 그보다 늦게(혀 몸통이 뒤따른다)
-            # 움직이기 시작한다. 실측: 발성이 붙는 순간 F1 은 이미 867 로 열렸는데
-            # F2 는 아직 2130 이고 그 뒤로 떨어진다.
-            onset_f1 = min(onset, split)
-            # F1 과 F2/F3 는 **속도가 다르다**. F1 은 협착 정도가 정하므로 해제와
-            # 함께 빠르게 열리고, F2/F3 는 혀 몸통이 움직이는 만큼 느리게 간다.
-            # 실측(본 화자 "사"): 발성이 붙을 때 F1 은 이미 867(열림)인데 F2 는
-            # 아직 2130 이고, 그 뒤로 1038 까지 떨어진다. 같은 속도로 두면 둘 중
-            # 하나가 틀린다 - 빠르면 F2 전이가 안 들리고, 느리면 F1 이 낮은 채로
-            # 유성이 시작돼 활음(/j/)이 된다.
-            trans_f1 = float(seg.get("f1_transition_s", 0.035)) \
+            # (구강내압이 빠져야 성대가 떨 수 있으므로). 그래서 F1 도 F2/F3 도
+            # 전이를 **해제 시점**에서 출발시킨다.
+            #
+            # F2 만 발성 시작에 맞춰 두었더니 "사" 가 "샤" 로 들렸다. 그러면 F2 가
+            # 로커스에 머문 채로 유성이 시작되고, 그 뒤 100 ms 동안 1292 까지
+            # 내려가는 활강이 통째로 들린다 - 고 F2 에서 저 F2 로의 유성 활강은
+            # 정의상 /j/ 다. 실제로는 해제와 함께 혀가 이미 움직이고 있어서,
+            # 소리가 붙을 때는 F2 전이가 거의 끝나 있다.
+            onset_f1 = onset_f2 = min(onset, split)
+            # F1 과 F2/F3 는 **속도가 다르다**. 다만 방향이 예상과 반대다.
+            # 실측(본 화자 "사" 녹음, 30 ms 창 LPC, 유성 시작 기준):
+            #   F2 : -20 ms 1317 -> +0 ms 1277 -> +30 ms 1129  (이미 도착해 있다)
+            #   F1 : +0 ms 599 -> +25 ms 670 -> +85 ms 875     (천천히 열린다)
+            # 혀 몸통(F2)은 협착을 푸는 순간 튕기듯 제자리로 가고, 턱(F1)은
+            # 관성이 커서 뒤늦게 열린다. 그래서 F1 쪽 전이가 오히려 더 길다.
+            trans_f1 = float(seg.get("f1_transition_s", 0.055)) \
                 * a.frame_rate / max(t, 1)
             tracks = []
             for k in range(K):
                 start = tgt[k] if k >= 3 or loc[k] is None else float(loc[k])
-                on_k, tr = (onset_f1, trans_f1) if k == 0 else (onset, trans)
+                on_k, tr = (onset_f1, trans_f1) if k == 0 else (onset_f2, trans)
                 tracks.append(ramp(t, [(0.0, start), (on_k, start),
                                        (min(on_k + tr, 1.0), tgt[k]),
                                        (1.0, tgt[k])]))
