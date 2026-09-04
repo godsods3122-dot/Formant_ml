@@ -69,6 +69,7 @@ def test_centroid_descends_from_constriction_area_alone():
 
     협착이 열리며 입자속도가 떨어져 무게중심이 내려간다(Stevens 1971).
     """
+    from formant_ml.score import build_segment
     prof = PROF
     sa = {"type": "syllable", "onset": "s", "vowel": "a", "dur": 0.5,
           "aero": True, "onset_s": 0.14,
@@ -84,11 +85,17 @@ def test_centroid_descends_from_constriction_area_alone():
             m = f > 1500
             cs.append(float((f[m] * S[m] ** 2).sum() / (S[m] ** 2).sum().clamp_min(1e-9)))
         return cs
-    c = cen(0.0, 0.16)
-    # 하강 폭 기준은 600 Hz. 예전엔 800 이었는데, 무게중심 배율이 이제 **구간
-    # 정점에서 1.0** 으로 앵커링돼(치찰음 지문이 그 지점에 적합돼 있으므로)
-    # 궤적 전체가 다시 스케일된다. 하강한다는 사실은 그대로고 폭만 줄었다.
-    assert c[0] - c[-1] > 600, f"무게중심이 안 내려간다: {c[0]:.0f}->{c[-1]:.0f}"
+    # **마찰음이 살아 있는 구간에서** 잰다. 고정 창(0~160 ms)으로 재면 뒤쪽
+    # 모음 프레임까지 섞여 들어가 하강 폭이 부풀려진다.
+    nbv = build_segment(sa, prof, CFG)["noise_bands"][0].sum(-1)
+    nbv = (nbv / nbv.amax()).numpy()
+    alive = [i for i, v in enumerate(nbv) if v > 0.10]
+    c = cen(alive[0] * 0.01, (alive[-1] + 1) * 0.01)
+    # 기준 150 Hz. 예전엔 800 이었는데 그 큰 하강은 상당 부분 **성문이 마찰음
+    # 중간에 닫히던** 데서 왔다(그때 유속이 급락한다). 그건 /s/ 의 물리가
+    # 아니라서 없앴다(성문은 /s/ 내내 벌어져 있다). 남은 하강은 협착이 열리며
+    # 생기는 것뿐이고, 레이놀즈 게이트가 마찰음을 끄기 전까지만 보이므로 작다.
+    assert c[0] - c[-1] > 150, f"무게중심이 안 내려간다: {c[0]:.0f}->{c[-1]:.0f}"
 
 
 def test_body_cover_three_mass_self_oscillates():
@@ -173,10 +180,14 @@ def test_symmetric_pressure_cannot_make_the_fade_alone():
 def test_frication_and_voicing_overlap_instead_of_switching():
     """마찰음 -> 기식 -> 유성이 **겹치며** 넘어간다 (성문파열음 방지).
 
-    실측 /사/: 유성이 10 % 에 이른 순간 마찰음이 아직 18~19 % 남아 있다.
-    예전에는 기식을 (1-v_frac) 로 껐고 후두 내전을 협착 해제 뒤에 뒀더니,
-    마찰음이 완전히 죽은 다음에야 발성이 붙어 겹침이 0 ms 였다 — 그 무음이
-    성문파열음으로 들린다.
+    이어주는 건 마찰음의 꼬리가 **아니라 기식**이다. 실측 /사/ 의 고역은
+    마찰음 끝에서 0.14 까지 떨어졌다가 발성과 함께 0.33 으로 **다시 오른다** —
+    성대가 덜 모인 상태의 기식성 발성이지 마찰음 잔향이 아니다.
+    (마찰음 꼬리로 이으려고 내전을 앞당겼더니, 성문이 좁아지는 순간 압력강하가
+     성문으로 옮겨가 협착 뒤 압력이 무너지고 /s/ 가 혀를 풀기도 전에 죽었다.)
+
+    그래서 검사하는 건 셋이다: 발성이 계단으로 들어오지 않을 것, 마찰음이
+    꺼지는 창을 기식이 메울 것, 그 기식이 모음에서 잦아들되 0 은 아닐 것.
     """
     from formant_ml.score import build_segment
     c = build_segment({"type": "syllable", "onset": "s", "vowel": "a",
@@ -189,13 +200,19 @@ def test_frication_and_voicing_overlap_instead_of_switching():
     ab = (ab / ab.amax().clamp_min(1e-12)).numpy()
     ha = (ha / ha.amax().clamp_min(1e-12)).numpy()
     i10 = int((ha > 0.10).argmax())
-    assert nb[i10] > 0.12, f"발성 시작 때 마찰음이 {nb[i10]*100:.0f}% 밖에 안 남았다"
+    pk = int(nb.argmax())
+    # 마찰음 정점 -> 발성 개시 사이에 잡음이 **끊기는 구간이 없어야** 한다.
+    gap = [i for i in range(pk, i10 + 1) if nb[i] < 0.05 and ab[i] < 0.30]
+    assert not gap, f"마찰음과 발성 사이 {len(gap)} 프레임이 비었다 (성문파열음)"
     # 발성이 계단으로 들어오면 안 된다(예전: 두 프레임 만에 0.09 -> 0.76).
     jump = max(ha[i + 1] - ha[i] for i in range(len(ha) - 1))
     assert jump < 0.25, f"유성 진폭이 한 프레임에 {jump*100:.0f}% 뛴다 (성문파열음)"
     # 기식은 마찰음이 죽는 창을 메우고, 모음에서 잦아들되 0 이 되지는 않는다.
-    assert ab[i10] > 0.5, "마찰음-유성 사이를 기식이 안 메운다"
-    assert 0.1 < ab[-1] < 0.8, f"모음 끝 기식이 비생리적: {ab[-1]:.2f}"
+    assert ab[i10] > 0.3, "마찰음-유성 사이를 기식이 안 메운다"
+    # 모음에도 기식성 바닥이 남아야 한다(성대가 완전히 닫히지 않는다).
+    # 상한은 두지 않는다 — 전이 기식이 (1-vfrac) 로 줄어든 뒤에는 이 바닥이
+    # 구간 최대가 되는 게 정상이다.
+    assert ab[-1] > 0.1, f"모음에 기식성 바닥이 없다: {ab[-1]:.2f}"
 
 
 def test_voicing_does_not_start_during_the_fricative():

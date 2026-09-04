@@ -25,4 +25,4 @@ smooth_frames: 2
 
 timeline:
   - {type: syllable, onset: s, vowel: a, dur: 1.05, onset_s: 0.55,
-     aero: true, transition_s: 0.12, f0: [[0, 131], [1, 122]]}
+     aero: true, f0: [[0, 131], [1, 122]]}

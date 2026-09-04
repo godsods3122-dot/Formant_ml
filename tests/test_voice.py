@@ -43,6 +43,12 @@ def _hf_ratio_db(y, cut=5000.0):
     return 20 * math.log10(max(hi, 1e-12) / max(lo, 1e-12))
 
 
+def _me_profile():
+    """화자 프로파일(profiles/me.json). 없으면 None."""
+    p = os.path.join(os.path.dirname(__file__), "..", "profiles", "me.json")
+    return VoiceProfile.load(p) if os.path.exists(p) else None
+
+
 def _vowel(**kw):
     seg = {"type": "vowel", "vowel": "a", "dur": 1.0, "f0": 120.0}
     seg.update(kw)
@@ -51,8 +57,18 @@ def _vowel(**kw):
 
 # ------------------------------------------------------------------------ 고역
 def test_tilt_control_moves_high_frequency_energy():
-    """tilt 손잡이가 5 kHz 위 에너지를 단조롭게 올린다 ('고역 부족' 의 직접 손잡이)."""
-    r = [_hf_ratio_db(_vowel(tilt=t)) for t in (-8.0, -4.0, 0.0, 4.0, 8.0)]
+    """tilt 손잡이가 5 kHz 위 **하모닉** 에너지를 단조롭게 올린다.
+
+    기식성 잡음 바닥을 끄고 잰다. 그 바닥은 5 kHz 위를 지배하도록 만들어진
+    것이라(gestures.BREATH_NOISE_*), 켜둔 채로 재면 tilt 를 ±8 dB/oct 돌려도
+    비율이 거의 안 움직여 이 손잡이만 따로 검증할 수가 없다.
+    """
+    import dataclasses
+    dry = dataclasses.replace(PROF, breathiness=0.0)
+    r = [_hf_ratio_db(render({"timeline": [{"type": "vowel", "vowel": "a",
+                                            "dur": 1.0, "f0": 120.0, "tilt": t}],
+                              "seed": 3}, dry, CFG))
+         for t in (-8.0, -4.0, 0.0, 4.0, 8.0)]
     assert all(a < b for a, b in zip(r, r[1:])), r
     assert r[-1] - r[0] > 12.0, f"±8 dB/oct 를 돌렸는데 고역이 {r[-1] - r[0]:.1f} dB 밖에"
 
@@ -730,7 +746,9 @@ def test_streaming_matches_offline_synthesis():
     c = build_controls({"timeline": [{"type": "vowel", "vowel": "a", "dur": 1.5,
                                       "f0": [[0, 150], [0.5, 190], [1, 110]],
                                       "jitter": 0.0, "shimmer": 0.0}]}, PROF, CFG)
-    c.noise_bands = c.noise_bands * 0           # 노이즈는 난수라 청크마다 다르다
+    # 잡음은 난수라 청크마다 다르다 - 필터 상태 연속성만 보려면 꺼야 한다.
+    c.noise_bands = c.noise_bands * 0
+    c.aspiration_bands = c.aspiration_bands * 0
     syn = PhysicalVoiceSynth(CFG)
     with torch.no_grad():
         full = syn(c)["audio"]
@@ -1079,6 +1097,39 @@ def test_custom_flow_curve_makes_two_amplitude_bumps():
     # 두 봉우리가 있고, 그 사이 골이 두 봉우리보다 뚜렷이 낮다
     assert r[valley] < 0.5 * min(float(peak_a), float(peak_b)), \
         f"두 봉우리 사이에 골이 없다: valley={float(r[valley])}"
+
+
+def test_syllable_fricative_level_matches_profile():
+    """음절 안에서도 마찰음/모음 세기 비가 프로파일대로 나와야 한다.
+
+    위의 test_fricative_level_matches_profile 은 **비공기역학** 경로만 잰다.
+    무게중심 배율(정점 앵커)과 앞니 다이폴은 공기역학 경로에만 걸려서, 그쪽이
+    21 dB 어긋나 있어도 저 테스트는 통과한다 — 실제로 그렇게 드리프트했다:
+    음절에서 마찰음이 모음보다 9.5 dB 컸다(실측은 모음이 11.4~12.7 dB 크다).
+    /s/ 만 튀어나오고 모음이 묻히면 둘이 한 소리로 안 들린다.
+
+    **알려진 한계**: SYLLABLE_FRICATIVE_CAL_DB 는 프로파일마다 다르게 맞는다
+    (기본 프로파일과 화자 프로파일이 약 15 dB 벌어진다). 원인은 마찰음 세기를
+    **소스 진폭**(harmonic_amp)으로 기준화하는데 유성음의 실제 세기에는 성도
+    캐스케이드 이득이 곱해져 있기 때문이다 — 마찰음은 캐스케이드를 우회하므로
+    (noise_entry = K+6) 화자마다 그 이득만큼 어긋난다. 제대로 고치려면 기준을
+    소스가 아니라 **렌더된 모음 세기**로 옮겨야 한다. 그래서 이 테스트는 지금
+    보정이 맞춰져 있는 화자 프로파일로 잰다.
+    """
+    prof = _me_profile()
+    if prof is None:
+        return                     # 화자 프로파일이 없으면 건너뛴다
+    y = render({"timeline": [{"type": "syllable", "onset": "s", "vowel": "a",
+                              "dur": 0.58, "onset_s": 0.11, "aero": True}],
+                "seed": 5}, prof, CFG).reshape(-1)
+
+    def level(a, b):
+        s = y[int(a * FS):int(b * FS)]
+        return 20 * math.log10(float(s.pow(2).mean().sqrt()) + 1e-12)
+
+    got = level(0.30, 0.57) - level(0.03, 0.11)      # 모음 - 마찰음
+    want = -float(prof.fricative_level_db)
+    assert abs(got - want) < 4.0, f"목표 {want:+.1f} dB, 실제 {got:+.1f} dB"
 
 
 if __name__ == "__main__":

@@ -21,7 +21,7 @@ import math
 import torch
 
 from .presets import FRICATIVES, VOWELS
-from .utils import band_bump, ramp
+from .utils import band_bump, band_shelf, ramp
 from .voice import VoiceProfile, extend_formants
 
 
@@ -34,8 +34,24 @@ def _phase_ramp(t: int, rate_hz: float, frame_rate: float, phase0: float = 0.0):
     return 2 * math.pi * rate_hz * n + phase0
 
 
+#: 유성 구간에 깔리는 성문 기식 잡음. (게인, 셸프 하한 [Hz], 옥타브당 기울기)
+#:
+#: 실측 이 화자 '아' 는 4~6 kHz 에 에너지의 1.88 % 가 있는데, 잡음 없이 합성하면
+#: 0.00 % 다 — **어떤 소스 기울기로도 못 만든다**(하모닉이 그 위로 안 올라간다.
+#: tilt 를 -8~+6 까지 훑어도 4~6 kHz 는 최대 0.28 %). 기식성은 성문 난류가
+#: 성도를 지나 깔리는 **잡음 바닥**이고, 그게 빠지면 모음이 둔탁해져 밝은 /s/ 와
+#: 이어지지 않는다 — "목소리랑 연결이 안 된다" 의 스펙트럼 쪽 원인이다.
+#:
+#: 셸프를 1200 Hz 에 두면 잡음이 F1/F2 공진에 얹혀 1~2 kHz 부터 채운다(게인을
+#: 올려도 4~6 kHz 가 차기 전에 1~2 kHz 가 69 % 로 넘친다). 3500 Hz 로 올리면
+#: 하모닉이 이미 떨어진 자리에만 깔려서 실측 분포와 맞는다.
+BREATH_NOISE_GAIN = 3.6
+BREATH_NOISE_HZ = 3500.0
+BREATH_NOISE_SLOPE = 3.5
+
+
 def base(t: int, prof: VoiceProfile, n_formants: int = 8, n_bands: int = 40,
-         vowel: str = "a") -> dict:
+         vowel: str = "a", sample_rate: int = 24000) -> dict:
     """프로파일의 기본 상태(중립 모음, 말하는 F0)."""
     # 화자 포먼트로 스케일: 모음의 상대 형태는 유지하고 전체 규모만 화자에 맞춘다
     scale = (prof.formants[0] / VOWELS["a"][0]) if prof.formants else 1.0
@@ -54,8 +70,19 @@ def base(t: int, prof: VoiceProfile, n_formants: int = 8, n_bands: int = 40,
         "formant_gain": prof.gain_tensor(1, t, n_formants),
         "noise_bands": torch.full((1, t, n_bands), 1e-4),
         # 성문 기식(두 번째 노이즈 경로). 모든 세그먼트가 키를 가져야 이어붙일 때
-        # 깨지지 않는다. 기본은 0 = 기식 경로 꺼짐.
-        "aspiration_bands": torch.zeros(1, t, n_bands),
+        # 깨지지 않는다.
+        #
+        # 예전엔 여기가 0 이었고 `breathiness` 는 noise_am(변조 깊이)에만 걸려
+        # 있었다 — **있지도 않은 잡음의 변조 깊이**만 정하고 있었던 셈이다.
+        # 그래서 화자의 기식성 0.16 이 소리에 아무 기여도 안 했다.
+        # **발성 중에만** 난다. 기식성은 성대가 떨면서 동시에 새는 기류의 난류라,
+        # 유성 세기에 비례한다. 상수로 깔면 무성 마찰음에도 잡음 바닥이 생겨
+        # /s/ 의 페이드 인/아웃 모양까지 바뀐다(측정: 페이드인 비율 58 % -> 45 %).
+        "aspiration_bands": (band_shelf(n_bands, BREATH_NOISE_HZ,
+                                        BREATH_NOISE_GAIN * prof.breathiness,
+                                        sample_rate, slope_oct=BREATH_NOISE_SLOPE,
+                                        floor=0.0)
+                             .reshape(1, 1, -1).expand(1, t, n_bands).contiguous()),
         "noise_entry": _c(t, 0.0),
         "noise_am": _c(t, prof.breathiness),
         "noise_rough": _c(t, prof.roughness),

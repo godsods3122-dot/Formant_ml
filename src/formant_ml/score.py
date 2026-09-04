@@ -119,8 +119,17 @@ FRICATIVE_CAL_DB = -19.2
 
 #: 음절 안의 마찰음은 위 상수 대신 **같은 음절의 유성 최대 진폭**으로 기준화한다
 #: (아래 참조). 그 기준이 독립 마찰음 경로와 어긋난 만큼을 여기서 되돌린다.
-#: 측정: 프로파일이 -11.0 dB 를 요청했을 때 음절은 +7.8 dB 를 냈다 -> 3.2 dB 크다.
-SYLLABLE_FRICATIVE_CAL_DB = 3.2
+#:
+#: 3.2 -> 25.0 으로 재측정했다. 무게중심 배율의 앵커를 구간 정점으로 옮기면서
+#: 치찰음 봉우리가 8.4 -> 10.0 kHz 로 올라갔는데, 하필 거기가 앞니 다이폴 부스트가
+#: 가장 큰 자리(f_max_boost 11 kHz)라 /s/ 가 통째로 세졌다. 그 결과 음절에서
+#: **마찰음이 모음보다 9.5 dB 컸다** — 실측은 모음이 11.4~12.7 dB 크다(21 dB 오차).
+#: /s/ 만 튀어나오고 모음이 묻히니 "목소리랑 연결이 안 된다" 로 들린다.
+#:
+#: 위의 FRICATIVE_CAL_DB 테스트는 이걸 못 잡는다 — 그건 **비공기역학** 경로만
+#: 재는데 무게중심 배율은 공기역학 경로에만 걸리기 때문이다. 그래서 음절 경로용
+#: 검사를 따로 뒀다(test_voice.py::test_syllable_fricative_level_matches_profile).
+SYLLABLE_FRICATIVE_CAL_DB = 25.0
 
 
 def fricative_gain(prof: VoiceProfile) -> float:
@@ -272,11 +281,11 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
                 f"또는 파라미터 이름: {sorted(PARAM_HELP)[:6]} …")
         c = fn(t, prof, n_formants=K, n_bands=NB, **opts)
     elif kind == "silence":
-        c = base(t, prof, K, NB)
+        c = base(t, prof, K, NB, sample_rate=a.sample_rate)
         c["harmonic_amp"] = torch.zeros(1, t, 1)
         c["noise_bands"] = torch.full((1, t, NB), 1e-6)
     elif kind == "vowel":
-        c = base(t, prof, K, NB, seg.get("vowel", "a"))
+        c = base(t, prof, K, NB, seg.get("vowel", "a"), a.sample_rate)
         c["formant_freq"] = torch.tensor(
             _vowel_formants(seg.get("vowel", "a"), prof, K)
         ).reshape(1, 1, -1).expand(1, t, K).contiguous()
@@ -287,12 +296,12 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
             pts = [(i / max(len(names) - 1, 1), _vowel_formants(v, prof, K)[k])
                    for i, v in enumerate(names)]
             tracks.append(ramp(t, pts))
-        c = base(t, prof, K, NB, names[0])
+        c = base(t, prof, K, NB, names[0], a.sample_rate)
         c["formant_freq"] = torch.cat(tracks, dim=-1)
     elif kind in ("fricative", "syllable"):
         phone = seg.get("onset", seg.get("phone", "s"))
         vowel = seg.get("vowel", "a")
-        c = base(t, prof, K, NB, vowel)
+        c = base(t, prof, K, NB, vowel, a.sample_rate)
         cf, bw, pos, g = FRICATIVES.get(phone, FRICATIVES["s"])
         # 소스는 광대역, 모양은 치찰음 필터가 만든다(둘이 겹치면 손잡이가 죽는다).
         # 레벨: 마찰음이 유성음보다 얼마나 조용한지는 화자 프로파일이 정한다.
@@ -309,6 +318,10 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
         aero_env = aero_cent = None
         if kind == "fricative":
             c["harmonic_amp"] = torch.zeros(1, t, 1)
+            # 무성 마찰음에는 기식성 잡음 바닥이 없다 — 그건 **발성 중에** 성대가
+            # 덜 닫혀 새는 잡음이라 발성이 없으면 존재하지 않는다. 남겨두면
+            # /s/ 위에 상수 잡음이 깔려 페이드 모양이 뭉개진다(58 % -> 45 %).
+            c["aspiration_bands"] = torch.zeros(1, t, NB)
             if wants_aero(seg):
                 # 공기음향 경로: 협착 면적에서 진폭·무게중심을 유도(권장).
                 # /s/ 를 내려면 상당한 압력이 필요하고, 그 압력은 서서히 올랐다
@@ -388,20 +401,26 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
                 # 마찰음 꼬리로 남아 하강이 85 ms 로 늘어졌다(실측 52~64 ms).
                 # 해제 하나가 두 제스처를 함께 촉발해야 연결이 유기적이다.
                 addt = float(seg.get("adduction_s", 0.04)) * a.frame_rate / max(t, 1)
-                # 후두는 혀보다 **먼저** 움직이기 시작한다. 무성 마찰음의 성문
-                # 벌림은 마찰음 **중간**에서 최대가 되고, 후반부에는 이미 다시
-                # 모이는 중이다(후두-구강 협조). 그래서 내전 시작을 협착 해제
-                # 뒤가 아니라 마찰음 구간의 이 지점으로 잡는다.
+                # 내전은 마찰음이 **끝날 때** 시작한다(해제 시점). 더 일찍
+                # 당기면 안 된다 — 성문이 좁아지는 순간 직렬 저항의 무게중심이
+                # 성문으로 옮겨가서, 협착(Ac)은 그대로인데 그 **뒤**의 구강내압이
+                # 무너진다. 측정(내전을 0.40 지점에서 시작했을 때):
+                #   60 ms  Ag 0.080  Pm 0.313  마찰음 0.79
+                #   80 ms  Ag 0.034  Pm 0.091  마찰음 0.18   <- Ac 는 아직 0.10
+                # 즉 혀가 협착을 풀기도 전에 /s/ 가 죽고 발성이 붙어버린다.
+                # 실제 /s/ 는 성문을 벌린 채로 내는 소리이고, 마찰음을 끝내는 건
+                # 후두가 아니라 **혀**다.
                 #
-                # 해제 뒤에 두면 마찰음이 완전히 죽은 다음에야 발성이 붙어서
-                # 둘이 한 프레임도 안 겹친다(측정 0 ms, 실측 180~260 ms) —
-                # 그 무음 구간이 성문파열음으로 들린다.
+                # 이렇게 두면 순서가 맞는다: 마찰음 정점 100 ms -> 해제 110 ms
+                # -> 발성 140 ms (VOT 30 ms, 한국어 평음 ㅅ 의 25~40 ms).
+                # 발성 개시 시점은 여전히 구강내압이 정한다 — 협착이 열려 Pm 이
+                # 빠져야 (Ps-Pm) 이 역치를 넘는다.
                 #
-                # 일찍 모여도 /s/ 가 유성이 되지는 않는다: 협착 뒤 구강내압이
-                # Ps 의 59 % 를 잡고 있어 (Ps-Pm) 이 발성 역치에 못 미친다.
-                # 협착이 열려 Pm 이 빠져야 비로소 떨기 시작한다 — 성문은 미리
-                # 준비하고, 발성 개시 시점은 구강내압이 정한다.
-                a_start = float(seg.get("adduction_start_ratio", 0.40)) * split
+                # 마찰음과 목소리를 잇는 건 마찰음의 꼬리가 아니라 **기식**이다.
+                # 실측에서도 고역이 마찰음 끝에서 0.14 까지 떨어졌다가 발성과
+                # 함께 0.33 으로 **다시 오른다** — 그건 마찰음 잔향이 아니라
+                # 성대가 덜 모인 상태의 기식성 발성이다.
+                a_start = float(seg.get("adduction_start_ratio", 1.0)) * split
                 lag = a_start - hold_r
                 # 내전은 **두 단계**다. /s/ 는 성문을 벌린 자세라, 모음으로 갈 때
                 # 성대가 한 번에 모달 위치로 가지 않는다. 먼저 발성이 가능한 정도만
@@ -472,7 +491,12 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
                 # 게이트로 계산돼 있으니(aspiration_source_amp), 물리에 맡긴다.
                 # (1-env) 도 이중계상이었다: 협착이 좁을 때 성문 유속이 낮다는 건
                 # 직렬 유량 u 에 이미 들어 있고, asp 는 그 u 로 계산된다.
-                asp = asp_env * float(seg.get("aspiration", 4.0))
+                # 4.0 -> 0.8. 예전 값은 기식이 (1-v_frac)·(1-env) 두 게이트로
+                # 좁은 창에만 남던 시절에 맞춘 것이다. 게이트를 물리로 바꾼 뒤
+                # 그대로 두었더니 /s/ 구간에서 기식이 치찰음을 덮어(기식 진폭
+                # 0.365 > 마찰음 0.174), 마찰음 게인을 아무리 낮춰도 음절의
+                # 모음-마찰음 비가 +7.8 dB 에서 안 올라갔다.
+                asp = asp_env * float(seg.get("aspiration", 0.8))
             else:
                 # 마찰음 게이트: 모음으로 넘어갈 때 빠르게 꺼진다(자연스러운 fade-out).
                 env = ramp(t, [(0.0, 1.0), (split, 1.0), (split + 0.1, 0.02),
@@ -510,7 +534,32 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
                 # 그 전환이 전이에 레벨 점프를 만들어 연결이 끊겼다.
                 c["noise_bands"] = (nb * env).contiguous()
                 c["noise_entry"] = torch.full((1, t, 1), float(K) + 6.0)
-                c["aspiration_bands"] = (asp_n * asp).contiguous()
+                # 성문 잡음은 **두 가지**이고 발성에 대한 의존이 서로 반대다.
+                #
+                #  (1) 전이 기식 (asp_n, 900 Hz 셸프): 성문이 벌어진 채 기류만
+                #      지나가는 동안의 난류. 발성이 자리잡으면 성대가 주기마다
+                #      완전히 닫혀 직류 기류가 끊기므로 사라진다.
+                #  (2) 기식성 바닥 (3500 Hz 셸프): 발성 **중에** 성대가 덜 닫혀
+                #      새는 잡음. 발성에 비례해 커진다.
+                #
+                # 정적 성문 면적으로는 (1) 이 저절로 안 꺼진다. 성문 제트속도는
+                # v=sqrt(2Ps/ρ) 로 압력만이 정하고 면적과 무관해서, 성문을
+                # 0.004 cm² 까지 조여도 진폭이 /s/ 때(3103)와 거의 같다(3169).
+                # 주기적 완전폐쇄를 정적 면적이 표현 못 하기 때문이다. 그 몫을
+                # 발성 비율로 대신 준다.
+                #
+                # (1) 만 있으면 모음이 900 Hz 셸프 잡음에 잠겨 1~2 kHz 가 42 %
+                # 가 된다(실측 4.2 %). (2) 만 있으면 마찰음과 발성 사이가 빈다.
+                # 바닥은 **유성 진폭 자체**에 비례한다(정규화된 비율이 아니라).
+                # 새는 잡음은 기류에서 나오므로 소스가 세면 같이 세야 비율이
+                # 유지된다. 비율로 스케일하면 음절처럼 유성 진폭이 1.0 보다
+                # 작을 때 잡음만 상대적으로 커진다(측정: 4~6 kHz 가 7.2 %,
+                # 목표 1.9 %).
+                vfrac = (c["harmonic_amp"]
+                         / c["harmonic_amp"].amax().clamp_min(1e-6)).clamp(0.0, 1.0)
+                c["aspiration_bands"] = (
+                    asp_n * asp * (1.0 - vfrac)
+                    + c["aspiration_bands"] * c["harmonic_amp"]).contiguous()
             else:
                 w_asp = torch.sigmoid((asp - env) * 8.0)
                 c["noise_bands"] = (nb * env + asp_n * asp * 0.5).contiguous()
@@ -520,10 +569,17 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
             # 치경 로커스에서 출발해 짧은 전이(기본 50 ms)로 모음에 도달한다.
             tgt = _vowel_formants(vowel, prof, K)
             loc = LOCUS.get(phone, LOCUS["s"])
-            trans = float(seg.get("transition_s", 0.045)) * a.frame_rate / max(t, 1)
-            amp = c["harmonic_amp"][0, :, 0]
-            voiced = (amp > 0.05 * float(amp.max().clamp_min(1e-6))).nonzero()
-            onset = (float(voiced[0]) / max(t - 1, 1)) if len(voiced) else split
+            # 45 ms 로 두면 발성이 붙을 때 F2 전이가 72 % 밖에 안 끝나서,
+            # 남은 128 Hz 활강이 유성 구간 안에서 들린다 = /j/ = "야".
+            # 32 ms 면 97 % 가 끝나 남는 활강이 30 Hz 남짓이라 안 들린다
+            # (실측: 발성 개시 +2 ms 에 F2 가 이미 목표에 있다).
+            trans = float(seg.get("transition_s", 0.032)) * a.frame_rate / max(t, 1)
+            # 전이 시작은 **해제 시점**이다. 발성 개시에 묶으면 안 된다 —
+            # 후두 타이밍을 건드릴 때마다 포먼트 궤적이 같이 끌려다닌다.
+            # (실제로 내전을 앞당겼더니 전이가 30 ms 일찍 시작됐고, 그 활강이
+            #  유성 구간 안으로 들어와 "사" 가 "야" 로 들렸다.)
+            # 혀는 협착을 푸는 순간 움직이기 시작하고, 발성은 구강내압이 빠진
+            # 뒤에 붙는다. 그래서 소리가 날 때쯤 전이는 이미 끝나 있어야 한다.
             # 혀는 **협착을 푸는 순간**부터 움직인다. 발성은 그보다 늦게 붙는다
             # (구강내압이 빠져야 성대가 떨 수 있으므로). 그래서 F1 도 F2/F3 도
             # 전이를 **해제 시점**에서 출발시킨다.
@@ -533,7 +589,7 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
             # 내려가는 활강이 통째로 들린다 - 고 F2 에서 저 F2 로의 유성 활강은
             # 정의상 /j/ 다. 실제로는 해제와 함께 혀가 이미 움직이고 있어서,
             # 소리가 붙을 때는 F2 전이가 거의 끝나 있다.
-            onset_f1 = onset_f2 = min(onset, split)
+            onset_f1 = onset_f2 = hold_r if wants_aero(seg) else split
             # F1 과 F2/F3 는 **속도가 다르다**. 다만 방향이 예상과 반대다.
             # 실측(본 화자 "사" 녹음, 30 ms 창 LPC, 유성 시작 기준):
             #   F2 : -20 ms 1317 -> +0 ms 1277 -> +30 ms 1129  (이미 도착해 있다)

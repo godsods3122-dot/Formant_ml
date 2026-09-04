@@ -280,7 +280,13 @@ class PhysicalVoiceSynth(nn.Module):
                                    am_depth=c.noise_am * voiced_gate,
                                    glottal_phase=phase, roughness=c.noise_rough,
                                    generator=generator)
-            asp_out = ltv_filter(asp_noise, h_asp, hop, ir)
+            # 이 경로도 **꼬리 상태를 이어야** 스트리밍이 오프라인과 일치한다.
+            # (안 이으면 청크 경계마다 필터 잔향이 잘려 나가 어긋난다.)
+            if state is None:
+                asp_out = ltv_filter(asp_noise, h_asp, hop, ir)
+            else:
+                asp_out, ta = ltv_filter(asp_noise, h_asp, hop, ir,
+                                         st.get("tail_a"), True)
 
         if state is None:
             voiced = ltv_filter(src, h_harm, hop, ir)
@@ -291,6 +297,8 @@ class PhysicalVoiceSynth(nn.Module):
             unvoiced, tn = ltv_filter(raw_noise, h_noise, hop, ir,
                                       st.get("tail_n"), True)
             new_state = {"phase": phase[:, -1:], "tail_h": tv, "tail_n": tn}
+            if asp_out is not None:
+                new_state["tail_a"] = ta
             del phase_full
         if asp_out is not None:
             unvoiced = unvoiced + asp_out
