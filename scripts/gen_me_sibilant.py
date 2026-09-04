@@ -37,7 +37,7 @@ from formant_ml.voice import VoiceProfile
 #: 깨졌다. 제대로 된 해법은 이 상수들을 **샘플레이트 불변**으로 만드는 것이다
 #: (셸프를 활성 밴드 수로 정규화). HANDOFF §5g 참조.
 CAL_44K = {"BREATH_NOISE_GAIN": 7.8, "ASPIRATION_GAIN": 10.0,
-           "SYLLABLE_FRICATIVE_CAL_DB": 19.0}
+           "SYLLABLE_FRICATIVE_CAL_DB": 23.0}
 
 # 협착 궤적을 손으로 그리지 않는다. 예전엔 7 개 꺾은점으로 페이드를 만들었는데,
 # 그건 물리가 아니라 곡선 맞추기였고 호흡 압력과 서로 싸워서 정점이 가청 구간의
@@ -91,8 +91,13 @@ def main() -> None:
     # 음절에도 적용했다 — 폐압은 일정하고 포락선은 혀가 만든다.
     # 재측정(44.1 kHz): 마찰 127.7 ms(실측 122~139), 정점 59 %(57~68),
     # 모음 세기상승 75.5 ms(81~87), 모음 개시 H1-H2 +10.2 dB(+11.8~12.6).
-    sa = {"type": "syllable", "onset": "s", "vowel": "a", "dur": 0.60,
-          "onset_s": 0.085, "aero": True, "drive": "tongue",
+    # 혀 제스처는 **닫고 - 유지하고 - 연다**. 고원(hold_s)이 곧 마찰음의 몸통
+    # 이다(Kim et al. 2022: "높은 Pio 고원 = 음향 마찰음 길이"). 고원 없이
+    # 삼각형으로 두면 상승만 있고 몸통이 없어 짧고 가파른 소리가 된다.
+    # 측정: onset_s 0.09 + hold 0.07 -> 가청 136.4 ms, 정점 64 %, 10->90 상승
+    # 43.5 ms (실측 130 ms, 42~57 %, 48 ms).
+    sa = {"type": "syllable", "onset": "s", "vowel": "a", "dur": 0.72,
+          "onset_s": 0.09, "hold_s": 0.07, "aero": True, "drive": "tongue",
           "f0": [[0, 129], [1, 123]]}
     # 발화는 **무음에서 시작한다**. 첫 세그먼트가 곧바로 시작하면 필터 상태가
     # 0 에서 출발해 첫 1 ms 에 진폭 0.34 짜리 트랜지언트가 난다(실측 0.0054).
@@ -107,7 +112,7 @@ def main() -> None:
     W("m03_s_to_eu_a.wav", {"timeline": [
         lead,
         {"type": "syllable", "onset": "s", "vowel": "a", "dur": 1.05,
-         "onset_s": 0.55, "aero": True, "drive": "tongue",
+         "onset_s": 0.09, "hold_s": 0.50, "aero": True, "drive": "tongue",
          "f0": [[0, 131], [1, 122]]}]})
 
     # 3) 유성 마찰음 /z/ — 성대가 떨며 마찰음을 성문주기로 변조한다(소스-치찰음 결합).

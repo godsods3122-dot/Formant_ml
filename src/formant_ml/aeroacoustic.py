@@ -708,8 +708,46 @@ def cv_gesture_times(onset_s: float, peak_frac: float, a_min: float = TONGUE_A_M
     return (onset_s * p * l_close / k, onset_s * (1.0 - p) * l_open / k)
 
 
+#: 발화 개시에서 폐압이 서는 데 걸리는 시간 [s]. 호흡근이 흉곽을 눌러 압력을
+#: 만드는 과정이라 계단일 수 없다.
+BREATH_ONSET_S = 0.045
+
+
+def breath_onset(t: int, frame_rate: float, onset_s: float = BREATH_ONSET_S,
+                 delay_s: float = 0.0, device=None) -> torch.Tensor:
+    """발화 개시의 폐압 상승 0~1 (1,T,1). 부드러운 S 자(raised cosine).
+
+    **왜 필요한가**: Signorello et al.(2018) 의 "Ps 는 마찰음 내내 거의 일정"
+    은 마찰음 **구간 안**의 관찰이다. 발화가 시작될 때 압력이 계단으로 선다는
+    뜻이 아니다. 그런데 혀 제스처 모드는 폐압을 상수로 두므로, 세그먼트 첫
+    프레임부터 Ps 가 최대다.
+
+    그러면 무슨 일이 나나: 발화 개시에는 혀가 아직 협착을 안 만들었고(성도가
+    열려 있고) 성문도 마찰음용으로 크게 벌어져 있다. 직렬 저항이 양쪽 다 낮아
+    **유량이 즉시 최대**가 되고, 성문 난류(기식)가 첫 프레임에 최대로 켜진다.
+    그 잡음은 성도 **전체**를 통과하므로 포먼트로 울리고, 계단 입력이라
+    감쇠 진동 = 파열음 버스트가 된다.
+
+    측정(무음 + '사'): 경계에서 aspiration_bands 가 0 -> 0.1024 로 한 프레임에
+    뛰고 파형이 ±0.95 까지 튄 뒤 30 ms 에 걸쳐 감쇠했다. 사용자가 "ksa" 의
+    /k/ 로 듣던 것이 이것이다. 마찰음(noise_bands)은 그 시점에 0.0001 로
+    정상이었다 — 범인은 마찰음이 아니라 기식이었다.
+
+    `delay_s` 만큼 늦게 시작한다. **램프를 늘리는 것과 늦추는 것은 다르다** —
+    압력이 서는 데 걸리는 시간은 생리적으로 40~60 ms 로 고정이고, 조음과
+    맞추려면 그 램프를 **옮겨야** 한다. 늘려 버리면(폐쇄 시간 200 ms 에 맞춰
+    램프도 200 ms 로) 마찰음 앞 130 ms 가 통째로 안 들리게 된다(측정).
+    """
+    n = max(int(t), 1)
+    k = max(int(round(onset_s * frame_rate)), 1)
+    d = max(int(round(delay_s * frame_rate)), 0)
+    i = (torch.arange(n, device=device, dtype=torch.float32) - d).clamp_min(0.0)
+    return (0.5 - 0.5 * torch.cos(torch.pi * (i / k).clamp(0.0, 1.0))).reshape(1, n, 1)
+
+
 def tongue_constriction_cv(t: int, frame_rate: float, close_s: float,
-                           release_s: float, a_min: float = TONGUE_A_MIN,
+                           release_s: float, hold_s: float = 0.0,
+                           a_min: float = TONGUE_A_MIN,
                            a_rest: float = TONGUE_A_REST,
                            a_open: float = NEUTRAL_TRACT_AREA,
                            device=None) -> tuple:
@@ -731,19 +769,30 @@ def tongue_constriction_cv(t: int, frame_rate: float, close_s: float,
 
     로그 면적에서 선형 보간한다(조음기가 일정 속도로 움직이면 면적은 지수적으로
     변한다 — 간극이 좁을수록 같은 변위가 면적을 더 크게 바꾼다).
+
+    **고원이 있어야 한다.** Kim et al.(2022) 은 한국어 /s/ 에서 "높은 Pio 고원
+    이 음향 마찰음 길이의 공기역학적 대응물" 이라고 못박았다. 닫자마자 바로
+    여는 삼각형이면 상승만 있고 몸통이 없다 — 게다가 Ps 가 일정할 때 진폭은
+    1/(Ac²/Ag²+1) 이라 Ac ≪ Ag 에서 **포화**하므로, 가청 구간이 짧고 가파른
+    상승 하나로 뭉친다(측정: 가청 80 ms, 정점 위치 26~32 %, 상승 20 ms —
+    실측은 130 ms, 42~57 %, 48 ms).
+
+    반환하는 위치는 **고원의 끝**(해제 시작)이다. 그게 곧 포먼트 전이·내전의
+    기준점이다.
     """
     n = max(int(t), 1)
     dur = max((n - 1) / max(frame_rate, 1e-6), 1e-6)
-    cf = min(max(close_s / dur, 1e-3), 0.95)
-    rf = min(max(release_s / dur, 1e-3), 1.0 - cf)
+    cf = min(max(close_s / dur, 1e-3), 0.9)
+    hf = min(max(hold_s / dur, 0.0), 0.95 - cf)
+    rf = min(max(release_s / dur, 1e-3), 1.0 - cf - hf)
     lo = math.log(max(a_min, 1e-6))
     hi = math.log(max(a_rest, a_min * 1.01))
     op = math.log(max(a_open, a_min * 1.01))
     i = torch.arange(n, device=device, dtype=torch.float32) / max(n - 1, 1)
     closing = hi + (lo - hi) * (i / cf).clamp(0.0, 1.0)
-    opening = lo + (op - lo) * ((i - cf) / rf).clamp(0.0, 1.0)
-    logA = torch.where(i <= cf, closing, opening)
-    return logA.exp().reshape(1, n, 1), cf
+    opening = lo + (op - lo) * ((i - cf - hf) / rf).clamp(0.0, 1.0)
+    logA = torch.where(i <= cf + hf, closing, opening)
+    return logA.exp().reshape(1, n, 1), cf + hf
 
 
 # --- 호흡 구동압: /s/ 의 페이드 인/아웃이 여기서 나온다 -----------------------

@@ -212,6 +212,12 @@ def aero_drive(seg: dict, t: int, frame_rate: float, glottal_area=None) -> dict:
         # 되고(실측은 0.08 -> 0.85 -> 0.08 로 크게 변한다) 유량이 가운데서
         # 최대가 된다(실측은 가운데가 최소인 U 자다). 부호까지 반대였다.
         ps_t = torch.full((1, t, 1), _PS_CGS * float(seg.get("pressure", 1.0)))
+        # 발화 개시에서는 폐압이 서는 데 시간이 걸린다. 이게 없으면 성도가
+        # 열려 있는 첫 프레임에 유량이 즉시 최대가 되어 성문 기식이 계단으로
+        # 켜지고, 그 계단이 성도를 때려 파열음 버스트가 된다(§breath_onset).
+        ps_t = ps_t * aac.breath_onset(
+            t, frame_rate, float(seg.get("breath_onset_s", aac.BREATH_ONSET_S)),
+            float(seg.get("breath_delay_s", 0.0)))
     elif ps_scale is None:
         # 기본값은 **호흡 제스처**다(실측에서 적합). 신경 구동 -> 근육 2단 지연
         # -> 압력. 올릴 때가 내릴 때보다 느려서(능동 동원 vs 힘 놓기) 가청
@@ -531,8 +537,17 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
                         glottal_area=_abd)
                     cls = float(seg.get("close_s", _cls))
                     rel = float(seg.get("release_s", _rel))
+                    # 폐압은 **협착을 만들면서 같이** 오른다. 성도가 아직 열려
+                    # 있는 동안 압력이 다 걸리면 그 구간이 /h/ 가 된다 —
+                    # 측정: 압력 램프 45 ms, 협착이 가청 경계를 지나는 시점
+                    # 30 ms 였을 때 앞쪽 기식 혹이 0.037(마찰음은 0.0005).
+                    # 램프를 폐쇄 시간에 맞추면 0.014 로 줄고 마찰음은 그대로다.
+                    # 램프 길이는 생리적 상수(~45 ms)로 두고 **시작을 늦춘다**.
+                    # 협착이 다 만들어지는 순간(cls)에 압력이 서도록 맞춘다.
+                    seg.setdefault("breath_delay_s", max(cls - aac.BREATH_ONSET_S, 0.0))
+                    hld = float(seg.get("hold_s", onset_s))
                     ac_cv, hold_r = aac.tongue_constriction_cv(
-                        t, a.frame_rate, cls, rel,
+                        t, a.frame_rate, cls, rel, hld,
                         a_min=_amin, a_rest=_rest,
                         a_open=float(seg.get("a_open", 3.0)))
                     # 혀 제스처에 맞는 후두 타이밍 기본값. 마찰음의 성문 개대는
