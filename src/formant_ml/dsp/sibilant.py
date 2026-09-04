@@ -158,8 +158,11 @@ def sibilant_response(p: SibilantParams, sample_rate: float,
     H = H * tilt_response(p.tilt, sample_rate, n_freq)
     if p.teeth_f is not None and p.teeth_bw is not None:
         # resonator_response 는 단(stage)축을 남긴 (B,T,K,F) 를 돌려준다. 곱해서 접는다.
-        tg = (torch.ones_like(p.teeth_f) if p.teeth_gain is None
-              else p.teeth_gain.clamp(0.0, 1.0))
+        # 혼합 가중치는 **단 축을 접은 뒤** 곱하므로 (B,T,1) 이어야 한다.
+        # `ones_like(teeth_f)` 로 두면 앞니 공진을 두 개 이상 줄 때 모양이
+        # 어긋난다(K=1 을 가정한 잠재 버그였다).
+        tg = (torch.ones_like(p.teeth_f[..., :1]) if p.teeth_gain is None
+              else p.teeth_gain[..., :1].clamp(0.0, 1.0))
         # 공진을 **병렬로** 섞는다: (1-g)·평탄 + g·공진. 게인을 공진기 자체에
         # 곱하면 세기를 줄일 때 그 대역이 통째로 파여서 스펙트럼에 구멍이 난다.
         # 여기서 원하는 건 "앞니 공진이 덜 도드라진다" 이지 "그 대역이 없다" 가

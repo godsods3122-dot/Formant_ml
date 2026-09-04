@@ -348,6 +348,10 @@ def obstacle_dipole_bands(n_bands: int, sample_rate: float = 24000.0,
     f = torch.linspace(0.0, sample_rate / 2, n_bands).clamp_min(50.0)
     oct_ = torch.log2((f / f_ref).clamp_min(1.0))
     oct_ = torch.minimum(oct_, torch.log2(torch.tensor(f_max_boost / f_ref)))
+    # **고역 하강 모서리는 여기 두지 않는다.** 13 kHz 위로 -20~-50 dB/oct 를
+    # 걸어 봤지만 실측과의 진짜 차이인 12 kHz 구멍(실측 -4.7/-10.7, 합성 -31.6)
+    # 은 전혀 안 움직이고 18~22 kHz 만 더 내려갔다(이미 -40 인데 실측 -32).
+    # 그 구멍은 다이폴이 아니라 앞니 공진기의 대역폭이 만든다. HANDOFF §6.10.
     if torch.is_tensor(db_per_oct):
         # 시변: (1,T,1) 기울기 -> (1,T,n_bands). 제트가 느려지면 다이폴이
         # 약해지므로 기울기 자체가 프레임마다 달라진다.

@@ -138,6 +138,44 @@ def lip_radiation_response(sample_rate: float, n_freq: int, alpha: float = 0.98,
     return (1.0 - alpha * z1).reshape(1, 1, -1)
 
 
+def min_phase_from_log_mag(log_mag: torch.Tensor) -> torch.Tensor:
+    """log|H| (..., n_freq) -> **최소위상** 복소응답 (..., n_freq).
+
+    실수 캡스트럼의 인과 부분만 남기는 표준 힐베르트 재구성이다.
+
+    **왜 크기만 주면 안 되는가.** 크기만 실수로 돌려주면 그건 영위상 필터이고,
+    영위상 필터의 임펄스응답은 t=0 대칭이라 **비인과적**이다. `response_to_ir`
+    이 ir_size//2 만큼 롤하고 `ltv_filter` 가 그 지연을 보정하므로, 대칭인 절반이
+    그대로 **프리에코**(여기가 되기 전에 소리가 나는 것)로 남는다.
+
+    측정(치찰음 경로, 정점보다 앞에 오는 임펄스응답 에너지 비율):
+        극·영점  0.0 %      앞니 공진기 0.0 %     (둘 다 최소위상)
+        스커트  21.3 %      tilt       46.7 %    (둘 다 영위상이었다)
+        노이즈 경로 전체 26.0 %, -20 dB 기준 0.16 ms 선행
+
+    **정상 잡음에서는 위상이 관측 불가능하다**(시간 이동에 대해 통계가 불변이다 —
+    실제로 군지연 추정기가 이론값 1.06 ms 짜리 공진기에서도 0 을 돌려준다).
+    그래서 이 결함은 마찰음의 **정상부가 아니라 개시·해제·변조** 에서만 드러난다.
+
+    .. warning::
+       `tilt_response` / `skirt_response` 는 **아직 이걸 안 쓴다**. 위상은 곱셈
+       에서는 크기에 영향이 없지만 **병렬 덧셈**(치찰음 필터의 `floor_db`,
+       `_oral_leak`, 앞니 병렬 혼합)에서는 영향이 있고, 프로파일의 `floor_db` 와
+       포먼트 추출기가 지금의 혼합위상 모델에 맞춰 적합돼 있다. 바꿨더니
+       분석/합성 왕복이 깨졌다(pole_f 3500 -> 4266). 실측 대비 개선은 무시할
+       수준이었다(무게중심 아치 7862->8549->8010 vs 7513->8476->7468).
+       바꾸려면 `floor_db` 재적합과 추출기 수정이 같이 가야 한다. HANDOFF §6.12.
+    """
+    n_freq = log_mag.shape[-1]
+    n_fft = 2 * (n_freq - 1)
+    cep = torch.fft.irfft(log_mag.to(torch.complex64), n_fft)
+    w = torch.zeros(n_fft, device=log_mag.device, dtype=log_mag.dtype)
+    w[0] = 1.0
+    w[1: n_fft // 2] = 2.0
+    w[n_fft // 2] = 1.0
+    return torch.exp(torch.fft.rfft(cep * w, n_fft))
+
+
 def bands_to_response(band_gains: torch.Tensor, n_freq: int,
                       min_phase: bool = True) -> torch.Tensor:
     """대역 게인 (B, T, n_bands) -> 매끄러운 복소응답 (B, T, n_freq).
@@ -151,16 +189,7 @@ def bands_to_response(band_gains: torch.Tensor, n_freq: int,
     ).reshape(b, t, n_freq).clamp_min(1e-7)
     if not min_phase:
         return mag.to(torch.complex64)
-    # log|H| 의 실수 캡스트럼 -> 최소위상 재구성
-    log_mag = torch.log(mag)
-    n_fft = 2 * (n_freq - 1)
-    cep = torch.fft.irfft(log_mag.to(torch.complex64), n_fft)
-    w = torch.zeros(n_fft, device=mag.device, dtype=mag.dtype)
-    w[0] = 1.0
-    w[1 : n_fft // 2] = 2.0
-    w[n_fft // 2] = 1.0
-    spec = torch.fft.rfft(cep * w, n_fft)
-    return torch.exp(spec)
+    return min_phase_from_log_mag(torch.log(mag))
 
 
 def tilt_response(tilt_db_per_oct: torch.Tensor, sample_rate: float, n_freq: int,
@@ -187,6 +216,8 @@ def tilt_response(tilt_db_per_oct: torch.Tensor, sample_rate: float, n_freq: int
                   dtype=tilt_db_per_oct.dtype).clamp_min(20.0)
     oct_ = torch.log2(f / pivot_hz)                        # (n_freq,)
     db = tilt_db_per_oct * oct_.view(1, 1, -1)             # (B, T, n_freq)
+    # **영위상(실수)이다.** 최소위상이 물리적으로 맞지만 지금은 못 바꾼다 —
+    # 이유와 측정은 `min_phase_from_log_mag` 주석과 HANDOFF §6.12 에 있다.
     return (10.0 ** (db.clamp(lo_db, hi_db) / 20.0)).to(torch.complex64)
 
 
@@ -224,6 +255,7 @@ def skirt_response(peak_f, slope_lo, slope_hi, sample_rate: float, n_freq: int,
                   dtype=peak_f.dtype).clamp_min(20.0).view(1, 1, -1)
     o = torch.log2(f / peak_f.clamp_min(100.0))
     db = torch.where(o < 0, slope_lo * o, slope_hi * o).clamp_min(floor_db)
+    # tilt_response 와 같은 이유로 영위상이다(HANDOFF §6.12).
     return (10.0 ** (db / 20.0)).to(torch.complex64)
 
 

@@ -202,3 +202,31 @@ if __name__ == "__main__":
             print(f"  FAIL  {fn.__name__}: {e}")
     print(f"\n{len(fns) - failed}/{len(fns)} 통과")
     sys.exit(1 if failed else 0)
+
+def test_sibilant_accepts_more_than_one_teeth_resonance():
+    """앞니 공진을 두 개 이상 줘도 모양이 안 깨진다.
+
+    `teeth_gain` 은 단(stage) 축을 접은 **뒤** 곱하는 병렬 혼합 가중치라
+    (B,T,1) 이어야 하는데, 없을 때 `ones_like(teeth_f)` 로 만들고 있었다.
+    그래서 K=1 일 때만 우연히 맞았고 K=2 면 터졌다.
+
+    (실측 긴 /s/ 의 8~13 kHz 고원을 공진 두 개로 덮는 실험을 하려면 이게
+     되어야 한다. 그 실험 자체는 무게중심 아치를 잃어서 채택하지 않았다 —
+     HANDOFF §6.10.)
+    """
+    from formant_ml.dsp.sibilant import SibilantParams, sibilant_response
+    fs, nf, t = 44100, 129, 3
+
+    def const(v, k):
+        return torch.full((1, t, k), float(v)) if k else None
+    for k in (1, 2, 3):
+        p = SibilantParams(
+            pole_f=const(5300, 1), pole_bw=const(600, 1),
+            zero_f=const(2000, 1), zero_bw=const(400, 1),
+            teeth_f=torch.tensor([[[10015.0, 12500.0, 14000.0][:k]]] * t
+                                 ).reshape(1, t, k),
+            teeth_bw=const(900, k), tilt=const(-5.0, 1), mix=const(1.0, 1),
+            floor_db=const(-25.0, 1), roughness=const(0.12, 1))
+        H = sibilant_response(p, fs, nf)
+        assert H.shape == (1, t, nf), f"K={k} 에서 모양이 {tuple(H.shape)}"
+        assert torch.isfinite(H.abs()).all()
