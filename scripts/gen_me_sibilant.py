@@ -11,11 +11,33 @@ from __future__ import annotations
 
 import argparse
 import os
+from dataclasses import replace
 
+from formant_ml import gestures as G
+from formant_ml import score as SC
 from formant_ml.config import Config
 from formant_ml.score import render
 from formant_ml.utils import save_wav
 from formant_ml.voice import VoiceProfile
+
+#: **샘플레이트에 의존하는 잡음 보정 상수들** (44.1 kHz 용).
+#:
+#: 이 상수들은 `band_shelf(n_bands, ...)` 가 0~나이퀴스트를 n_bands 로 나누는 데서
+#: 샘플레이트에 딸려 온다. 24 kHz 에서는 한 밴드가 300 Hz 이고 3500 Hz 셸프 위로
+#: 28 밴드가 남는데, 44.1 kHz 에서는 551 Hz 에 34 밴드다. 같은 게인을 쓰면 잡음
+#: 파워가 22 kHz 까지 퍼져서 모음 4~6 kHz 비중이 2.1 % -> 0.27 % 로 8 배 줄어든다.
+#:
+#: 그래서 24 kHz 기본값을 그대로 쓰면 44.1 kHz 출력이 이렇게 어긋난다:
+#:   모음-마찰음 +9.9 dB (목표 +11~13), 전이 최저 0.070 (목표 >=0.13),
+#:   모음 4~6 kHz 0.27 % (실측 2.1 %)
+#: 아래 값으로 다시 맞추면: +12.0 dB / 0.159 / 2.20 % / 0-1k 92.9 % (실측 92.6).
+#:
+#: **모듈 기본값을 안 건드리는 이유**: 테스트 79 개가 24 kHz 를 전제로 잡혀 있다
+#: (hop 240, 밴드 인덱스, 프레임 크기). 기본값을 44.1 kHz 로 바꿨더니 17 개가
+#: 깨졌다. 제대로 된 해법은 이 상수들을 **샘플레이트 불변**으로 만드는 것이다
+#: (셸프를 활성 밴드 수로 정규화). HANDOFF §5g 참조.
+CAL_44K = {"BREATH_NOISE_GAIN": 7.8, "ASPIRATION_GAIN": 10.0,
+           "SYLLABLE_FRICATIVE_CAL_DB": 27.0}
 
 # 협착 궤적을 손으로 그리지 않는다. 예전엔 7 개 꺾은점으로 페이드를 만들었는데,
 # 그건 물리가 아니라 곡선 맞추기였고 호흡 압력과 서로 싸워서 정점이 가청 구간의
@@ -39,8 +61,20 @@ def main() -> None:
     ap.add_argument("--out", default="out")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
+    # **44.1 kHz 로 낸다.** 기본값 24 kHz 는 나이퀴스트가 12 kHz 인데, 이 화자의
+    # 앞니 공명이 10015 Hz 다 — 봉우리 바로 위 1.2 kHz 에서 스펙트럼이 벽에 부딪힌다.
+    # 실제 /s/ 는 16 kHz 위까지 이어지고 기준 녹음도 44.1 kHz 다. 그래서 24 kHz 로
+    # 내면 /s/ 가 통째로 둔탁해진다(사용자 지적).
+    # 측정: 치찰음 봉우리가 24 kHz 에서 10266~10289 Hz, 44.1 kHz 에서 9905~10099 Hz
+    # (실측 9905~9991). 나이퀴스트가 봉우리를 위로 밀고 있었다.
     cfg = Config()
+    cfg = replace(cfg, audio=replace(cfg.audio, sample_rate=44100,
+                                     hop_size=441, fmax=22050.0))
     sr = cfg.audio.sample_rate
+    # 샘플레이트를 올렸으면 잡음 보정도 같이 올려야 한다(위 CAL_44K 주석 참조).
+    G.BREATH_NOISE_GAIN = CAL_44K["BREATH_NOISE_GAIN"]
+    SC.ASPIRATION_GAIN = CAL_44K["ASPIRATION_GAIN"]
+    SC.SYLLABLE_FRICATIVE_CAL_DB = CAL_44K["SYLLABLE_FRICATIVE_CAL_DB"]
     here = os.path.dirname(os.path.abspath(__file__))
     prof = VoiceProfile.load(os.path.join(here, "..", "profiles", "me.json"))
 
