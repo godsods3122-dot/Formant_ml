@@ -33,6 +33,8 @@ Shadle(1985/1990), Narayanan & Alwan(2000)의 극-영점 모형이며 `dsp/sibil
 """
 from __future__ import annotations
 
+import math
+
 import torch
 
 from .utils import ramp
@@ -236,3 +238,120 @@ def relax_pressure(pm: torch.Tensor, oral_area: torch.Tensor,
 def transglottal_pressure(ps: torch.Tensor, pm: torch.Tensor) -> torch.Tensor:
     """성대를 실제로 구동하는 압력 (Ps - Pm), 음수는 0 으로."""
     return (ps - pm).clamp_min(0.0)
+
+
+# --- 구강 공동을 '상태변수' 로: 되밀림(back-pressure)이 유량을 제한한다 -------
+# 위의 `intraoral_pressure` 는 **정상상태** 값이다. 실제 구강은 압축성 공동이라
+# 압력이 붙었다 빠지는 데 시간이 걸리고, 그 압력이 성문 쪽 유입을 **되밀어**
+# 유량을 깎는다. 상태변수 Pm 하나로 쓰면
+#
+#     C·dPm/dt = U_in - U_out
+#     U_in  = Ag·sqrt(2(Ps-Pm)/ρ)     (성문 통과 — Pm 이 클수록 덜 들어온다)
+#     U_out = Ac·sqrt(2·Pm/ρ)         (협착 통과 — 마찰음을 만드는 그 유량)
+#     C     = V/(ρc²)                 (공동의 음향 컴플라이언스)
+#
+# 정상상태(U_in=U_out)를 풀면 정확히 `series_flow` 가 나온다 — 같은 모형의
+# 정적 극한이다. 달라지는 건 **과도구간**이고, 그게 /s/ 의 시작과 해제다.
+#
+# 시상수: 두 오리피스의 (선형화) 컨덕턴스 G = dU_in/d(-Pm) + dU_out/dPm 로
+# τ = C/G. /s/ 유지 중에는 τ≈1~2 ms 라 Pm 이 사실상 정상상태를 따라가고,
+# 협착을 풀면 Ac 가 커져 G 가 급증 -> τ 가 더 짧아져 압력이 **빠르고 부드럽게**
+# 빠진다. 그 순간 (Ps-Pm) 이 발성 역치를 넘는다 = VOT.
+#
+# (예전 `oral_relax_tau` 는 저항을 음향 방사저항 ρc/Ac 로 잡아 τ 를 17~21 ms 로
+#  봤는데, 준정적 기류에 맞는 저항은 난류 오리피스 저항이다. 여기서 쓰는 값이
+#  그것이고, 같은 '느리게 쌓이고 빠르게 빠진다' 를 올바른 크기로 준다.)
+ORAL_COMPLIANCE = ORAL_VOLUME / (RHO * SOUND_SPEED ** 2)   # [cm^5/dyn]
+
+
+def oral_cavity(ps: torch.Tensor, glottal_area: torch.Tensor,
+                oral_area: torch.Tensor, frame_rate: float,
+                compliance: float = ORAL_COMPLIANCE) -> tuple:
+    """구강 공동을 적분한다. 입력·출력 모두 (1,T,1).
+
+    반환 (pm, u_out): 구강내압 [dyn/cm^2] 과 협착을 지나는 유량 [cm^3/s].
+
+    프레임률(100 Hz)에 비해 τ 가 훨씬 짧으므로(dt/τ≈7) 전진 오일러는 발산한다.
+    선형화 해가 정확한 **지수 적분**을 쓴다: 매 프레임 정상상태 Pm_ss 로
+    시상수 τ 만큼 지수적으로 다가간다. 두 극한(τ≫dt, τ≪dt)에서 모두 정확하고
+    무조건 안정하며 미분가능하다.
+    """
+    dt = 1.0 / max(frame_rate, 1e-6)
+    ag = glottal_area.clamp_min(1e-4)
+    ac_ = oral_area.clamp_min(1e-4)
+    # 정상상태: series_flow 의 유량으로 만든 협착 압력강하가 그대로 Pm_ss.
+    u_ss = series_flow(ps, ag, ac_)
+    pm_ss = 0.5 * RHO * (u_ss / ac_) ** 2
+    # 선형화 컨덕턴스 -> 시상수 (프레임별)
+    dps = (ps - pm_ss).clamp_min(1.0)
+    g = ag / (2.0 * RHO * dps).sqrt() + ac_ / (2.0 * RHO * pm_ss.clamp_min(1.0)).sqrt()
+    tau = compliance / g.clamp_min(1e-12)
+    a = 1.0 - torch.exp(-dt / tau.clamp_min(1e-9))       # 프레임별 접근계수
+    pm = torch.zeros_like(pm_ss)
+    prev = torch.zeros_like(pm_ss[:, :1, :])
+    for i in range(pm_ss.shape[1]):
+        prev = prev + a[:, i:i + 1, :] * (pm_ss[:, i:i + 1, :] - prev)
+        pm[:, i:i + 1, :] = prev
+    return pm, ac_ * (2.0 * pm.clamp_min(0.0) / RHO).sqrt()
+
+
+# --- 호흡 구동압: /s/ 의 페이드 인/아웃이 여기서 나온다 -----------------------
+# 실측(업로드 녹음 4 토큰, 4 kHz 이상 대역 포락선):
+#
+#   토큰        길이     피크위치   상승     하강    상승/하강
+#   사 #1      122 ms    57.1 %    70 ms    52 ms     1.35
+#   사 #2      128 ms    68.2 %    87 ms    41 ms     2.12
+#   긴 /s/ #1 1097 ms    56.1 %   615 ms   482 ms     1.28
+#   긴 /s/ #2 1649 ms    56.7 %   935 ms   714 ms     1.31
+#
+# 두 가지가 읽힌다.
+#
+# 1. **페이드 인이 소리의 절반을 넘는다** (56~68 %). 이건 협착이나 게이트로는
+#    안 나온다: 압력 아치를 완벽히 대칭으로 주고 레이놀즈 게이트 + 제곱법칙을
+#    다 태워도 가청 포락선의 피크는 49.5 % 에 그대로 남는다(진폭이 Ps 의 단조
+#    함수라 피크가 안 옮겨간다). 즉 **비대칭은 호흡 구동 자체에 있다** —
+#    올릴 때가 내릴 때보다 느리다. 좁은 협착 뒤에 압력을 쌓는 건 호기근을
+#    능동적으로 밀어 넣는 일이라 느리고, 끄는 건 그 힘을 놓는 일이라 빠르다.
+#
+# 2. **불변량은 시간이 아니라 비율이다.** 길이가 13 배(122 ms → 1.65 s) 차이나도
+#    피크 위치는 56~57 % 로 같다. 그래서 시상수를 초로 박으면 안 되고 **구간
+#    길이에 대한 비율**로 잡아야 한다 — 화자가 의도한 길이에 맞춰 힘 주는
+#    속도를 조절하는, 계획된 운동 제스처다.
+#
+# 모형: 신경 구동(사각) -> 1차 지연 2단(근육 활성화 + 힘 발생) -> 압력.
+# 오르내림의 시상수를 따로 둔다(능동 수축 vs 이완). 2단이라 꼭짓점이 뾰족하지
+# 않고 둥글게 나온다 — 실측 포락선의 모양이 그렇다.
+#: 실측 4 토큰에 맞춘 값. 이 셋으로 합성한 가청 포락선은 0.13~2.3 s 구간에서
+#: 피크 56.4~57.8 %, 상승/하강 1.29~1.37 로 나온다(실측 56~57 %, 1.28~1.35).
+#: 구강내압은 Ps 의 59 % 를 먹는다(문헌 60~70 %).
+BREATH_HOLD = 0.40      # 신경 구동이 켜져 있는 비율
+BREATH_RISE = 0.22      # 상승 시상수 / 구간길이 (능동 호기근 동원: 느리다)
+BREATH_FALL = 0.07      # 하강 시상수 / 구간길이 (힘을 놓는다: 빠르다)
+BREATH_PEAK = 0.57      # 가청 포락선의 정점 위치 (실측 56~57 %, 음절도 57~68 %)
+
+
+def breath_drive(t: int, hold: float = BREATH_HOLD, rise: float = BREATH_RISE,
+                 fall: float = BREATH_FALL, floor: float = 0.02,
+                 peak: float = 1.0, sustain: float | None = None,
+                 device=None) -> torch.Tensor:
+    """호흡 구동압 Ps(t)/Ps0 (1,T,1). hold/rise/fall 은 **구간 길이 대비 비율**.
+
+    `sustain` 을 주면 신경 구동이 0 으로 안 떨어지고 그 값에서 유지된다 —
+    음절(/사/)에서 마찰음이 끝나도 모음을 낼 압력은 남아 있어야 하기 때문이다.
+    그때 마찰음이 꺼지는 건 압력이 아니라 **협착이 열려서**다.
+    """
+    n = max(int(t), 1)
+    drive = torch.full((1, n, 1), 0.0 if sustain is None else float(sustain),
+                       device=device)
+    drive[:, :max(int(round(hold * n)), 1), :] = 1.0
+    ar = 1.0 - math.exp(-1.0 / max(rise * n, 1e-6))
+    af = 1.0 - math.exp(-1.0 / max(fall * n, 1e-6))
+    out = torch.zeros_like(drive)
+    s1 = torch.zeros((1, 1, 1), device=device)
+    s2 = torch.zeros((1, 1, 1), device=device)
+    for i in range(n):
+        d = drive[:, i:i + 1, :]
+        s1 = s1 + torch.where(d > s1, ar, af) * (d - s1)
+        s2 = s2 + torch.where(s1 > s2, ar, af) * (s1 - s2)
+        out[:, i:i + 1, :] = s2
+    return floor + (peak - floor) * out.clamp(0.0, 1.0)

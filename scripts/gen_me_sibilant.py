@@ -17,11 +17,15 @@ from formant_ml.score import render
 from formant_ml.utils import save_wav
 from formant_ml.voice import VoiceProfile
 
-# 실측 /사/: 협착이 프리케이션 동안 서서히 열려 무게중심이 6500->3900 으로 내려간다.
-# 협착 해제를 발성 개시와 **겹치게** 맞춘다. 예전엔 마찰음이 꺼진 뒤 발성까지
-# 120 ms 무음이 생겨 '무음 + 급개시' = 폐쇄음으로 들렸다(/사/ 가 "스트라").
-SA_AREA = [[0, 0.20], [0.06, 0.13], [0.24, 0.18], [0.30, 0.26],
-           [0.34, 1.0], [0.44, 3.0], [1, 3.0]]
+# 협착 궤적을 손으로 그리지 않는다. 예전엔 7 개 꺾은점으로 페이드를 만들었는데,
+# 그건 물리가 아니라 곡선 맞추기였고 호흡 압력과 서로 싸워서 정점이 가청 구간의
+# 24 % 로 앞당겨졌다(실측 52~63 %). 이제 협착은 그냥 '좁게 유지하다 해제' 이고,
+# 페이드 인/아웃은 전부 **호흡 구동압**에서 나온다(aeroacoustic.breath_drive).
+
+#: 독립 마찰음에서 가청 /s/ 는 세그먼트의 약 48 % 다 — 나머지는 압력이 임계
+#: 유속에 못 미쳐 소리가 안 나는 앞뒤 램프다(그게 페이드 인/아웃의 실체다).
+#: 그래서 1.1 s 짜리 /s/ 를 들으려면 세그먼트를 2.3 s 로 잡는다.
+AUDIBLE_FRAC = 0.48
 
 
 def main() -> None:
@@ -41,10 +45,12 @@ def main() -> None:
 
     print(f"내 목소리 · 공기음향 재구성 -> {args.out}/")
 
-    # 1) '사' — 협착 면적에서 진폭·게이트·무게중심 하강이 전부 유도된다
+    # 1) '사' — 호흡 압력이 페이드를, 협착 해제가 마찰음 종료를 만든다.
+    #    onset_s 0.11 -> 가청 /s/ 160 ms, 정점 60 %, 상승 96 / 하강 64 ms
+    #    (실측 134~139 ms, 52~63 %, 70~87 / 52~64 ms).
     sa = {"type": "syllable", "onset": "s", "vowel": "a", "dur": 0.58,
-          "onset_s": 0.14, "aero": True, "transition_s": 0.12,
-          "constriction_area": SA_AREA, "f0": [[0, 129], [1, 123]]}
+          "onset_s": 0.11, "aero": True, "transition_s": 0.12,
+          "f0": [[0, 129], [1, 123]]}
     W("m01_sa.wav", {"timeline": [sa]})
     W("m02_sa_sa.wav", {"timeline": [sa, {"type": "silence", "dur": 0.3}, dict(sa)]})
 
@@ -55,8 +61,6 @@ def main() -> None:
     W("m03_s_to_eu_a.wav", {"timeline": [
         {"type": "syllable", "onset": "s", "vowel": "a", "dur": 1.05,
          "onset_s": 0.55, "aero": True, "transition_s": 0.12,
-         "constriction_area": [[0, 0.5], [0.08, 0.12], [0.45, 0.10],
-                               [0.52, 0.18], [0.56, 1.0], [0.63, 3.0], [1, 3.0]],
          "f0": [[0, 131], [1, 122]]}]})
 
     # 3) 유성 마찰음 /z/ — 성대가 떨며 마찰음을 성문주기로 변조한다(소스-치찰음 결합).
@@ -68,14 +72,16 @@ def main() -> None:
          "f0": [[0, 126], [1, 122]], "level_db": -8}]})
 
     # 4) 녹음 흐름 재현: 사, 사, 길게 s, 길게 s
-    long_s = {"type": "fricative", "phone": "s", "dur": 0.7, "aero": True,
-              "constriction_area": [[0, 0.6], [0.2, 0.11], [0.6, 0.10],
-                                    [0.85, 0.14], [0.95, 0.5], [1, 2.0]],
-              "glottal_area": 0.12, "level_db": -5}
+    #    협착은 **고정**(0.10 cm²)이다. 페이드 인/아웃이 전부 압력에서 나오므로
+    #    무게중심도 함께 오르내린다(Stevens 1971) — 실측 7350->9008->7194 Hz.
+    def long_s(audible):
+        return {"type": "fricative", "phone": "s", "dur": audible / AUDIBLE_FRAC,
+                "aero": True, "constriction_area": [[0, 0.10], [1, 0.10]],
+                "glottal_area": 0.12, "level_db": -5}
     W("m04_like_recording.wav", {"timeline": [
         sa, {"type": "silence", "dur": 0.32}, dict(sa),
-        {"type": "silence", "dur": 0.5}, long_s,
-        {"type": "silence", "dur": 0.5}, {**long_s, "dur": 1.1}]})
+        {"type": "silence", "dur": 0.5}, long_s(1.10),
+        {"type": "silence", "dur": 0.5}, long_s(1.65)]})
 
     print("완료.")
 

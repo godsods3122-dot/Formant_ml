@@ -166,13 +166,24 @@ def aero_drive(seg: dict, t: int, frame_rate: float, glottal_area=None) -> dict:
     # 첫 프레임부터 최대라 그 급개시가 파열음(/k/)으로 들린다.
     # 게다가 레이놀즈 게이트 때문에 압력이 낮은 동안은 난류가 아예 안 켜져서,
     # 압력 램프가 그대로 부드러운 페이드 인/아웃이 된다.
-    ps_scale = seg.get("pressure_scale", 1.0)
-    ps_t = _PS_CGS * (curve(ps_scale, t) if not isinstance(ps_scale, (int, float))
-                      else torch.full((1, t, 1), float(ps_scale)))
-    u = aac.series_flow(ps_t, ag_t, ac_area)
+    ps_scale = seg.get("pressure_scale")
+    if ps_scale is None:
+        # 기본값은 **호흡 제스처**다(실측에서 적합). 신경 구동 -> 근육 2단 지연
+        # -> 압력. 올릴 때가 내릴 때보다 느려서(능동 동원 vs 힘 놓기) 가청
+        # 포락선의 절반 이상이 페이드 인이 된다 — 실측 56~68 %.
+        ps_t = _PS_CGS * aac.breath_drive(
+            t, hold=float(seg.get("breath_hold", aac.BREATH_HOLD)),
+            rise=float(seg.get("breath_rise", aac.BREATH_RISE)),
+            fall=float(seg.get("breath_fall", aac.BREATH_FALL)),
+            sustain=seg.get("breath_sustain"))
+    else:
+        ps_t = _PS_CGS * (curve(ps_scale, t) if not isinstance(ps_scale, (int, float))
+                          else torch.full((1, t, 1), float(ps_scale)))
 
-    # 구강내압과 그 1차 감쇄(구강 컴플라이언스) -> 성대 구동압
-    pm = aac.relax_pressure(aac.intraoral_pressure(u, ac_area), ac_area, frame_rate)
+    # 구강 공동을 상태변수로 적분한다: 되밀린 압력 Pm 이 유입을 깎고, 협착을
+    # 지나는 유량 u 가 곧 마찰음을 만든다. 정상상태는 series_flow 와 같고,
+    # 다른 건 과도구간 — 그게 /s/ 의 개시와 해제(VOT)다.
+    pm, u = aac.oral_cavity(ps_t, ag_t, ac_area, frame_rate)
     drive = aac.transglottal_pressure(ps_t, pm)
     ps_norm = drive / _PS_CGS                       # 1.0 = 보통 발화 구동압
 
@@ -284,11 +295,10 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
                 # 서서히 내린다. 그래서 독립 마찰음은 거의 절반이 페이드 인,
                 # 절반이 페이드 아웃이다. 압력이 낮은 동안은 레이놀즈 게이트가
                 # 난류를 아예 안 켜므로, 이 램프가 그대로 부드러운 페이드가 된다.
-                seg_f = dict(seg)
-                seg_f.setdefault("pressure_scale",
-                                 [[0.0, 0.12], [0.45, 1.0], [0.55, 1.0],
-                                  [1.0, 0.15]])
-                _d = aero_drive(seg_f, t, a.frame_rate)
+                # 압력은 손으로 그린 램프가 아니라 호흡 제스처에서 나온다
+                # (aeroacoustic.breath_drive). 협착은 고정이고 페이드 인/아웃이
+                # 전부 압력에서 나오므로, 무게중심도 함께 오르내린다(Stevens).
+                _d = aero_drive(dict(seg), t, a.frame_rate)
                 aero_env, aero_cent = _d["env"], _d["cent"]
                 env = aero_env
             else:
@@ -305,7 +315,9 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
             # 실측("사"): /s/ 120 ms, 전이 60 ms, 모음 360 ms.
             # 비율이 아니라 절대 시간이 음성학적으로 맞다 — 자음 길이는 음절
             # 길이에 비례해 늘어나지 않는다.
-            onset_s = float(seg.get("onset_s", 0.12))
+            # 협착 유지시간. 가청 /s/ 는 이보다 길다 — 앞에 호흡 램프가, 뒤에
+            # 해제+VOT 가 붙기 때문이다(0.11 -> 가청 160 ms, 실측 134~139 ms).
+            onset_s = float(seg.get("onset_s", 0.11))
             split = float(seg.get("onset_ratio", onset_s / max(dur, 1e-3)))
             split = min(max(split, 0.05), 0.8)
             # 발성 시작을 **공기역학**으로 만든다. 세기만 램프로 올리면 녹음을
@@ -322,19 +334,40 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
                 # /s/ 동안은 협착 뒤 압력이 Ps 의 60~70% 를 잡아먹어 성대를 구동할
                 # 압력이 없다(목소리가 눌린다). 협착을 풀면 그 압력이 τ=V/(c·Ac) 로
                 # 빠지며 구동압이 살아나 발성이 붙는다 -> VOT 가 유도된다.
-                trans = float(seg.get("transition_s", 0.10)) * a.frame_rate / max(t, 1)
+                # 조음기관은 **셋이 따로** 움직인다. 예전엔 transition_s 하나가
+                # 셋을 다 끌어서, 포먼트 전이를 길게 잡으면 후두 내전까지 같이
+                # 늘어져 /s/ 가 224 ms 로 끌렸다(실측 134~139 ms).
+                #   * 혀끝(협착 해제) release_s   ~50 ms — 빠르다
+                #   * 후두(성문 내전) adduction_s ~40 ms — 빠르다, VOT 를 정한다
+                #   * 혀몸(포먼트 전이) transition_s ~45~120 ms — 느리다
+                # 한국어 평음 ㅅ 의 VOT 25~40 ms 는 후두 제스처가 정하는 값이지
+                # 혀몸이 모음 목표에 도달하는 시간이 아니다.
+                # 협착은 onset_s 동안 유지되다 열린다. 정점을 앞당기려고 이 값을
+                # 줄이면 안 된다 — 호흡 램프가 이미 가청 개시를 뒤로 밀어놔서,
+                # 협착을 그대로 두면 정점이 저절로 가청 구간의 59 % 에 온다
+                # (실측 52~63 %). 줄이면 36 % 로 앞당겨져 페이드 인이 사라진다.
+                hold_r = float(seg.get("hold_ratio", split))
+                # 후두는 혀끝과 **거의 같이** 움직인다. 예전엔 성문이 split(명목상
+                # /s/ 끝)에서야 닫히기 시작해 혀보다 한참 늦었고, 그 지연이 그대로
+                # 마찰음 꼬리로 남아 하강이 85 ms 로 늘어졌다(실측 52~64 ms).
+                # 해제 하나가 두 제스처를 함께 촉발해야 연결이 유기적이다.
+                addt = float(seg.get("adduction_s", 0.04)) * a.frame_rate / max(t, 1)
+                lag = float(seg.get("adduction_lag_s", 0.01)) * a.frame_rate / max(t, 1)
                 ag_curve = seg.get("glottal_area", [
-                    [0.0, 0.12], [split, 0.12], [min(split + trans, 1.0), 0.03],
-                    [1.0, 0.03]])
+                    [0.0, 0.12], [min(hold_r + lag, 1.0), 0.12],
+                    [min(hold_r + lag + addt, 1.0), 0.03], [1.0, 0.03]])
                 seg2 = dict(seg)
                 seg2.setdefault("a_open", 3.0)
-                seg2.setdefault("hold_ratio", split)
-                seg2.setdefault("release_s", float(seg.get("transition_s", 0.05)))
-                # 호흡 압력은 /s/ 를 내는 동안 서서히 올라 모음까지 유지된다.
-                # 상수로 던지면 마찰음이 첫 프레임부터 최대라 /k/ 처럼 들린다.
-                seg2.setdefault("pressure_scale",
-                                [[0.0, 0.12], [split * 0.85, 0.95],
-                                 [min(split + 0.1, 1.0), 1.0], [1.0, 0.95]])
+                seg2.setdefault("hold_ratio", hold_r)
+                seg2.setdefault("release_s", 0.05)      # 혀끝은 빨리 떨어진다
+                # 호흡 제스처를 **마찰음 구간에 맞춰 시간축을 축소**한다(비율이
+                # 불변량이므로 그냥 split 을 곱하면 된다). 모음에는 압력이 계속
+                # 필요하므로 0 으로 떨어뜨리지 않고 sustain 에서 유지한다 —
+                # 음절에서 마찰음이 꺼지는 건 압력이 아니라 협착이 열려서다.
+                seg2.setdefault("breath_hold", aac.BREATH_HOLD * split)
+                seg2.setdefault("breath_rise", aac.BREATH_RISE * split)
+                seg2.setdefault("breath_fall", aac.BREATH_FALL * split)
+                seg2.setdefault("breath_sustain", 0.95)
                 drive = aero_drive(seg2, t, a.frame_rate, glottal_area=ag_curve)
                 ps, add = drive["ps_norm"], drive["add"]
             else:
