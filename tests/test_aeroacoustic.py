@@ -309,22 +309,63 @@ def test_fricative_envelope_is_an_arch_not_a_rectangle():
       * 폐압이 발화 개시에서 램프로 오른다 (UTTERANCE_PS_RISE_S)
       * 후두가 매끄러운 종 모양이다 (devoicing_gesture)
       * 해제 시간이 조음기 속도에서 나온다 (release_from_speed)
+
+    **제어 신호가 아니라 렌더된 소리에서 잰다.** 제어의 `noise_bands` 는 꼬리가
+    -240 dB 까지 내려가는데 실제 소리의 그 구간은 기식이 메우고 있어서, 제어만
+    보면 들리지도 않는 곳의 계단을 잡는다. 실측과 같은 잣대(4~12 kHz 포락선)로
+    재야 비교가 된다 — 실측 /사/ 두 토큰은 최대 12.0 / 12.2 dB per 10 ms 다.
     """
-    from formant_ml.score import build_segment
-    c = build_segment({"type": "syllable", "onset": "s", "vowel": "a",
-                       "dur": 0.72, "onset_s": 0.09, "hold_s": 0.07,
-                       "aero": True, "drive": "tongue"}, PROF, CFG)
-    nb = c["noise_bands"][0].amax(-1)
-    db = 20 * torch.log10(nb.clamp_min(1e-12))
+    seg = {"type": "syllable", "onset": "s", "vowel": "a", "dur": 0.72,
+           "onset_s": 0.09, "hold_s": 0.07, "aero": True, "drive": "tongue"}
+    y = render({"timeline": [{"type": "silence", "dur": 0.08}, seg],
+                "seed": 5}, PROF, CFG).reshape(-1)
+    win, hop = 512, 128                       # hop = 5.3 ms @ 24 kHz
+    f = torch.linspace(0, FS / 2, win // 2 + 1)
+    S = torch.stft(y, win, hop, window=torch.hann_window(win),
+                   return_complex=True).abs()
+    hi = (S[(f > 4000) & (f < 12000)] ** 2).sum(0).sqrt()
+    db = 20 * torch.log10(hi.clamp_min(1e-12))
     pk = float(db.max())
-    live = (db > pk - 25.0)                       # 가청 구간만 본다
-    step = [abs(float(db[i] - db[i + 1])) for i in range(len(db) - 1)
-            if bool(live[i]) and bool(live[i + 1])]
+    n10 = max(int(round(0.010 * FS / hop)), 1)        # 10 ms
+    live = db > pk - 45.0
+    step = [abs(float(db[i] - db[i + n10])) for i in range(len(db) - n10)
+            if bool(live[i]) and bool(live[i + n10])]
     assert step, "가청 마찰음 구간이 없다"
-    assert max(step) < 12.0, (f"포락선이 한 프레임에 {max(step):.1f} dB 뛴다 "
-                              "(수직 모서리 = 파열음)")
-    flat = int((db > pk - 0.5).sum())
-    assert flat <= 4, f"정점이 {flat} 프레임 동안 평평하다 (직사각형)"
+    assert max(step) < 16.0, (f"포락선이 10 ms 에 {max(step):.1f} dB 뛴다 "
+                              "(수직 모서리 = 파열음). 실측 12.0~12.2")
+    # 고원 금지: 정점 ±0.5 dB 가 길게 이어지면 아치가 아니라 직사각형이다.
+    flat = int((db > pk - 0.5).sum()) * hop / FS * 1000
+    assert flat <= 40.0, f"정점이 {flat:.0f} ms 동안 평평하다 (직사각형)"
+
+
+def test_transition_aspiration_is_not_louder_than_the_vowel():
+    """전이 기식이 모음보다 크면 안 된다 — /s/ 뒤에 /h/ 가 붙는다.
+
+    전이 기식(`asp_n`)만 900 Hz 셸프를 쓰던 시절, 그 셸프가 성도 캐스케이드를
+    통째로 지나며 F1/F2 를 때렸다. 고역 골을 메우려고 ASPIRATION_GAIN 을
+    6.3 -> 26 으로 올리자 그대로 따라 커져서, 마찰음 직후 0.9~2 kHz 가 모음
+    정상부보다 **9~11 dB 컸다**. 경로별로 따로 렌더해서 확인했다: 그 구간이
+    전체 -11.7 dB 인데 기식을 빼면 -59.8 dB 였다(= 통째로 기식).
+
+    지금은 기식성 바닥과 **같은 소스 스펙트럼**을 쓴다(같은 성문 제트 난류다).
+    실측 /사/ 두 토큰의 같은 비는 0.81 / 1.06 이다.
+    """
+    seg = {"type": "syllable", "onset": "s", "vowel": "a", "dur": 0.72,
+           "onset_s": 0.09, "hold_s": 0.07, "aero": True, "drive": "tongue"}
+    y = render({"timeline": [{"type": "silence", "dur": 0.08}, seg],
+                "seed": 5}, PROF, CFG).reshape(-1)
+    win, hop = 512, 128
+    f = torch.linspace(0, FS / 2, win // 2 + 1)
+    S = torch.stft(y, win, hop, window=torch.hann_window(win),
+                   return_complex=True).abs()
+    f2 = (S[(f > 900) & (f < 2000)] ** 2).sum(0).sqrt()
+    hi = (S[(f > 4000) & (f < 12000)] ** 2).sum(0).sqrt()
+    pk = int(hi[:int(0.30 * FS / hop)].argmax())            # 마찰음 정점
+    trans = float(f2[pk:pk + int(0.12 * FS / hop)].max())   # 전이 구간 최대
+    vowel = float(f2[int(0.45 * FS / hop):].quantile(0.97))
+    assert trans < 1.4 * vowel, (
+        f"전이 F2 대역이 모음의 {trans / max(vowel, 1e-9):.2f} 배 (/h/ 가 붙었다). "
+        "실측 0.81~1.06")
 
 
 def test_vowel_has_an_interharmonic_noise_floor():

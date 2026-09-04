@@ -35,6 +35,7 @@ from .dsp.sibilant import PRESETS as SIB_PRESETS
 from .dsp.sibilant import SibilantParams
 from . import aerodynamics as aero
 from . import aeroacoustic as aac
+from . import gestures as G
 from .gestures import GESTURES, base
 from .models.synth import Controls, PhysicalVoiceSynth
 from .presets import FRICATIVES, LOCUS, VOWELS
@@ -642,12 +643,27 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
                 # **저절로 지나간다** — 따로 박을 필요가 없다.
                 # 개대 정점은 고원 한가운데다(Löfqvist & Yoshioka: Pgg 정점이
                 # 마찰음 중간). 그래야 Ac 가 고원이어도 유량이 혹이 된다.
+                # **개대는 혀의 폐쇄와 같이 시작한다.** Löfqvist & Yoshioka:
+                # 무성 마찰음의 성문 개대 제스처는 구강 협착이 만들어지기
+                # **전에** 시작한다 — 마찰음이 켜질 때 성문이 이미 열려 있어야
+                # 기류가 흐른다. 개대 시간을 100 ms 상수로 두면 정점(고원 중앙)
+                # 에서 거꾸로 세어 폐쇄 시작보다 **늦게** 출발한다.
+                #
+                # 그러면 혀가 좁히는 동안 성문이 같이 열려 두 효과가 **곱해진다**.
+                # 측정(개시 10 ms 당): 전체 +38.2 dB 중 면적항 1/(1+Ac²/Ag²) 가
+                # +27.9, 압력은 +3.6 뿐이었다. Ac/Ag 가 20 ms 만에 11.6 -> 1.3
+                # 으로 9 배 변하니 제곱해서 19 dB/10 ms 다. 그 계단이 마찰음이
+                # "펄스처럼" 켜지는 소리다(실측은 95 ms 에 걸쳐 4.7 dB/10 ms).
+                # 폐쇄 시작(세그먼트 t=0)에 맞추면 같은 구간이 +6.8 / +3.3 dB 다.
+                pk_r = min(plateau_mid + lag, 1.0)
+                seg_dur = max(t - 1, 1) / max(a.frame_rate, 1e-6)
                 ag_curve = seg.get("glottal_area")
                 if ag_curve is None:
                     ag_curve = aac.devoicing_gesture(
-                        t, a.frame_rate, min(plateau_mid + lag, 1.0), abd,
+                        t, a.frame_rate, pk_r, abd,
                         abduct_s=float(seg.get("abduction_s",
-                                               aac.GLOTTIS_ABDUCT_S)),
+                                               max(aac.GLOTTIS_ABDUCT_S,
+                                                   pk_r * seg_dur))),
                         adduct_s=(float(seg.get("adduction_s", 0.04))
                                   + float(seg.get("firming_s", 0.12))))
                 seg2 = dict(seg)
@@ -734,9 +750,26 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
             # 기식은 성문에서 나므로 **앞니 다이폴이 없다**. fricative_gain 은
             # 다이폴 부스트를 상쇄하느라 -16 dB 쯤 내려가 있어서, 그걸 그대로 쓰면
             # 기식이 30 배 작아져 전이 구간을 못 메운다. 그만큼 되돌린다.
-            asp_n = band_shelf(NB, 900.0,
+            # **소스가 하나면 스펙트럼도 하나다.** 전이 기식과 모음의 기식성
+            # 바닥은 둘 다 성문 제트 난류이고, 다른 건 성대가 떨고 있느냐뿐이다.
+            # 그런데 전이 기식만 900 Hz 셸프를 쓰고 있었다 — 그 셸프가 성도
+            # 캐스케이드를 통째로 지나며 F1/F2 를 때린다.
+            #
+            # 측정(경로별로 따로 렌더): 마찰음 직후 285 ms 의 0.9~2 kHz 가
+            # 전체 -11.7 dB 인데 **기식을 빼면 -59.8 dB** 였다 — 그 구간은
+            # 통째로 기식이고, 모음 정상부(-21~-26 dB)보다 10~15 dB 크다.
+            # /s/ **앞**(110~160 ms)도 마찬가지로 기식만 있었다(마찰음은 165 ms
+            # 부터다). 즉 /s/ 앞뒤에 /h/ 가 하나씩 붙어 있었고, 그 둘이
+            # 사용자가 들은 "두 개의 파열음" 이다.
+            #
+            # 고역 골(§6)을 메우려고 ASPIRATION_GAIN 을 6.3 -> 26 으로 올린 게
+            # 900 Hz 셸프를 타고 F1/F2 로 그대로 쏟아졌다. 셸프를 기식성 바닥과
+            # 같은 것(G.BREATH_NOISE_HZ, floor 포함)으로 통일하면 같은 게인이
+            # 고역만 메운다.
+            asp_n = band_shelf(NB, G.BREATH_NOISE_HZ,
                                fricative_gain(prof) * ASPIRATION_GAIN,
-                               a.sample_rate).reshape(1, 1, -1) * float(
+                               a.sample_rate, slope_oct=G.BREATH_NOISE_SLOPE,
+                               floor=G.BREATH_NOISE_FLOOR).reshape(1, 1, -1) * float(
                                    c["harmonic_amp"].max().clamp_min(1e-3))
             # 주입 위치는 **부드럽게 미끄러뜨리면 안 된다**. 중간값은 캐스케이드의
             # 앞부분만 우회한 '반쪽 필터' 라 어떤 성도 형상에도 대응하지 않고,
@@ -756,10 +789,10 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
                 c["noise_entry"] = torch.full((1, t, 1), float(K) + 6.0)
                 # 성문 잡음은 **두 가지**이고 발성에 대한 의존이 서로 반대다.
                 #
-                #  (1) 전이 기식 (asp_n, 900 Hz 셸프): 성문이 벌어진 채 기류만
+                #  (1) 전이 기식 (asp_n): 성문이 벌어진 채 기류만
                 #      지나가는 동안의 난류. 발성이 자리잡으면 성대가 주기마다
                 #      완전히 닫혀 직류 기류가 끊기므로 사라진다.
-                #  (2) 기식성 바닥 (3500 Hz 셸프): 발성 **중에** 성대가 덜 닫혀
+                #  (2) 기식성 바닥: 발성 **중에** 성대가 덜 닫혀
                 #      새는 잡음. 발성에 비례해 커진다.
                 #
                 # 정적 성문 면적으로는 (1) 이 저절로 안 꺼진다. 성문 제트속도는
@@ -768,8 +801,10 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
                 # 주기적 완전폐쇄를 정적 면적이 표현 못 하기 때문이다. 그 몫을
                 # 발성 비율로 대신 준다.
                 #
-                # (1) 만 있으면 모음이 900 Hz 셸프 잡음에 잠겨 1~2 kHz 가 42 %
-                # 가 된다(실측 4.2 %). (2) 만 있으면 마찰음과 발성 사이가 빈다.
+                # 둘은 **같은 소스 스펙트럼**을 쓴다(같은 성문 제트 난류다).
+                # 예전엔 (1) 만 900 Hz 셸프여서 F1/F2 를 때렸고, 그게 /s/ 앞뒤의
+                # /h/ 가 됐다(위 asp_n 주석의 측정).
+                # (2) 만 있으면 마찰음과 발성 사이가 빈다.
                 # 바닥은 **유성 진폭 자체**에 비례한다(정규화된 비율이 아니라).
                 # 새는 잡음은 기류에서 나오므로 소스가 세면 같이 세야 비율이
                 # 유지된다. 비율로 스케일하면 음절처럼 유성 진폭이 1.0 보다
