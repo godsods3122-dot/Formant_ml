@@ -52,7 +52,7 @@ SCALAR_PARAMS = {
     "noise_entry": "난류 주입 위치 0=성문 … K=입술 … K+6=성도 완전 우회",
     "noise_am": "성문동기 노이즈 변조 깊이 (기식성)",
     "noise_rough": "난류의 시간 변조 (0 = 정상 히스, 1 = 거친 난류)",
-    "noise_bw_scale": "노이즈 경로 포먼트 대역폭 배율 (1~6). 낮으면 잡음이 "
+    "noise_bw_scale": "구강 마찰음 경로 포먼트 대역폭 배율 (1~6). 낮으면 잡음이 "
                       "공진에서 울려 음조가 들린다",
     "level_db": "이 구간 전체 레벨 [dB]. 유성·무성 성분을 함께 키우고 줄인다",
     "noise_back_leak": "구강 결합 0~1. 협착 뒤 공동까지 새어 통과하는 비율. "
@@ -308,9 +308,15 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
                 f"또는 파라미터 이름: {sorted(PARAM_HELP)[:6]} …")
         c = fn(t, prof, n_formants=K, n_bands=NB, **opts)
     elif kind == "silence":
+        # 침묵은 **기류가 없다는 뜻**이다. 잡음은 전부 기류에서 나오므로 세 경로를
+        # 다 꺼야 한다. 예전엔 `aspiration_bands` 를 안 껐다 — base() 가 그걸
+        # 상수 셸프로 깔아 두기 때문에, "침묵" 구간이 사실은 **최대 -3 dB 의
+        # 기식 잡음**이었다(m02 의 두 '사' 사이, m04 의 토큰 사이 -19~-21 dB).
+        # 발성이 끝나도 잡음이 안 꺼지고 계속 나던 게 이것이다.
         c = base(t, prof, K, NB, sample_rate=a.sample_rate)
         c["harmonic_amp"] = torch.zeros(1, t, 1)
         c["noise_bands"] = torch.full((1, t, NB), 1e-6)
+        c["aspiration_bands"] = torch.zeros(1, t, NB)
     elif kind == "vowel":
         c = base(t, prof, K, NB, seg.get("vowel", "a"), a.sample_rate)
         c["formant_freq"] = torch.tensor(
