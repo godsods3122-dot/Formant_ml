@@ -161,8 +161,14 @@ def aero_drive(seg: dict, t: int, frame_rate: float, glottal_area=None) -> dict:
         glottal_area = seg.get("glottal_area", 0.12)
     ag_t = curve(glottal_area, t) if not isinstance(glottal_area, (int, float)) \
         else torch.full((1, t, 1), float(glottal_area))
-    ps_cgs = _PS_CGS * float(seg.get("pressure_scale", 1.0))
-    ps_t = torch.full((1, t, 1), ps_cgs)
+    # 호흡 구동압은 **곡선**이다. /s/ 를 내려면 상당한 압력이 필요한데, 그 압력을
+    # 툭 던지는 게 아니라 서서히 올렸다가 서서히 내린다. 상수로 두면 마찰음이
+    # 첫 프레임부터 최대라 그 급개시가 파열음(/k/)으로 들린다.
+    # 게다가 레이놀즈 게이트 때문에 압력이 낮은 동안은 난류가 아예 안 켜져서,
+    # 압력 램프가 그대로 부드러운 페이드 인/아웃이 된다.
+    ps_scale = seg.get("pressure_scale", 1.0)
+    ps_t = _PS_CGS * (curve(ps_scale, t) if not isinstance(ps_scale, (int, float))
+                      else torch.full((1, t, 1), float(ps_scale)))
     u = aac.series_flow(ps_t, ag_t, ac_area)
 
     # 구강내압과 그 1차 감쇄(구강 컴플라이언스) -> 성대 구동압
@@ -181,46 +187,6 @@ def aero_drive(seg: dict, t: int, frame_rate: float, glottal_area=None) -> dict:
             "asp": asp / asp.amax().clamp_min(1e-9),
             "ps_norm": ps_norm, "add": add,
             "pm_frac": pm / _PS_CGS}
-
-
-def aero_frication(seg: dict, t: int, frame_rate: float,
-                   glottal_area=None):
-    """협착 면적 궤적 -> (진폭 포락선, 무게중심 배율). 둘 다 (1, T, 1).
-
-    물리(aeroacoustic.py): 폐압이 성문·구강 협착을 직렬로 지나며 유량 U 를 만들고,
-    협착부 레이놀즈수가 임계값을 넘을 때만 난류(마찰음)가 난다. 협착이 열리거나
-    (모음) 성문이 닫히면(발성) 유량이 줄어 저절로 꺼지고, 입자속도가 떨어지면
-    무게중심도 내려간다. 손으로 그린 페이드/치찰음 곡선이 아니라 **면적에서 전부
-    유도**된다.
-
-    `glottal_area` 로 성문 면적 궤적(스칼라/곡선)을 줄 수 있다. 안 주면 seg 에서
-    읽고, 그것도 없으면 무성 마찰음 기본값(0.12, 열림)을 쓴다.
-    """
-    ac_area = aac.constriction_area(
-        t, frame_rate,
-        a_closed=float(seg.get("a_closed", 0.10)),
-        a_open=float(seg.get("a_open", 3.0)),
-        hold=float(seg.get("hold_ratio", 0.5)),
-        release=float(seg.get("release_s", 0.06)),
-        shape=seg.get("constriction_area"))
-    # 성문 면적: 무성 마찰음은 열려 있고(기류 셈), 발성으로 가며 내전해 닫힌다.
-    if glottal_area is None:
-        glottal_area = seg.get("glottal_area", 0.12)
-    ag_t = curve(glottal_area, t) if not isinstance(glottal_area, (int, float)) \
-        else torch.full((1, t, 1), float(glottal_area))
-    ps = _PS_CGS * float(seg.get("pressure_scale", 1.0))
-    ps_t = torch.full((1, t, 1), ps)
-    u = aac.series_flow(ps_t, ag_t, ac_area)
-    amp = aac.frication_source_amp(u, ac_area)
-    env = amp / amp.amax().clamp_min(1e-9)          # 피크 1 로 정규화(레벨은 nb 가)
-    cent = aac.velocity_centroid_scale(u, ac_area)
-    # 성문에서의 난류(기식). 성문이 내전하며 좁아지는 **도중**에 유속이 올라 최대가
-    # 된다 — 그래서 구강 마찰음이 꺼지고 발성이 아직 안 붙은 전이 구간을 이 기식이
-    # 메운다. 이게 없으면 그 자리에 무음이 생겨 '무음 + 급개시' = 폐쇄음(/t/)으로
-    # 들린다(실측: /사/ 에서 120 ms 무음 -> "스트라" 처럼 들림).
-    asp = aac.aspiration_source_amp(u, ag_t)
-    asp_env = asp / asp.amax().clamp_min(1e-9)
-    return env, cent, asp_env
 
 
 def _scale_sib_center(sib: SibilantParams, cent: torch.Tensor) -> None:
@@ -314,7 +280,16 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
             c["harmonic_amp"] = torch.zeros(1, t, 1)
             if wants_aero(seg):
                 # 공기음향 경로: 협착 면적에서 진폭·무게중심을 유도(권장).
-                aero_env, aero_cent, _asp = aero_frication(seg, t, a.frame_rate)
+                # /s/ 를 내려면 상당한 압력이 필요하고, 그 압력은 서서히 올랐다
+                # 서서히 내린다. 그래서 독립 마찰음은 거의 절반이 페이드 인,
+                # 절반이 페이드 아웃이다. 압력이 낮은 동안은 레이놀즈 게이트가
+                # 난류를 아예 안 켜므로, 이 램프가 그대로 부드러운 페이드가 된다.
+                seg_f = dict(seg)
+                seg_f.setdefault("pressure_scale",
+                                 [[0.0, 0.12], [0.45, 1.0], [0.55, 1.0],
+                                  [1.0, 0.15]])
+                _d = aero_drive(seg_f, t, a.frame_rate)
+                aero_env, aero_cent = _d["env"], _d["cent"]
                 env = aero_env
             else:
                 # 단순 경로: 유량 포락선을 직접 준다(페이드 인/아웃, 초).
@@ -355,6 +330,11 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
                 seg2.setdefault("a_open", 3.0)
                 seg2.setdefault("hold_ratio", split)
                 seg2.setdefault("release_s", float(seg.get("transition_s", 0.05)))
+                # 호흡 압력은 /s/ 를 내는 동안 서서히 올라 모음까지 유지된다.
+                # 상수로 던지면 마찰음이 첫 프레임부터 최대라 /k/ 처럼 들린다.
+                seg2.setdefault("pressure_scale",
+                                [[0.0, 0.12], [split * 0.85, 0.95],
+                                 [min(split + 0.1, 1.0), 1.0], [1.0, 0.95]])
                 drive = aero_drive(seg2, t, a.frame_rate, glottal_area=ag_curve)
                 ps, add = drive["ps_norm"], drive["add"]
             else:
