@@ -525,6 +525,11 @@ TONGUE_A_REST = 0.60
 #: 폐쇄가 해제보다 오래 걸리는 비율. 가청 포락선의 정점 위치와 **같은 수**다
 #: (아래 참조). 실측 4 토큰의 상승/하강비 1.28~1.35 -> 정점 56~57 %.
 TONGUE_CLOSE_FRAC = 0.57
+#: CV(음절)에서 `cv_gesture_times` 에 넣는 정점 위치. 가청 목표(0.62)보다 높다 —
+#: 해제와 **동시에 시작되는 내전**이 성문 유량을 깎아 하강을 한 번 더 줄이기
+#: 때문이다(면적만 보는 모형에는 그 항이 없다). 0.72 를 넣으면 실제 가청 정점이
+#: 59 % 로 나온다(실측 57~68 %).
+TONGUE_CV_PEAK = 0.72
 
 
 def tongue_constriction(t: int, frame_rate: float, a_min: float = TONGUE_A_MIN,
@@ -571,6 +576,117 @@ def tongue_constriction(t: int, frame_rate: float, a_min: float = TONGUE_A_MIN,
     up = lo + (hi - lo) * ((i - f) / max(1.0 - f, 1e-6)).clamp(0.0, 1.0)
     logA = torch.where(i <= f, down, up)
     return logA.exp().reshape(1, n, 1)
+
+
+def audible_area(a_min: float, glottal_area: float, frac: float = 0.10) -> float:
+    """가청 경계가 되는 협착 면적 [cm²] — 진폭이 정점의 `frac` 로 떨어지는 지점.
+
+    Ps 가 일정하면 협착부 속도는 v = sqrt(2Ps/ρ)/sqrt(Ac²/Ag²+1) 이므로 진폭
+    ½ρv² 의 **면적 의존은 1/(Ac²/Ag²+1) 하나**로 줄어든다(Ps 가 약분된다).
+    정점은 Ac = a_min 이고, 거기서 frac 배가 되는 Ac 를 풀면
+
+        Ac = Ag·sqrt( (1/frac)·(a_min²/Ag² + 1) − 1 )
+
+    이 면적이 곧 "혀가 여기까지 좁혀야 소리가 나기 시작한다" 는 경계이고,
+    제스처 시간을 가청 길이로 환산할 때 쓰인다(`cv_gesture_times`).
+
+    .. note::
+       위 닫힌 해는 레이놀즈 게이트를 뺀 값이다. 협착이 열리면 유속이 떨어져
+       게이트가 **더 일찍** 난류를 끄므로 실제 경계는 이보다 좁다. 그래서 닫힌
+       해를 상한으로 삼고 게이트까지 포함한 진짜 경계를 수치로 찾는다
+       (게이트를 빼면 가청 길이가 110 ms 요청에 80 ms 로 나온다 — 측정).
+    """
+    ag = torch.tensor(float(max(glottal_area, 1e-9)))
+    amin = torch.tensor(float(max(a_min, 1e-9)))
+    ps = torch.tensor(8000.0)
+
+    def amp(ac_):
+        u = series_flow(ps, ag, ac_)
+        return frication_source_amp(u, ac_)
+
+    peak = float(amp(amin))
+    r = (a_min / float(ag)) ** 2
+    hi = float(ag) * math.sqrt(max((r + 1.0) / max(frac, 1e-6) - 1.0, 1e-9))
+    lo = float(amin)
+    for _ in range(60):                      # 이분법: amp(A) = frac·peak
+        mid = 0.5 * (lo + hi)
+        if float(amp(torch.tensor(mid))) > frac * peak:
+            lo = mid
+        else:
+            hi = mid
+    return 0.5 * (lo + hi)
+
+
+def cv_gesture_times(onset_s: float, peak_frac: float, a_min: float = TONGUE_A_MIN,
+                     a_rest: float = TONGUE_A_REST,
+                     a_open: float = NEUTRAL_TRACT_AREA,
+                     glottal_area: float = 0.12) -> tuple:
+    """가청 마찰음 길이와 정점 위치 -> (폐쇄시간, 해제시간) [s].
+
+    독립 마찰음에서는 혀가 왔던 자리로 되돌아가므로 양쪽 로그 거리가 같고,
+    그래서 "정점 위치 = 폐쇄/(폐쇄+해제)" 가 그대로 성립했다
+    (`tongue_constriction` 주석). **CV 는 다르다** — 해제가 a_rest 가 아니라
+    모음 면적까지 열리므로 로그 거리가 한쪽만 길다:
+
+        L_close = ln(a_rest/a_min) = 2.48,   L_open = ln(a_open/a_min) = 4.09
+
+    로그 면적에서 등속으로 움직이면 가청 경계 A_th 까지 걸리는 시간은
+    (거리 비례)이므로
+
+        상승 = ln(A_th/a_min)·close_s/L_close,  하강 = ln(A_th/a_min)·release_s/L_open
+
+    이라 정점 위치는 close_s/release_s 가 아니라 그 둘을 각자의 로그 거리로
+    나눈 비가 정한다. 같은 close_frac 0.57 을 그대로 CV 에 쓰면 정점이 75 %
+    로 밀린다(측정) — 해제가 더 먼 거리를 같은 시간에 가느라 더 빨리 꺼지기
+    때문이다. 그래서 CV 의 해제는 **시간으로는 폐쇄보다 길어야** 한다.
+
+    반환값을 그대로 `tongue_constriction_cv` 에 넣으면 가청 길이와 정점 위치가
+    요청한 값으로 나온다.
+    """
+    a_th = audible_area(a_min, glottal_area)
+    k = math.log(max(a_th / max(a_min, 1e-9), 1.0 + 1e-9))
+    l_close = math.log(max(a_rest / max(a_min, 1e-9), 1.0 + 1e-9))
+    l_open = math.log(max(a_open / max(a_min, 1e-9), 1.0 + 1e-9))
+    p = min(max(peak_frac, 0.05), 0.95)
+    return (onset_s * p * l_close / k, onset_s * (1.0 - p) * l_open / k)
+
+
+def tongue_constriction_cv(t: int, frame_rate: float, close_s: float,
+                           release_s: float, a_min: float = TONGUE_A_MIN,
+                           a_rest: float = TONGUE_A_REST,
+                           a_open: float = NEUTRAL_TRACT_AREA,
+                           device=None) -> tuple:
+    """자음+모음(CV)에서의 혀끝 제스처. 반환 (면적 (1,T,1), 해제 시작 위치 0~1).
+
+    독립 마찰음(`tongue_constriction`)과 다른 점은 **되돌아가지 않는다**는 것이다.
+    뒤에 모음이 오므로 혀는 협착을 만들었다가 모음 자세(a_open)로 **열고 만다**.
+
+        a_rest ──(close_s)──> a_min ──(release_s)──> a_open ─────
+                                 ↑
+                          해제 시작 = 모든 타이밍의 기준점
+
+    왜 이 지점이 기준인가: Ps 가 일정하면(Signorello et al. 2018) 협착부 속도가
+    Ac 의 단조감소 함수라 **마찰음 정점이 최소 면적 순간과 정확히 일치**한다.
+    같은 순간에 혀가 열리기 시작하고, 구강내압이 빠지기 시작하고, 포먼트 전이가
+    출발한다. 그래서 하나의 조음 사건이 세 가지를 한꺼번에 촉발한다 — 타이밍을
+    따로 맞출 필요가 없어진다(예전에는 발성 개시에 묶여 있어서 후두를 건드릴
+    때마다 포먼트가 딸려 왔다. HANDOFF §9).
+
+    로그 면적에서 선형 보간한다(조음기가 일정 속도로 움직이면 면적은 지수적으로
+    변한다 — 간극이 좁을수록 같은 변위가 면적을 더 크게 바꾼다).
+    """
+    n = max(int(t), 1)
+    dur = max((n - 1) / max(frame_rate, 1e-6), 1e-6)
+    cf = min(max(close_s / dur, 1e-3), 0.95)
+    rf = min(max(release_s / dur, 1e-3), 1.0 - cf)
+    lo = math.log(max(a_min, 1e-6))
+    hi = math.log(max(a_rest, a_min * 1.01))
+    op = math.log(max(a_open, a_min * 1.01))
+    i = torch.arange(n, device=device, dtype=torch.float32) / max(n - 1, 1)
+    closing = hi + (lo - hi) * (i / cf).clamp(0.0, 1.0)
+    opening = lo + (op - lo) * ((i - cf) / rf).clamp(0.0, 1.0)
+    logA = torch.where(i <= cf, closing, opening)
+    return logA.exp().reshape(1, n, 1), cf
 
 
 # --- 호흡 구동압: /s/ 의 페이드 인/아웃이 여기서 나온다 -----------------------

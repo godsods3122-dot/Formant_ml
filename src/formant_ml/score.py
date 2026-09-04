@@ -179,6 +179,9 @@ def aero_drive(seg: dict, t: int, frame_rate: float, glottal_area=None) -> dict:
             a_min=float(seg.get("a_min", aac.TONGUE_A_MIN)),
             a_rest=float(seg.get("a_rest", aac.TONGUE_A_REST)),
             close_frac=float(seg.get("close_frac", aac.TONGUE_CLOSE_FRAC)))
+    elif torch.is_tensor(seg.get("constriction_area")):
+        # 이미 만들어진 궤적(음절의 CV 혀 제스처)을 그대로 쓴다.
+        ac_area = seg["constriction_area"]
     else:
         ac_area = aac.constriction_area(
             t, frame_rate,
@@ -226,7 +229,11 @@ def aero_drive(seg: dict, t: int, frame_rate: float, glottal_area=None) -> dict:
     ps_norm = drive / _PS_CGS                       # 1.0 = 보통 발화 구동압
 
     # 내전: 성문 면적이 좁아질수록 1 에 가깝다(성문이 닫힌다).
-    ag_ref = float(seg.get("glottal_open_area", 0.12))
+    # 기준은 **그 구간에서 실제로 벌어진 최대 성문 면적**이다. 0.12 로 박아
+    # 두면 개대를 넓힐 때(마찰음은 0.25 cm² 안팎으로 크게 벌어진다) ag/0.12 가
+    # 1 을 넘어 clamp 에 걸리고, 내전이 0.02 에 붙어 있다가 성문이 0.12 아래로
+    # 내려온 뒤에야 움직인다 — 내전 램프가 뒤쪽으로 압축돼 기식 구간이 안 생긴다.
+    ag_ref = float(seg.get("glottal_open_area", float(ag_t.amax())))
     add = (1.0 - (ag_t / max(ag_ref, 1e-3)).clamp(0.0, 1.0)).clamp(0.02, 1.0)
 
     amp = aac.frication_source_amp(u, ac_area)
@@ -452,7 +459,40 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
                 # 줄이면 안 된다 — 호흡 램프가 이미 가청 개시를 뒤로 밀어놔서,
                 # 협착을 그대로 두면 정점이 저절로 가청 구간의 59 % 에 온다
                 # (실측 52~63 %). 줄이면 36 % 로 앞당겨져 페이드 인이 사라진다.
-                hold_r = float(seg.get("hold_ratio", split))
+                # **혀 제스처 구동**(논문 구조, HANDOFF §6.1). 폐압을 일정하게
+                # 두고 포락선을 협착에서 낸다 — Signorello et al.(2018) 이 기관
+                # 천자로 잰 Ps 는 마찰음 내내 거의 일정하고(8.0->8.9->8.4 hPa),
+                # 변하는 건 혀가 만드는 구강내압이다(2.5->7.6->5.6).
+                #
+                # 최소 면적 순간이 곧 마찰음 정점이자 해제 시작이고, 그 하나가
+                # 포먼트 전이·내전·구강내압 방전을 **함께** 촉발한다.
+                if seg.get("drive") == "tongue" and "constriction_area" not in seg:
+                    # 폐쇄/해제 시간은 "가청 길이 onset_s, 정점 위치 peak" 에서
+                    # 유도한다(aeroacoustic.cv_gesture_times). CV 는 해제가 모음
+                    # 면적까지 열려 로그 거리가 한쪽만 기므로, 독립 마찰음의
+                    # close_frac 을 그대로 쓰면 정점이 75 % 로 밀린다.
+                    _cls, _rel = aac.cv_gesture_times(
+                        onset_s, float(seg.get("frication_peak", aac.TONGUE_CV_PEAK)),
+                        a_min=float(seg.get("a_min", aac.TONGUE_A_MIN)),
+                        a_rest=float(seg.get("a_rest", aac.TONGUE_A_REST)),
+                        a_open=float(seg.get("a_open", 3.0)),
+                        glottal_area=0.12)
+                    cls = float(seg.get("close_s", _cls))
+                    rel = float(seg.get("release_s", _rel))
+                    ac_cv, hold_r = aac.tongue_constriction_cv(
+                        t, a.frame_rate, cls, rel,
+                        a_min=float(seg.get("a_min", aac.TONGUE_A_MIN)),
+                        a_rest=float(seg.get("a_rest", aac.TONGUE_A_REST)),
+                        a_open=float(seg.get("a_open", 3.0)))
+                    # 혀 제스처에 맞는 후두 타이밍 기본값. 마찰음의 성문 개대는
+                    # 크고(Löfqvist & Yoshioka 1984) 되모으는 데 시간이 걸린다.
+                    seg = {**seg, "constriction_area": None}
+                    seg.setdefault("adduction_s", 0.05)
+                    seg.setdefault("firming_s", 0.06)
+                    _cv_area = ac_cv
+                else:
+                    _cv_area = None
+                    hold_r = float(seg.get("hold_ratio", split))
                 # 후두는 혀끝과 **거의 같이** 움직인다. 예전엔 성문이 split(명목상
                 # /s/ 끝)에서야 닫히기 시작해 혀보다 한참 늦었고, 그 지연이 그대로
                 # 마찰음 꼬리로 남아 하강이 85 ms 로 늘어졌다(실측 52~64 ms).
@@ -477,8 +517,10 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
                 # 실측에서도 고역이 마찰음 끝에서 0.14 까지 떨어졌다가 발성과
                 # 함께 0.33 으로 **다시 오른다** — 그건 마찰음 잔향이 아니라
                 # 성대가 덜 모인 상태의 기식성 발성이다.
-                a_start = float(seg.get("adduction_start_ratio", 1.0)) * split
-                lag = a_start - hold_r
+                # 내전 시작은 **해제 시점** 기준이다(혀 제스처면 hold_r 이 곧
+                # 최소 면적 순간). split 에 걸면 혀 제스처에서 어긋난다.
+                lag = (float(seg["adduction_start_ratio"]) * split - hold_r
+                       if "adduction_start_ratio" in seg else 0.0)
                 # 내전은 **두 단계**다. /s/ 는 성문을 벌린 자세라, 모음으로 갈 때
                 # 성대가 한 번에 모달 위치로 가지 않는다. 먼저 발성이 가능한 정도만
                 # 빠르게 모이고(VOT 를 정한다), 그 뒤로 100 ms 남짓에 걸쳐 마저
@@ -493,23 +535,34 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
                 # 성대가 주기마다 완전히 닫혀 후두 틈만 남는 상태라 0.004 cm² 쯤이고,
                 # 그제서야 Re 가 임계 아래로 내려가 기식이 꺼진다.
                 firm = float(seg.get("firming_s", 0.12)) * a.frame_rate / max(t, 1)
+                # **마찰음의 성문 개대는 크다.** Löfqvist & Yoshioka(1984): 성문
+                # 개대 진폭은 마찰음이 파열음보다 크고, 시점도 이르다. 개대가
+                # 좁으면 마찰음 길이와 기식 구간이 서로 묶인다 — 성문을 오래
+                # 열어 두어 발성을 늦추려 하면 유량이 커져 마찰음까지 길어진다.
+                # 넓게 열면 직렬 저항이 협착에 몰려서 마찰음은 협착이, 발성
+                # 시점은 후두가 따로 정한다.
+                abd = float(seg.get("abduction_area", 0.25))
                 ag_curve = seg.get("glottal_area", [
-                    [0.0, 0.12], [min(hold_r + lag, 1.0), 0.12],
+                    [0.0, abd], [min(hold_r + lag, 1.0), abd],
                     [min(hold_r + lag + addt, 1.0), 0.03],      # 발성 시작: 기식성
                     [min(hold_r + lag + addt + firm, 1.0), 0.004],   # 모달로 조여짐
                     [1.0, 0.004]])
                 seg2 = dict(seg)
                 seg2.setdefault("a_open", 3.0)
                 seg2.setdefault("hold_ratio", hold_r)
-                seg2.setdefault("release_s", 0.05)      # 혀끝은 빨리 떨어진다
-                # 호흡 제스처를 **마찰음 구간에 맞춰 시간축을 축소**한다(비율이
-                # 불변량이므로 그냥 split 을 곱하면 된다). 모음에는 압력이 계속
-                # 필요하므로 0 으로 떨어뜨리지 않고 sustain 에서 유지한다 —
-                # 음절에서 마찰음이 꺼지는 건 압력이 아니라 협착이 열려서다.
-                seg2.setdefault("breath_hold", aac.BREATH_HOLD * split)
-                seg2.setdefault("breath_rise", aac.BREATH_RISE * split)
-                seg2.setdefault("breath_fall", aac.BREATH_FALL * split)
-                seg2.setdefault("breath_sustain", 0.95)
+                if _cv_area is not None:
+                    # 혀 제스처 궤적을 그대로 넘긴다. 폐압은 aero_drive 가
+                    # drive="tongue" 를 보고 일정하게 잡는다.
+                    seg2["constriction_area"] = _cv_area
+                else:
+                    seg2.setdefault("release_s", 0.05)  # 혀끝은 빨리 떨어진다
+                    # 호흡 제스처를 마찰음 구간에 맞춰 시간축을 축소한다(비율이
+                    # 불변량이라 split 을 곱하면 된다). 모음에는 압력이 계속
+                    # 필요하므로 0 으로 안 떨어뜨리고 sustain 에서 유지한다.
+                    seg2.setdefault("breath_hold", aac.BREATH_HOLD * split)
+                    seg2.setdefault("breath_rise", aac.BREATH_RISE * split)
+                    seg2.setdefault("breath_fall", aac.BREATH_FALL * split)
+                    seg2.setdefault("breath_sustain", 0.95)
                 drive = aero_drive(seg2, t, a.frame_rate, glottal_area=ag_curve)
                 ps, add = drive["ps_norm"], drive["add"]
             else:

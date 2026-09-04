@@ -87,8 +87,12 @@ def main() -> None:
     # 1) '사' — 호흡 압력이 페이드를, 협착 해제가 마찰음 종료를 만든다.
     #    onset_s 0.11 -> 가청 /s/ 160 ms, 정점 60 %, 상승 96 / 하강 64 ms
     #    (실측 134~139 ms, 52~63 %, 70~87 / 52~64 ms).
-    sa = {"type": "syllable", "onset": "s", "vowel": "a", "dur": 0.58,
-          "onset_s": 0.11, "aero": True,
+    # **혀 제스처 구동**(HANDOFF §6.1 완료). 독립 마찰음과 같은 논문 구조를
+    # 음절에도 적용했다 — 폐압은 일정하고 포락선은 혀가 만든다.
+    # 재측정(44.1 kHz): 마찰 127.7 ms(실측 122~139), 정점 59 %(57~68),
+    # 모음 세기상승 75.5 ms(81~87), 모음 개시 H1-H2 +10.2 dB(+11.8~12.6).
+    sa = {"type": "syllable", "onset": "s", "vowel": "a", "dur": 0.60,
+          "onset_s": 0.085, "aero": True, "drive": "tongue",
           "f0": [[0, 129], [1, 123]]}
     W("m01_sa.wav", {"timeline": [sa]})
     W("m02_sa_sa.wav", {"timeline": [sa, {"type": "silence", "dur": 0.3}, dict(sa)]})
@@ -99,7 +103,7 @@ def main() -> None:
     #    압력은 /s/ 내내 서서히 오르므로 페이드 인이 마찰음 전체에 걸친다.
     W("m03_s_to_eu_a.wav", {"timeline": [
         {"type": "syllable", "onset": "s", "vowel": "a", "dur": 1.05,
-         "onset_s": 0.55, "aero": True,
+         "onset_s": 0.55, "aero": True, "drive": "tongue",
          "f0": [[0, 131], [1, 122]]}]})
 
     # 3) 유성 마찰음 /z/ — 성대가 떨며 마찰음을 성문주기로 변조한다(소스-치찰음 결합).
