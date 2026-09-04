@@ -37,7 +37,7 @@ from formant_ml.voice import VoiceProfile
 #: 깨졌다. 제대로 된 해법은 이 상수들을 **샘플레이트 불변**으로 만드는 것이다
 #: (셸프를 활성 밴드 수로 정규화). HANDOFF §5g 참조.
 CAL_44K = {"BREATH_NOISE_GAIN": 7.8, "ASPIRATION_GAIN": 10.0,
-           "SYLLABLE_FRICATIVE_CAL_DB": 27.0}
+           "SYLLABLE_FRICATIVE_CAL_DB": 19.0}
 
 # 협착 궤적을 손으로 그리지 않는다. 예전엔 7 개 꺾은점으로 페이드를 만들었는데,
 # 그건 물리가 아니라 곡선 맞추기였고 호흡 압력과 서로 싸워서 정점이 가청 구간의
@@ -94,14 +94,18 @@ def main() -> None:
     sa = {"type": "syllable", "onset": "s", "vowel": "a", "dur": 0.60,
           "onset_s": 0.085, "aero": True, "drive": "tongue",
           "f0": [[0, 129], [1, 123]]}
-    W("m01_sa.wav", {"timeline": [sa]})
-    W("m02_sa_sa.wav", {"timeline": [sa, {"type": "silence", "dur": 0.3}, dict(sa)]})
+    # 발화는 **무음에서 시작한다**. 첫 세그먼트가 곧바로 시작하면 필터 상태가
+    # 0 에서 출발해 첫 1 ms 에 진폭 0.34 짜리 트랜지언트가 난다(실측 0.0054).
+    lead = {"type": "silence", "dur": 0.08}
+    W("m01_sa.wav", {"timeline": [lead, sa]})
+    W("m02_sa_sa.wav", {"timeline": [lead, sa, {"type": "silence", "dur": 0.3}, dict(sa)]})
 
     # 2) 재구성 본편: 길게 끈 치찰음 -> 짧은 '으' 전이 -> '아'
     #    '으' 는 별도 모음이 아니라 /s/ 자세(혀 높음)의 잔상이다. 로커스에서
     #    출발해 60 ms 안에 '아' 로 간다 — 길게 끌면 그게 활음(/j/)이라 "야" 가 된다.
     #    압력은 /s/ 내내 서서히 오르므로 페이드 인이 마찰음 전체에 걸친다.
     W("m03_s_to_eu_a.wav", {"timeline": [
+        lead,
         {"type": "syllable", "onset": "s", "vowel": "a", "dur": 1.05,
          "onset_s": 0.55, "aero": True, "drive": "tongue",
          "f0": [[0, 131], [1, 122]]}]})
@@ -135,7 +139,7 @@ def main() -> None:
                 "aero": True, "drive": "tongue",
                 "glottal_area": 0.12, "level_db": -5}
     W("m04_like_recording.wav", {"timeline": [
-        sa, {"type": "silence", "dur": 0.32}, dict(sa),
+        lead, sa, {"type": "silence", "dur": 0.32}, dict(sa),
         {"type": "silence", "dur": 0.5}, long_s(1.10),
         {"type": "silence", "dur": 0.5}, long_s(1.65)]})
 

@@ -137,6 +137,45 @@ def area_centroid_scale(area: torch.Tensor, a_ref: torch.Tensor | float | None =
     return (a_ref / area.clamp_min(1e-6)).clamp(1e-3, 1.0) ** exp
 
 
+#: 제트 속도가 기준 자세의 이 비율까지 떨어지면 앞니 다이폴이 사실상 사라진다.
+#: Shadle(1985/1990) 의 장애물 소스는 제트가 앞니를 때려서 생기므로, 협착이 덜
+#: 극단적이어서 제트가 느리면 다이폴도 약해진다. 지수 2 는 다이폴 소스 세기가
+#: 속도의 거듭제곱으로 붙는다는 것(단극보다 가파르다)에서 온다.
+OBSTACLE_JET_EXP = 1.0
+
+
+def obstacle_strength(area: torch.Tensor, a_ref: float | None = None,
+                      glottal_area: torch.Tensor | float = 0.12,
+                      exp: float | None = None) -> torch.Tensor:
+    """앞니(장애물) 공진의 세기 0~1. 기준 자세에서 1.0.
+
+    치찰음 지문은 **길게 끈 /s/** 에서 적합됐다. 거기서는 혀가 목표 자세
+    (`a_ref`)에 완전히 도달해 제트가 가장 빠르고, 앞니 다이폴이 스펙트럼을
+    지배한다(실측 봉우리 9.7 kHz = 앞니 공명 10015 Hz).
+
+    짧은 CV 의 '사' 는 다르다. 뒤따르는 모음을 예기해 협착이 목표까지 못 가고
+    (undershoot) 제트가 느려서, 앞니를 때리는 힘이 약하다. 그러면 다이폴이
+    물러나고 **앞공동 극이 드러난다** — 실측 봉우리 4.7~5.6 kHz(앞공동 극
+    5274 Hz), 4~6 kHz 에 에너지의 43~48 %.
+
+    **속도로 재면 안 된다.** 협착부 속도는 v = sqrt(2Ps/ρ)/sqrt(Ac²/Ag²+1) 인데,
+    무성 마찰음은 성문이 크게 벌어져 있어(Ag 0.25 cm²) Ac ≪ Ag 인 동안 Ac²/Ag²
+    가 거의 0 이라 **v 가 압력에만 묶인다**. 측정: 협착을 0.05 -> 0.10 으로 두 배
+    넓혀도 속도비가 0.897 로 10 % 밖에 안 움직인다. 판별력이 없다.
+
+    실제로 변하는 건 **제트의 기하**다. 협착이 넓어지면 제트가 굵고 퍼져서
+    앞니라는 국소 장애물을 때리는 효율이 떨어진다(Shadle 의 장애물 소스는 좁은
+    제트가 모서리에 부딪히는 구조다). 그래서 면적비로 잡는다:
+
+        g = (a_ref / Ac)^exp,  단 1 을 넘지 않는다
+    """
+    if a_ref is None:
+        a_ref = TONGUE_A_MIN
+    if exp is None:
+        exp = OBSTACLE_JET_EXP        # 호출 시점에 읽는다(기본인자 고정 방지)
+    return (torch.as_tensor(float(a_ref)) / area.clamp_min(1e-6)).clamp(0.0, 1.0) ** exp
+
+
 def glottal_drop_fraction(glottal_area: torch.Tensor,
                           constriction_area_: torch.Tensor) -> torch.Tensor:
     """직렬 저항 중 **성문**이 먹는 압력강하의 비율 0~1 (순수 기하).
@@ -308,6 +347,10 @@ def obstacle_dipole_bands(n_bands: int, sample_rate: float = 24000.0,
     f = torch.linspace(0.0, sample_rate / 2, n_bands).clamp_min(50.0)
     oct_ = torch.log2((f / f_ref).clamp_min(1.0))
     oct_ = torch.minimum(oct_, torch.log2(torch.tensor(f_max_boost / f_ref)))
+    if torch.is_tensor(db_per_oct):
+        # 시변: (1,T,1) 기울기 -> (1,T,n_bands). 제트가 느려지면 다이폴이
+        # 약해지므로 기울기 자체가 프레임마다 달라진다.
+        return 10.0 ** (db_per_oct * oct_.reshape(1, 1, -1) / 20.0)
     return 10.0 ** (db_per_oct * oct_ / 20.0)
 
 
@@ -530,6 +573,20 @@ TONGUE_CLOSE_FRAC = 0.57
 #: 때문이다(면적만 보는 모형에는 그 항이 없다). 0.72 를 넣으면 실제 가청 정점이
 #: 59 % 로 나온다(실측 57~68 %).
 TONGUE_CV_PEAK = 0.72
+#: 음절(CV)에서 혀가 실제로 도달하는 협착 면적 [cm²]. 길게 끈 /s/ 의 목표
+#: (`TONGUE_A_MIN` 0.050)보다 **넓다** — 짧은 제스처가 뒤따르는 모음을 예기해
+#: 목표까지 못 가기 때문이다(undershoot). 그만큼 제트가 굵어 앞니 다이폴이
+#: 약해지고 앞공동 극이 드러난다.
+#:
+#: 실측 대조로 잡았다: 0.11 에서 봉우리 5276 Hz, 4~6 kHz 50.2 %
+#: (실측 4673~5556 Hz, 43~48 %). 0.050 이면 10218 Hz / 17 % 로 지속음과
+#: 구분이 안 된다. 구강내압비도 Po/Ps = Ag²/(Ag²+Ac²) = 0.84 로 논문의
+#: 0.85~0.89 안에 남는다.
+TONGUE_CV_A_MIN = 0.11
+#: 제스처 출발 자세를 가청 경계보다 이만큼 넓게 잡는다. 1.0 이면 시작하자마자
+#: 소리가 나기 시작하므로 여유가 필요하다 — 페이드 인은 **소리가 안 나는 구간
+#: 에서 출발해 경계를 넘어오는 과정**이고, 그 앞부분이 없으면 계단이 된다.
+REST_AUDIBLE_MARGIN = 2.2
 
 
 def tongue_constriction(t: int, frame_rate: float, a_min: float = TONGUE_A_MIN,

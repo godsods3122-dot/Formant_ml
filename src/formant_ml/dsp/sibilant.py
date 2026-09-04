@@ -94,6 +94,16 @@ class SibilantParams:
     # 사이로 얕게 빠져나가는 제트가 만드는 휘파람 같은 성분이다.
     teeth_f: torch.Tensor | None = None
     teeth_bw: torch.Tensor | None = None
+    #: 앞니(장애물) 공진의 **세기** 0~1. 1 이면 지문 그대로, 0 이면 앞니 공진이
+    #: 없고 앞공동 극만 남는다.
+    #:
+    #: 왜 손잡이가 필요한가: 장애물 다이폴은 제트가 앞니를 때려야 생긴다
+    #: (Shadle 1985/1990). 협착이 덜 극단적이면 제트가 느려 다이폴이 약해지고,
+    #: 그러면 **앞공동 공진이 드러난다**. 실측에서 같은 화자의 /s/ 가 문맥에
+    #: 따라 한 옥타브 다른 게 이것이다 — 짧은 CV 의 '사' 는 4.7~5.6 kHz(앞공동
+    #: 극 5274 Hz)에서, 길게 끈 /s/ 는 9.7 kHz(앞니 공명 10015 Hz)에서 봉우리가
+    #: 선다. 세기가 고정(ones_like)이면 이 대조가 아예 안 생긴다.
+    teeth_gain: torch.Tensor | None = None
     # 직접 방사 바닥 [dB, 피크 대비]. 난류원은 앞공동 공진만 통해 나오는 게
     # 아니라 입 구멍에서 그대로도 방사된다(단극 방사). 이게 없으면 봉우리 밖이
     # 통째로 비어서, 실제 녹음처럼 **스펙트럼이 전역적으로** 깔리지 않는다.
@@ -148,9 +158,16 @@ def sibilant_response(p: SibilantParams, sample_rate: float,
     H = H * tilt_response(p.tilt, sample_rate, n_freq)
     if p.teeth_f is not None and p.teeth_bw is not None:
         # resonator_response 는 단(stage)축을 남긴 (B,T,K,F) 를 돌려준다. 곱해서 접는다.
-        H = H * resonator_response(p.teeth_f, p.teeth_bw,
+        tg = (torch.ones_like(p.teeth_f) if p.teeth_gain is None
+              else p.teeth_gain.clamp(0.0, 1.0))
+        # 공진을 **병렬로** 섞는다: (1-g)·평탄 + g·공진. 게인을 공진기 자체에
+        # 곱하면 세기를 줄일 때 그 대역이 통째로 파여서 스펙트럼에 구멍이 난다.
+        # 여기서 원하는 건 "앞니 공진이 덜 도드라진다" 이지 "그 대역이 없다" 가
+        # 아니다.
+        teeth = resonator_response(p.teeth_f, p.teeth_bw,
                                    torch.ones_like(p.teeth_f), sample_rate,
                                    n_freq).prod(dim=2)
+        H = H * ((1.0 - tg).to(teeth.dtype) + tg.to(teeth.dtype) * teeth)
     if p.floor_db is not None:
         # 입 구멍에서 직접 방사되는 광대역 성분을 **병렬로** 더한다.
         # (max 로 자르지 않는다 — 병렬 경로의 합이 물리적으로 맞고 미분도 매끄럽다.)

@@ -125,8 +125,12 @@ def cat_controls(parts: list[Controls]) -> Controls:
         if torch.is_tensor(vals[0]):
             out[f.name] = torch.cat(vals, dim=1)
         elif isinstance(vals[0], SibilantParams):
+            # 선택 필드(teeth_gain 등)는 None 일 수 있다. 전부 무조건
+            # torch.cat 하면 그 순간 터진다 — 필드를 하나 추가할 때마다
+            # 스트리밍이 조용히 깨지는 구조였다.
             out[f.name] = SibilantParams(**{
-                k: torch.cat([getattr(v, k) for v in vals], dim=1)
+                k: (None if any(getattr(v, k) is None for v in vals)
+                    else torch.cat([getattr(v, k) for v in vals], dim=1))
                 for k in vals[0].__dict__})
         else:
             out[f.name] = vals[0]

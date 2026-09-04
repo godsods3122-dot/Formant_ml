@@ -129,7 +129,11 @@ FRICATIVE_CAL_DB = -19.2
 #: 위의 FRICATIVE_CAL_DB 테스트는 이걸 못 잡는다 — 그건 **비공기역학** 경로만
 #: 재는데 무게중심 배율은 공기역학 경로에만 걸리기 때문이다. 그래서 음절 경로용
 #: 검사를 따로 뒀다(test_voice.py::test_syllable_fricative_level_matches_profile).
-SYLLABLE_FRICATIVE_CAL_DB = 25.0
+#:
+#: 25.0 -> 17.0 재측정: 앞니 다이폴 기울기를 제트에 묶으면서(_dipole_jet_correction)
+#: 음절의 /s/ 스펙트럼이 재배분됐다. 모양만 바꾸도록 RMS 정규화를 했는데도
+#: 대역별 재배분이 성도·치찰음 필터를 거치며 레벨을 8 dB 옮긴다.
+SYLLABLE_FRICATIVE_CAL_DB = 17.0
 
 
 def fricative_gain(prof: VoiceProfile) -> float:
@@ -261,7 +265,10 @@ def aero_drive(seg: dict, t: int, frame_rate: float, glottal_area=None) -> dict:
     # 앞니 공명(teeth_f)은 혀끝-앞니 간극이 정하는 순수 기하라 **둘 다 안 곱한다**.
     cent = aac.area_centroid_scale(ac_area)
     src_tilt = aac.source_tilt_shift(u, ac_area)
-    return {"env": env, "cent": cent, "src_tilt": src_tilt,
+    # 앞니 다이폴의 **세기**는 제트가 정한다(주파수가 아니라). 협착이 목표
+    # 자세에 못 미치면 제트가 느려 다이폴이 약해지고 앞공동 극이 드러난다.
+    teeth = aac.obstacle_strength(ac_area, glottal_area=ag_t)
+    return {"env": env, "cent": cent, "src_tilt": src_tilt, "teeth": teeth,
             "asp_share": asp_share,
             "asp": asp / asp.amax().clamp_min(1e-9),
             "ps_norm": ps_norm, "add": add,
@@ -274,8 +281,33 @@ def aero_drive(seg: dict, t: int, frame_rate: float, glottal_area=None) -> dict:
 _GEOMETRIC_SIB_KEYS = ("pole_f", "zero_f")
 
 
+def _dipole_jet_correction(n_bands: int, sample_rate: float, db_per_oct: float,
+                           strength: torch.Tensor) -> torch.Tensor:
+    """제트 세기 `strength`(0~1)에 맞춘 앞니 다이폴 기울기 보정 (1,T,NB).
+
+    다이폴 게인은 10^(d·oct/20) 이라 기울기 d 가 **지수에 선형**이다. 따라서
+    기울기를 g 배로 줄이는 건 원래 게인을 g 제곱하는 것과 같고, 이미 곱해 둔
+    전체 다이폴에 대한 보정은 `dip^(g-1)` — 즉 기울기 d·(g-1) 짜리 다이폴을
+    한 번 더 곱하면 된다. 그래서 같은 함수를 시변 기울기로 재사용한다.
+
+    왜 필요한가: 8~13 kHz 를 지배하는 건 앞니 공진기(좁은 봉우리)가 아니라 이
+    광대역 상승이다. 협착이 목표 자세에 못 미쳐 제트가 느리면 장애물 다이폴도
+    약해져야 앞공동 극(5.3 kHz)이 드러난다 — 실측에서 짧은 '사' 가 4.7~5.6 kHz
+    에서 봉우리를 세우는 이유다.
+    """
+    corr = aac.obstacle_dipole_bands(n_bands, sample_rate,
+                                     db_per_oct * (strength - 1.0))
+    # **모양만** 바꾸고 전체 세기는 그대로 둔다(밴드 RMS 로 정규화).
+    # 안 그러면 기울기를 낮추는 게 곧 /s/ 를 조용하게 만드는 일이 된다 —
+    # /s/ 에너지가 거의 다 고역에 있어서 기울기를 깎으면 13 dB 가 통째로
+    # 빠지고, 그러면 모음이 고역 정점을 가져간다(측정). 세기는 프로파일의
+    # fricative_level_db 와 보정 상수가 정하고, 이 함수는 배분만 한다.
+    return corr / corr.pow(2).mean(-1, keepdim=True).clamp_min(1e-12).sqrt()
+
+
 def _scale_sib_center(sib: SibilantParams, cent: torch.Tensor,
-                      src_tilt: torch.Tensor | None = None) -> None:
+                      src_tilt: torch.Tensor | None = None,
+                      teeth: torch.Tensor | None = None) -> None:
     """협착 기하에서 나온 배율을 치찰음 공진에 곱한다(제자리).
 
     `cent` 는 **면적**에서 나온다(`aeroacoustic.area_centroid_scale`). 협착이
@@ -292,6 +324,10 @@ def _scale_sib_center(sib: SibilantParams, cent: torch.Tensor,
             setattr(sib, k, v * cent)
     if src_tilt is not None and sib.tilt is not None:
         sib.tilt = sib.tilt + src_tilt
+    if teeth is not None:
+        # 앞니 공진의 **세기**. 제트가 느리면 다이폴이 물러나고 앞공동 극이
+        # 드러난다(aeroacoustic.obstacle_strength). 주파수는 안 건드린다.
+        sib.teeth_gain = teeth if sib.teeth_gain is None else sib.teeth_gain * teeth
 
 
 def _vowel_formants(name: str, prof: VoiceProfile, n: int) -> list[float]:
@@ -371,10 +407,14 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
         # 롤오프가 그대로 남아 9~12 kHz 가 반토막 나고 5~6 kHz 에 없는 혹이 생겨
         # '스' 로 안 들린다(실측 대조: 고역 79% vs 합성 38%).
         if phone in OBSTACLE_SIBILANTS and seg.get("obstacle_dipole", True):
-            nb = nb * aac.obstacle_dipole_bands(
-                NB, a.sample_rate,
-                float(seg.get("dipole_db_oct", 10.0))).reshape(1, 1, -1)
-        aero_env = aero_cent = aero_tilt = None
+            # 다이폴 기울기는 **제트에 묶인다**. 8~13 kHz 를 지배하는 건 앞니
+            # 공진기(좁은 봉우리)가 아니라 이 광대역 상승이라, 협착이 목표에
+            # 못 미쳐 제트가 느릴 때 이것도 같이 약해져야 앞공동 극이 드러난다.
+            # 시변 텐서로 주면 (1,T,NB) 가 되고, 상수면 예전대로 (NB,) 다.
+            _dpo = float(seg.get("dipole_db_oct", 10.0))
+            dip = aac.obstacle_dipole_bands(NB, a.sample_rate, _dpo)
+            nb = nb * (dip if dip.dim() == 3 else dip.reshape(1, 1, -1))
+        aero_env = aero_cent = aero_tilt = aero_teeth = None
         if kind == "fricative":
             c["harmonic_amp"] = torch.zeros(1, t, 1)
             # 무성 마찰음에는 기식성 잡음 바닥이 없다 — 그건 **발성 중에** 성대가
@@ -408,6 +448,7 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
                 _d = aero_drive(seg_f, t, a.frame_rate)
                 aero_env, aero_cent = _d["env"], _d["cent"]
                 aero_tilt = _d["src_tilt"]
+                aero_teeth = _d["teeth"]
                 env = aero_env
             else:
                 # 단순 경로: 유량 포락선을 직접 준다.
@@ -471,18 +512,28 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
                     # 유도한다(aeroacoustic.cv_gesture_times). CV 는 해제가 모음
                     # 면적까지 열려 로그 거리가 한쪽만 기므로, 독립 마찰음의
                     # close_frac 을 그대로 쓰면 정점이 75 % 로 밀린다.
+                    # **혀는 소리가 안 나는 자세에서 출발해야 한다.** 제스처의
+                    # 시작 면적이 가청 경계보다 좁으면 첫 프레임부터 마찰음이
+                    # 켜져 있어서, 그 계단이 파열음처럼 들린다("ksa").
+                    # 측정: 개대를 0.25 로 넓히자 가청 경계가 0.392 -> 0.766 cm²
+                    # 로 올라갔는데 a_rest 는 0.60 그대로여서, 합성 /s/ 의 첫
+                    # 프레임 값이 0.10 이었다(실측은 0.017 = 무음).
+                    # 그래서 기본 출발 자세를 가청 경계에서 **유도**한다.
+                    _abd = float(seg.get("abduction_area", 0.25))
+                    _amin = float(seg.get("a_min", aac.TONGUE_CV_A_MIN))
+                    _rest = float(seg.get("a_rest", max(
+                        aac.TONGUE_A_REST,
+                        aac.REST_AUDIBLE_MARGIN * aac.audible_area(_amin, _abd))))
                     _cls, _rel = aac.cv_gesture_times(
                         onset_s, float(seg.get("frication_peak", aac.TONGUE_CV_PEAK)),
-                        a_min=float(seg.get("a_min", aac.TONGUE_A_MIN)),
-                        a_rest=float(seg.get("a_rest", aac.TONGUE_A_REST)),
+                        a_min=_amin, a_rest=_rest,
                         a_open=float(seg.get("a_open", 3.0)),
-                        glottal_area=0.12)
+                        glottal_area=_abd)
                     cls = float(seg.get("close_s", _cls))
                     rel = float(seg.get("release_s", _rel))
                     ac_cv, hold_r = aac.tongue_constriction_cv(
                         t, a.frame_rate, cls, rel,
-                        a_min=float(seg.get("a_min", aac.TONGUE_A_MIN)),
-                        a_rest=float(seg.get("a_rest", aac.TONGUE_A_REST)),
+                        a_min=_amin, a_rest=_rest,
                         a_open=float(seg.get("a_open", 3.0)))
                     # 혀 제스처에 맞는 후두 타이밍 기본값. 마찰음의 성문 개대는
                     # 크고(Löfqvist & Yoshioka 1984) 되모으는 데 시간이 걸린다.
@@ -590,6 +641,7 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
                 # 마찰음이 저절로 꺼지고, 같은 순간 구강내압이 빠져 발성이 붙는다.
                 env, aero_cent, asp_env = drive["env"], drive["cent"], drive["asp"]
                 aero_tilt = drive["src_tilt"]
+                aero_teeth = drive["teeth"]
                 asp_share = drive["asp_share"]
                 # 기식을 손으로 게이팅하지 않는다. 예전엔 (1-v_frac)·(1-env) 를
                 # 곱해서 **발성이 붙는 순간 잡음을 껐다**. 그래서 마찰음과 목소리가
@@ -644,6 +696,10 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
                 #   성문 기식   -> 성도 전체            (aspiration_bands)
                 # 예전에는 경로가 하나뿐이라 noise_entry 를 둘 사이에서 튕겼는데,
                 # 그 전환이 전이에 레벨 점프를 만들어 연결이 끊겼다.
+                if phone in OBSTACLE_SIBILANTS and seg.get("obstacle_dipole", True):
+                    nb = nb * _dipole_jet_correction(
+                        NB, a.sample_rate, float(seg.get("dipole_db_oct", 10.0)),
+                        aero_teeth)
                 c["noise_bands"] = (nb * env).contiguous()
                 c["noise_entry"] = torch.full((1, t, 1), float(K) + 6.0)
                 # 성문 잡음은 **두 가지**이고 발성에 대한 의존이 서로 반대다.
@@ -751,7 +807,7 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
         # 협착이 열리며 속도가 떨어지면 봉우리가 내려간다(Stevens 1971). 실측 /사/
         # 의 무게중심 하강(6700->3900)이 손 곡선 없이 여기서 나온다.
         if aero_cent is not None:
-            _scale_sib_center(sib, aero_cent, aero_tilt)
+            _scale_sib_center(sib, aero_cent, aero_tilt, aero_teeth)
         c["sib"] = sib
     else:
         raise ValueError(f"모르는 세그먼트 type: {kind!r}. "
@@ -876,11 +932,41 @@ def build_controls(score: dict, prof: VoiceProfile, cfg: Config) -> Controls:
     # 보간하면 중간 프레임이 '캐스케이드의 앞부분만 우회한 반쪽 필터' 가 되는데,
     # 그건 어떤 성도 형상에도 대응하지 않는 응답이고 국소 이득이 100 배까지
     # 솟아 전이부에 클릭을 만든다. 들리는 전이는 noise_bands 포락선이 만든다.
+    # **여기(무음 구간)에서는 noise_entry 를 뒤 세그먼트 값으로 채운다.**
+    # 위 주석대로 보간은 안 되지만, 여기 있는 건 보간이 아니라 **점프 제거**다.
+    # 기류가 없는 구간에서는 주입 위치가 소리에 아무 영향이 없으므로, 뒤에서
+    # 쓸 값을 미리 넣어 두면 경계에서 필터가 안 튄다.
+    #
+    # 안 하면 무음(0) -> /s/(K+6=18) 로 한 프레임에 뛰면서 성도 응답이 통째로
+    # 바뀌고, 그 불연속이 클릭이 된다 — 사용자가 "ksa" 로 듣던 그 /k/ 다.
+    # 측정(무음 + '사'): 경계 직후 1 ms 최대진폭 0.648 -> 0.544 (이것만으로),
+    # sib.mix 램프까지 같이 하면 0.278. 실측 녹음의 개시는 0.0054 다.
+    if "noise_entry" in merged and "noise_bands" in merged:
+        ne = merged["noise_entry"]
+        amp = merged["noise_bands"].amax(dim=-1, keepdim=True)
+        if "harmonic_amp" in merged:
+            amp = amp + merged["harmonic_amp"]
+        quiet = (amp < 1e-3)[0, :, 0]
+        idx = torch.arange(ne.shape[1])
+        loud = (~quiet).nonzero().reshape(-1)
+        if len(loud):
+            # 각 무음 프레임을 **뒤쪽 첫 유음 프레임**의 값으로 채운다.
+            nxt = torch.searchsorted(loud, idx.clamp_max(int(loud[-1])))
+            src = loud[nxt.clamp_max(len(loud) - 1)]
+            ne = torch.where(quiet.reshape(1, -1, 1), ne[:, src, :], ne)
+            merged["noise_entry"] = ne
+
     n = int(score.get("smooth_frames", 2))
     for k in ("f0", "rd", "tilt", "formant_freq", "formant_bw", "harmonic_amp",
               "noise_bands", "noise_am", "noise_rough"):
         if k in merged:
             merged[k] = _smooth(merged[k], n)
+    # 치찰음 필터는 **켤 때 램프**한다. mix 는 항등응답과의 크로스페이드라
+    # (sibilant_response: (1-m)+m·H) 중간값이 물리적으로 정의된다 — noise_entry
+    # 와 달리 미끄러뜨려도 되는 양이다. 한 프레임에 0->1 로 뛰면 성도 응답이
+    # 급변해 경계에서 클릭이 난다.
+    if sib_fields.get("mix") is not None and n > 0:
+        sib_fields["mix"] = _smooth(sib_fields["mix"], max(n, 4))
 
     merged["formant_freq"] = enforce_formant_spacing(merged["formant_freq"])
 
