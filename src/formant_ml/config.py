@@ -58,6 +58,17 @@ class FilterConfig:
 @dataclass
 class NoiseConfig:
     n_bands: int = 40             # 노이즈 대역 게인 개수
+    # 난류 **소스**의 고역 컷오프(TurbulenceSource 의 학습 사전 초기값).
+    # 협착부 제트의 에디에는 특징적인 크기가 있어 그 위로 스펙트럼이 떨어진다.
+    #
+    # 실측 긴 /s/ 는 12->18 kHz 에서 26.6 dB(-46 dB/oct) 떨어지는데 여기 값은
+    # -6 dB/oct 라 3.6 dB 밖에 안 떨어진다. 그래서 14 kHz / 25 dB/oct 로 바꿔
+    # 봤는데 **무게중심 아치가 무너졌다**(2823 Hz -> 279 Hz): 상단을 고정 컷오프로
+    # 자르면 제트 속도에 따른 소스 기울기 변화가 갈 곳이 없어진다. 실측의 상단
+    # 절벽은 소스의 정적 컷오프가 아니라 다른 데서 온다 — 아직 못 찾았다.
+    # HANDOFF §6.10. 그래서 원래 값으로 되돌렸고, 설정으로만 빼 두었다.
+    source_corner_hz: float = 5000.0
+    source_slope_db_oct: float = 6.0
     # 성문 개방기에 동기화된 진폭변조(기식음) 세기 범위
     am_depth_max: float = 1.0
     roughness_max: float = 1.0    # 난류의 시간 변조(정상 히스가 되는 것을 막는다)

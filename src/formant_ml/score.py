@@ -116,7 +116,7 @@ def curve(spec, t: int) -> torch.Tensor:
 #: 레벨에 섞여 들어간다 - 페이드를 절반씩으로 늘리자 같은 게인인데 RMS 가
 #: 3.7 dB 떨어졌다. 그러면 페이드를 만질 때마다 음량이 따라 움직이고, 음량을
 #: 맞추려고 게인을 올리면 페이드가 도로 얕아진다. 둘은 분리되어야 한다.
-FRICATIVE_CAL_DB = -11.0
+FRICATIVE_CAL_DB = -6.1
 
 #: 음절 안의 마찰음은 위 상수 대신 **같은 음절의 유성 최대 진폭**으로 기준화한다
 #: (아래 참조). 그 기준이 독립 마찰음 경로와 어긋난 만큼을 여기서 되돌린다.
@@ -134,7 +134,7 @@ FRICATIVE_CAL_DB = -11.0
 #: 25.0 -> 17.0 재측정: 앞니 다이폴 기울기를 제트에 묶으면서(_dipole_jet_correction)
 #: 음절의 /s/ 스펙트럼이 재배분됐다. 모양만 바꾸도록 RMS 정규화를 했는데도
 #: 대역별 재배분이 성도·치찰음 필터를 거치며 레벨을 8 dB 옮긴다.
-SYLLABLE_FRICATIVE_CAL_DB = -7.3
+SYLLABLE_FRICATIVE_CAL_DB = -2.9
 
 
 def fricative_gain(prof: VoiceProfile) -> float:
@@ -217,7 +217,13 @@ def aero_drive(seg: dict, t: int, frame_rate: float, glottal_area=None) -> dict:
     # 게다가 레이놀즈 게이트 때문에 압력이 낮은 동안은 난류가 아예 안 켜져서,
     # 압력 램프가 그대로 부드러운 페이드 인/아웃이 된다.
     ps_scale = seg.get("pressure_scale")
-    if ps_scale is None and seg.get("drive") == "tongue":
+    # 폐압을 **일정하게** 두는 건 말이 이미 진행 중인 구간의 관찰이다
+    # (Signorello et al. 2018). 독립 지속 마찰음은 토큰 하나가 발화 전체라
+    # 폐압이 올랐다 내려야 하고, 혀는 자세를 유지하므로 포락선을 만드는 건
+    # 호흡이다(`ps_drive="breath"`). CV 음절에서는 반대다 — 폐압이 일정하고
+    # 혀의 해제가 포락선을 만든다(`ps_drive="constant"`).
+    if ps_scale is None and seg.get("ps_drive", "constant") == "constant" \
+            and seg.get("drive") == "tongue":
         # **폐압을 일정하게 둔다.** Signorello et al.(2018) 이 기관 천자로 직접
         # 잰 Ps 는 마찰음 내내 8.0 -> 8.9 -> 8.4 hPa 로 거의 안 변한다. 변하는
         # 건 구강내압 Po 이고, 그건 혀가 만든다. 예전에는 여기에 호흡 아치를
@@ -436,9 +442,14 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
         aero_env = aero_cent = aero_tilt = aero_teeth = None
         if kind == "fricative":
             c["harmonic_amp"] = torch.zeros(1, t, 1)
-            # 무성 마찰음에는 기식성 잡음 바닥이 없다 — 그건 **발성 중에** 성대가
-            # 덜 닫혀 새는 잡음이라 발성이 없으면 존재하지 않는다. 남겨두면
-            # /s/ 위에 상수 잡음이 깔려 페이드 모양이 뭉개진다(58 % -> 45 %).
+            # 무성 마찰음에는 **기식성 바닥**이 없다 — 그건 발성 중에 성대가 덜
+            # 닫혀 새는 잡음이라 발성이 없으면 존재하지 않는다. 남겨두면 /s/ 위에
+            # 상수 잡음이 깔려 페이드 모양이 뭉개진다(58 % -> 45 %).
+            # 성문 난류를 여기에 더해 보았지만(/s/ 는 성문을 벌린 채 내는
+            # 소리이므로 물리적으로는 있어야 한다) **가장자리를 망가뜨렸다**:
+            # 마찰음이 작아지는 구간에서 그 광대역 잡음이 스펙트럼을 지배해
+            # 무게중심이 6359 -> 2353 Hz 로 무너졌다. 세기를 어떻게 잡아야
+            # 하는지 아직 모른다. HANDOFF §6.11.
             c["aspiration_bands"] = torch.zeros(1, t, NB)
             if wants_aero(seg):
                 # 공기음향 경로: 협착 면적에서 진폭·무게중심을 유도(권장).
@@ -464,11 +475,26 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
                 if seg_f.get("drive") != "tongue":
                     seg_f.setdefault("constriction_area",
                                      [[0.0, 0.10], [1.0, 0.10]])
+                # 지속 마찰음: 혀는 자세를 유지하고 **호흡이 포락선을 만든다**.
+                seg_f.setdefault("ps_drive", "breath")
                 _d = aero_drive(seg_f, t, a.frame_rate)
                 aero_env, aero_cent = _d["env"], _d["cent"]
                 aero_tilt = _d["src_tilt"]
                 aero_teeth = _d["teeth"]
                 env = aero_env
+                # **다이폴도 제트에 묶는다.** 음절 경로에만 걸려 있어서
+                # 독립 마찰음은 첫 프레임부터 +10 dB/oct 다이폴이 만땅이었다.
+                # 측정: `noise_bands` 모양이 전 구간 완전히 동일하고 무게중심이
+                # 15245 Hz 에 **고정**이었다. 실측 긴 /s/ 의 무게중심은
+                # 5 -> 9.5 -> 5 kHz 로 아치를 그린다(제트가 빠를 때 중심이
+                # 오른다, Stevens 1971). 우리는 12 -> 8.3 -> 12 로 **반대**였고,
+                # 그래서 11~18 kHz 가 2.5~6 kHz 보다 200 ms 먼저 나왔다
+                # (실측은 2.5~6 kHz 가 150 ms 먼저다). 사용자가 "처음부터 고역이
+                # 확 튀어나온다" 고 한 게 이것이다.
+                if phone in OBSTACLE_SIBILANTS and seg.get("obstacle_dipole", True):
+                    nb = nb * _dipole_jet_correction(
+                        NB, a.sample_rate, float(seg.get("dipole_db_oct", 10.0)),
+                        aero_teeth)
             else:
                 # 단순 경로: 유량 포락선을 직접 준다.
                 # 기본값을 **초로 박지 않는다**. 30/40 ms 로 두었더니 400 ms 짜리

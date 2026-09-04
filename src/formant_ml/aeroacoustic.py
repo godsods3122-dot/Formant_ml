@@ -343,6 +343,7 @@ def obstacle_dipole_bands(n_bands: int, sample_rate: float = 24000.0,
     """앞니 다이폴의 대역게인 (n_bands,). f_ref 위로 +db_per_oct 로 상승.
 
     `f_max_boost` 위에서는 더 올리지 않는다(나이퀴스트 근처에서 발산 방지).
+
     """
     f = torch.linspace(0.0, sample_rate / 2, n_bands).clamp_min(50.0)
     oct_ = torch.log2((f / f_ref).clamp_min(1.0))
@@ -674,9 +675,21 @@ def devoicing_gesture(t: int, frame_rate: float, peak_pos: float,
     return a.reshape(1, n, 1)
 
 
+#: 지속 마찰음에서 혀가 **목표 자세를 유지하는** 구간의 비율.
+#:
+#: 0 이면 닫자마자 바로 여는 삼각형이라 혀가 토큰 내내 움직인다. 그러면 앞공동
+#: 공진(`area_centroid_scale`)과 앞니 다이폴 세기가 계속 따라 움직여 **음색이
+#: 요동친다**. 실측 긴 /s/ 는 반대다 — 스펙트럼 **모양이 거의 안 변하고**
+#: 레벨만 변한다(6~11 kHz 기준 2.5~6 kHz 가 12/50/88 % 에서 -1.6/-2.8/-1.2 dB).
+#: 사용자가 "사람 소리 같지 않다" 고 한 게 그 요동이다.
+#: 지속 마찰음은 자세를 잡고 유지하며, 포락선은 호흡이 만든다.
+TONGUE_SUSTAIN_HOLD = 0.62
+
+
 def tongue_constriction(t: int, frame_rate: float, a_min: float = TONGUE_A_MIN,
                         a_rest: float = TONGUE_A_REST,
                         close_frac: float = TONGUE_CLOSE_FRAC,
+                        hold_frac: float = TONGUE_SUSTAIN_HOLD,
                         device=None) -> torch.Tensor:
     """혀끝 제스처로서의 협착 면적 A(t) [cm²] (1,T,1).
 
@@ -712,11 +725,14 @@ def tongue_constriction(t: int, frame_rate: float, a_min: float = TONGUE_A_MIN,
     n = max(int(t), 1)
     lo, hi = math.log(max(a_min, 1e-6)), math.log(max(a_rest, a_min * 1.01))
     f = min(max(close_frac, 0.05), 0.95)
+    h = min(max(hold_frac, 0.0), 0.9)
+    # 고원을 정점 위치 f 를 중심으로 close:open 비율대로 나눠 넣는다.
+    c_end = f - h * f                       # 폐쇄가 끝나는 지점
+    o_beg = f + h * (1.0 - f)               # 해제가 시작하는 지점
     i = torch.arange(n, device=device, dtype=torch.float32) / max(n - 1, 1)
-    # 닫힐 때: hi -> lo (0 ~ f), 열릴 때: lo -> hi (f ~ 1)
-    down = hi + (lo - hi) * min_jerk(i / f)
-    up = lo + (hi - lo) * min_jerk((i - f) / max(1.0 - f, 1e-6))
-    logA = torch.where(i <= f, down, up)
+    down = hi + (lo - hi) * min_jerk(i / max(c_end, 1e-6))
+    up = lo + (hi - lo) * min_jerk((i - o_beg) / max(1.0 - o_beg, 1e-6))
+    logA = torch.where(i <= o_beg, down, up)
     return logA.exp().reshape(1, n, 1)
 
 

@@ -164,13 +164,24 @@ def bands_to_response(band_gains: torch.Tensor, n_freq: int,
 
 
 def tilt_response(tilt_db_per_oct: torch.Tensor, sample_rate: float, n_freq: int,
-                  pivot_hz: float = 1000.0, lo_db: float = -40.0,
+                  pivot_hz: float = 1000.0, lo_db: float = -90.0,
                   hi_db: float = 40.0) -> torch.Tensor:
     """스펙트럼 기울기 (실수 이득, 영위상). tilt: (B, T, 1) dB/oct, 1 kHz 기준.
 
     `one_pole_tilt` 은 한 극점의 고정된 -6 dB/oct 모양만 낼 수 있어서 6~12 kHz 를
     따로 올리거나 내릴 수 없다. 여기서는 log 주파수에 대한 직선(=옥타브당 dB)이라
     고역만 정확히 원하는 만큼 조절할 수 있다. (고역 부족 문제의 직접 손잡이)
+
+    **감쇠 쪽 클램프는 넉넉해야 한다.** -40 dB 로 두면 44.1 kHz 에서 문제가 된다:
+    1 kHz 피벗에서 22 kHz 는 4.46 옥타브라, 기울기가 -9 dB/oct 보다 가파르면
+    나이퀴스트에 닿기 전에 클램프에 걸려 **고역이 -40 dB 짜리 선반**이 된다.
+    치찰음 기울기는 -5 ~ -12 dB/oct(+ 소스 기울기)라 거의 항상 걸렸고, 그래서
+    18~22 kHz 가 실측 대비 12~23 dB 과다했다. 더 나쁜 건 기울기가 가팔라질수록
+    선반이 넓어져서 **어두워야 할 구간이 오히려 상대적으로 밝아진다**는 것이다
+    (측정: 긴 /s/ 의 11~18 kHz 가 가운데보다 양 끝에서 8 dB 높았다 — 실측은
+    반대로 가운데가 4~7 dB 높다).
+
+    부스트 쪽(hi_db)은 그대로 둔다. 그쪽은 이득이 폭발하는 위험한 방향이다.
     """
     f = freq_grid(n_freq, sample_rate, device=tilt_db_per_oct.device,
                   dtype=tilt_db_per_oct.dtype).clamp_min(20.0)

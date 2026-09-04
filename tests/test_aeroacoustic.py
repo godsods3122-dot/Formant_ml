@@ -65,39 +65,55 @@ def test_series_driver_couples_glottis_and_oral_constriction():
     assert float(fr_s) > 100.0 * float(fr_v.clamp_min(1e-6))
 
 
-def test_centroid_descends_from_constriction_area_alone():
-    """치찰음 무게중심이 협착 면적 궤적만으로 내려간다(손 곡선 없이).
+def test_centroid_follows_the_jet_not_a_hand_drawn_curve():
+    """치찰음 무게중심이 **제트를 따라 아치**를 그린다(손 곡선 없이).
 
-    협착이 열리며 입자속도가 떨어져 무게중심이 내려간다(Stevens 1971).
+    Stevens(1971): 무게중심은 협착부 입자속도와 함께 오른다. 그래서 지속
+    마찰음의 무게중심은 세기와 함께 **가운데서 높고 양 끝에서 낮은 아치**여야
+    한다. 실측(업로드 녹음의 긴 /s/, 1~20 kHz, 가청 구간의 5/50/95 %):
+
+        토큰 #1   6521 -> 8770 -> 7339 Hz
+        토큰 #2   7867 -> 9201 -> 6651 Hz
+
+    예전에는 **정확히 반대**였다(12228 -> 8300 -> 12218): 앞니 다이폴이 독립
+    마찰음 경로에서 제트에 안 묶여 있어서 첫 프레임부터 +10 dB/oct 가 만땅이라
+    소스 무게중심이 15245 Hz 에 **고정**돼 있었다. 사용자가 "우리 건 처음부터
+    고역이 확 튀어나온다" 고 지적한 것이 이것이다. HANDOFF §5.8.
+
+    여기서는 방향만 본다(절대값은 화자 지문이 정한다). **화자 프로파일로 잰다** —
+    아치의 크기는 앞니 공명/앞공동 극의 위치에 달려 있고, 기본 프로파일에는
+    그 지문이 없다.
     """
-    from formant_ml.score import build_segment
-    prof = PROF
-    sa = {"type": "syllable", "onset": "s", "vowel": "a", "dur": 0.5,
-          "aero": True, "onset_s": 0.14,
-          "constriction_area": [[0, 0.13], [0.2, 0.22], [0.26, 1.2],
-                                [0.34, 3.0], [1, 3.0]]}
-    y = render({"timeline": [sa], "seed": 5}, prof, CFG).reshape(-1)
-    f = torch.linspace(0, FS / 2, 361)
-
-    def cen(a, b, win=720):
-        cs = []
-        for i in range(int(a * FS), int(b * FS) - win, win // 2):
-            S = torch.fft.rfft(y[i:i + win] * torch.hann_window(win)).abs()
-            m = f > 1500
-            cs.append(float((f[m] * S[m] ** 2).sum() / (S[m] ** 2).sum().clamp_min(1e-9)))
-        return cs
-    # **마찰음이 살아 있는 구간에서** 잰다. 고정 창(0~160 ms)으로 재면 뒤쪽
-    # 모음 프레임까지 섞여 들어가 하강 폭이 부풀려진다.
-    nbv = build_segment(sa, prof, CFG)["noise_bands"][0].sum(-1)
-    nbv = (nbv / nbv.amax()).numpy()
-    alive = [i for i, v in enumerate(nbv) if v > 0.10]
-    c = cen(alive[0] * 0.01, (alive[-1] + 1) * 0.01)
-    # 기준 150 Hz. 예전엔 800 이었는데 그 큰 하강은 상당 부분 **성문이 마찰음
-    # 중간에 닫히던** 데서 왔다(그때 유속이 급락한다). 그건 /s/ 의 물리가
-    # 아니라서 없앴다(성문은 /s/ 내내 벌어져 있다). 남은 하강은 협착이 열리며
-    # 생기는 것뿐이고, 레이놀즈 게이트가 마찰음을 끄기 전까지만 보이므로 작다.
-    assert c[0] - c[-1] > 150, f"무게중심이 안 내려간다: {c[0]:.0f}->{c[-1]:.0f}"
-
+    prof = _me_profile()
+    if prof is None:
+        return
+    # **44.1 kHz 로 잰다.** 24 kHz 는 나이퀴스트가 12 kHz 라 앞니 공명(10 kHz)
+    # 바로 위에서 스펙트럼이 잘려 무게중심이 움직일 여지가 없다(9314 -> 9354).
+    from dataclasses import replace as _replace
+    cfg = _replace(CFG, audio=_replace(CFG.audio, sample_rate=44100,
+                                       hop_size=441, fmax=22050.0),
+                   filt=_replace(CFG.filt, n_formants=len(prof.formants) + 2))
+    fs = cfg.audio.sample_rate
+    seg = {"type": "fricative", "phone": "s", "dur": 1.6, "aero": True,
+           "drive": "tongue", "glottal_area": 0.12}
+    y = render({"timeline": [{"type": "silence", "dur": 0.08}, seg],
+                "seed": 5}, prof, cfg).reshape(-1)
+    win, hop = 2048, 512
+    f = torch.linspace(0, fs / 2, win // 2 + 1)
+    S = torch.stft(y, win, hop, window=torch.hann_window(win),
+                   return_complex=True).abs()
+    band = (f > 1000) & (f < fs / 2 - 2000)
+    P = S[band] ** 2
+    tot = P.sum(0)
+    alive = (tot > 0.02 * tot.max()).nonzero().reshape(-1)
+    a, b = int(alive[0]), int(alive[-1])
+    cen = (f[band].unsqueeze(-1) * P).sum(0) / tot.clamp_min(1e-20)
+    n = b - a
+    lo1 = float(cen[a + int(n * 0.05)])
+    mid = float(cen[a + int(n * 0.50)])
+    lo2 = float(cen[a + int(n * 0.95)])
+    assert mid > lo1 + 150, f"무게중심이 가운데서 안 올라간다: {lo1:.0f} -> {mid:.0f}"
+    assert mid > lo2 + 150, f"무게중심이 끝에서 안 내려간다: {mid:.0f} -> {lo2:.0f}"
 
 def test_reactive_cavity_matches_quasistatic_and_is_stable():
     """관성(리액턴스)을 넣은 구강 공동은 준정상 모형의 **상위 집합**이다.

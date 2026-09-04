@@ -147,7 +147,10 @@ class PhysicalVoiceSynth(nn.Module):
         self.n_freq = a.n_fft // 2 + 1
         self.source = GlottalSource(a.sample_rate, a.hop_size, s.n_harmonics,
                                     s.n_rd_tables, s.table_size, s.rd_min, s.rd_max)
-        self.noise = TurbulenceSource(a.sample_rate, a.hop_size, cfg.noise.n_bands)
+        self.noise = TurbulenceSource(
+            a.sample_rate, a.hop_size, cfg.noise.n_bands,
+            init_corner_hz=cfg.noise.source_corner_hz,
+            init_slope_db_oct=cfg.noise.source_slope_db_oct)
         self.register_buffer(
             "radiation", lip_radiation_response(a.sample_rate, self.n_freq, 0.0))
 

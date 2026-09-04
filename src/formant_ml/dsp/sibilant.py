@@ -171,9 +171,22 @@ def sibilant_response(p: SibilantParams, sample_rate: float,
     if p.floor_db is not None:
         # 입 구멍에서 직접 방사되는 광대역 성분을 **병렬로** 더한다.
         # (max 로 자르지 않는다 — 병렬 경로의 합이 물리적으로 맞고 미분도 매끄럽다.)
+        #
+        # **이 바닥도 소스 기울기(tilt)를 받는다.** 같은 난류원이 앞공동을 안 거치고
+        # 나오는 경로라, 소스의 색은 똑같이 입혀져야 한다. 평탄하게 두면 고역에서
+        # 필터를 뚫고 나와 스펙트럼이 floor_db 에서 **하강을 멈춘다**.
+        # 측정(긴 /s/): 18~22 kHz 가 실측 대비 12~23 dB 과다했고, 더 나쁜 건
+        # 제트가 느린 양 끝에서 바닥이 상대적으로 커져 **무게중심이 거꾸로
+        # 올라간다**는 것이다(합성 8682 -> 8387 -> 10308 Hz, 실측은
+        # 6521 -> 8770 -> 7339 의 아치다).
+        #
+        # 기울기를 **바닥에만** 건다(필터 전체가 아니라). 앞공동 필터 경로는
+        # 예전과 똑같이 두어야 추출기가 적합한 pole_f/zero_f 가 그대로 복원된다
+        # (tests/test_voice.py::test_extracted_profile_recovers_what_was_synthesized).
         peak = H.abs().amax(dim=-1, keepdim=True).clamp_min(1e-9)
         H = H / peak.to(H.dtype)
-        H = H + (10.0 ** (p.floor_db.clamp(-60.0, -3.0) / 20.0)).to(H.dtype)
+        H = H + (10.0 ** (p.floor_db.clamp(-60.0, -3.0) / 20.0)).to(H.dtype) \
+            * tilt_response(p.tilt, sample_rate, n_freq)
     H = rms_normalize(H)
     m = p.mix.clamp(0.0, 1.0).to(H.dtype)
     return (1.0 - m) + m * H
