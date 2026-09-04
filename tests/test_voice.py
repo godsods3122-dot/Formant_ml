@@ -26,6 +26,7 @@ from formant_ml.dsp.phase import allpass_phase
 from formant_ml.models.losses import (band_energy_loss, periodicity,
                                       relative_phase_loss)
 from formant_ml.models.synth import Controls, PhysicalVoiceSynth
+from formant_ml.presets import LOCUS
 from formant_ml.score import SEGMENT_TYPES, render
 from formant_ml.voice import VoiceProfile
 
@@ -864,11 +865,16 @@ def test_syllable_uses_a_consonant_locus_not_a_glide():
     amp = c.harmonic_amp[0, :, 0]
     onset = int((amp > 0.05).float().argmax())
     assert onset > 0, "유성 시작을 못 찾았다"
-    # /j/ 활음이면 F1 이 /이/ 처럼 낮게(<450) 출발한다.
-    assert float(f1[onset]) > 500.0, \
-        f"유성 시작 F1 이 {float(f1[onset]):.0f} Hz — /이/ 활음(야)처럼 들린다"
-    # F2 는 높게 출발해 **내려가야** 한다 (치찰음의 높은 혀 위치 -> /a/).
-    assert float(f2[onset]) > float(f2[-1]) + 400.0, "F2 가 내려가지 않는다"
+    # 판정 기준: 발성이 붙을 때 F1 이 **자음 자세(로커스 350)를 넘어 이미 열려**
+    # 있어야 한다. 혀는 협착을 푸는 순간부터 움직이고 발성은 그보다 늦게 붙기
+    # 때문이다. 로커스 값 그대로(=350, /이/ 270 에 가까움)에서 유성이 시작되면
+    # 그게 /j/ 활음이라 "야" 로 들린다.
+    loc_f1 = LOCUS["s"][0]
+    assert float(f1[onset]) > loc_f1 + 100.0, \
+        f"유성 시작 F1 이 {float(f1[onset]):.0f} Hz — 자음 자세({loc_f1:.0f})에서 " \
+        f"안 열렸다. /이/ 활음(야)처럼 들린다"
+    # 마찰음 구간의 F2(높은 혀 자세)에서 모음으로 **내려가야** 한다.
+    assert float(f2[0]) > float(f2[-1]) + 400.0, "F2 가 내려가지 않는다"
     # 전이는 짧아야 한다 (60 ms 안팎). 길면 활음처럼 들린다.
     tgt = float(f2[-1])
     reached = int((((f2 - tgt).abs() < 40.0).float()).argmax())

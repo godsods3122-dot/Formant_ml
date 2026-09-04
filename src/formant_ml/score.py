@@ -322,7 +322,7 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
                 # /s/ 동안은 협착 뒤 압력이 Ps 의 60~70% 를 잡아먹어 성대를 구동할
                 # 압력이 없다(목소리가 눌린다). 협착을 풀면 그 압력이 τ=V/(c·Ac) 로
                 # 빠지며 구동압이 살아나 발성이 붙는다 -> VOT 가 유도된다.
-                trans = float(seg.get("transition_s", 0.05)) * a.frame_rate / max(t, 1)
+                trans = float(seg.get("transition_s", 0.10)) * a.frame_rate / max(t, 1)
                 ag_curve = seg.get("glottal_area", [
                     [0.0, 0.12], [split, 0.12], [min(split + trans, 1.0), 0.03],
                     [1.0, 0.03]])
@@ -411,17 +411,34 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
             # 치경 로커스에서 출발해 짧은 전이(기본 50 ms)로 모음에 도달한다.
             tgt = _vowel_formants(vowel, prof, K)
             loc = LOCUS.get(phone, LOCUS["s"])
-            trans = float(seg.get("transition_s", 0.05)) * a.frame_rate / max(t, 1)
+            trans = float(seg.get("transition_s", 0.10)) * a.frame_rate / max(t, 1)
             # 전이는 **실제 유성이 시작하는 순간**부터다. 그 전에 시작하면 포먼트가
             # 이미 모음 쪽으로 움직인 뒤에 소리가 나서 활음처럼 들린다.
             amp = c["harmonic_amp"][0, :, 0]
             voiced = (amp > 0.05 * float(amp.max().clamp_min(1e-6))).nonzero()
             onset = (float(voiced[0]) / max(t - 1, 1)) if len(voiced) else split
+            # 혀는 **협착을 푸는 순간**부터 움직인다. 발성은 그보다 늦게 붙는다
+            # (구강내압이 빠져야 성대가 떨 수 있으므로). 그래서 전이를 발성
+            # 시작이 아니라 해제 시점에서 출발시켜야 한다. 발성 시작에 맞추면
+            # /s/ 자세의 낮은 F1 이 유성 구간까지 남아 활음(/j/, "야")이 된다.
+            # F1 은 협착 해제와 함께, F2/F3 는 그보다 늦게(혀 몸통이 뒤따른다)
+            # 움직이기 시작한다. 실측: 발성이 붙는 순간 F1 은 이미 867 로 열렸는데
+            # F2 는 아직 2130 이고 그 뒤로 떨어진다.
+            onset_f1 = min(onset, split)
+            # F1 과 F2/F3 는 **속도가 다르다**. F1 은 협착 정도가 정하므로 해제와
+            # 함께 빠르게 열리고, F2/F3 는 혀 몸통이 움직이는 만큼 느리게 간다.
+            # 실측(본 화자 "사"): 발성이 붙을 때 F1 은 이미 867(열림)인데 F2 는
+            # 아직 2130 이고, 그 뒤로 1038 까지 떨어진다. 같은 속도로 두면 둘 중
+            # 하나가 틀린다 - 빠르면 F2 전이가 안 들리고, 느리면 F1 이 낮은 채로
+            # 유성이 시작돼 활음(/j/)이 된다.
+            trans_f1 = float(seg.get("f1_transition_s", 0.035)) \
+                * a.frame_rate / max(t, 1)
             tracks = []
             for k in range(K):
                 start = tgt[k] if k >= 3 or loc[k] is None else float(loc[k])
-                tracks.append(ramp(t, [(0.0, start), (onset, start),
-                                       (min(onset + trans, 1.0), tgt[k]),
+                on_k, tr = (onset_f1, trans_f1) if k == 0 else (onset, trans)
+                tracks.append(ramp(t, [(0.0, start), (on_k, start),
+                                       (min(on_k + tr, 1.0), tgt[k]),
                                        (1.0, tgt[k])]))
             c["formant_freq"] = torch.cat(tracks, dim=-1)
         # 치찰음 필터를 쓰는 동안에는 노이즈를 포먼트 캐스케이드에 통과시키지
