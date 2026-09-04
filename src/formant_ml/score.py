@@ -140,7 +140,8 @@ def fricative_gain(prof: VoiceProfile) -> float:
 
 #: 공기음향 마찰음을 요청하는 키들. 하나라도 있으면 임의 페이드 대신 협착 면적
 #: 궤적에서 유량·레이놀즈 게이트·무게중심을 **유도**한다(aeroacoustic.py).
-_AERO_KEYS = ("constriction_area", "a_open", "a_closed", "release_s", "hold_ratio",
+_AERO_KEYS = ("drive", "a_min", "a_rest", "close_frac",
+              "constriction_area", "a_open", "a_closed", "release_s", "hold_ratio",
               "glottal_area", "aero")
 _PS_CGS = 8000.0    # 보통 발화 성문하압 [dyn/cm^2] ≈ 8 cmH2O (pressure=1.0 기준)
 
@@ -169,13 +170,23 @@ def aero_drive(seg: dict, t: int, frame_rate: float, glottal_area=None) -> dict:
     로 급락해서 **빠르고 부드럽게** 사라진다. 그 순간 (Ps-Pm) 이 발성 역치를 넘어
     목소리가 붙는다 — VOT 를 손으로 박지 않아도 여기서 유도된다.
     """
-    ac_area = aac.constriction_area(
-        t, frame_rate,
-        a_closed=float(seg.get("a_closed", 0.10)),
-        a_open=float(seg.get("a_open", 3.0)),
-        hold=float(seg.get("hold_ratio", 0.5)),
-        release=float(seg.get("release_s", 0.06)),
-        shape=seg.get("constriction_area"))
+    # `drive="tongue"` 이면 협착 궤적을 **혀 제스처**로 만든다(논문 구조).
+    # 그때 포락선은 전부 여기서 나오고 폐압은 일정하다 — aeroacoustic.
+    # tongue_constriction 의 주석과 HANDOFF §5h 참조.
+    if seg.get("drive") == "tongue" and seg.get("constriction_area") is None:
+        ac_area = aac.tongue_constriction(
+            t, frame_rate,
+            a_min=float(seg.get("a_min", aac.TONGUE_A_MIN)),
+            a_rest=float(seg.get("a_rest", aac.TONGUE_A_REST)),
+            close_frac=float(seg.get("close_frac", aac.TONGUE_CLOSE_FRAC)))
+    else:
+        ac_area = aac.constriction_area(
+            t, frame_rate,
+            a_closed=float(seg.get("a_closed", 0.10)),
+            a_open=float(seg.get("a_open", 3.0)),
+            hold=float(seg.get("hold_ratio", 0.5)),
+            release=float(seg.get("release_s", 0.06)),
+            shape=seg.get("constriction_area"))
     if glottal_area is None:
         glottal_area = seg.get("glottal_area", 0.12)
     ag_t = curve(glottal_area, t) if not isinstance(glottal_area, (int, float)) \
@@ -186,7 +197,15 @@ def aero_drive(seg: dict, t: int, frame_rate: float, glottal_area=None) -> dict:
     # 게다가 레이놀즈 게이트 때문에 압력이 낮은 동안은 난류가 아예 안 켜져서,
     # 압력 램프가 그대로 부드러운 페이드 인/아웃이 된다.
     ps_scale = seg.get("pressure_scale")
-    if ps_scale is None:
+    if ps_scale is None and seg.get("drive") == "tongue":
+        # **폐압을 일정하게 둔다.** Signorello et al.(2018) 이 기관 천자로 직접
+        # 잰 Ps 는 마찰음 내내 8.0 -> 8.9 -> 8.4 hPa 로 거의 안 변한다. 변하는
+        # 건 구강내압 Po 이고, 그건 혀가 만든다. 예전에는 여기에 호흡 아치를
+        # 걸어 놓고 협착을 고정했는데(정반대), 그러면 Po/Ps 가 0.59 에 **고정**
+        # 되고(실측은 0.08 -> 0.85 -> 0.08 로 크게 변한다) 유량이 가운데서
+        # 최대가 된다(실측은 가운데가 최소인 U 자다). 부호까지 반대였다.
+        ps_t = torch.full((1, t, 1), _PS_CGS * float(seg.get("pressure", 1.0)))
+    elif ps_scale is None:
         # 기본값은 **호흡 제스처**다(실측에서 적합). 신경 구동 -> 근육 2단 지연
         # -> 압력. 올릴 때가 내릴 때보다 느려서(능동 동원 vs 힘 놓기) 가청
         # 포락선의 절반 이상이 페이드 인이 된다 — 실측 56~68 %.
@@ -374,7 +393,11 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
                 # 함께 오르내린다(Stevens 1971) — 실측 7350->9008->7194 Hz 를
                 # 협착을 손대지 않고 재현한다. 면적으로 페이드를 만들면 무게중심이
                 # 반대로 움직여(협착이 열리면 유속이 떨어진다) 실측과 어긋난다.
-                seg_f.setdefault("constriction_area", [[0.0, 0.10], [1.0, 0.10]])
+                # `drive="tongue"` 이 아닐 때만 협착을 고정한다. 혀 제스처
+                # 모드에서는 협착이 **바로 그 포락선**이므로 고정하면 안 된다.
+                if seg_f.get("drive") != "tongue":
+                    seg_f.setdefault("constriction_area",
+                                     [[0.0, 0.10], [1.0, 0.10]])
                 _d = aero_drive(seg_f, t, a.frame_rate)
                 aero_env, aero_cent = _d["env"], _d["cent"]
                 aero_tilt = _d["src_tilt"]

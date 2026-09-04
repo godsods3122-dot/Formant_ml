@@ -515,6 +515,64 @@ def oral_cavity_reactive(ps: torch.Tensor, glottal_area: torch.Tensor,
     return pm_o, uc_o, ug_o
 
 
+#: 혀끝 협착의 최소 면적 [cm^2]. 실측 구강내압비에서 나온다.
+#: 직렬 모형에서 Po/Ps = Ag²/(Ag²+Ac²) 이므로, Ag=0.12 에서 Ac=0.050 이면
+#: Po/Ps = 0.85 — Signorello et al.(2018) 이 [asa]/[isi]/[usu] 의 /s/ 중간점에서
+#: 잰 0.85~0.89 와 맞는다. 예전 값 0.10 은 0.59 를 내서 실측과 크게 어긋났다.
+TONGUE_A_MIN = 0.050
+#: 협착이 안 만들어진 상태(중립 혀 위치)의 면적 [cm^2].
+TONGUE_A_REST = 0.60
+#: 폐쇄가 해제보다 오래 걸리는 비율. 가청 포락선의 정점 위치와 **같은 수**다
+#: (아래 참조). 실측 4 토큰의 상승/하강비 1.28~1.35 -> 정점 56~57 %.
+TONGUE_CLOSE_FRAC = 0.57
+
+
+def tongue_constriction(t: int, frame_rate: float, a_min: float = TONGUE_A_MIN,
+                        a_rest: float = TONGUE_A_REST,
+                        close_frac: float = TONGUE_CLOSE_FRAC,
+                        device=None) -> torch.Tensor:
+    """혀끝 제스처로서의 협착 면적 A(t) [cm²] (1,T,1).
+
+    **이게 마찰음의 포락선을 만든다 — 호흡압이 아니다.**
+
+    Signorello, Hassid & Demolin (2018, JASA 143(5) EL386) 이 기관 천자로 Ps 를
+    직접 재 보니 마찰음 내내 **Ps 는 거의 일정**하고(8.0 -> 8.9 -> 8.4 hPa),
+    변하는 건 **구강내압 Po** 다(2.5 -> 7.6 -> 5.6 hPa). 유량은 양끝이 높은
+    **U 자**다(0.5 -> 0.3 -> 0.5 dm³/s). Kim et al.(2022) 은 한국어 /s/ 에서
+    "높은 Pio 고원 = 음향 마찰음 길이" 라고 못박았다.
+
+    즉 페이드 인은 **혀가 협착을 만들어 가는 과정**이다. 압력 스웰이 아니다.
+
+    왜 정점 위치가 곧 폐쇄/해제 비율인가
+    ------------------------------------
+    Ps 가 일정하면 협착부 입자속도는
+
+        v = U/Ac = sqrt(2Ps/ρ) / sqrt(Ac²/Ag² + 1)
+
+    로 **Ac 의 단조감소 함수**다. 난류 진폭은 ½ρv² 이므로 포락선의 정점은
+    **협착이 가장 좁은 순간**과 정확히 일치한다. 그리고 가청 경계(정점 대비
+    10 %)도 Ac 하나로 정해지므로, 로그 면적에서 일정 속도로 닫고 여는 제스처면
+
+        가청 포락선의 정점 위치 = 폐쇄시간 / (폐쇄시간 + 해제시간)
+
+    가 **정확히** 성립한다. 실측 상승/하강비 1.28~1.35 는 곧 폐쇄가 해제보다
+    1.33 배 느리다는 뜻이고, 그게 정점 56~57 % 다. 호흡 구동에 비대칭을 넣을
+    이유가 없었다 — 비대칭은 **혀에** 있다.
+
+    로그 면적에서 선형으로 보간한다(조음기가 일정 속도로 움직이면 면적은
+    지수적으로 변한다 — 간극이 좁아질수록 같은 변위가 면적을 더 크게 바꾼다).
+    """
+    n = max(int(t), 1)
+    lo, hi = math.log(max(a_min, 1e-6)), math.log(max(a_rest, a_min * 1.01))
+    f = min(max(close_frac, 0.05), 0.95)
+    i = torch.arange(n, device=device, dtype=torch.float32) / max(n - 1, 1)
+    # 닫힐 때: hi -> lo (0 ~ f), 열릴 때: lo -> hi (f ~ 1)
+    down = hi + (lo - hi) * (i / f).clamp(0.0, 1.0)
+    up = lo + (hi - lo) * ((i - f) / max(1.0 - f, 1e-6)).clamp(0.0, 1.0)
+    logA = torch.where(i <= f, down, up)
+    return logA.exp().reshape(1, n, 1)
+
+
 # --- 호흡 구동압: /s/ 의 페이드 인/아웃이 여기서 나온다 -----------------------
 # 실측(업로드 녹음 4 토큰, 4 kHz 이상 대역 포락선):
 #
