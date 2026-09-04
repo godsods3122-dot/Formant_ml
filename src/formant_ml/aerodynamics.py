@@ -119,25 +119,57 @@ def phonation_threshold(adduction: torch.Tensor) -> torch.Tensor:
 #: 주기 수로 잡는 게 맞다(초가 아니라): 높은 목소리는 같은 시간에 더 많이 떨어
 #: 더 빨리 자리를 잡는다.
 #:
-#: 값: 실측 이 화자(F0 126 Hz)의 유성 10->90% 상승은 81 ms 다. 1차 지연 **하나**
-#: 로만 보면 τ≈37 ms = 4.6 주기지만, 그렇게 잡으면 안 된다 — 진폭은 이 관성만이
-#: 아니라 내전 램프와 구강내압 감쇄로도 이미 서서히 오르고 있어서, 4.6 주기를
-#: 얹으면 상승이 130 ms 로 늘어진다(측정). 이 관성은 그 셋 중 하나일 뿐이다.
-#: 2.5 주기면 합쳐서 100 ms 가 되고, 발성 개시 순간 마찰음이 아직 20 % 남아 있어
-#: 실측(18~19 %)과 맞는다.
-ONSET_CYCLES = 2.5
+#: 값: 로지스틱 성장에서 e 배로 자라는 데 걸리는 주기 수다. 실측 대조로 잡았다 —
+#: 발성 개시 후 50 ms 의 최대진폭이 정상부의 27 % 여야 하는데(실측),
+#: 3.0 주기에서 24 % 가 나온다. 주기별로도 7·9·11·15·19·24 로 자란다
+#: (실측 27·25·19·11·16·16 — 값이 흔들리지만 같은 대역이다).
+#: 2.5 로 내리면 38 %, 4.0 으로 올리면 18 % 다.
+ONSET_CYCLES = 3.0
+
+
+#: 진동이 자라기 시작하는 씨앗 진폭 (목표 대비). 성대는 완전한 정지에서 켜지지
+#: 않는다 — 기류가 만드는 미세한 요동이 씨앗이다.
+ONSET_SEED = 0.02
 
 
 def oscillation_buildup(amp: torch.Tensor, f0: torch.Tensor, frame_rate: float,
-                        cycles: float | None = None) -> torch.Tensor:
-    """목표 진폭에 성대 진동의 기동/감쇠 관성을 준다 (1차 지연, τ = 몇 주기)."""
+                        cycles: float | None = None,
+                        seed: float = ONSET_SEED) -> torch.Tensor:
+    """목표 진폭에 성대 진동의 기동/감쇠를 준다 — **로지스틱 성장**.
+
+    예전엔 1 차 지연이었는데 **모양이 반대**였다. 1 차 지연은 t=0 에서 가장
+    빠르게 오르는 오목한 곡선이다. 그런데 성대 진동은 스위치가 아니라 **자라나는
+    불안정**이라(Titze 1988), 작은 요동에서 지수적으로 커지다 비선형으로 포화한다
+    — t=0 부근이 가장 **느린** 볼록한 S 자다.
+
+    측정으로 드러났다. 잡음을 전부 끄고 하모닉만 남겨도 발성 개시 후 50 ms 의
+    최대진폭이 정상부의 **76 %** 였다(실측 27 %). 주기별로 보면 실측은
+    27·25·19·11·16·16 으로 여섯 주기를 낮게 끌다가 50·79·92 로 솟는데,
+    1 차 지연은 첫 주기부터 곧장 오른다. 그 급개시가 경성 개시(hard attack)로
+    들린다.
+
+        dA/dt = σ·A·(1 − A/A_target),   σ = f0 / cycles
+
+    포화항 (1−A/A_target) 이 있어야 목표에서 멈춘다(순수 지수는 발산한다).
+    `cycles` 는 e 배로 자라는 데 걸리는 주기 수다 — 초가 아니라 주기로 잡는 건
+    높은 목소리가 같은 시간에 더 많이 떨어 더 빨리 자리 잡기 때문이다.
+    """
     dt = 1.0 / max(frame_rate, 1e-6)
-    tau = (ONSET_CYCLES if cycles is None else cycles) / f0.clamp_min(20.0)
-    a = (dt / (tau + dt)).clamp(0.0, 1.0)
+    cyc = ONSET_CYCLES if cycles is None else cycles
+    sigma = f0.clamp_min(20.0) / max(cyc, 1e-3)          # [1/s]
     out = torch.zeros_like(amp)
     prev = torch.zeros_like(amp[:, :1, :])
+    started = torch.zeros_like(prev, dtype=torch.bool)
     for i in range(amp.shape[1]):
-        prev = prev + a[:, i:i + 1, :] * (amp[:, i:i + 1, :] - prev)
+        tgt = amp[:, i:i + 1, :]
+        # 목표가 처음 살아나는 순간 씨앗을 심는다.
+        fresh = (~started) & (tgt > 0)
+        prev = torch.where(fresh, tgt * seed, prev)
+        started = started | fresh
+        grow = sigma[:, i:i + 1, :] * prev * (1.0 - prev / tgt.clamp_min(1e-9))
+        prev = (prev + dt * grow).clamp_min(0.0)
+        # 목표가 내려가면(발성 종료) 따라 내려간다.
+        prev = torch.minimum(prev, tgt.clamp_min(0.0))
         out[:, i:i + 1, :] = prev
     return out
 

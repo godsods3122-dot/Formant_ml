@@ -36,7 +36,11 @@ from formant_ml.voice import VoiceProfile
 #: (hop 240, 밴드 인덱스, 프레임 크기). 기본값을 44.1 kHz 로 바꿨더니 17 개가
 #: 깨졌다. 제대로 된 해법은 이 상수들을 **샘플레이트 불변**으로 만드는 것이다
 #: (셸프를 활성 밴드 수로 정규화). HANDOFF §5g 참조.
-CAL_44K = {"BREATH_NOISE_GAIN": 7.8, "ASPIRATION_GAIN": 10.0,
+#: ASPIRATION_GAIN 10.0 -> 2.5: 마찰음에서 목소리로 넘어가는 창의 기식이 너무
+#: 컸다. 실측은 그 구간 최대가 모음 정상부의 27 % 인데 83 % 가 나왔고, 포락선
+#: 으로 보면 **모음보다 큰 스파이크 버스트**였다(전이/모음 1.08, 실측 0.36).
+#: 그게 경성 개시로 들린다. 2.5 에서 25~27 % 로 맞는다.
+CAL_44K = {"BREATH_NOISE_GAIN": 7.8, "ASPIRATION_GAIN": 2.5,
            "SYLLABLE_FRICATIVE_CAL_DB": 23.0}
 
 # 협착 궤적을 손으로 그리지 않는다. 예전엔 7 개 꺾은점으로 페이드를 만들었는데,

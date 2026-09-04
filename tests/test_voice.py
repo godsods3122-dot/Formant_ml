@@ -1030,8 +1030,12 @@ def test_pressure_after_fricative_does_not_break_concat():
     v = (amp > 1e-3).nonzero().squeeze(-1)
     assert len(v) > 0, "유성 구간이 없다"
     onset, tail = int(v[0]), int(v[-1])
-    assert float(amp[onset + 1]) > float(amp[tail]), "압력 실린 시작이 더 세야 한다"
-    assert float(rd[onset + 1]) < PROF.rd_median + 0.05, "시작이 pressed 여야 한다"
+    # 개시 **직후**로 재면 안 된다. 성대 진동은 씨앗에서 로지스틱으로 자라므로
+    # (aerodynamics.oscillation_buildup) 첫 몇 주기는 목표의 2~10 % 다 — 압력이
+    # 아무리 높아도 그렇다. 성장이 끝난 뒤에 재야 압력-세기 결합을 보는 것이다.
+    grown = min(onset + 12, tail)
+    assert float(amp[grown]) > float(amp[tail]), "압력 실린 구간이 더 세야 한다"
+    assert float(rd[grown]) < PROF.rd_median + 0.05, "압력 실린 구간이 pressed 여야 한다"
 
 
 def test_extracted_profile_sibilant_is_high_frequency():
