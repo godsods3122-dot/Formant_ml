@@ -204,7 +204,17 @@ def aero_drive(seg: dict, t: int, frame_rate: float, glottal_area=None) -> dict:
     amp = aac.frication_source_amp(u, ac_area)
     env = amp / amp.amax().clamp_min(1e-9)
     asp = aac.aspiration_source_amp(u, ag_t)
-    return {"env": env, "cent": aac.velocity_centroid_scale(u, ac_area),
+    # 무게중심 배율은 **이 구간의 정점에서 1.0** 이어야 한다. 프로파일의 치찰음
+    # 지문(pole_f/teeth_f)은 화자의 실제 /s/ 스펙트럼에 적합한 값이라, 그 /s/ 가
+    # 가장 셀 때의 입자속도가 이미 그 안에 들어 있다. 고정된 v_ref=3000 cm/s 로
+    # 재면 실제 속도(정점에서 ~2170 cm/s)와 어긋나 배율이 0.45~0.85 로 **한 번도
+    # 1.0 에 못 미치고**, 앞니 공명 10.0 kHz 가 8.5 kHz 로 끌려 내려가 /s/ 가
+    # /ʃ/ 처럼 어두워진다(실측 봉우리 9.9 kHz, 그 상태의 합성 8.4 kHz).
+    # 정점에서 1.0 으로 다시 앵커를 잡으면 지문이 그대로 재생되고, 그 주위로만
+    # Stevens 의 속도-무게중심 관계가 움직인다.
+    cent = aac.velocity_centroid_scale(u, ac_area)
+    cent = cent / cent.reshape(-1)[int(env.reshape(-1).argmax())].clamp_min(1e-6)
+    return {"env": env, "cent": cent,
             "asp": asp / asp.amax().clamp_min(1e-9),
             "ps_norm": ps_norm, "add": add,
             "pm_frac": pm / _PS_CGS}
@@ -378,10 +388,40 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
                 # 마찰음 꼬리로 남아 하강이 85 ms 로 늘어졌다(실측 52~64 ms).
                 # 해제 하나가 두 제스처를 함께 촉발해야 연결이 유기적이다.
                 addt = float(seg.get("adduction_s", 0.04)) * a.frame_rate / max(t, 1)
-                lag = float(seg.get("adduction_lag_s", 0.01)) * a.frame_rate / max(t, 1)
+                # 후두는 혀보다 **먼저** 움직이기 시작한다. 무성 마찰음의 성문
+                # 벌림은 마찰음 **중간**에서 최대가 되고, 후반부에는 이미 다시
+                # 모이는 중이다(후두-구강 협조). 그래서 내전 시작을 협착 해제
+                # 뒤가 아니라 마찰음 구간의 이 지점으로 잡는다.
+                #
+                # 해제 뒤에 두면 마찰음이 완전히 죽은 다음에야 발성이 붙어서
+                # 둘이 한 프레임도 안 겹친다(측정 0 ms, 실측 180~260 ms) —
+                # 그 무음 구간이 성문파열음으로 들린다.
+                #
+                # 일찍 모여도 /s/ 가 유성이 되지는 않는다: 협착 뒤 구강내압이
+                # Ps 의 59 % 를 잡고 있어 (Ps-Pm) 이 발성 역치에 못 미친다.
+                # 협착이 열려 Pm 이 빠져야 비로소 떨기 시작한다 — 성문은 미리
+                # 준비하고, 발성 개시 시점은 구강내압이 정한다.
+                a_start = float(seg.get("adduction_start_ratio", 0.40)) * split
+                lag = a_start - hold_r
+                # 내전은 **두 단계**다. /s/ 는 성문을 벌린 자세라, 모음으로 갈 때
+                # 성대가 한 번에 모달 위치로 가지 않는다. 먼저 발성이 가능한 정도만
+                # 빠르게 모이고(VOT 를 정한다), 그 뒤로 100 ms 남짓에 걸쳐 마저
+                # 모이고 조여진다. 그 사이 성문이 아직 벌어져 있어 모음 첫머리가
+                # **기식성**으로 나온다 — 마찰음과 목소리가 섞이는 구간이 이것이다.
+                # 한 단계로 두면 목소리가 이미 다 닫힌 성문에서 시작해 잡음 없이
+                # 툭 튀어나온다(성문파열음).
+                # 끝값이 중요하다. 0.03 cm²(=3 mm²)는 **기식성** 성문이지 모달이
+                # 아니다. 거기서 멈추면 성문 제트속도가 압력만으로 정해져 있어
+                # (v=sqrt(2Ps/ρ), 면적과 무관) 레이놀즈수가 계속 임계 위에 남고,
+                # 기식이 모음 내내 최대로 켜져 있다(측정: 전 구간 0.99). 모달은
+                # 성대가 주기마다 완전히 닫혀 후두 틈만 남는 상태라 0.004 cm² 쯤이고,
+                # 그제서야 Re 가 임계 아래로 내려가 기식이 꺼진다.
+                firm = float(seg.get("firming_s", 0.12)) * a.frame_rate / max(t, 1)
                 ag_curve = seg.get("glottal_area", [
                     [0.0, 0.12], [min(hold_r + lag, 1.0), 0.12],
-                    [min(hold_r + lag + addt, 1.0), 0.03], [1.0, 0.03]])
+                    [min(hold_r + lag + addt, 1.0), 0.03],      # 발성 시작: 기식성
+                    [min(hold_r + lag + addt + firm, 1.0), 0.004],   # 모달로 조여짐
+                    [1.0, 0.004]])
                 seg2 = dict(seg)
                 seg2.setdefault("a_open", 3.0)
                 seg2.setdefault("hold_ratio", hold_r)
@@ -404,7 +444,7 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
                                (min(split + vot * 1.2, 1.0), 1.0), (1.0, 1.0)])
             asp = aero.apply(c, ps, add, rd_modal=prof.rd_median,
                              rd_breathy=min(2.6, prof.rd_high + 0.6),
-                             route_noise=False)
+                             route_noise=False, frame_rate=a.frame_rate)
             # 마찰음 레벨은 **같은 음절의 유성 세기**를 기준으로 맞춘다.
             # 전역 상수로 맞추면, 공기역학 모형이 내는 모음 세기(압력·Rd 에 따라
             # 달라진다)와 어긋나 음절마다 비율이 흔들린다(실측: 목표 +9.7 dB 인데
@@ -420,20 +460,19 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
                 # 구동에서 나온다). 협착이 열리며 레이놀즈수가 임계 아래로 떨어져
                 # 마찰음이 저절로 꺼지고, 같은 순간 구강내압이 빠져 발성이 붙는다.
                 env, aero_cent, asp_env = drive["env"], drive["cent"], drive["asp"]
-                # 기식은 **기류는 있는데 아직 발성이 안 붙은** 동안에만 난다.
-                # 성대가 제대로 떨기 시작하면 성문이 주기적으로 닫혀 난류가 사라진다.
-                # 이 게이트가 있어야 기식이 정확히 '마찰음 꺼짐 ~ 발성 시작' 창을
-                # 메운다. 안 그러면 그 자리가 무음이 되어 무음+급개시 = /t/ 로
-                # 들린다(실측 /사/ 가 "스트라" 로 들리던 원인).
-                # 게이트가 둘이다. (1-v_frac): 발성이 붙으면 성문이 주기적으로 닫혀
-                # 난류가 사라진다. (1-env): 구강 협착이 좁을 때는 압력강하가 입에
-                # 몰려 성문 유속이 낮다 — 협착이 열려야 압력강하가 성문으로 옮겨와
-                # 기식이 난다. 둘을 곱하면 기식이 정확히 '마찰음 꺼짐 ~ 발성 시작'
-                # 창에만 남아, 그 자리의 무음(=/t/ 지각)을 메운다.
-                vamp = c["harmonic_amp"]
-                v_frac = (vamp / vamp.amax().clamp_min(1e-6)).clamp(0.0, 1.0)
-                asp = (asp_env * (1.0 - v_frac) * (1.0 - env).clamp(0.0, 1.0)
-                       * float(seg.get("aspiration", 4.0)))
+                # 기식을 손으로 게이팅하지 않는다. 예전엔 (1-v_frac)·(1-env) 를
+                # 곱해서 **발성이 붙는 순간 잡음을 껐다**. 그래서 마찰음과 목소리가
+                # 한 프레임도 겹치지 않고(실측 겹침 180~260 ms, 그때 합성 0 ms),
+                # 목소리가 무음에서 툭 시작해 성문파열음처럼 들렸다.
+                #
+                # 실제로는 발성이 난류를 없애지 않는다. 성문이 주기마다 열리는 동안
+                # 공기는 계속 지나가므로, 성대가 아직 덜 모인 모음 첫머리는
+                # **유성 + 난류가 동시에** 난다(기식성 발성). 그걸 줄이는 건 발성이
+                # 아니라 **내전**이다. 성문 난류는 이미 성문 면적에 대한 레이놀즈
+                # 게이트로 계산돼 있으니(aspiration_source_amp), 물리에 맡긴다.
+                # (1-env) 도 이중계상이었다: 협착이 좁을 때 성문 유속이 낮다는 건
+                # 직렬 유량 u 에 이미 들어 있고, asp 는 그 u 로 계산된다.
+                asp = asp_env * float(seg.get("aspiration", 4.0))
             else:
                 # 마찰음 게이트: 모음으로 넘어갈 때 빠르게 꺼진다(자연스러운 fade-out).
                 env = ramp(t, [(0.0, 1.0), (split, 1.0), (split + 0.1, 0.02),
@@ -590,7 +629,8 @@ def apply_overrides(c: dict, spec: dict, t: int, cfg: Config) -> None:
     if "pressure" in spec or "adduction" in spec:
         # 압력/내전이 주어지면 세기·F0·Rd·기식을 거기서 일관되게 끌어낸다
         aero.apply(c, curve(spec.get("pressure", 1.0), t),
-                   curve(spec.get("adduction", 1.0), t))
+                   curve(spec.get("adduction", 1.0), t),
+                   frame_rate=cfg.audio.frame_rate)
     if noise_shape:
         sr = cfg.audio.sample_rate
         g = noise_shape.get("noise_gain", 1.0)

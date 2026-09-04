@@ -105,13 +105,53 @@ def phonation_threshold(adduction: torch.Tensor) -> torch.Tensor:
     return PTP_AT_FULL_ADDUCTION / a
 
 
+#: 성대 진동이 정상 진폭에 이르기까지의 시상수 [성문 주기 수].
+#:
+#: 성대 진동은 스위치가 아니라 **자라나는 불안정**이다. 구동압이 역치를 넘어도
+#: 진폭이 즉시 정상값이 되지 않고, 작은 요동에서 시작해 여러 주기에 걸쳐
+#: 지수적으로 자란다(Titze 1988 의 flow-induced instability). 끌 때도 마찬가지로
+#: 몇 주기에 걸쳐 잦아든다.
+#:
+#: 이게 없으면 역치를 넘는 순간 진폭이 계단으로 들어간다 — 측정: /사/ 의 유성
+#: 진폭이 두 프레임 만에 0.09 -> 0.76 으로 뛰었다. 그 급개시가 **성문파열음**으로
+#: 들리고, 마찰음과 목소리가 섞이지 않고 뚝 끊겨 이어진다.
+#:
+#: 주기 수로 잡는 게 맞다(초가 아니라): 높은 목소리는 같은 시간에 더 많이 떨어
+#: 더 빨리 자리를 잡는다.
+#:
+#: 값: 실측 이 화자(F0 126 Hz)의 유성 10->90% 상승은 81 ms 다. 1차 지연 **하나**
+#: 로만 보면 τ≈37 ms = 4.6 주기지만, 그렇게 잡으면 안 된다 — 진폭은 이 관성만이
+#: 아니라 내전 램프와 구강내압 감쇄로도 이미 서서히 오르고 있어서, 4.6 주기를
+#: 얹으면 상승이 130 ms 로 늘어진다(측정). 이 관성은 그 셋 중 하나일 뿐이다.
+#: 2.5 주기면 합쳐서 100 ms 가 되고, 발성 개시 순간 마찰음이 아직 20 % 남아 있어
+#: 실측(18~19 %)과 맞는다.
+ONSET_CYCLES = 2.5
+
+
+def oscillation_buildup(amp: torch.Tensor, f0: torch.Tensor, frame_rate: float,
+                        cycles: float | None = None) -> torch.Tensor:
+    """목표 진폭에 성대 진동의 기동/감쇠 관성을 준다 (1차 지연, τ = 몇 주기)."""
+    dt = 1.0 / max(frame_rate, 1e-6)
+    tau = (ONSET_CYCLES if cycles is None else cycles) / f0.clamp_min(20.0)
+    a = (dt / (tau + dt)).clamp(0.0, 1.0)
+    out = torch.zeros_like(amp)
+    prev = torch.zeros_like(amp[:, :1, :])
+    for i in range(amp.shape[1]):
+        prev = prev + a[:, i:i + 1, :] * (amp[:, i:i + 1, :] - prev)
+        out[:, i:i + 1, :] = prev
+    return out
+
+
 def phonation(pressure: torch.Tensor, adduction: torch.Tensor,
               f0_base: torch.Tensor, rd_modal: float = 1.0,
-              rd_breathy: float = 2.4, amp_scale: float = 1.0) -> dict:
+              rd_breathy: float = 2.4, amp_scale: float = 1.0,
+              frame_rate: float | None = None) -> dict:
     """(Ps, 내전) -> 서로 맞물린 제어값들.
 
     반환 dict: harmonic_amp, f0, rd, aspiration (0~1 성문 누출 기류)
     모두 입력과 같은 (B, T, 1) 모양이다.
+
+    `frame_rate` 를 주면 진동 기동 관성(`oscillation_buildup`)을 씌운다.
     """
     ps = pressure.clamp_min(0.0)
     ptp = phonation_threshold(adduction)
@@ -120,6 +160,8 @@ def phonation(pressure: torch.Tensor, adduction: torch.Tensor,
     amp = amp_scale * drive.pow(AMP_EXPONENT)
     # 압력이 오르면 성대가 늘어나 F0 가 따라 오른다
     f0 = f0_base * (1.0 + F0_PER_PRESSURE * (ps - 1.0))
+    if frame_rate is not None:
+        amp = oscillation_buildup(amp, f0, frame_rate)
     # 구동이 약할 때는 성문이 완전히 닫히지 않아 기식적(Rd 큼)
     rd = rd_modal + (rd_breathy - rd_modal) * torch.exp(-4.0 * drive)
     # 성문 누출: 내전이 덜 됐고 압력이 있으면 난류 소음이 난다
@@ -129,13 +171,15 @@ def phonation(pressure: torch.Tensor, adduction: torch.Tensor,
 
 def apply(controls: dict, pressure: torch.Tensor, adduction: torch.Tensor,
           rd_modal: float = 1.0, rd_breathy: float = 2.4,
-          noise_scale: float = 1.0, route_noise: bool = True) -> torch.Tensor:
+          noise_scale: float = 1.0, route_noise: bool = True,
+          frame_rate: float | None = None) -> torch.Tensor:
     """제어 dict 를 공기역학적으로 일관되게 덮어쓴다 (제자리).
 
     `controls` 는 `gestures.base` 가 만든 프레임률 dict 이며, f0 는 이미 들어 있는
     값을 기준선(f0_base)으로 삼는다.
     """
-    out = phonation(pressure, adduction, controls["f0"], rd_modal, rd_breathy)
+    out = phonation(pressure, adduction, controls["f0"], rd_modal, rd_breathy,
+                    frame_rate=frame_rate)
     controls["harmonic_amp"] = out["harmonic_amp"]
     controls["f0"] = out["f0"]
     controls["rd"] = out["rd"]

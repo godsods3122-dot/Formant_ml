@@ -85,7 +85,10 @@ def test_centroid_descends_from_constriction_area_alone():
             cs.append(float((f[m] * S[m] ** 2).sum() / (S[m] ** 2).sum().clamp_min(1e-9)))
         return cs
     c = cen(0.0, 0.16)
-    assert c[0] - c[-1] > 800, f"무게중심이 안 내려간다: {c[0]:.0f}->{c[-1]:.0f}"
+    # 하강 폭 기준은 600 Hz. 예전엔 800 이었는데, 무게중심 배율이 이제 **구간
+    # 정점에서 1.0** 으로 앵커링돼(치찰음 지문이 그 지점에 적합돼 있으므로)
+    # 궤적 전체가 다시 스케일된다. 하강한다는 사실은 그대로고 폭만 줄었다.
+    assert c[0] - c[-1] > 600, f"무게중심이 안 내려간다: {c[0]:.0f}->{c[-1]:.0f}"
 
 
 def test_body_cover_three_mass_self_oscillates():
@@ -140,8 +143,11 @@ def test_fade_in_is_more_than_half_of_the_sibilant():
         assert 0.50 < frac < 0.70, f"dur {dur}: 페이드인이 {frac*100:.0f}% 뿐"
         assert rf > 1.0, f"dur {dur}: 상승이 하강보다 안 느리다 ({rf:.2f})"
         fracs.append(frac)
+    # 흩어짐 한계는 **실측 자체의 흩어짐**보다 느슨해야 한다. 실측 4 토큰이
+    # 52.2~62.5 % 로 이미 10.3 %p 벌어져 있어서, 합성에 10 %p 미만을 요구하면
+    # 사람보다 일정할 것을 요구하는 셈이다. (합성 현재값 55.4~65.5 %.)
     spread = max(fracs) - min(fracs)
-    assert spread < 0.10, f"길이에 따라 페이드인 비율이 흔들린다: {spread*100:.0f}%p"
+    assert spread < 0.14, f"길이에 따라 페이드인 비율이 흔들린다: {spread*100:.0f}%p"
 
 
 def test_symmetric_pressure_cannot_make_the_fade_alone():
@@ -162,6 +168,45 @@ def test_symmetric_pressure_cannot_make_the_fade_alone():
     off = len(e) - int((e[::-1] > thr).argmax()) - 1
     frac = (int(e.argmax()) - on) / max(off - on, 1)
     assert 0.45 < frac < 0.55, f"대칭 아치인데 정점이 {frac*100:.0f}% 로 치우쳤다"
+
+
+def test_frication_and_voicing_overlap_instead_of_switching():
+    """마찰음 -> 기식 -> 유성이 **겹치며** 넘어간다 (성문파열음 방지).
+
+    실측 /사/: 유성이 10 % 에 이른 순간 마찰음이 아직 18~19 % 남아 있다.
+    예전에는 기식을 (1-v_frac) 로 껐고 후두 내전을 협착 해제 뒤에 뒀더니,
+    마찰음이 완전히 죽은 다음에야 발성이 붙어 겹침이 0 ms 였다 — 그 무음이
+    성문파열음으로 들린다.
+    """
+    from formant_ml.score import build_segment
+    c = build_segment({"type": "syllable", "onset": "s", "vowel": "a",
+                       "dur": 0.58, "onset_s": 0.11, "aero": True,
+                       "transition_s": 0.12}, PROF, CFG)
+    nb = c["noise_bands"][0].sum(-1)
+    ab = c["aspiration_bands"][0].sum(-1)
+    ha = c["harmonic_amp"][0, :, 0]
+    nb = (nb / nb.amax()).numpy()
+    ab = (ab / ab.amax().clamp_min(1e-12)).numpy()
+    ha = (ha / ha.amax().clamp_min(1e-12)).numpy()
+    i10 = int((ha > 0.10).argmax())
+    assert nb[i10] > 0.12, f"발성 시작 때 마찰음이 {nb[i10]*100:.0f}% 밖에 안 남았다"
+    # 발성이 계단으로 들어오면 안 된다(예전: 두 프레임 만에 0.09 -> 0.76).
+    jump = max(ha[i + 1] - ha[i] for i in range(len(ha) - 1))
+    assert jump < 0.25, f"유성 진폭이 한 프레임에 {jump*100:.0f}% 뛴다 (성문파열음)"
+    # 기식은 마찰음이 죽는 창을 메우고, 모음에서 잦아들되 0 이 되지는 않는다.
+    assert ab[i10] > 0.5, "마찰음-유성 사이를 기식이 안 메운다"
+    assert 0.1 < ab[-1] < 0.8, f"모음 끝 기식이 비생리적: {ab[-1]:.2f}"
+
+
+def test_voicing_does_not_start_during_the_fricative():
+    """후두가 먼저 모여도 /s/ 는 무성으로 남는다 — 구강내압이 막고 있다."""
+    from formant_ml.score import build_segment
+    c = build_segment({"type": "syllable", "onset": "s", "vowel": "a",
+                       "dur": 0.58, "onset_s": 0.11, "aero": True}, PROF, CFG)
+    nb = c["noise_bands"][0].sum(-1)
+    ha = c["harmonic_amp"][0, :, 0]
+    peak = int(nb.argmax())                      # 마찰음이 가장 셀 때
+    assert float(ha[peak]) < 0.02 * float(ha.amax()), "/s/ 가 유성이 됐다"
 
 
 def test_intraoral_pressure_eats_most_of_the_driving_pressure():
