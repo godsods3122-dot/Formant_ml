@@ -153,6 +153,11 @@ class PhysicalVoiceSynth(nn.Module):
             init_slope_db_oct=cfg.noise.source_slope_db_oct)
         self.register_buffer(
             "radiation", lip_radiation_response(a.sample_rate, self.n_freq, 0.0))
+        # 난류 경로 전용 방사 (config.NoiseConfig.noise_radiation_alpha 주석 참고).
+        self.register_buffer(
+            "noise_radiation",
+            lip_radiation_response(a.sample_rate, self.n_freq,
+                                   cfg.noise.noise_radiation_alpha))
 
     # ---------------------------------------------------------------- 성도 응답
     def _formant_paths(self, c: Controls):
@@ -271,6 +276,7 @@ class PhysicalVoiceSynth(nn.Module):
         h_noise = self._oral_leak(c, h_noise)
         h_noise = h_noise * bands_to_response(
             c.noise_bands * self.noise.spectral_prior(), nf, min_phase=True)
+        h_noise = h_noise * self.noise_radiation
 
         # 성문 기식 경로: 치찰음 필터를 거치지 않고 성도 **전체**를 통과한다.
         asp_out = None
@@ -283,6 +289,7 @@ class PhysicalVoiceSynth(nn.Module):
                                            full, fs, nf) * shared
             h_asp = h_asp * bands_to_response(
                 c.aspiration_bands * self.noise.spectral_prior(), nf, min_phase=True)
+            h_asp = h_asp * self.noise_radiation
             asp_noise = self.noise(t, b, c.f0.device, c.f0.dtype,
                                    am_depth=c.noise_am * voiced_gate,
                                    glottal_phase=phase, roughness=c.noise_rough,

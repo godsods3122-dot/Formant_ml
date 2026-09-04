@@ -1148,3 +1148,31 @@ if __name__ == "__main__":
             print(f"  FAIL  {fn.__name__}: {e}")
     print(f"\n{len(fns) - failed}/{len(fns)} 통과")
     sys.exit(1 if failed else 0)
+
+def test_breath_is_broadband_not_a_low_blob():
+    """숨소리는 광대역이어야 한다 — 저역 덩어리가 아니라.
+
+    예전에는 소스가 가우시안 범프(중심 1680 Hz, sigma 1250)였다. 그건 난류가
+    아니라 좁은 혹이라, 성문에서 주입돼 성도 전체를 지나면 F1/F2 만 남는다.
+    측정(삽입된 들숨): 에너지의 **87.2 % 가 500~1500 Hz**, 8 kHz -64 dB.
+
+    실제 숨소리는 성도가 저역에서 공진해도 저역이 두드러지지 않는다 — 소스에
+    저역이 없기 때문이다. 셸프로 바꾸고 모서리를 F1/F2 위에 두면
+    500~1500 Hz 2.1 %, 1.5~4 kHz 73.4 %, 4~8 kHz 24.5 % 가 된다.
+    """
+    y = render({"timeline": [{"type": "silence", "dur": 0.1},
+                             {"type": "breath", "dur": 0.32, "inhale": True},
+                             {"type": "silence", "dur": 0.1}],
+                "seed": 5}, PROF, CFG).reshape(-1)
+    seg = y[int(0.12 * FS):int(0.40 * FS)]
+    w = torch.hann_window(len(seg))
+    P = torch.fft.rfft(seg * w).abs() ** 2
+    f = torch.linspace(0, FS / 2, len(P))
+    tot = float(P[(f >= 100) & (f < 11000)].sum()) + 1e-20
+
+    def share(lo, hi):
+        return 100.0 * float(P[(f >= lo) & (f < hi)].sum()) / tot
+    assert share(100, 500) < 5.0, f"숨소리 저역이 {share(100, 500):.1f} %"
+    assert share(500, 1500) < 30.0, (f"숨소리가 F1/F2 에 몰려 있다: "
+                                     f"{share(500, 1500):.1f} % (예전 87.2)")
+    assert share(1500, 8000) > 55.0, f"숨소리 몸통이 {share(1500, 8000):.1f} % 뿐"

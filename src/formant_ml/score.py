@@ -393,6 +393,12 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
                 f"'{kind}' 세그먼트가 모르는 옵션: {sorted(unknown)}. "
                 f"가능한 옵션: {sorted(accepted - {'t', 'prof', 'n_formants', 'n_bands'})} "
                 f"또는 파라미터 이름: {sorted(PARAM_HELP)[:6]} …")
+        # **샘플레이트를 넘긴다.** 예전에는 안 넘겨서 제스처가 전부 24 kHz
+        # 기본값으로 대역 게인을 만들었다. 44.1 kHz 로 내면 `band_shelf` /
+        # `band_bump` 가 0~나이퀴스트를 n_bands 로 나누므로 모서리 주파수가
+        # 통째로 어긋난다(4800 Hz 셸프가 8800 Hz 자리에 놓인다).
+        if "sample_rate" in accepted:
+            opts.setdefault("sample_rate", a.sample_rate)
         c = fn(t, prof, n_formants=K, n_bands=NB, **opts)
     elif kind == "silence":
         # 침묵은 **기류가 없다는 뜻**이다. 잡음은 전부 기류에서 나오므로 세 경로를

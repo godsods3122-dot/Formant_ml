@@ -129,7 +129,7 @@ def laugh(t: int, prof: VoiceProfile, frame_rate: float = 100.0, rate_hz: float 
     voiced=0.2, rate=8 이면 '킥킥', voiced=0.95, rate=4 이면 '껄껄',
     voiced=0.0 이면 소리 없이 숨만 터지는 웃음이 된다.
     """
-    c = base(t, prof, n_formants, n_bands, vowel)
+    c = base(t, prof, n_formants, n_bands, vowel, sample_rate)
     ph = _phase_ramp(t, rate_hz, frame_rate)
     # 각 호기 펄스: 빠르게 열리고 천천히 닫히는 비대칭 포락선
     frac = torch.frac(torch.as_tensor(ph) / (2 * math.pi))
@@ -155,16 +155,42 @@ def laugh(t: int, prof: VoiceProfile, frame_rate: float = 100.0, rate_hz: float 
     return c
 
 
+#: 숨소리 난류 소스의 저역 모서리 [Hz]. **아래로 떨어진다.**
+#:
+#: 예전에는 가우시안 범프(중심 1680 Hz, sigma 1250)였다. 그건 난류가 아니라
+#: 좁은 혹이라, 성도 전체를 지나면 F1/F2 만 남고 고역은 통째로 사라진다.
+#: 측정(삽입된 들숨): 에너지의 **87.2 %가 500~1500 Hz**, 8 kHz -64 dB,
+#: 12 kHz -88 dB. 저역 덩어리다.
+#:
+#: 실제 숨소리는 성문·인두의 난류라 **광대역**이고, 성도가 저역에서 공진해도
+#: 저역이 두드러지지 않는다 — 소스에 저역이 없기 때문이다. 그래서 셸프로
+#: 바꾼다(모서리 위는 넓게 평탄, 아래로는 떨어진다). 고역은 성도 캐스케이드와
+#: 소스 사전(TurbulenceSource.spectral_prior)이 알아서 떨어뜨린다.
+#:
+#: **모서리는 F1/F2 보다 위여야 한다.** 이 잡음은 성문에서 주입돼 성도 전체를
+#: 지나므로(noise_entry=0), 소스가 879/1292 Hz 근처에서 평탄하면 그 두 극이
+#: 그대로 도드라진다. 모서리를 쓸어 본 결과(100-500 / 500-1.5k / 1.5-4k / 4-8k):
+#:    900 Hz   0.0 / 82.8 / 15.5 /  1.7 %   <- 저역 덩어리
+#:   1800 Hz   0.0 / 13.4 / 70.5 / 16.1 %
+#:   2200 Hz   (채택)
+#:   3500 Hz   0.0 /  0.0 / 37.1 / 62.9 %   <- 너무 얇다
+#: 8 kHz 위가 0 % 인 건 성도 캐스케이드의 고역 절벽 때문이다(HANDOFF §6.8).
+BREATH_SOURCE_HZ = 2200.0
+BREATH_SOURCE_SLOPE = 1.6
+
+
 def breath(t: int, prof: VoiceProfile, inhale: bool = False, strength: float = 0.5,
            n_formants: int = 8, n_bands: int = 40, sample_rate: int = 24000) -> dict:
     """들숨/날숨. 성대 진동 없이 성문 마찰만."""
-    c = base(t, prof, n_formants, n_bands)
+    c = base(t, prof, n_formants, n_bands, sample_rate=sample_rate)
     c["harmonic_amp"] = torch.zeros(1, t, 1)
-    cf, bw, pos, g = FRICATIVES["h"]
+    # 발성이 없으면 기식성 바닥도 없다(base 가 깔아 둔 것을 끈다).
+    c["aspiration_bands"] = torch.zeros(1, t, n_bands)
     env = ramp(t, [(0.0, 0.05), (0.35, 1.0), (1.0, 0.1)]) if inhale else \
         ramp(t, [(0.0, 1.0), (1.0, 0.05)])
-    c["noise_bands"] = (band_bump(n_bands, cf * (1.4 if inhale else 1.0), bw,
-                                  strength, sample_rate).reshape(1, 1, -1)
+    c["noise_bands"] = (band_shelf(n_bands, BREATH_SOURCE_HZ, strength,
+                                   sample_rate, slope_oct=BREATH_SOURCE_SLOPE,
+                                   floor=0.0).reshape(1, 1, -1)
                         * env).contiguous()
     c["noise_entry"] = _c(t, 0.0)
     c["noise_rough"] = _c(t, 0.20)
@@ -174,7 +200,7 @@ def breath(t: int, prof: VoiceProfile, inhale: bool = False, strength: float = 0
 def sigh(t: int, prof: VoiceProfile, n_formants: int = 8, n_bands: int = 40,
          sample_rate: int = 24000) -> dict:
     """한숨: 유성으로 시작해 기식으로 풀리며 F0 가 내려간다."""
-    c = base(t, prof, n_formants, n_bands)
+    c = base(t, prof, n_formants, n_bands, sample_rate=sample_rate)
     c["harmonic_amp"] = ramp(t, [(0.0, 0.9), (0.6, 0.55), (1.0, 0.0)])
     c["f0"] = _c(t, prof.f0_median) * ramp(t, [(0.0, 1.12), (1.0, 0.8)])
     c["rd"] = ramp(t, [(0.0, prof.rd_median), (1.0, min(2.7, prof.rd_high + 0.5))])
@@ -186,13 +212,13 @@ def sigh(t: int, prof: VoiceProfile, n_formants: int = 8, n_bands: int = 40,
 
 
 def creak(t: int, prof: VoiceProfile, rate_hz: float = 45.0, n_formants: int = 8,
-          n_bands: int = 40) -> dict:
+          n_bands: int = 40, sample_rate: int = 24000) -> dict:
     """성대 프라이(보컬 프라이). 아주 낮은 F0 + 큰 지터 + 압착된 성문파.
 
     (2질량 ODE 로 하면 주기 배가 분기로 '진짜' 프라이가 나온다.
      LF 경로에서는 낮은 F0 + jitter + pressed Rd 로 근사한다.)
     """
-    c = base(t, prof, n_formants, n_bands)
+    c = base(t, prof, n_formants, n_bands, sample_rate=sample_rate)
     c["f0"] = _c(t, max(rate_hz, 35.0))
     c["rd"] = _c(t, max(0.3, prof.rd_low - 0.2))
     c["jitter"] = _c(t, 0.03)
@@ -205,7 +231,7 @@ def creak(t: int, prof: VoiceProfile, rate_hz: float = 45.0, n_formants: int = 8
 def whisper(t: int, prof: VoiceProfile, vowel: str = "a", strength: float = 0.6,
             n_formants: int = 8, n_bands: int = 40, sample_rate: int = 24000) -> dict:
     """속삭임: 성대 진동 0, 성문 협착 난류가 성도 전체를 통과."""
-    c = base(t, prof, n_formants, n_bands, vowel)
+    c = base(t, prof, n_formants, n_bands, vowel, sample_rate)
     c["harmonic_amp"] = torch.zeros(1, t, 1)
     c["noise_bands"] = band_bump(n_bands, 1600.0, 5000.0, strength, sample_rate
                                  ).reshape(1, 1, -1).expand(1, t, -1).contiguous()
@@ -227,7 +253,7 @@ def sob(t: int, prof: VoiceProfile, frame_rate: float = 100.0, rate_hz: float = 
 def throat_clear(t: int, prof: VoiceProfile, n_formants: int = 8, n_bands: int = 40,
                  sample_rate: int = 24000) -> dict:
     """헛기침: 짧은 압착 유성 + 넓은 대역 난류."""
-    c = base(t, prof, n_formants, n_bands)
+    c = base(t, prof, n_formants, n_bands, sample_rate=sample_rate)
     c["harmonic_amp"] = ramp(t, [(0.0, 0.0), (0.15, 1.0), (0.5, 0.3), (1.0, 0.0)])
     c["f0"] = _c(t, prof.f0_low * 0.85)
     c["rd"] = _c(t, 0.4)
