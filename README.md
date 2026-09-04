@@ -20,6 +20,7 @@
 - 구현된 방정식: [`docs/THEORY.md`](docs/THEORY.md)
 - 선행연구 정리: [`docs/LITERATURE.md`](docs/LITERATURE.md)
 - **목소리를 만들고 조종하는 법: [`docs/VOICE.md`](docs/VOICE.md)**
+- 진행 중인 /s/ 치찰음 작업 인수인계: [`docs/HANDOFF.md`](docs/HANDOFF.md)
 
 ## 빠른 시작
 
