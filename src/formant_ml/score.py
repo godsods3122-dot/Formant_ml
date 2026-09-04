@@ -213,32 +213,59 @@ def aero_drive(seg: dict, t: int, frame_rate: float, glottal_area=None) -> dict:
     amp = aac.frication_source_amp(u, ac_area)
     env = amp / amp.amax().clamp_min(1e-9)
     asp = aac.aspiration_source_amp(u, ag_t)
-    # 무게중심 배율은 **이 구간의 정점에서 1.0** 이어야 한다. 프로파일의 치찰음
-    # 지문(pole_f/teeth_f)은 화자의 실제 /s/ 스펙트럼에 적합한 값이라, 그 /s/ 가
-    # 가장 셀 때의 입자속도가 이미 그 안에 들어 있다. 고정된 v_ref=3000 cm/s 로
-    # 재면 실제 속도(정점에서 ~2170 cm/s)와 어긋나 배율이 0.45~0.85 로 **한 번도
-    # 1.0 에 못 미치고**, 앞니 공명 10.0 kHz 가 8.5 kHz 로 끌려 내려가 /s/ 가
-    # /ʃ/ 처럼 어두워진다(실측 봉우리 9.9 kHz, 그 상태의 합성 8.4 kHz).
-    # 정점에서 1.0 으로 다시 앵커를 잡으면 지문이 그대로 재생되고, 그 주위로만
-    # Stevens 의 속도-무게중심 관계가 움직인다.
-    cent = aac.velocity_centroid_scale(u, ac_area)
-    cent = cent / cent.reshape(-1)[int(env.reshape(-1).argmax())].clamp_min(1e-6)
-    return {"env": env, "cent": cent,
+    # 성문/구강 난류의 **세기 배분**. asp 는 아래에서 제 최대값으로 정규화되는데
+    # 그러면 직렬 모형이 계산해 둔 이 배분이 지워진다. 따로 꺼내 둔다.
+    # 성문 난류가 (1) 얼마나 **생기고** (2) 얼마나 협착을 지나 **나오는가**.
+    # 서로 다른 물리라 둘 다 곱한다.
+    asp_share = (aac.glottal_drop_fraction(ag_t, ac_area)
+                 * aac.constriction_transmission(
+                     ac_area, float(seg.get("a_open", aac.NEUTRAL_TRACT_AREA))))
+    # 소스와 필터를 **나눈다**. 예전에는 입자속도에서 낸 배율 하나를 극·영점·앞니
+    # 공명에 전부 곱했는데, 그건 Stevens 의 소스 관계를 성도 공진에 잘못 건 것이다.
+    # /s/ 개시에는 압력이 낮아 속도가 느리므로 배율이 0.62 까지 내려가고, 앞니
+    # 공명 10.0 kHz 가 6.2 kHz(= /ʃ/ 영역)에 놓였다 — **/s/ 가 /ʃ/ 로 시작했다.**
+    # 게다가 페이드 인 구간은 협착 면적이 **고정**이다(우리가 그렇게 만들었다).
+    # 기하가 안 변하는데 공진만 움직이는 건 자기모순이다.
+    #
+    #   cent      : 협착 **면적**(기하) -> 앞공동 극·반공진. 협착이 고정인 동안
+    #               정확히 1.0 이라 지문이 첫 프레임부터 그대로 나온다.
+    #   src_tilt  : 입자속도 -> 난류 **소스** 기울기 [dB/oct]. 개시가 어두운 건
+    #               맞지만, 그건 봉우리가 옮겨가서가 아니라 소스가 약해서다.
+    #
+    # 앞니 공명(teeth_f)은 혀끝-앞니 간극이 정하는 순수 기하라 **둘 다 안 곱한다**.
+    cent = aac.area_centroid_scale(ac_area)
+    src_tilt = aac.source_tilt_shift(u, ac_area)
+    return {"env": env, "cent": cent, "src_tilt": src_tilt,
+            "asp_share": asp_share,
             "asp": asp / asp.amax().clamp_min(1e-9),
             "ps_norm": ps_norm, "add": add,
             "pm_frac": pm / _PS_CGS}
 
 
-def _scale_sib_center(sib: SibilantParams, cent: torch.Tensor) -> None:
-    """무게중심 배율(1,T,1)을 치찰음 공진 주파수들에 곱한다(제자리).
+#: `cent` 를 곱하는 대상. **`teeth_f` 는 여기 없다** — 앞니 공명은 혀끝과 앞니
+#: 사이 간극이 정하는 순수 기하이고, 협착이 열려도 앞니는 그 자리에 있다.
+#: 극(앞공동 1/4 파장)과 영점(뒤공동 반공진)만 최협착점이 물러나며 내려간다.
+_GEOMETRIC_SIB_KEYS = ("pole_f", "zero_f")
 
-    입자속도가 떨어지면(협착이 열리면) 앞공동 공진·앞니 공명·반공진이 함께
-    내려간다 = 스펙트럼 전체가 아래로 미끄러진다(Stevens 1971).
+
+def _scale_sib_center(sib: SibilantParams, cent: torch.Tensor,
+                      src_tilt: torch.Tensor | None = None) -> None:
+    """협착 기하에서 나온 배율을 치찰음 공진에 곱한다(제자리).
+
+    `cent` 는 **면적**에서 나온다(`aeroacoustic.area_centroid_scale`). 협착이
+    좁게 유지되는 동안 1.0 이고, 열릴 때만 앞공동 극과 반공진이 내려간다.
+
+    `src_tilt` 는 입자속도에서 나온 난류 **소스** 기울기 변화 [dB/oct] 다
+    (Stevens 1971). 공진 주파수가 아니라 `tilt` 에 더한다 — 그래야 압력이 낮은
+    개시 구간에서 봉우리 **위치**는 지문(앞니 10.0 kHz) 그대로이고 스펙트럼
+    **색깔**만 어두워진다. 예전처럼 공진에 곱하면 /s/ 가 /ʃ/ 로 시작한다.
     """
-    for k in ("pole_f", "zero_f", "teeth_f"):
+    for k in _GEOMETRIC_SIB_KEYS:
         v = getattr(sib, k)
         if v is not None:
             setattr(sib, k, v * cent)
+    if src_tilt is not None and sib.tilt is not None:
+        sib.tilt = sib.tilt + src_tilt
 
 
 def _vowel_formants(name: str, prof: VoiceProfile, n: int) -> list[float]:
@@ -315,7 +342,7 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
             nb = nb * aac.obstacle_dipole_bands(
                 NB, a.sample_rate,
                 float(seg.get("dipole_db_oct", 10.0))).reshape(1, 1, -1)
-        aero_env = aero_cent = None
+        aero_env = aero_cent = aero_tilt = None
         if kind == "fricative":
             c["harmonic_amp"] = torch.zeros(1, t, 1)
             # 무성 마찰음에는 기식성 잡음 바닥이 없다 — 그건 **발성 중에** 성대가
@@ -344,6 +371,7 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
                 seg_f.setdefault("constriction_area", [[0.0, 0.10], [1.0, 0.10]])
                 _d = aero_drive(seg_f, t, a.frame_rate)
                 aero_env, aero_cent = _d["env"], _d["cent"]
+                aero_tilt = _d["src_tilt"]
                 env = aero_env
             else:
                 # 단순 경로: 유량 포락선을 직접 준다.
@@ -479,6 +507,8 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
                 # 구동에서 나온다). 협착이 열리며 레이놀즈수가 임계 아래로 떨어져
                 # 마찰음이 저절로 꺼지고, 같은 순간 구강내압이 빠져 발성이 붙는다.
                 env, aero_cent, asp_env = drive["env"], drive["cent"], drive["asp"]
+                aero_tilt = drive["src_tilt"]
+                asp_share = drive["asp_share"]
                 # 기식을 손으로 게이팅하지 않는다. 예전엔 (1-v_frac)·(1-env) 를
                 # 곱해서 **발성이 붙는 순간 잡음을 껐다**. 그래서 마찰음과 목소리가
                 # 한 프레임도 겹치지 않고(실측 겹침 180~260 ms, 그때 합성 0 ms),
@@ -557,8 +587,16 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
                 # 목표 1.9 %).
                 vfrac = (c["harmonic_amp"]
                          / c["harmonic_amp"].amax().clamp_min(1e-6)).clamp(0.0, 1.0)
+                # (1) 전이 기식에는 **직렬 저항 배분**을 곱한다. 성문 난류는
+                # 성문에 걸리는 압력강하에서 나오고, /s/ 처럼 구강 협착이 성문
+                # 보다 좁으면 그 몫이 41 % 뿐이다. 이걸 빼먹으면(= asp 를 제
+                # 최대값으로만 정규화하면) 마찰음 구간 내내 기식이 제 세기로
+                # 나오고, 그게 성도 캐스케이드를 지나 F1/F2 로 나와 /s/ 정점의
+                # 36 % 가 1~2 kHz 에 쌓인다 — 봉우리가 10 kHz 가 아니라 1.7 kHz
+                # 로 잡혔다. 협착이 풀리면 배분이 1 로 가므로 전이에서는 기식이
+                # 제 세기를 되찾는다(전이를 메우는 건 여전히 기식이다).
                 c["aspiration_bands"] = (
-                    asp_n * asp * (1.0 - vfrac)
+                    asp_n * asp * asp_share * (1.0 - vfrac)
                     + c["aspiration_bands"] * c["harmonic_amp"]).contiguous()
             else:
                 w_asp = torch.sigmoid((asp - env) * 8.0)
@@ -631,7 +669,7 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
         # 협착이 열리며 속도가 떨어지면 봉우리가 내려간다(Stevens 1971). 실측 /사/
         # 의 무게중심 하강(6700->3900)이 손 곡선 없이 여기서 나온다.
         if aero_cent is not None:
-            _scale_sib_center(sib, aero_cent)
+            _scale_sib_center(sib, aero_cent, aero_tilt)
         c["sib"] = sib
     else:
         raise ValueError(f"모르는 세그먼트 type: {kind!r}. "

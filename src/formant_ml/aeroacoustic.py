@@ -87,12 +87,142 @@ def velocity_centroid_scale(flow: torch.Tensor, area: torch.Tensor,
     """입자속도에 따른 무게중심 배율 (Stevens 1971).
 
     무게중심은 입자속도와 함께 오른다. v_ref(전형적 /s/ 협착 속도 ~3000 cm/s)에서
-    1.0 이 되도록 정규화한 완만한 배율. 협착이 열려 v 가 떨어지면 <1 이 되어
-    치찰음 봉우리가 내려간다 — 앞공동이 길어지는 기하 효과와 같은 방향이다.
-    sqrt 로 완만하게(속도가 절반이면 중심은 0.7 배).
+    1.0 이 되도록 정규화한 완만한 배율. sqrt 로 완만하게.
+
+    .. warning::
+       **이걸 성도 공진 주파수에 곱하면 안 된다.** Stevens 가 말하는 건 난류
+       **소스** 스펙트럼의 무게중심이지 성도의 극/영점이 아니다. 공진은 기하가
+       정한다 — 기류가 느리다고 앞니가 멀어지지 않는다. 실제로 곱해 봤더니
+       /s/ 개시(압력이 낮아 속도가 느린 구간)에서 앞니 공명이 10.0 kHz 대신
+       6.2 kHz 에 놓여 **/s/ 가 /ʃ/ 로 시작했다**. 소스 기울기는
+       `source_tilt_shift`, 공진 기하는 `area_centroid_scale` 를 쓴다.
+
+    남겨 둔 이유: 소스 무게중심 자체가 필요한 곳(학습/분석)에서 쓴다.
     """
     v = particle_velocity(flow, area)
     return (v / v_ref).clamp(0.2, 2.5).sqrt()
+
+
+#: 앞공동 공진 배율의 지수. 협착이 열릴 때 공진이 얼마나 빨리 내려가는가.
+#: 1/4 파장 f=c/(4·Lf) 에서 유효 앞공동 길이가 면적비의 거듭제곱으로 늘어난다고
+#: 본 것이다(협착이 풀리면 최협착점이 혀 뒤쪽으로 물러나 앞공동이 길어진다).
+#: 0.5 는 실측 /사/ 해제 구간의 무게중심 하강(6700 -> 3900 Hz, 비 0.58)에 맞춘
+#: 값이다. 손으로 그린 곡선이 아니라 지수 하나이고, 협착 궤적이 바뀌면 하강도
+#: 저절로 따라간다.
+FRONT_CAVITY_EXP = 0.5
+
+#: 입자속도가 2 배가 될 때 난류 **소스** 스펙트럼이 고역쪽으로 기우는 양 [dB/oct].
+#: Stevens(1971): 소스 무게중심은 속도와 함께 오른다. 공진을 옮기는 대신 소스
+#: 기울기로 준다 — 그래야 개시에서 봉우리 **위치**는 지문 그대로이고 **색깔**만
+#: 어두워진다(그게 물리적으로 일어나는 일이다).
+SOURCE_TILT_DB_PER_OCT = 1.5
+
+
+def area_centroid_scale(area: torch.Tensor, a_ref: torch.Tensor | float | None = None,
+                        exp: float = FRONT_CAVITY_EXP) -> torch.Tensor:
+    """협착 면적 -> 앞공동 공진/반공진 주파수 배율 (**순수 기하**).
+
+    치찰음 필터의 극(앞공동 1/4 파장)과 영점(뒤공동·설하공 반공진)은 성도
+    **모양**이 정한다. 협착이 좁게 유지되는 동안에는 모양이 안 변하므로 배율은
+    정확히 1.0 이고, 협착이 **열릴 때** 최협착점이 뒤로 물러나며 앞공동이 길어져
+    공진이 내려간다(f = c/4Lf).
+
+    `a_ref` 는 그 궤적에서 가장 좁은 면적 — 화자 지문(pole_f 등)이 적합된
+    자세다. 그래서 배율은 항상 <= 1.0 이고, 협착이 가장 좁을 때 지문이 **그대로**
+    재생된다. 정점 정규화 같은 보정이 필요 없다(예전엔 속도로 재느라 그게
+    필요했고, 그 정규화가 개시를 /ʃ/ 로 만들었다).
+    """
+    if a_ref is None:
+        a_ref = area.amin()
+    return (a_ref / area.clamp_min(1e-6)).clamp(1e-3, 1.0) ** exp
+
+
+def glottal_drop_fraction(glottal_area: torch.Tensor,
+                          constriction_area_: torch.Tensor) -> torch.Tensor:
+    """직렬 저항 중 **성문**이 먹는 압력강하의 비율 0~1 (순수 기하).
+
+    이 파일 머리의 직렬 모형 그대로다: Ps = ½ρU²(1/Ag² + 1/Ac²) 이므로 각
+    협착이 먹는 몫은 1/A² 에 비례하고,
+
+        f_glottis = (1/Ag²) / (1/Ag² + 1/Ac²) = Ac² / (Ac² + Ag²)
+
+    난류 소스 진폭은 그 협착의 압력강하 ½ρv² 자체이므로, 이 비율이 곧 **성문
+    난류(기식)와 구강 난류(마찰음)의 세기 배분**이다.
+
+    왜 필요한가: `aspiration_source_amp` 의 결과를 제 최대값으로 정규화하면
+    이 배분이 지워진다. 그러면 /s/ 처럼 구강 협착(0.10 cm²)이 성문(0.12 cm²)
+    보다 좁아 **압력강하의 41 % 만** 성문에 걸리는 구간에서도 기식이 제 최대
+    세기로 나온다. 기식은 성도 캐스케이드를 통과하므로 그 몫이 F1/F2 로 나와
+    /s/ 정점 스펙트럼의 36 % 가 1~2 kHz 에 쌓였다(실제 /s/ 는 거의 0 이다).
+    봉우리가 10 kHz 가 아니라 1.7 kHz 로 잡히는 원인이 이것이다.
+
+    협착이 열리면(해제) 비율이 1 로 가므로 기식이 저절로 제 세기를 되찾는다 —
+    마찰음과 목소리를 잇는 그 기식이다. 발성으로 끄는 게 아니라 **기하**로
+    배분하는 것이라 전이가 비지 않는다.
+    """
+    ac2 = constriction_area_.clamp_min(1e-6).pow(2)
+    ag2 = glottal_area.clamp_min(1e-6).pow(2)
+    return ac2 / (ac2 + ag2)
+
+
+#: 협착이 없는 중립 성도의 단면적 [cm^2]. 협착의 '좁음' 을 재는 기준이다.
+NEUTRAL_TRACT_AREA = 3.0
+
+
+#: 협착부(혀끝-치경 간극)의 길이 [cm]. /s/ 의 혀끝 협착은 1 cm 안팎이다.
+CONSTRICTION_LEN = 1.0
+#: 협착 앞쪽 공동(앞니까지)의 길이 [cm]. /s/ 는 1.5 cm 안팎 — `dsp/sibilant.py`
+#: 의 앞공동 극(5~8 kHz)과 같은 기하다.
+FRONT_CAVITY_LEN = 1.5
+
+
+def constriction_transmission(constriction_area_: torch.Tensor,
+                              a_open: float = NEUTRAL_TRACT_AREA,
+                              l_c: float = CONSTRICTION_LEN,
+                              l_f: float = FRONT_CAVITY_LEN) -> torch.Tensor:
+    """**성문** 소스가 협착을 지나 입술까지 전달되는 비율 0~1 (순수 기하).
+
+    `glottal_drop_fraction` 이 성문에서 난류가 얼마나 **생기는가** 라면, 이건
+    그렇게 생긴 소리가 얼마나 **나오는가** 다. 둘은 다른 물리이고 둘 다 있다.
+
+    성문에서 난 잡음이 입술까지 가려면 협착과 앞공동을 지나야 한다. 저역에서
+    (파장 >> 길이) 둘 다 관성 임피던스 Z ∝ L/A 이므로, 협착이 없을 때
+    (전부 A0) 대비 전달비는 임피던스 분배로
+
+        T = (Lc + Lf)/A0  /  (Lc/Ac + Lf/A0)
+          = (Lc + Lf)·Ac / (Lc·A0 + Lf·Ac)
+
+    Ac -> A0 이면 정확히 1 (협착이 협착이 아니게 된다), Ac = 0.10 cm² 이면
+    0.079 (약 -22 dB). 단순 면적비 Ac/A0 를 쓰면 협착이 풀리는 도중을 과소평가해
+    (해제 중반에 0.23 vs 0.42) 마찰음이 꺼지는 창을 기식이 늦게 메운다.
+
+    왜 필요한가: 이게 없으면 성문 잡음이 성도가 열려 있는 것처럼 방사된다.
+    그러면 협착 **뒤에 갇혀 있어야 할** 뒤공동 공진(치경 F2 1750 Hz)이 /s/ 정점
+    스펙트럼에 봉우리 대비 -1.8 dB 로 서고(에너지의 9.8 %), 실제 /s/ 에는 거의
+    없는 1~2 kHz 성분이 마찰음을 어둡게 만든다.
+
+    협착이 풀리면 1 로 가므로 전이에서 기식이 제 세기를 되찾는다. 발성이 아니라
+    **혀**가 여는 것이라 전이가 비지 않는다(성문파열음이 안 된다).
+    """
+    ac = constriction_area_.clamp_min(0.0)
+    return ((l_c + l_f) * ac / (l_c * max(a_open, 1e-6) + l_f * ac).clamp_min(1e-9)
+            ).clamp(0.0, 1.0)
+
+
+def source_tilt_shift(flow: torch.Tensor, area: torch.Tensor,
+                      v_ref: torch.Tensor | float | None = None,
+                      db_per_oct: float = SOURCE_TILT_DB_PER_OCT) -> torch.Tensor:
+    """입자속도 -> 난류 **소스** 기울기 변화 [dB/oct] (Stevens 1971).
+
+    속도가 빠를수록 난류 소스가 고역쪽으로 기운다. 공진 주파수는 건드리지 않고
+    소스의 색깔만 바꾼다. `v_ref`(지문이 적합된 속도, 보통 그 구간의 최대 속도)
+    에서 0 이고, 속도가 절반이면 `-db_per_oct` 만큼 어두워진다.
+    """
+    v = particle_velocity(flow, area)
+    if v_ref is None:
+        v_ref = v.amax()
+    return db_per_oct * torch.log2((v / torch.as_tensor(v_ref).clamp_min(1e-6)
+                                    ).clamp(0.05, 4.0))
 
 
 def constriction_area(t: int, frame_rate: float, a_closed: float = 0.10,

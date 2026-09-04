@@ -190,9 +190,9 @@ def test_frication_and_voicing_overlap_instead_of_switching():
     꺼지는 창을 기식이 메울 것, 그 기식이 모음에서 잦아들되 0 은 아닐 것.
     """
     from formant_ml.score import build_segment
-    c = build_segment({"type": "syllable", "onset": "s", "vowel": "a",
-                       "dur": 0.58, "onset_s": 0.11, "aero": True,
-                       "transition_s": 0.12}, PROF, CFG)
+    seg = {"type": "syllable", "onset": "s", "vowel": "a",
+           "dur": 0.58, "onset_s": 0.11, "aero": True, "transition_s": 0.12}
+    c = build_segment(seg, PROF, CFG)
     nb = c["noise_bands"][0].sum(-1)
     ab = c["aspiration_bands"][0].sum(-1)
     ha = c["harmonic_amp"][0, :, 0]
@@ -201,14 +201,39 @@ def test_frication_and_voicing_overlap_instead_of_switching():
     ha = (ha / ha.amax().clamp_min(1e-12)).numpy()
     i10 = int((ha > 0.10).argmax())
     pk = int(nb.argmax())
-    # 마찰음 정점 -> 발성 개시 사이에 잡음이 **끊기는 구간이 없어야** 한다.
-    gap = [i for i in range(pk, i10 + 1) if nb[i] < 0.05 and ab[i] < 0.30]
-    assert not gap, f"마찰음과 발성 사이 {len(gap)} 프레임이 비었다 (성문파열음)"
+    # 마찰음 정점 -> 발성 개시 사이에 소리가 **끊기는 구간이 없어야** 한다.
+    #
+    # 이건 **렌더된 소리**에서 잰다. 예전에는 제어신호로 재면서
+    # `ab[i] < 0.30` (구간 최대 대비) 을 썼는데, 그 기준이 무엇을 재는지가
+    # 바뀌었다. `ab` 의 구간 최대는 **모음의 기식성 바닥**(발성 중 성대가 덜
+    # 닫혀 새는 잡음)이고, 전이 기식은 이제 협착 **기하**로 배분된다
+    # (`glottal_drop_fraction` x `constriction_transmission`). 두 양은 물리가
+    # 달라서 한쪽만 줄면 비율이 떨어지는데, 그게 성문파열음을 뜻하지는 않는다.
+    # 실제로 그 비율이 0.16 으로 떨어졌을 때 렌더된 고역 포락선의 최저는
+    # 0.23 이었다 — 실측 /사/ 의 0.14 보다 오히려 **덜** 빈다.
+    # (예전 코드는 0.42 로 실측보다 과하게 메워져 있었다.)
+    # 그래서 임계값을 낮추는 대신 **직접 소리를 재도록** 바꿨다.
+    y = render({"timeline": [seg], "seed": 5}, PROF, CFG).reshape(-1)
+    win, hop = 1024, 256
+    f = torch.linspace(0, FS / 2, win // 2 + 1)
+    S = torch.stft(y, win, hop, window=torch.hann_window(win),
+                   return_complex=True).abs()
+    hi = (S[f > 4000] ** 2).sum(0).sqrt()
+    hi = hi / hi.amax().clamp_min(1e-12)
+    lo = (S[(f > 200) & (f < 1000)] ** 2).sum(0).sqrt()
+    lo = lo / lo.amax().clamp_min(1e-12)
+    a_pk = int(hi.argmax())
+    v_on = int((lo > 0.5).float().argmax())
+    floor = float(hi[a_pk:v_on + 1].min())
+    # 실측 /사/ 는 0.13~0.14 까지 떨어졌다가 발성과 함께 다시 오른다.
+    assert floor >= 0.13, f"마찰음과 발성 사이가 비었다 (성문파열음): {floor:.3f}"
     # 발성이 계단으로 들어오면 안 된다(예전: 두 프레임 만에 0.09 -> 0.76).
     jump = max(ha[i + 1] - ha[i] for i in range(len(ha) - 1))
     assert jump < 0.25, f"유성 진폭이 한 프레임에 {jump*100:.0f}% 뛴다 (성문파열음)"
-    # 기식은 마찰음이 죽는 창을 메우고, 모음에서 잦아들되 0 이 되지는 않는다.
-    assert ab[i10] > 0.3, "마찰음-유성 사이를 기식이 안 메운다"
+    # 기식은 마찰음이 죽는 창에서 **올라오고 있어야** 한다. 절대 크기가 아니라
+    # 방향으로 본다 — 크기는 위의 렌더 검사가 맡는다.
+    assert ab[i10] > ab[pk], ("마찰음이 꺼지는데 기식이 안 올라온다: "
+                              f"{ab[pk]:.3f} -> {ab[i10]:.3f}")
     # 모음에도 기식성 바닥이 남아야 한다(성대가 완전히 닫히지 않는다).
     # 상한은 두지 않는다 — 전이 기식이 (1-vfrac) 로 줄어든 뒤에는 이 바닥이
     # 구간 최대가 되는 게 정상이다.
