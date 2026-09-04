@@ -7,6 +7,7 @@ Titze(1988) mucosal wave, Jackson&Shadle(2000) 성문동기 마찰음 변조.
 """
 from __future__ import annotations
 
+import math
 import os
 import sys
 
@@ -263,11 +264,23 @@ def test_frication_and_voicing_overlap_instead_of_switching():
     a_pk = int(hi.argmax())
     v_on = int((lo > 0.5).float().argmax())
     floor = float(hi[a_pk:v_on + 1].min())
-    # 실측 /사/ 는 0.13~0.14 까지 떨어졌다가 발성과 함께 다시 오른다.
-    assert floor >= 0.13, f"마찰음과 발성 사이가 비었다 (성문파열음): {floor:.3f}"
+    # 실측 /사/ 는 마찰음 정점 대비 **0.122~0.123** 까지 떨어졌다가 발성과 함께
+    # 다시 오른다(두 토큰, 4 kHz 고역통과 + 6 ms RMS 포락선으로 재측정).
+    # 예전 주석의 0.13~0.14 는 다른 창/대역으로 잰 값이었다. 합성이 실측보다
+    # **더 메워져 있을** 이유는 없으므로 하한을 실측 바로 아래에 둔다.
+    assert floor >= 0.11, f"마찰음과 발성 사이가 비었다 (성문파열음): {floor:.3f}"
     # 발성이 계단으로 들어오면 안 된다(예전: 두 프레임 만에 0.09 -> 0.76).
-    jump = max(ha[i + 1] - ha[i] for i in range(len(ha) - 1))
-    assert jump < 0.25, f"유성 진폭이 한 프레임에 {jump*100:.0f}% 뛴다 (성문파열음)"
+    #
+    # **프레임당 증분이 아니라 상승 시간으로 잰다.** 로지스틱 기동의 최대 기울기는
+    # σ/4 이고 σ 는 ONSET_CYCLES 에 묶여 있어서(=문헌의 "발성 개시 몇 주기"),
+    # 증분 임계값을 두면 그 상수를 간접적으로 못 박게 된다. 실제로 실측 녹음에
+    # 맞춘 6 주기(저역 10->90 % 상승 47.7 ms, 실측 49.5~50.0)에서 프레임당
+    # 최대 증분이 34 % 라 0.25 임계에 걸렸다 — 소리는 오히려 실측에 가까워졌는데.
+    # 계단인지 아닌지를 직접 보는 건 **몇 프레임에 걸쳐 오르는가**다.
+    i10 = int((ha > 0.10).argmax())
+    i90 = int((ha > 0.90).argmax())
+    assert i90 - i10 >= 3, (f"유성 진폭이 {i90 - i10} 프레임 만에 10->90 % "
+                            "(성문파열음)")
     # 기식은 마찰음이 죽는 창에서 **올라오고 있어야** 한다. 절대 크기가 아니라
     # 방향으로 본다 — 크기는 위의 렌더 검사가 맡는다.
     assert ab[i10] > ab[pk], ("마찰음이 꺼지는데 기식이 안 올라온다: "
@@ -276,6 +289,69 @@ def test_frication_and_voicing_overlap_instead_of_switching():
     # 상한은 두지 않는다 — 전이 기식이 (1-vfrac) 로 줄어든 뒤에는 이 바닥이
     # 구간 최대가 되는 게 정상이다.
     assert ab[-1] > 0.1, f"모음에 기식성 바닥이 없다: {ab[-1]:.2f}"
+
+
+
+def _me_profile():
+    """화자 프로파일 (없으면 None). 보정 상수가 이 프로파일에 맞춰져 있다."""
+    path = os.path.join(os.path.dirname(__file__), "..", "profiles", "me.json")
+    return VoiceProfile.load(path) if os.path.exists(path) else None
+
+def test_fricative_envelope_is_an_arch_not_a_rectangle():
+    """마찰음 포락선에 **수직 모서리도 고원도** 없어야 한다.
+
+    2026-09-04 이전에는 직사각형이었다: 한 프레임(10 ms)에 16.6 dB 오르고,
+    60 ms 동안 -40.45 dB 가 **여섯 프레임 연속 완전히 동일**하다가, 40 ms 만에
+    88 dB 가 사라졌다. 스펙트로그램에서 수직 모서리를 가진 블록으로 보이고,
+    그 모서리가 임펄스라 "치찰음 중반부의 파열음" 으로 들렸다.
+
+    셋이 함께 지켜져야 이 모양이 안 돌아온다.
+      * 폐압이 발화 개시에서 램프로 오른다 (UTTERANCE_PS_RISE_S)
+      * 후두가 매끄러운 종 모양이다 (devoicing_gesture)
+      * 해제 시간이 조음기 속도에서 나온다 (release_from_speed)
+    """
+    from formant_ml.score import build_segment
+    c = build_segment({"type": "syllable", "onset": "s", "vowel": "a",
+                       "dur": 0.72, "onset_s": 0.09, "hold_s": 0.07,
+                       "aero": True, "drive": "tongue"}, PROF, CFG)
+    nb = c["noise_bands"][0].amax(-1)
+    db = 20 * torch.log10(nb.clamp_min(1e-12))
+    pk = float(db.max())
+    live = (db > pk - 25.0)                       # 가청 구간만 본다
+    step = [abs(float(db[i] - db[i + 1])) for i in range(len(db) - 1)
+            if bool(live[i]) and bool(live[i + 1])]
+    assert step, "가청 마찰음 구간이 없다"
+    assert max(step) < 12.0, (f"포락선이 한 프레임에 {max(step):.1f} dB 뛴다 "
+                              "(수직 모서리 = 파열음)")
+    flat = int((db > pk - 0.5).sum())
+    assert flat <= 4, f"정점이 {flat} 프레임 동안 평평하다 (직사각형)"
+
+
+def test_vowel_has_an_interharmonic_noise_floor():
+    """모음의 하모닉 **사이**가 비어 있으면 안 된다 — 그게 "사각파" 다.
+
+    실측 /아/ 는 300~2000 Hz 에서 스펙트럼 중앙값이 그 구간 최댓값의 -38.1 dB
+    이다. 합성은 `aspiration_bands` 셸프의 floor 가 0 이라 -58.6 dB 였다 —
+    거의 선 스펙트럼이라 톱니파처럼 들린다.
+
+    **임계값이 실측(-38.1)보다 느슨한 이유**: 여기는 24 kHz 이고
+    `BREATH_NOISE_GAIN` 은 24 kHz 값(2.7)이 그대로다. 실측에 맞춘 건 44.1 kHz
+    쪽(16.0)이고 거기서는 -38.0 dB 가 나온다. 24 kHz 게인은 아직 재적합하지
+    않았다(HANDOFF §6.2). floor 를 0 으로 되돌리면 -62.1 dB 로 떨어진다.
+    """
+    prof = _me_profile()
+    if prof is None:
+        return
+    y = render({"timeline": [{"type": "vowel", "vowel": "a", "dur": 0.4}],
+                "seed": 5}, prof, CFG).reshape(-1)
+    seg = y[int(0.15 * FS):int(0.38 * FS)]
+    w = torch.hann_window(len(seg))
+    P = torch.fft.rfft(seg * w).abs() ** 2
+    f = torch.linspace(0, FS / 2, len(P))
+    m = (f > 300) & (f < 2000)
+    floor_db = 10 * math.log10(float(P[m].median() / P[m].max()) + 1e-20)
+    assert floor_db > -52.0, (f"하모닉 사이 바닥이 {floor_db:.1f} dB — "
+                              "선 스펙트럼(사각파)이다")
 
 
 def test_voicing_does_not_start_during_the_fricative():

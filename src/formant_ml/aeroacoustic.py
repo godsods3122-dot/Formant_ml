@@ -589,6 +589,91 @@ TONGUE_CV_A_MIN = 0.11
 REST_AUDIBLE_MARGIN = 2.2
 
 
+def min_jerk(x: torch.Tensor) -> torch.Tensor:
+    """최소 저크(minimum-jerk) 변위 프로파일 0 -> 1. 양 끝에서 속도·가속도가 0.
+
+    **왜 선형 램프를 쓰면 안 되는가.** 조음기는 질량을 가진 근육이 움직인다.
+    변위가 시간에 대해 조각별 선형이면 꺾은점에서 가속도가 무한대이고, 그
+    불연속이 유량 -> 난류 진폭으로 그대로 내려가 **계단**이 된다. 측정(합성
+    '사', 프레임 10 ms): 마찰음 포락선이 -74.8 -> -58.2 dB 로 한 프레임에
+    16.6 dB 뛰었고, 고원 끝에서는 40 ms 만에 -40 -> -128 dB 로 떨어졌다.
+    스펙트로그램에서 /s/ 가 **수직 모서리를 가진 직사각형 블록**으로 보인다.
+    실측 녹음은 같은 자리가 부드러운 혹이다. 사용자가 "치찰음 중반부에 파열음
+    같은 소리" 라고 한 게 이 모서리다.
+
+    조음 운동학의 표준 모형(Nelson 1983; Ostry & Munhall 1985; Perkell)은
+    종 모양 속도 프로파일이다. 최소 저크 s(u) = u³(10 - 15u + 6u²) 가 그
+    닫힌 해이고, 양 끝에서 속도와 가속도가 모두 0 이라 이어 붙여도 꺾이지 않는다.
+    """
+    u = x.clamp(0.0, 1.0)
+    return u * u * u * (10.0 - 15.0 * u + 6.0 * u * u)
+
+
+def gesture_fractions(t: int, frame_rate: float, close_s: float,
+                      hold_s: float = 0.0, release_s: float = 0.0) -> tuple:
+    """제스처 구간 길이[s] -> 세그먼트 안에서의 비율 (닫기, 고원, 열기).
+
+    `tongue_constriction_cv` 와 후두 제스처가 **같은 눈금**을 봐야 해서 따로 뺐다
+    (후두 개대의 정점을 고원 한가운데에 놓으려면 고원의 시작을 알아야 한다).
+    """
+    n = max(int(t), 1)
+    dur = max((n - 1) / max(frame_rate, 1e-6), 1e-6)
+    cf = min(max(close_s / dur, 1e-3), 0.9)
+    hf = min(max(hold_s / dur, 0.0), 0.95 - cf)
+    rf = min(max(release_s / dur, 1e-3), 1.0 - cf - hf)
+    return cf, hf, rf
+
+
+#: 모달 발성의 성문 틈 [cm²]. 성대가 주기마다 완전히 닫히고 후두 틈만 남는다.
+GLOTTIS_MODAL_AREA = 0.004
+#: 개대 개시 -> 정점 [s]. Kim et al.(2022): 성문 개대 개시가 유량 정점을
+#: 80~120 ms 앞선다. 되모으는 쪽은 모음을 위한 능동 내전이라 조금 빠르다.
+GLOTTIS_ABDUCT_S = 0.10
+GLOTTIS_ADDUCT_S = 0.11
+
+
+def devoicing_gesture(t: int, frame_rate: float, peak_pos: float,
+                      abd_area: float, modal_area: float = GLOTTIS_MODAL_AREA,
+                      abduct_s: float = GLOTTIS_ABDUCT_S,
+                      adduct_s: float = GLOTTIS_ADDUCT_S,
+                      device=None) -> torch.Tensor:
+    """무성 마찰음의 후두 제스처 — 성문 면적 Ag(t) [cm²] (1,T,1).
+
+    **후두는 계단이 아니라 하나의 매끄러운 열고-닫기다.** Löfqvist & Yoshioka
+    (1980, 1981, 1984) 의 투과광 성문도(Pgg)는 무성 마찰음에서 단일한 종 모양
+    이고, 정점은 마찰음의 시간적 **중간** 근처다. 예전 구현은 개대를 0.25 로
+    **고정**했다가 해제 시점에 꺾어 내렸는데, 그러면
+
+      * 협착이 고원에 있는 동안 Ag 도 상수라 유량이 상수 -> 포락선이 60 ms
+        동안 정확히 평평했다(측정: -40.45 dB 가 6 프레임 연속 동일).
+      * 고원 끝에서 혀와 후두가 **동시에** 꺾여 40 ms 만에 88 dB 가 사라졌다.
+
+    실제로는 Ac 가 고원이어도 Ag 가 종 모양이면 직렬 유량
+
+        U = sqrt(2·Ps/ρ) / sqrt(1/Ag² + 1/Ac²)
+
+    이 종 모양이 된다. Kim et al.(2022) 이 한국어 /s/ 에서 실제로 잰 구강
+    유량이 그 혹이다(정점 0.08~0.12 L/s). 즉 마찰음 포락선의 몸통을 만드는 건
+    혀가 아니라 **후두**이고, 혀는 그 위에 시작과 끝을 얹는다.
+
+    면적은 **선형**으로 보간한다(로그가 아니다). 성문은 피열연골 변위에 대해
+    삼각형으로 열려서 Ag ~ ½·L·d 로 변위에 거의 비례하고, Pgg 자체가 면적에
+    비례하는 신호다 — 그 종 모양을 그대로 옮기려면 선형이 맞다. 혀끝 협착
+    (`tongue_constriction_cv`)이 로그 면적인 것과 다른 이유가 이것이다.
+    """
+    n = max(int(t), 1)
+    dur = max((n - 1) / max(frame_rate, 1e-6), 1e-6)
+    i = torch.arange(n, device=device, dtype=torch.float32) / max(n - 1, 1)
+    pk = min(max(float(peak_pos), 0.0), 1.0)
+    ow = max(float(abduct_s) / dur, 1e-3)
+    cw = max(float(adduct_s) / dur, 1e-3)
+    bell = torch.where(i <= pk,
+                       min_jerk((i - (pk - ow)) / ow),
+                       1.0 - min_jerk((i - pk) / cw))
+    a = float(modal_area) + (float(abd_area) - float(modal_area)) * bell
+    return a.reshape(1, n, 1)
+
+
 def tongue_constriction(t: int, frame_rate: float, a_min: float = TONGUE_A_MIN,
                         a_rest: float = TONGUE_A_REST,
                         close_frac: float = TONGUE_CLOSE_FRAC,
@@ -629,8 +714,8 @@ def tongue_constriction(t: int, frame_rate: float, a_min: float = TONGUE_A_MIN,
     f = min(max(close_frac, 0.05), 0.95)
     i = torch.arange(n, device=device, dtype=torch.float32) / max(n - 1, 1)
     # 닫힐 때: hi -> lo (0 ~ f), 열릴 때: lo -> hi (f ~ 1)
-    down = hi + (lo - hi) * (i / f).clamp(0.0, 1.0)
-    up = lo + (hi - lo) * ((i - f) / max(1.0 - f, 1e-6)).clamp(0.0, 1.0)
+    down = hi + (lo - hi) * min_jerk(i / f)
+    up = lo + (hi - lo) * min_jerk((i - f) / max(1.0 - f, 1e-6))
     logA = torch.where(i <= f, down, up)
     return logA.exp().reshape(1, n, 1)
 
@@ -708,9 +793,54 @@ def cv_gesture_times(onset_s: float, peak_frac: float, a_min: float = TONGUE_A_M
     return (onset_s * p * l_close / k, onset_s * (1.0 - p) * l_open / k)
 
 
+
+#: 해제 제스처가 폐쇄 제스처보다 몇 배 빠른가 (로그 면적에서의 조음기 속도비).
+#: 해제는 근육을 놓는 탄도적 운동이라 능동적으로 좁혀 가는 폐쇄보다 빠르다.
+#: 문헌의 조음 운동학은 1.3~1.5 배 범위다(Kent & Moll; Ostry & Munhall).
+TONGUE_RELEASE_SPEEDUP = 1.4
+
+
+def release_from_speed(close_s: float, a_min: float, a_rest: float,
+                       a_open: float,
+                       speedup: float = TONGUE_RELEASE_SPEEDUP) -> float:
+    """폐쇄 시간과 **조음기 속도**로 해제 시간을 낸다 [s].
+
+    `cv_gesture_times` 는 "정점 위치" 를 요구값으로 받아 해제 시간을 거꾸로
+    풀었다. 그 풀이는 "포락선 정점 = 최소 면적 순간" 을 전제한다. 폐압 램프를
+    되살린 뒤로는(UTTERANCE_PS_RISE_S) 그 전제가 깨졌다 — 정점은 압력이 정하고
+    최소 면적은 고원 내내 유지되므로, 정점 위치로 해제 시간을 풀면 물리적으로
+    말이 안 되는 속도가 나온다.
+
+    측정: 정점 0.72 를 맞추려면 해제가 80.0 nepers/s 여야 했는데 폐쇄는
+    31.1 nepers/s 였다 — 같은 혀끝이 2.6 배 빨리 움직이는 셈이다. 그 결과
+    해제 구간에서 진폭이 **10 ms 에 26 dB** 떨어졌고(실측은 45 ms 에 15 dB),
+    스펙트로그램에 수직 모서리가 남았다. 사용자가 들은 "치찰음 중반부의
+    파열음" 이 이것이다.
+
+    여기서는 정점을 요구하지 않는다. 혀끝은 한 가지 속도로 움직이고(해제가
+    `speedup` 배 빠르다), 정점 위치는 압력·면적이 알아서 정하게 둔다.
+    """
+    l_close = math.log(max(a_rest / max(a_min, 1e-9), 1.0 + 1e-9))
+    l_open = math.log(max(a_open / max(a_min, 1e-9), 1.0 + 1e-9))
+    return close_s * (l_open / l_close) / max(speedup, 1e-3)
+
 #: 발화 개시에서 폐압이 서는 데 걸리는 시간 [s]. 호흡근이 흉곽을 눌러 압력을
 #: 만드는 과정이라 계단일 수 없다.
 BREATH_ONSET_S = 0.045
+
+#: **발화 개시**의 폐압 상승 시간 [s]. 위 45 ms 는 문장 안에서 다음 음절로
+#: 넘어갈 때의 값이고, 무음에서 말을 시작할 때는 훨씬 길다 — 호기근이 이완압
+#: 위로 압력을 세우는 데 100~200 ms 가 걸린다(Draper, Ladefoged & Whitteridge
+#: 1959; Hixon). Signorello et al.(2018) 의 "마찰음 내내 Ps 일정" 은 이미 말이
+#: 진행 중인 구간의 관찰이지 개시 구간이 아니다.
+#:
+#: 이게 왜 마찰음 포락선을 정하는가: Ps 가 일정할 때 진폭은
+#: ½ρv² = Ps/(1+Ac²/Ag²) 라 **Ps 에 정확히 비례**한다. 그리고 Ac ≪ Ag 면
+#: 면적 항이 포화하므로, 협착이 다 만들어진 뒤의 포락선은 **오직 Ps 곡선**이다.
+#: 압력을 협착 완성 시점에 이미 다 세워 두면(예전 동작) 포락선에 상승이 없어
+#: 마찰음이 수직 모서리를 가진 직사각형이 된다 — 측정: 10->90 % 상승 18 ms,
+#: 실측 46~78 ms.
+UTTERANCE_PS_RISE_S = 0.15
 
 
 def breath_onset(t: int, frame_rate: float, onset_s: float = BREATH_ONSET_S,
@@ -781,16 +911,13 @@ def tongue_constriction_cv(t: int, frame_rate: float, close_s: float,
     기준점이다.
     """
     n = max(int(t), 1)
-    dur = max((n - 1) / max(frame_rate, 1e-6), 1e-6)
-    cf = min(max(close_s / dur, 1e-3), 0.9)
-    hf = min(max(hold_s / dur, 0.0), 0.95 - cf)
-    rf = min(max(release_s / dur, 1e-3), 1.0 - cf - hf)
+    cf, hf, rf = gesture_fractions(t, frame_rate, close_s, hold_s, release_s)
     lo = math.log(max(a_min, 1e-6))
     hi = math.log(max(a_rest, a_min * 1.01))
     op = math.log(max(a_open, a_min * 1.01))
     i = torch.arange(n, device=device, dtype=torch.float32) / max(n - 1, 1)
-    closing = hi + (lo - hi) * (i / cf).clamp(0.0, 1.0)
-    opening = lo + (op - lo) * ((i - cf - hf) / rf).clamp(0.0, 1.0)
+    closing = hi + (lo - hi) * min_jerk(i / cf)
+    opening = lo + (op - lo) * min_jerk((i - cf - hf) / rf)
     logA = torch.where(i <= cf + hf, closing, opening)
     return logA.exp().reshape(1, n, 1), cf + hf
 

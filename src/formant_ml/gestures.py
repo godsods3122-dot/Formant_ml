@@ -51,8 +51,25 @@ def _phase_ramp(t: int, rate_hz: float, frame_rate: float, phase0: float = 0.0):
 #: "모음 4~6 kHz 가 조금 세다" 도 이것이다.
 #: 재측정: 0-1k 92.8 / 1-2k 4.1 / 4-6k 2.1 % (실측 92.6 / 5.0 / 2.1).
 BREATH_NOISE_GAIN = 2.7
-BREATH_NOISE_HZ = 3500.0
+BREATH_NOISE_HZ = 4800.0
 BREATH_NOISE_SLOPE = 3.5
+#: 셸프 **아래쪽 바닥**. 0 이면 안 된다.
+#:
+#: 성문 난류는 광대역이다. 셸프 모양은 성도·복사가 고역을 들어 올려서 생기는
+#: 것이지, 소스가 3.5 kHz 아래에서 침묵하기 때문이 아니다. 0 으로 두면 합성
+#: 모음의 **하모닉 사이가 완전히 비어** 선 스펙트럼이 된다 — 실측 /아/ 는
+#: 200~2000 Hz 에서 하모닉 사이 바닥이 H1 대비 -40 dB 언저리로 이어지는데
+#: 합성은 -60 ~ -80 dB 였다. 그 차이가 "사각파처럼 들린다" 는 지적이다.
+BREATH_NOISE_FLOOR = 0.30
+
+#: 협착 뒤 공동으로 새어 성도 전체를 지나는 난류의 비율.
+#:
+#: 0.25 -> 0.70. 실측 /s/ 는 저역 치마가 두껍다. 6~13 kHz 봉우리를 기준으로
+#: 80 Hz -9.3 dB, 300 Hz -2.9 dB, 800~2000 Hz +1.1 dB 인데, 0.25 에서는 각각
+#: -17.5 / -8.9 / -5.7 dB 로 8 dB 씩 얇았다. 0.70 에서 -10.7 / -3.8 / -2.7 이다.
+#: 치찰음 필터(앞공동)만 지난 소리는 봉우리만 남은 '입 밖에 얹힌 히스' 다 —
+#: 실제 /s/ 는 협착 뒤 공동도 함께 울린다.
+NOISE_BACK_LEAK = 0.70
 
 
 def base(t: int, prof: VoiceProfile, n_formants: int = 8, n_bands: int = 40,
@@ -86,14 +103,14 @@ def base(t: int, prof: VoiceProfile, n_formants: int = 8, n_bands: int = 40,
         "aspiration_bands": (band_shelf(n_bands, BREATH_NOISE_HZ,
                                         BREATH_NOISE_GAIN * prof.breathiness,
                                         sample_rate, slope_oct=BREATH_NOISE_SLOPE,
-                                        floor=0.0)
+                                        floor=BREATH_NOISE_FLOOR * prof.breathiness)
                              .reshape(1, 1, -1).expand(1, t, n_bands).contiguous()),
         "noise_entry": _c(t, 0.0),
         "noise_am": _c(t, prof.breathiness),
         "noise_rough": _c(t, prof.roughness),
         # 난류가 성도를 울릴 때는 감쇠가 크다 (Controls.noise_bw_scale 주석 참고)
         "noise_bw_scale": _c(t, 3.0),
-        "noise_back_leak": _c(t, 0.25),
+        "noise_back_leak": _c(t, NOISE_BACK_LEAK),
 
     }
 

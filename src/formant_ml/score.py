@@ -115,7 +115,7 @@ def curve(spec, t: int) -> torch.Tensor:
 #: 레벨에 섞여 들어간다 - 페이드를 절반씩으로 늘리자 같은 게인인데 RMS 가
 #: 3.7 dB 떨어졌다. 그러면 페이드를 만질 때마다 음량이 따라 움직이고, 음량을
 #: 맞추려고 게인을 올리면 페이드가 도로 얕아진다. 둘은 분리되어야 한다.
-FRICATIVE_CAL_DB = -19.2
+FRICATIVE_CAL_DB = -11.0
 
 #: 음절 안의 마찰음은 위 상수 대신 **같은 음절의 유성 최대 진폭**으로 기준화한다
 #: (아래 참조). 그 기준이 독립 마찰음 경로와 어긋난 만큼을 여기서 되돌린다.
@@ -133,7 +133,7 @@ FRICATIVE_CAL_DB = -19.2
 #: 25.0 -> 17.0 재측정: 앞니 다이폴 기울기를 제트에 묶으면서(_dipole_jet_correction)
 #: 음절의 /s/ 스펙트럼이 재배분됐다. 모양만 바꾸도록 RMS 정규화를 했는데도
 #: 대역별 재배분이 성도·치찰음 필터를 거치며 레벨을 8 dB 옮긴다.
-SYLLABLE_FRICATIVE_CAL_DB = 17.0
+SYLLABLE_FRICATIVE_CAL_DB = -7.3
 
 
 def fricative_gain(prof: VoiceProfile) -> float:
@@ -155,7 +155,15 @@ OBSTACLE_SIBILANTS = {"s", "ss", "z", "sh"}
 
 #: 성문 기식의 게인 보정. fricative_gain 은 앞니 다이폴(+약 16 dB)을 상쇄하려고
 #: 낮춰 잡혀 있는데, 성문에는 장애물이 없어 그 부스트를 안 받는다. 되돌리는 값.
-ASPIRATION_GAIN = 6.3
+#:
+#: 6.3 -> 26.0. 마찰음과 목소리 **사이의 골**을 메우는 게 이 값이다. 실측 /사/ 의
+#: 4 kHz 이상 포락선은 마찰음 정점 대비 0.122~0.123 까지만 내려갔다가 발성과
+#: 함께 다시 오르는데, 6.3 에서는 0.082(24 kHz) / 0.041(44.1 kHz) 로 훨씬 깊었다.
+#: 그 골이 깊으면 마찰음이 끊겼다가 목소리가 새로 시작하는 것처럼 들린다.
+#: (예전에 2.5 까지 내렸던 건 목소리가 200 ms 에 걸쳐 부풀어 오르던 시절의
+#:  보정이다 — 그때는 전이 기식이 모음보다 커 보였다. 발성 기동을 고친 뒤
+#:  `aerodynamics.oscillation_buildup` 그 이유가 사라졌다.)
+ASPIRATION_GAIN = 26.0
 
 
 def wants_aero(seg: dict) -> bool:
@@ -196,8 +204,12 @@ def aero_drive(seg: dict, t: int, frame_rate: float, glottal_area=None) -> dict:
             shape=seg.get("constriction_area"))
     if glottal_area is None:
         glottal_area = seg.get("glottal_area", 0.12)
-    ag_t = curve(glottal_area, t) if not isinstance(glottal_area, (int, float)) \
-        else torch.full((1, t, 1), float(glottal_area))
+    if torch.is_tensor(glottal_area):
+        ag_t = glottal_area                      # 이미 만들어진 후두 제스처
+    elif isinstance(glottal_area, (int, float)):
+        ag_t = torch.full((1, t, 1), float(glottal_area))
+    else:
+        ag_t = curve(glottal_area, t)
     # 호흡 구동압은 **곡선**이다. /s/ 를 내려면 상당한 압력이 필요한데, 그 압력을
     # 툭 던지는 게 아니라 서서히 올렸다가 서서히 내린다. 상수로 두면 마찰음이
     # 첫 프레임부터 최대라 그 급개시가 파열음(/k/)으로 들린다.
@@ -536,7 +548,11 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
                         a_open=float(seg.get("a_open", 3.0)),
                         glottal_area=_abd)
                     cls = float(seg.get("close_s", _cls))
-                    rel = float(seg.get("release_s", _rel))
+                    # 해제는 **조음기 속도**에서 낸다(`release_from_speed`).
+                    # cv_gesture_times 가 주는 _rel 은 정점 위치를 맞추려고
+                    # 혀끝을 폐쇄보다 2.6 배 빠르게 움직이게 만든다.
+                    rel = float(seg.get("release_s", aac.release_from_speed(
+                        cls, _amin, _rest, float(seg.get("a_open", 3.0)))))
                     # 폐압은 **협착을 만들면서 같이** 오른다. 성도가 아직 열려
                     # 있는 동안 압력이 다 걸리면 그 구간이 /h/ 가 된다 —
                     # 측정: 압력 램프 45 ms, 협착이 가청 경계를 지나는 시점
@@ -544,8 +560,18 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
                     # 램프를 폐쇄 시간에 맞추면 0.014 로 줄고 마찰음은 그대로다.
                     # 램프 길이는 생리적 상수(~45 ms)로 두고 **시작을 늦춘다**.
                     # 협착이 다 만들어지는 순간(cls)에 압력이 서도록 맞춘다.
-                    seg.setdefault("breath_delay_s", max(cls - aac.BREATH_ONSET_S, 0.0))
+                    # 폐압 램프는 **협착과 나란히** 오른다. 예전에는 램프가
+                    # 폐쇄 완료 시점에 끝나도록 뒤로 밀어 두었는데(그때는 램프가
+                    # 45 ms 였다), 그러면 마찰음이 켜지는 순간 압력이 이미 100 %
+                    # 라 포락선에 상승이 없다. 개시 램프는 100~200 ms 짜리
+                    # 생리적 상수이고(UTTERANCE_PS_RISE_S), 그동안 성문은 아직
+                    # 거의 닫혀 있어(devoicing_gesture) 앞쪽에 /h/ 가 안 생긴다.
+                    seg.setdefault("breath_onset_s", aac.UTTERANCE_PS_RISE_S)
+                    seg.setdefault("breath_delay_s", 0.0)
                     hld = float(seg.get("hold_s", onset_s))
+                    _cf, _hf, _ = aac.gesture_fractions(t, a.frame_rate,
+                                                        cls, hld, rel)
+                    plateau_mid = _cf + 0.5 * _hf
                     ac_cv, hold_r = aac.tongue_constriction_cv(
                         t, a.frame_rate, cls, rel, hld,
                         a_min=_amin, a_rest=_rest,
@@ -559,6 +585,7 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
                 else:
                     _cv_area = None
                     hold_r = float(seg.get("hold_ratio", split))
+                    plateau_mid = hold_r
                 # 후두는 혀끝과 **거의 같이** 움직인다. 예전엔 성문이 split(명목상
                 # /s/ 끝)에서야 닫히기 시작해 혀보다 한참 늦었고, 그 지연이 그대로
                 # 마찰음 꼬리로 남아 하강이 85 ms 로 늘어졌다(실측 52~64 ms).
@@ -608,11 +635,21 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
                 # 넓게 열면 직렬 저항이 협착에 몰려서 마찰음은 협착이, 발성
                 # 시점은 후두가 따로 정한다.
                 abd = float(seg.get("abduction_area", 0.25))
-                ag_curve = seg.get("glottal_area", [
-                    [0.0, abd], [min(hold_r + lag, 1.0), abd],
-                    [min(hold_r + lag + addt, 1.0), 0.03],      # 발성 시작: 기식성
-                    [min(hold_r + lag + addt + firm, 1.0), 0.004],   # 모달로 조여짐
-                    [1.0, 0.004]])
+                # **후두 제스처는 매끄러운 하나의 열고-닫기다**(devoicing_gesture).
+                # 예전에는 위 두 단계를 꺾은점 5 개로 그렸는데, 그 꺾은점이 곧
+                # 유량의 꺾은점이고 마찰음 포락선의 수직 모서리였다. 두 단계
+                # (기식성 0.03 -> 모달 0.004)는 이제 종 모양 궤적이 내려오면서
+                # **저절로 지나간다** — 따로 박을 필요가 없다.
+                # 개대 정점은 고원 한가운데다(Löfqvist & Yoshioka: Pgg 정점이
+                # 마찰음 중간). 그래야 Ac 가 고원이어도 유량이 혹이 된다.
+                ag_curve = seg.get("glottal_area")
+                if ag_curve is None:
+                    ag_curve = aac.devoicing_gesture(
+                        t, a.frame_rate, min(plateau_mid + lag, 1.0), abd,
+                        abduct_s=float(seg.get("abduction_s",
+                                               aac.GLOTTIS_ABDUCT_S)),
+                        adduct_s=(float(seg.get("adduction_s", 0.04))
+                                  + float(seg.get("firming_s", 0.12))))
                 seg2 = dict(seg)
                 seg2.setdefault("a_open", 3.0)
                 seg2.setdefault("hold_ratio", hold_r)
@@ -939,8 +976,18 @@ def build_controls(score: dict, prof: VoiceProfile, cfg: Config) -> Controls:
 
     # 전역 오버라이드
     if score.get("params"):
-        apply_overrides(merged | {"sib": SibilantParams(**sib_fields)},
-                        score["params"], t, cfg)
+        # `merged | {...}` 는 **새 dict** 를 만든다. 거기에 덮어쓰면 그 사본에만
+        # 들어가고 merged 에는 안 남아서, sib_* 를 뺀 모든 전역 오버라이드가
+        # 조용히 무시됐다(SibilantParams 는 객체라 제자리 변경이 통했다).
+        sib_obj = SibilantParams(**sib_fields)
+        over = dict(merged)
+        over["sib"] = sib_obj
+        apply_overrides(over, score["params"], t, cfg)
+        for k, v in over.items():
+            if k != "sib":
+                merged[k] = v
+        sib_fields = {f.name: getattr(sib_obj, f.name)
+                      for f in dc_fields(SibilantParams)}
 
     # 경계 평활. `noise_entry` 는 **일부러 빼 둔다**: 협착 위치는 연속적으로
     # 미끄러지는 양이 아니라 조음 상태다. 무음(성문 주입)에서 /s/(입술쪽 주입)로

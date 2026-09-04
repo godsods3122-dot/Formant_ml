@@ -18,6 +18,7 @@ from formant_ml import score as SC
 from formant_ml.config import Config
 from formant_ml.score import render
 from formant_ml.utils import save_wav
+from formant_ml import voice as VP
 from formant_ml.voice import VoiceProfile
 
 #: **샘플레이트에 의존하는 잡음 보정 상수들** (44.1 kHz 용).
@@ -40,8 +41,7 @@ from formant_ml.voice import VoiceProfile
 #: 컸다. 실측은 그 구간 최대가 모음 정상부의 27 % 인데 83 % 가 나왔고, 포락선
 #: 으로 보면 **모음보다 큰 스파이크 버스트**였다(전이/모음 1.08, 실측 0.36).
 #: 그게 경성 개시로 들린다. 2.5 에서 25~27 % 로 맞는다.
-CAL_44K = {"BREATH_NOISE_GAIN": 7.8, "ASPIRATION_GAIN": 2.5,
-           "SYLLABLE_FRICATIVE_CAL_DB": 23.0}
+CAL_44K = {"BREATH_NOISE_GAIN": 16.0, "SYLLABLE_FRICATIVE_CAL_DB": 11.5}
 
 # 협착 궤적을 손으로 그리지 않는다. 예전엔 7 개 꺾은점으로 페이드를 만들었는데,
 # 그건 물리가 아니라 곡선 맞추기였고 호흡 압력과 서로 싸워서 정점이 가청 구간의
@@ -70,16 +70,28 @@ def main() -> None:
     # 내면 /s/ 가 통째로 둔탁해진다(사용자 지적).
     # 측정: 치찰음 봉우리가 24 kHz 에서 10266~10289 Hz, 44.1 kHz 에서 9905~10099 Hz
     # (실측 9905~9991). 나이퀴스트가 봉우리를 위로 밀고 있었다.
+    here = os.path.dirname(os.path.abspath(__file__))
+    prof = VoiceProfile.load(os.path.join(here, "..", "profiles", "me.json"))
     cfg = Config()
+    # 극의 개수도 **나이퀴스트에 딸려 온다**. 균일관은 c/(2L)=1 kHz 마다 극이
+    # 하나이므로(voice.POLE_SPACING_HZ), 12 kHz 까지면 12 개, 22 kHz 까지면
+    # 22 개다. 12 개로 두면 8.8 kHz 위에 극이 없어서 캐스케이드가 절벽이 되고
+    # 모음의 6 kHz 위가 통째로 죽는다(실측 대비 9~13 kHz -37.8 dB).
+    # 상한이 있다. 캐스케이드가 **DC 정규화**(Klatt 관례)라 나이퀴스트 근처의
+    # 극은 이득이 1 을 크게 넘고, 그런 극을 몇 개 얹으면 응답 전체가 거기서
+    # 지배돼 저역이 상대적으로 사라진다. 측정(모음 대역 비중, 실측 대비):
+    #   극 15 개(최고 12951 Hz): 50~300 Hz 18.7 dB (실측 18.3) — 정상
+    #   극 18 개(최고 15951 Hz): 50~300 Hz -12.0 dB — 저역이 30 dB 무너짐
+    #   극 22 개(최고 21951 Hz): 50~300 Hz -87.5 dB — 완전 붕괴
+    # 그래서 측정된 극 위로 두 개까지만 연장한다.
+    n_pol = len(prof.formants) + 2
     cfg = replace(cfg, audio=replace(cfg.audio, sample_rate=44100,
-                                     hop_size=441, fmax=22050.0))
+                                     hop_size=441, fmax=22050.0),
+                  filt=replace(cfg.filt, n_formants=n_pol))
     sr = cfg.audio.sample_rate
     # 샘플레이트를 올렸으면 잡음 보정도 같이 올려야 한다(위 CAL_44K 주석 참조).
     G.BREATH_NOISE_GAIN = CAL_44K["BREATH_NOISE_GAIN"]
-    SC.ASPIRATION_GAIN = CAL_44K["ASPIRATION_GAIN"]
     SC.SYLLABLE_FRICATIVE_CAL_DB = CAL_44K["SYLLABLE_FRICATIVE_CAL_DB"]
-    here = os.path.dirname(os.path.abspath(__file__))
-    prof = VoiceProfile.load(os.path.join(here, "..", "profiles", "me.json"))
 
     def W(name, score, rms=0.05):
         y = render({"seed": 5, "smooth_frames": 2, **score}, prof, cfg)

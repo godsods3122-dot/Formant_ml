@@ -22,6 +22,8 @@ Titze 의 발성 역치압 이론을 저차원으로 요약한 것이다(정량�
 """
 from __future__ import annotations
 
+import math
+
 import torch
 
 from .utils import ramp
@@ -124,7 +126,7 @@ def phonation_threshold(adduction: torch.Tensor) -> torch.Tensor:
 #: 3.0 주기에서 24 % 가 나온다. 주기별로도 7·9·11·15·19·24 로 자란다
 #: (실측 27·25·19·11·16·16 — 값이 흔들리지만 같은 대역이다).
 #: 2.5 로 내리면 38 %, 4.0 으로 올리면 18 % 다.
-ONSET_CYCLES = 3.0
+ONSET_CYCLES = 6.0
 
 
 #: 진동이 자라기 시작하는 씨앗 진폭 (목표 대비). 성대는 완전한 정지에서 켜지지
@@ -148,15 +150,27 @@ def oscillation_buildup(amp: torch.Tensor, f0: torch.Tensor, frame_rate: float,
     1 차 지연은 첫 주기부터 곧장 오른다. 그 급개시가 경성 개시(hard attack)로
     들린다.
 
-        dA/dt = σ·A·(1 − A/A_target),   σ = f0 / cycles
+        dA/dt = σ·A·(1 − A/A_target)
 
     포화항 (1−A/A_target) 이 있어야 목표에서 멈춘다(순수 지수는 발산한다).
-    `cycles` 는 e 배로 자라는 데 걸리는 주기 수다 — 초가 아니라 주기로 잡는 건
-    높은 목소리가 같은 시간에 더 많이 떨어 더 빨리 자리 잡기 때문이다.
+
+    **`cycles` 는 "씨앗에서 95 % 까지 걸리는 총 주기 수"다** — e 배 시간이 아니다.
+    문헌이 보고하는 값(발성 개시 3~5 주기)이 그 총량이고, 실측 녹음도 저역
+    포락선이 150 -> 180 ms 에 -40 -> -3 dB 로 오른다(30 ms = 125 Hz 에서 3.7 주기).
+
+    예전엔 σ = f0/cycles 로 두어 cycles 를 **e 배 시간**으로 해석했다. 씨앗이
+    2 % 라 95 % 까지 ln(49/0.0526)=6.83 배의 e 배 시간이 필요해서, cycles=3 이
+    실제로는 **20 주기(150 ms)** 였다. 측정: 구동압과 내전이 210 ms 에 이미 1.0
+    인데 harmonic_amp 는 430 ms 까지 계속 자랐다 — 목소리가 '켜지는' 게 아니라
+    '부풀어 오르는' 소리다. 사용자가 "목소리의 페이드" 라고 한 그 문제다.
+
+    그래서 σ 를 씨앗과 함께 푼다:  σ = f0 · ln((1/seed−1)/(1/0.95−1)) / cycles.
     """
     dt = 1.0 / max(frame_rate, 1e-6)
     cyc = ONSET_CYCLES if cycles is None else cycles
-    sigma = f0.clamp_min(20.0) / max(cyc, 1e-3)          # [1/s]
+    sd = min(max(float(seed), 1e-4), 0.5)
+    span = math.log((1.0 / sd - 1.0) / (1.0 / 0.95 - 1.0))   # 씨앗 -> 95 %
+    sigma = f0.clamp_min(20.0) * span / max(cyc, 1e-3)       # [1/s]
     out = torch.zeros_like(amp)
     prev = torch.zeros_like(amp[:, :1, :])
     started = torch.zeros_like(prev, dtype=torch.bool)
@@ -165,7 +179,11 @@ def oscillation_buildup(amp: torch.Tensor, f0: torch.Tensor, frame_rate: float,
         # 목표가 처음 살아나는 순간 씨앗을 심는다.
         fresh = (~started) & (tgt > 0)
         prev = torch.where(fresh, tgt * seed, prev)
-        started = started | fresh
+        # 목표가 0 으로 돌아가면 **기동 상태도 풀린다**. 안 풀면 한 번 떨었던
+        # 성대가 다시는 못 떤다: /s/ 앞의 준비 자세에서 목표가 잠깐 살아났다가
+        # 꺼지면 씨앗이 이미 심긴 것으로 남아, 뒤따르는 모음이 통째로 무음이
+        # 됐다(측정: 음절 전체가 harmonic_amp 0).
+        started = (started | fresh) & (tgt > 0)
         grow = sigma[:, i:i + 1, :] * prev * (1.0 - prev / tgt.clamp_min(1e-9))
         prev = (prev + dt * grow).clamp_min(0.0)
         # 목표가 내려가면(발성 종료) 따라 내려간다.

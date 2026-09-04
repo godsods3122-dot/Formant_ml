@@ -9,10 +9,99 @@ JSON 한 장이 곧 목소리다.
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass, field
+import math
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any
 
 import torch
+
+
+#: 성도의 극 간격 상한 [Hz]. 길이 L 의 균일관은 c/(2L) 마다 극을 하나 가진다
+#: (c=35000 cm/s, L=17.5 cm -> 1000 Hz). 면적함수가 어떻게 생겼든 이 **밀도**는
+#: 변하지 않는다 — 면적이 바꾸는 건 극이 어디로 밀리느냐이지 몇 개냐가 아니다.
+POLE_SPACING_HZ = 1000.0
+
+#: 이 주파수 **위에서만** 구멍을 메운다.
+#:
+#: 아래쪽에서는 큰 간격이 진짜다. /아/ 의 F2-F3 는 1292 -> 2604 Hz 로 1.3 kHz
+#: 떨어져 있는데, 그건 추출기가 놓친 게 아니라 면적함수가 실제로 극을 그렇게
+#: 벌려 놓은 것이다. 거기에 극을 끼우면 없는 봉우리가 생긴다 — 실제로 해 봤더니
+#: 1948 / 3381 Hz 에 극이 끼어 F3 주변 이득이 9 dB 올라갔고, 모음 2.5~4 kHz 가
+#: 실측 대비 +34 dB 가 됐다(원래 +18 dB 였다).
+#:
+#: 균일관 논리가 통하는 건 면적함수의 영향이 씻겨 나가는 **고역**이다. 5 kHz
+#: 위에서 c/(2L) 보다 넓은 간격은 LPC 봉우리 집기가 두 극을 하나로 합친 자국이다.
+POLE_FILL_ABOVE_HZ = 5000.0
+
+
+def _bw_trend(freqs: list, bws: list):
+    """측정된 (F, B) 쌍에서 이 화자의 손실 추세를 뽑아 임의의 F 에 B 를 준다.
+
+    log B 를 log F 에 대해 선형 보간/외삽한다. 이 화자의 실측은
+    B/F 가 0.084 -> 0.234 로 F 와 함께 **자라므로**(벽·점성·복사 손실이 고역
+    에서 커진다) 마지막 값을 반복하면 고역 극이 지나치게 날카로워진다.
+    """
+    if not freqs or not bws:
+        return lambda f: max(60.0, 0.08 * f)
+    lf = [math.log(max(v, 1.0)) for v in freqs[:len(bws)]]
+    lb = [math.log(max(v, 1.0)) for v in bws[:len(freqs)]]
+    if len(lf) < 2:
+        return lambda f: math.exp(lb[0])
+
+    def bw(f: float) -> float:
+        x = math.log(max(f, 1.0))
+        if x <= lf[0]:
+            i = 0
+        elif x >= lf[-1]:
+            i = len(lf) - 2
+        else:
+            i = max(j for j in range(len(lf) - 1) if lf[j] <= x)
+        w = (x - lf[i]) / max(lf[i + 1] - lf[i], 1e-6)
+        return math.exp(lb[i] + w * (lb[i + 1] - lb[i]))
+    return bw
+
+
+def fill_pole_gaps(freqs: list, bws: list, gains: list,
+                   max_gap: float = POLE_SPACING_HZ,
+                   above_hz: float = POLE_FILL_ABOVE_HZ) -> tuple:
+    """포먼트 목록의 **빈 구멍**에 극을 끼워 넣는다. (freqs, bws, gains) 정렬 유지.
+
+    **왜 필요한가.** 포먼트 추출기는 봉우리를 집는 도구라 두 극이 가까우면
+    하나를 놓친다. 이 화자의 프로파일은 5420 Hz 다음이 8129 Hz 다 — 2.7 옥타브
+    가 아니라 2.7 kHz 짜리 구멍인데, 균일관 논리로는 그 사이에 극이 둘 있어야
+    한다. 캐스케이드 합성에서 그 구멍은 그냥 조용한 게 아니라 **절벽**이다:
+    아래쪽 6 개 극이 각각 -12 dB/oct 로 떨어지는데 막아 줄 극이 없어서
+    5.4 -> 8.1 kHz 사이에서 40 dB 가 사라진다.
+
+    측정(모음 /아/, 실측 대비): 6~9 kHz -12.9 dB, 9~13 kHz -37.8 dB.
+    스펙트럼을 겹쳐 보면 합성음이 6 kHz 위로 **죽어 있다**. 실측 목소리는
+    20 kHz 까지 -80 dB 언저리의 잡음 바닥을 유지한다. 그 차이가 "사각파처럼
+    들린다" 는 지적의 절반이다(나머지 절반은 하모닉 사이 잡음 바닥이다).
+
+    끼워 넣는 극의 대역폭은 이 화자의 실측 손실 추세에서 뽑고(`_bw_trend`),
+    게인은 이웃의 기하평균으로 둔다 — 새 봉우리를 만들자는 게 아니라
+    **바닥을 이어 주자는** 것이다.
+    """
+    if len(freqs) < 2:
+        return list(freqs), list(bws), list(gains)
+    bw = _bw_trend(list(freqs), list(bws))
+    g = list(gains) or [1.0] * len(freqs)
+    while len(g) < len(freqs):
+        g.append(g[-1] if g else 1.0)
+    of, ob, og = [freqs[0]], [bws[0] if bws else bw(freqs[0])], [g[0]]
+    for i in range(1, len(freqs)):
+        f0, f1 = freqs[i - 1], freqs[i]
+        n_ins = (int(math.floor((f1 - f0) / max(max_gap, 1.0)))
+                 if f0 >= above_hz else 0)
+        for k in range(1, n_ins + 1):
+            f = f0 + (f1 - f0) * k / (n_ins + 1)
+            of.append(f)
+            ob.append(bw(f))
+            og.append(math.sqrt(max(g[i - 1], 1e-6) * max(g[i], 1e-6)))
+        of.append(f1)
+        ob.append(bws[i] if i < len(bws) else bw(f1))
+        og.append(g[i])
+    return of, ob, og
 
 
 def extend_formants(values, n: int, step: float = 1000.0,
@@ -101,12 +190,31 @@ class VoiceProfile:
     @staticmethod
     def load(path: str) -> "VoiceProfile":
         with open(path, encoding="utf-8") as f:
-            return VoiceProfile(**json.load(f))
+            prof = VoiceProfile(**json.load(f))
+        # 추출기가 놓친 극을 메운다(`fill_pole_gaps`). 측정 프로파일에만 건다 —
+        # 기본 프로파일의 포먼트는 이미 균일 간격이라 손댈 게 없다.
+        return prof.with_filled_poles()
 
     @staticmethod
     def from_dict(d: dict[str, Any]) -> "VoiceProfile":
         known = {k: v for k, v in d.items() if k in VoiceProfile.__annotations__}
         return VoiceProfile(**known)
+
+    def with_filled_poles(self, max_gap: float = POLE_SPACING_HZ,
+                          above_hz: float = POLE_FILL_ABOVE_HZ) -> "VoiceProfile":
+        """포먼트 구멍을 메운 사본. 주파수·대역폭·게인·모음별 목록을 함께 옮긴다."""
+        if not self.formants:
+            return self
+        f, b, g = fill_pole_gaps(list(self.formants), list(self.bandwidths),
+                                 list(self.formant_gain), max_gap, above_hz)
+        vf = {}
+        for name, vals in (self.vowel_formants or {}).items():
+            nf, _, _ = fill_pole_gaps(list(vals), list(self.bandwidths),
+                                      list(self.formant_gain), max_gap, above_hz)
+            # 대역폭 목록은 하나뿐이라 **길이가 어긋나면 안 된다**.
+            vf[name] = nf[:len(f)] if len(nf) >= len(f) else nf + f[len(nf):]
+        return replace(self, formants=f, bandwidths=b, formant_gain=g,
+                       vowel_formants=vf or self.vowel_formants)
 
     # -------------------------------------------------------------- 합성 보조
     def sibilant_params(self, shape, mix: float = 1.0, roughness: float | None = None,
