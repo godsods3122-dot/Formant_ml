@@ -321,6 +321,20 @@ def _envelope_cv(y):
     return float(e.std() / e.mean().clamp_min(1e-9))
 
 
+def _plateau(y, frac=0.30):
+    """포락선이 평탄한 가운데 구간만 잘라낸다.
+
+    질감(첨도·평탄도)을 재는 통계는 **포락선 모양에 오염된다**. 마찰음 페이드를
+    길이의 절반씩으로 늘리자 같은 잡음인데 첨도가 3.08 -> 5.79 로 뛰었는데,
+    이건 잡음이 거칠어진 게 아니다: 순수 가우시안 잡음에 같은 삼각 포락선을
+    씌워도 첨도가 3.01 -> 5.39 가 된다. 진폭이 오르내리는 것 자체가 두꺼운
+    꼬리로 잡힌다. 질감은 포락선이 평탄한 데서 재야 잡음만 본다.
+    """
+    x = y.reshape(-1)
+    c, h = x.shape[0] // 2, int(x.shape[0] * frac / 2)
+    return x[c - h:c + h][None]
+
+
 def test_fricatives_are_as_smooth_as_pink_noise():
     """치찰음/속삭임이 지글거리면 안 된다.
 
@@ -342,7 +356,7 @@ def test_fricatives_are_as_smooth_as_pink_noise():
                [{"type": "fricative", "phone": "sh", "dur": 2.0}],
                [{"type": "whisper", "dur": 2.0}],
                [{"type": "whisper", "vowel": "i", "dur": 2.0}]):
-        y = render({"timeline": tl, "seed": 1}, PROF, CFG)
+        y = _plateau(render({"timeline": tl, "seed": 1}, PROF, CFG))
         k, cv = _kurtosis(y), _envelope_cv(y)
         assert k < k_ref + 0.4, f"{tl[0]['type']} 첨도 {k:.2f} (핑크 {k_ref:.2f})"
         assert cv < cv_ref * 2.0, f"{tl[0]['type']} 포락선 CV {cv:.3f} (핑크 {cv_ref:.3f})"
@@ -392,8 +406,8 @@ def test_fricative_spectrum_is_not_tonal():
     (측정으로 확인). 순전히 스펙트럼이 뾰족해서 생기므로 감쇠로만 고칠 수 있다.
     사람의 /s/ 는 4~10 kHz 의 넓은 고원이고 1~11 kHz 평탄도가 대략 0.2~0.4 다.
     """
-    y = render({"timeline": [{"type": "fricative", "phone": "s", "dur": 2.0}],
-                "seed": 1}, PROF, CFG)
+    y = _plateau(render({"timeline": [{"type": "fricative", "phone": "s",
+                                       "dur": 2.0}], "seed": 1}, PROF, CFG))
     # 판단 기준은 평탄도가 아니라 **봉우리의 좁기**다. 마찰음 스펙트럼은 원래
     # 삼각형이라 평탄하지 않다(사람도 그렇다). 음조는 봉우리가 *좁을* 때 들린다.
     width = _peak_width_octaves(y)
@@ -531,8 +545,9 @@ def test_roughness_knob_never_sizzles():
     """
     prev = 0.0
     for r in (0.0, 0.3, 0.6, 1.0):
-        y = render({"timeline": [{"type": "fricative", "phone": "s", "dur": 2.0,
-                                  "noise_rough": r}], "seed": 1}, PROF, CFG)
+        y = _plateau(render({"timeline": [{"type": "fricative", "phone": "s",
+                                           "dur": 2.0, "noise_rough": r}],
+                             "seed": 1}, PROF, CFG))
         k = _kurtosis(y)
         assert k < 4.6, f"noise_rough={r} 에서 첨도 {k:.2f}"
         assert k >= prev - 0.15, "거칠기를 올렸는데 오히려 매끄러워졌다"
@@ -780,9 +795,20 @@ def test_fricative_level_matches_profile():
     실측(한국어 "스"): 모음이 5.4 dB 크다. 이걸 안 맞추면 치찰음만 튀어나온다.
     합성 경로를 바꾸면 score.FRICATIVE_CAL_DB 를 다시 재야 하는데, 이 테스트가
     그 드리프트를 잡는다.
+
+    레벨은 **고원부**(가운데 10%)에서 잰다. 전체 RMS 로 재면 페이드 길이가
+    레벨에 섞인다 - 페이드를 길이의 절반씩으로 늘렸더니 게인은 그대로인데
+    RMS 가 3.7 dB 떨어졌다. 그러면 이 테스트가 "레벨이 틀렸다" 고 말하지만
+    실제로 틀린 건 아무것도 없다. 음량과 포락선 모양은 분리해서 재야 한다.
     """
     def level(a):
         return 20 * math.log10(float(a.pow(2).mean().sqrt()) + 1e-12)
+
+    def plateau(a):
+        """포락선이 1.0 인 가운데 10% 만 잘라낸다(페이드 구간을 뺀다)."""
+        y = a.reshape(-1)
+        c, h = y.shape[0] // 2, int(y.shape[0] * 0.05)
+        return y[c - h:c + h]
 
     v = render({"timeline": [{"type": "vowel", "vowel": "eu", "dur": 1.0}],
                 "seed": 1}, PROF, CFG)
@@ -791,8 +817,8 @@ def test_fricative_level_matches_profile():
         pr.fricative_level_db = want
         f = render({"timeline": [{"type": "fricative", "phone": "s", "dur": 1.0}],
                     "seed": 1}, pr, CFG)
-        assert abs((level(v) - level(f)) - (-want)) < 1.0, \
-            f"목표 {-want:+.1f} dB, 실제 {level(v) - level(f):+.1f} dB"
+        got = level(plateau(v)) - level(plateau(f))
+        assert abs(got - (-want)) < 1.0, f"목표 {-want:+.1f} dB, 실제 {got:+.1f} dB"
 
 
 def test_source_tilt_does_not_blow_up_the_level():

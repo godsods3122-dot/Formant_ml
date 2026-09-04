@@ -47,14 +47,24 @@ def _smoothstep(u: torch.Tensor) -> torch.Tensor:
     return 0.5 - 0.5 * torch.cos(torch.pi * u.clamp(0.0, 1.0))
 
 
-def frication_flow(t: int, frame_rate: float, fade_in: float = 0.03,
-                   fade_out: float = 0.04, plateau: float = 1.0,
+#: fade_in/fade_out 을 안 주면 이 **비율**로 정한다(각각 전체 길이의 45%).
+#: 절대 초로 두면 소리가 길어질수록 페이드가 상대적으로 짧아져 사라진다 —
+#: 30/40 ms 기본값은 400 ms 짜리 /s/ 에서 92% 가 평탄한 고원이 되어, 파라미터를
+#: 아무리 만져도 페이드가 있는 줄 모른다. 사람이 내는 독립 마찰음은 거의 절반이
+#: 페이드 인, 절반이 페이드 아웃이다(혀가 다가갔다 물러나는 시간 그 자체).
+FRICATION_FADE_FRAC = 0.45
+
+
+def frication_flow(t: int, frame_rate: float, fade_in: float | None = None,
+                   fade_out: float | None = None, plateau: float = 1.0,
                    floor: float = 0.0, shape=None,
+                   fade_frac: float = FRICATION_FADE_FRAC,
                    device=None, dtype=torch.float32) -> torch.Tensor:
     """협착부 부피속도 U 의 시간 포락선 (1, T, 1), 0~1.
 
     협착이 형성되며 기류가 붙고(fade_in), 해제되며 빠지는(fade_out) 과정을
     raised-cosine 로 근사한다. `fade_in`/`fade_out` 은 **초 단위** 상승/하강 시간.
+    둘 중 `None` 인 쪽은 `fade_frac * 길이` 로 정한다(길이에 비례).
     마찰음이 짧아 두 페이드가 겹치면 비례해서 줄인다.
 
     `shape=[(위치0~1, 값), ...]` 를 주면 그 곡선을 그대로 유량 포락선으로 쓴다
@@ -66,7 +76,9 @@ def frication_flow(t: int, frame_rate: float, fade_in: float = 0.03,
         return ramp(t, [(float(p), float(v)) for p, v in shape], device=device)
     x = torch.arange(t, device=device, dtype=dtype) / max(frame_rate, 1e-6)  # 초
     dur = max((t - 1) / max(frame_rate, 1e-6), 1e-6)
-    fi, fo = max(float(fade_in), 0.0), max(float(fade_out), 0.0)
+    ff = max(float(fade_frac), 0.0) * dur
+    fi = ff if fade_in is None else max(float(fade_in), 0.0)
+    fo = ff if fade_out is None else max(float(fade_out), 0.0)
     if fi + fo > dur:                       # 짧은 마찰음: 페이드가 안 들어가면 축소
         s = dur / (fi + fo)
         fi, fo = fi * s, fo * s

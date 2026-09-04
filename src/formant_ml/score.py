@@ -107,10 +107,20 @@ def curve(spec, t: int) -> torch.Tensor:
     return ramp(t, list(zip(pos, vals)))
 
 
-#: 마찰음 노이즈 게인 1.0 일 때 측정된 "모음 - 마찰음" RMS 차 [dB].
+#: 마찰음 노이즈 게인 1.0 일 때 측정된 "모음 - 마찰음" 레벨차 [dB].
 #: 합성 경로(소스 스펙트럼 사전, 치찰음 필터, 성도)가 바뀌면 이 값도 다시 재야 한다.
 #: tests/test_voice.py::test_fricative_level_matches_profile 가 드리프트를 잡는다.
-FRICATIVE_CAL_DB = -18.5   # 앞니 다이폴 도입으로 재측정(고역이 크게 살아남)
+#:
+#: **고원부**(포락선이 1.0 인 구간)에서 잰다. 전체 RMS 로 재면 페이드 길이가
+#: 레벨에 섞여 들어간다 - 페이드를 절반씩으로 늘리자 같은 게인인데 RMS 가
+#: 3.7 dB 떨어졌다. 그러면 페이드를 만질 때마다 음량이 따라 움직이고, 음량을
+#: 맞추려고 게인을 올리면 페이드가 도로 얕아진다. 둘은 분리되어야 한다.
+FRICATIVE_CAL_DB = -19.2
+
+#: 음절 안의 마찰음은 위 상수 대신 **같은 음절의 유성 최대 진폭**으로 기준화한다
+#: (아래 참조). 그 기준이 독립 마찰음 경로와 어긋난 만큼을 여기서 되돌린다.
+#: 측정: 프로파일이 -11.0 dB 를 요청했을 때 음절은 +7.8 dB 를 냈다 -> 3.2 dB 크다.
+SYLLABLE_FRICATIVE_CAL_DB = 3.2
 
 
 def fricative_gain(prof: VoiceProfile) -> float:
@@ -295,18 +305,34 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
                 # 서서히 내린다. 그래서 독립 마찰음은 거의 절반이 페이드 인,
                 # 절반이 페이드 아웃이다. 압력이 낮은 동안은 레이놀즈 게이트가
                 # 난류를 아예 안 켜므로, 이 램프가 그대로 부드러운 페이드가 된다.
-                # 압력은 손으로 그린 램프가 아니라 호흡 제스처에서 나온다
-                # (aeroacoustic.breath_drive). 협착은 고정이고 페이드 인/아웃이
-                # 전부 압력에서 나오므로, 무게중심도 함께 오르내린다(Stevens).
-                _d = aero_drive(dict(seg), t, a.frame_rate)
+                seg_f = dict(seg)
+                # 독립 마찰음에는 **해제가 없다**. constriction_area 의 기본값은
+                # "좁게 유지하다 60 ms 만에 모음 면적으로 확 연다" 인데, 그건
+                # 자음이 모음으로 넘어가는 해제 동작이다. 뒤에 모음이 없으면
+                # 혀는 그 자세를 유지할 뿐이다. 그대로 두면 압력을 아무리 만져도
+                # 같은 자리에서 끊긴다: 면적이 0.1 -> 3.0 으로 30 배 열리면
+                # 유속이 30 배 떨어져 30 ms 만에 -44 dB 절벽이 된다(측정).
+                #
+                # 그래서 협착을 **고정**한다. 페이드 인/아웃은 전부 호흡 구동압이
+                # 만든다(aero_drive 의 breath_drive). 그래야 무게중심도 진폭과
+                # 함께 오르내린다(Stevens 1971) — 실측 7350->9008->7194 Hz 를
+                # 협착을 손대지 않고 재현한다. 면적으로 페이드를 만들면 무게중심이
+                # 반대로 움직여(협착이 열리면 유속이 떨어진다) 실측과 어긋난다.
+                seg_f.setdefault("constriction_area", [[0.0, 0.10], [1.0, 0.10]])
+                _d = aero_drive(seg_f, t, a.frame_rate)
                 aero_env, aero_cent = _d["env"], _d["cent"]
                 env = aero_env
             else:
-                # 단순 경로: 유량 포락선을 직접 준다(페이드 인/아웃, 초).
+                # 단순 경로: 유량 포락선을 직접 준다.
+                # 기본값을 **초로 박지 않는다**. 30/40 ms 로 두었더니 400 ms 짜리
+                # /s/ 가 92% 평탄한 고원이 되어, 페이드 파라미터를 아무리 만져도
+                # 소리에 반영이 안 됐다. 안 주면 길이의 45% 씩(=거의 절반이
+                # 페이드 인, 절반이 페이드 아웃) 잡는다 - aero.FRICATION_FADE_FRAC.
+                fi, fo = seg.get("fade_in"), seg.get("fade_out")
                 flow = aero.frication_flow(
                     t, a.frame_rate,
-                    fade_in=float(seg.get("fade_in", 0.03)),
-                    fade_out=float(seg.get("fade_out", 0.04)),
+                    fade_in=None if fi is None else float(fi),
+                    fade_out=None if fo is None else float(fo),
                     shape=seg.get("flow"))
                 env = aero.flow_to_noise_amp(
                     flow, float(seg.get("flow_exp", aero.FRICATION_FLOW_EXPONENT)))
@@ -383,7 +409,12 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
             # 전역 상수로 맞추면, 공기역학 모형이 내는 모음 세기(압력·Rd 에 따라
             # 달라진다)와 어긋나 음절마다 비율이 흔들린다(실측: 목표 +9.7 dB 인데
             # -6.2 dB 가 나왔다).
-            nb = nb * float(c["harmonic_amp"].max().clamp_min(1e-3))
+            # 그런데 그 기준화가 **독립 마찰음 경로와 어긋나 있었다**. 유성 최대
+            # 진폭으로 재기준화하면 FRICATIVE_CAL_DB(독립 마찰음에서 잰 값)가 그대로
+            # 안 맞는다 - 프로파일이 -11.0 dB 를 요청해도 음절에서는 +7.8 dB 만
+            # 나왔다(3.2 dB 크다). 기울기는 1:1 로 맞으니 상수 오프셋이다.
+            nb = nb * float(c["harmonic_amp"].max().clamp_min(1e-3)) \
+                * (10.0 ** (-SYLLABLE_FRICATIVE_CAL_DB / 20.0))
             if drive is not None:
                 # 위에서 이미 같은 면적 궤적으로 계산했다(유량·압력·난류가 한
                 # 구동에서 나온다). 협착이 열리며 레이놀즈수가 임계 아래로 떨어져
@@ -408,8 +439,14 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
                 env = ramp(t, [(0.0, 1.0), (split, 1.0), (split + 0.1, 0.02),
                                (1.0, 0.01)])
                 # 협착 형성 구간의 유량 fade-in 을 곱한다(fade-out 은 위 게이트가 담당).
+                # 페이드 인은 **/s/ 구간 길이에 비례**한다. 25 ms 로 박아 두면
+                # /s/ 가 길어질수록 상대적으로 짧아져 페이드가 안 들린다.
+                # 음절의 /s/ 는 0 ~ split 구간이므로 그 길이를 기준으로 잡는다.
+                s_dur = split * (t - 1) / max(a.frame_rate, 1e-6)     # /s/ 길이 [s]
                 fin = aero.frication_flow(
-                    t, a.frame_rate, fade_in=float(seg.get("fade_in", 0.025)),
+                    t, a.frame_rate,
+                    fade_in=float(seg.get(
+                        "fade_in", aero.FRICATION_FADE_FRAC * s_dur)),
                     fade_out=0.0, shape=seg.get("flow"))
                 env = env * aero.flow_to_noise_amp(
                     fin, float(seg.get("flow_exp", aero.FRICATION_FLOW_EXPONENT)))
