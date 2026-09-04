@@ -425,6 +425,96 @@ def oral_cavity(ps: torch.Tensor, glottal_area: torch.Tensor,
     return pm, ac_ * (2.0 * pm.clamp_min(0.0) / RHO).sqrt()
 
 
+#: 성문의 두께 [cm]. 성문 관성 M_g = ρ·Lg/Ag 에 쓴다.
+GLOTTAL_LEN = 0.3
+
+#: `oral_cavity_reactive` 의 프레임당 적분 부분단계 수. 헬름홀츠 주기(협착
+#: 0.10 cm² 에서 4.4 ms)보다 훨씬 잘게 쪼개야 한다. 100 Hz 프레임에서 50 이면
+#: 0.2 ms — 주기의 1/22 라 안정하다.
+CAVITY_SUBSTEPS = 50
+
+
+def oral_cavity_reactive(ps: torch.Tensor, glottal_area: torch.Tensor,
+                         oral_area: torch.Tensor, frame_rate: float,
+                         volume: float = ORAL_VOLUME,
+                         l_c: float = CONSTRICTION_LEN,
+                         l_g: float = GLOTTAL_LEN,
+                         substeps: int = CAVITY_SUBSTEPS) -> tuple:
+    """**관성(리액턴스)까지 넣은** 구강 공동. 반환 (pm, u_c, u_g).
+
+    `oral_cavity` 는 공동을 순수 **컴플라이언스**로만 보고 협착을 저항성 오리피스로
+    뒀다 — 1 차 RC 다. 거기엔 **음향 질량이 어디에도 없다.** 그래서 유량이 압력의
+    순간값만으로 정해지고(기억이 없다), 진폭이 Ps 의 단조함수가 된다. 그 상태로는
+    압력 아치를 완벽히 대칭으로 줘도 가청 포락선의 정점이 49.5 % 에 머문다 —
+    "정점을 옮기려면 호흡 구동 자체가 비대칭이어야 한다" 는 결론이 거기서 나왔다.
+    **그건 모형에 관성이 없어서 생긴 결론이다.**
+
+    좁은 틈으로 공기를 밀어 넣으려면 그 안의 공기 기둥을 **가속**해야 한다:
+
+        M_c = ρ·Lc/Ac   (협착의 음향 질량. Ac=0.10 cm², Lc=1 cm 면 0.0114 g/cm⁴)
+        M_g = ρ·Lg/Ag   (성문도 같다)
+
+    이 질량이 유량의 **변화율**에 저항하므로 유량이 압력을 따라가지 못하고 뒤진다.
+    게다가 그 지연이 **유량에 의존한다** — 선형화 저항이 R = ρU/Ac² 라
+
+        τ = M_c/R = Lc·Ac/U
+
+    U=5 cm³/s 에서 20 ms, U=200 에서 0.5 ms. **개시에는 느리고 세지면 빨라진다.**
+    이 비대칭은 호흡 제스처가 아니라 공기의 관성에서 나온다.
+
+    그리고 사용자가 지적한 케이스가 여기서 저절로 나온다: 성문으로 들어온 기류가
+    **협착을 통과해 마찰음이 되는 대신 공동을 부풀려 Pm 을 올린다**. 관성이 없는
+    모형에서는 U_g 와 U_c 가 항상 같아서(직렬 정상류) 이 구간이 존재할 수 없었다.
+    여기서는 셋을 따로 적분한다:
+
+        dU_g/dt = (Ps − Pm − ½ρ·U_g|U_g|/Ag²) / M_g
+        dU_c/dt = (Pm      − ½ρ·U_c|U_c|/Ac²) / M_c
+        dPm/dt  = (U_g − U_c) / C ,        C = V/(ρc²)
+
+    U_g > U_c 인 동안 그 차이가 그대로 공동을 충전한다. 정상상태에서는 U_g = U_c
+    가 되어 `series_flow` 와 일치한다 — 즉 기존 모형은 이 모형의 준정상 극한이다.
+
+    적분은 프레임 안에서 영차 유지(zero-order hold) 로 `substeps` 번 전진한다.
+    헬름홀츠 공진(협착 0.10 cm² 에서 227 Hz)을 풀어야 하므로 프레임률로는 못 푼다.
+    """
+    ag = glottal_area.clamp_min(1e-4)
+    ac_ = oral_area.clamp_min(1e-4)
+    cap = volume / (RHO * SOUND_SPEED ** 2)          # 음향 컴플라이언스 C
+
+    # 부분단계 수는 **협착이 가장 열렸을 때**로 정한다. 헬름홀츠 각진동수
+    #   ω = 1/sqrt(M_c·C) = c·sqrt(Ac/(V·Lc))
+    # 는 Ac 가 **클수록** 높다(협착 0.10 cm² 227 Hz, 모음 3 cm² 1246 Hz).
+    # 좁은 협착 기준으로 잡으면 해제 순간에 발산한다(실제로 NaN 이 났다).
+    # 심플렉틱(반음적) 오일러는 dt·ω < 2 에서 안정하므로 여유 있게 dt·ω <= 0.5.
+    w_max = float(SOUND_SPEED * (ac_.amax() / (volume * l_c)).sqrt())
+    need = int(math.ceil(w_max / (0.5 * max(frame_rate, 1e-6))))
+    substeps = max(int(substeps), need)
+    dt = 1.0 / (max(frame_rate, 1e-6) * substeps)
+
+    t = ps.shape[1]
+    pm_o = torch.zeros_like(ps)
+    uc_o = torch.zeros_like(ps)
+    ug_o = torch.zeros_like(ps)
+    z = torch.zeros_like(ps[:, :1, :])
+    pm, u_c, u_g = z, z, z
+    for i in range(t):
+        p_i, ag_i, ac_i = ps[:, i:i + 1], ag[:, i:i + 1], ac_[:, i:i + 1]
+        m_g = RHO * l_g / ag_i
+        m_c = RHO * l_c / ac_i
+        for _ in range(substeps):
+            # **심플렉틱(반음적) 오일러**: 유량을 현재 Pm 으로 먼저 전진시키고,
+            # Pm 은 **갱신된** 유량으로 전진시킨다. 전진 오일러는 이 LC 계에서
+            # 에너지를 키워 해제 구간(고주파 헬름홀츠)에서 발산한다.
+            # 저항 항은 **부호를 살린다**(역류도 표현된다).
+            r_g = 0.5 * RHO * u_g.abs() * u_g / ag_i ** 2
+            r_c = 0.5 * RHO * u_c.abs() * u_c / ac_i ** 2
+            u_g = u_g + dt * (p_i - pm - r_g) / m_g
+            u_c = u_c + dt * (pm - r_c) / m_c
+            pm = pm + dt * (u_g - u_c) / cap
+        pm_o[:, i:i + 1], uc_o[:, i:i + 1], ug_o[:, i:i + 1] = pm, u_c, u_g
+    return pm_o, uc_o, ug_o
+
+
 # --- 호흡 구동압: /s/ 의 페이드 인/아웃이 여기서 나온다 -----------------------
 # 실측(업로드 녹음 4 토큰, 4 kHz 이상 대역 포락선):
 #

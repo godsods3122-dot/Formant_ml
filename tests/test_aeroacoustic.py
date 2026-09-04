@@ -98,6 +98,44 @@ def test_centroid_descends_from_constriction_area_alone():
     assert c[0] - c[-1] > 150, f"무게중심이 안 내려간다: {c[0]:.0f}->{c[-1]:.0f}"
 
 
+def test_reactive_cavity_matches_quasistatic_and_is_stable():
+    """관성(리액턴스)을 넣은 구강 공동은 준정상 모형의 **상위 집합**이다.
+
+    두 가지를 고정한다.
+
+    1. **정상상태 일치.** 유량이 정착하면 U_g = U_c = `series_flow`, Pm/Ps = 0.59
+       (문헌 60~70 %). 즉 기존 `oral_cavity` 는 이 모형의 준정상 극한이다.
+       이게 깨지면 둘 중 하나가 틀린 것이다.
+    2. **해제에서 발산하지 않는다.** 헬름홀츠 각진동수는 협착이 **열릴수록**
+       높다(0.10 cm² 227 Hz -> 3 cm² 1246 Hz). 좁은 협착 기준으로 부분단계를
+       잡고 전진 오일러를 쓰면 해제 순간 NaN 이 난다(실제로 났다). 그래서
+       심플렉틱 적분 + 최대 면적 기준 적응 부분단계를 쓴다.
+
+    왜 기본 경로에 안 쓰나: 프레임률(100 Hz)에서 **차이가 없기 때문이다**.
+    관성 시상수는 τ = Lc·Ac/U 로 0.5~20 ms 라 한 프레임 안에서 끝난다.
+    측정: 실제 음절 조건에서 U_g − U_c 의 최대가 유량의 0.03 % 였고 Pm/Ps 는
+    소수 셋째 자리까지 같았다. 계산량만 50~100 배다. 자세한 건 HANDOFF §5f.
+    """
+    T, fr = 40, 100.0
+    ps = torch.full((1, T, 1), 8000.0)
+    ag = torch.full((1, T, 1), 0.12)
+    # 앞부분은 좁은 협착, 뒤는 모음 면적으로 연다(발산 검사).
+    ac_t = ac.constriction_area(T, fr, a_closed=0.10, a_open=3.0,
+                                hold=0.5, release=0.05)
+    pm, u_c, u_g = ac.oral_cavity_reactive(ps, ag, ac_t, fr)
+    assert torch.isfinite(pm).all() and torch.isfinite(u_c).all(), "해제에서 발산했다"
+
+    # 좁은 협착 구간의 끝(정착 후)에서 준정상과 맞아야 한다.
+    i = int(0.5 * (T - 1)) - 1
+    u_ss = ac.series_flow(ps, ag, ac_t)[0, i, 0]
+    assert abs(float(u_c[0, i, 0] - u_ss)) / float(u_ss) < 0.02, \
+        f"정상상태 유량이 series_flow 와 다르다: {float(u_c[0,i,0]):.1f} vs {float(u_ss):.1f}"
+    assert abs(float(u_g[0, i, 0] - u_c[0, i, 0])) / float(u_ss) < 0.02, \
+        "정상상태에서 성문유량과 협착유량이 달라졌다(질량보존 위반)"
+    frac = float(pm[0, i, 0] / ps[0, i, 0])
+    assert 0.55 < frac < 0.65, f"구강내압 비율이 문헌 밖이다: {frac:.3f}"
+
+
 def test_body_cover_three_mass_self_oscillates():
     """Story & Titze(1995) body-cover 3질량이 자가진동한다."""
     flow, _ = simulate_body_cover(FoldParams(ps=8000.0, a01=0.02, a02=0.02),
