@@ -41,7 +41,7 @@ from formant_ml.voice import VoiceProfile
 #: 컸다. 실측은 그 구간 최대가 모음 정상부의 27 % 인데 83 % 가 나왔고, 포락선
 #: 으로 보면 **모음보다 큰 스파이크 버스트**였다(전이/모음 1.08, 실측 0.36).
 #: 그게 경성 개시로 들린다. 2.5 에서 25~27 % 로 맞는다.
-CAL_44K = {"BREATH_NOISE_GAIN": 16.0, "SYLLABLE_FRICATIVE_CAL_DB": 16.8}
+CAL_44K = {"BREATH_NOISE_GAIN": 16.0, "SYLLABLE_FRICATIVE_CAL_DB": 4.5}
 
 # 협착 궤적을 손으로 그리지 않는다. 예전엔 7 개 꺾은점으로 페이드를 만들었는데,
 # 그건 물리가 아니라 곡선 맞추기였고 호흡 압력과 서로 싸워서 정점이 가청 구간의

@@ -384,6 +384,48 @@ def test_transition_aspiration_is_not_louder_than_the_vowel():
         "실측 0.81~1.06")
 
 
+def test_high_band_fades_in_after_the_mid_band():
+    """치찰음의 **고역은 나중에 올라온다** (앞니 다이폴이 제트에 붙어 있어서).
+
+    Curle(1955)/Lighthill: 고체 경계가 있는 흐름의 **다이폴** 방사 파워는 U^6,
+    단극은 U^4 다. 우리가 쓰는 마찰음 진폭 ½ρv² 는 단극(파워 U^4)이므로 앞니
+    다이폴의 **상대** 세기는 U^(3-2) = U^1 이다. 폐압이 오르는 동안 제트가
+    빨라지면 다이폴이 단극보다 가파르게 커지고, 다이폴은 고역을 들어 올리는
+    성분이므로 그게 곧 고역의 페이드 인이다.
+
+    예전에는 `obstacle_strength` 가 **면적**에만 묶여 있었다. 지속 마찰음의
+    포락선은 이제 호흡압이 만들고 그동안 협착은 고원에 머물러 있으므로, 소스의
+    모양이 토큰 내내 고정돼 **대역들이 다 같이 올라왔다**.
+    측정(-6 dB 도달 시각의 대역 간 폭): 합성 90 ms, 실측 296~430 ms.
+
+    실측 긴 /s/ 두 토큰의 11~16 kHz - 2~4 kHz 지연: **127 / 296 ms**.
+    """
+    prof = _me_profile()
+    if prof is None:
+        return
+    from dataclasses import replace as _replace
+    cfg = _replace(CFG, audio=_replace(CFG.audio, sample_rate=44100,
+                                       hop_size=441, fmax=22050.0),
+                   filt=_replace(CFG.filt, n_formants=len(prof.formants) + 2))
+    fs = cfg.audio.sample_rate
+    seg = {"type": "fricative", "phone": "s", "dur": 2.7, "aero": True,
+           "drive": "tongue", "glottal_area": 0.12}
+    y = render({"timeline": [{"type": "silence", "dur": 0.08}, seg],
+                "seed": 5}, prof, cfg).reshape(-1)
+    win, hop = 2048, 512
+    f = torch.linspace(0, fs / 2, win // 2 + 1)
+    S = torch.stft(y, win, hop, window=torch.hann_window(win),
+                   return_complex=True).abs()
+
+    def onset_ms(lo, hi):
+        p = (S[(f > lo) & (f < hi)] ** 2).sum(0).sqrt()
+        j = (p > 0.5 * p.max()).nonzero().reshape(-1)      # -6 dB
+        return float(j[0]) * hop / fs * 1000.0
+    lag = onset_ms(11000, 16000) - onset_ms(2000, 4000)
+    assert lag > 80.0, (f"고역이 중역보다 {lag:.0f} ms 밖에 안 늦다 "
+                        "(실측 127 / 296 ms). 다이폴이 제트에 안 묶였다")
+
+
 def test_vowel_has_an_interharmonic_noise_floor():
     """모음의 하모닉 **사이**가 비어 있으면 안 된다 — 그게 "사각파" 다.
 

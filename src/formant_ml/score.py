@@ -116,7 +116,7 @@ def curve(spec, t: int) -> torch.Tensor:
 #: 레벨에 섞여 들어간다 - 페이드를 절반씩으로 늘리자 같은 게인인데 RMS 가
 #: 3.7 dB 떨어졌다. 그러면 페이드를 만질 때마다 음량이 따라 움직이고, 음량을
 #: 맞추려고 게인을 올리면 페이드가 도로 얕아진다. 둘은 분리되어야 한다.
-FRICATIVE_CAL_DB = -6.1
+FRICATIVE_CAL_DB = -16.8
 
 #: 음절 안의 마찰음은 위 상수 대신 **같은 음절의 유성 최대 진폭**으로 기준화한다
 #: (아래 참조). 그 기준이 독립 마찰음 경로와 어긋난 만큼을 여기서 되돌린다.
@@ -134,7 +134,7 @@ FRICATIVE_CAL_DB = -6.1
 #: 25.0 -> 17.0 재측정: 앞니 다이폴 기울기를 제트에 묶으면서(_dipole_jet_correction)
 #: 음절의 /s/ 스펙트럼이 재배분됐다. 모양만 바꾸도록 RMS 정규화를 했는데도
 #: 대역별 재배분이 성도·치찰음 필터를 거치며 레벨을 8 dB 옮긴다.
-SYLLABLE_FRICATIVE_CAL_DB = -2.9
+SYLLABLE_FRICATIVE_CAL_DB = -17.2
 
 
 def fricative_gain(prof: VoiceProfile) -> float:
@@ -154,17 +154,27 @@ _PS_CGS = 8000.0    # 보통 발화 성문하압 [dyn/cm^2] ≈ 8 cmH2O (pressur
 #: 만든다(Shadle 1985/1990). /f/ /θ/ /h/ 는 장애물이 없어 훨씬 약하고 평평하다.
 OBSTACLE_SIBILANTS = {"s", "ss", "z", "sh"}
 
+#: 앞니 다이폴의 기울기 [dB/oct]. 치찰음이 얼마나 **가벼운가**를 정한다.
+#:
+#: 10.0 -> 16.0. 긴 /s/ 의 중앙 무게중심이 8589 Hz 였는데 실측 두 토큰이
+#: 8770 / 9461 Hz 다 — 우리 치찰음이 낮고 둔탁했다. 16 에서 9084 로 그 사이에
+#: 들어온다(19 면 9562 로 넘어간다).
+DIPOLE_DB_PER_OCT = 16.0
+
 #: 성문 기식의 게인 보정. fricative_gain 은 앞니 다이폴(+약 16 dB)을 상쇄하려고
 #: 낮춰 잡혀 있는데, 성문에는 장애물이 없어 그 부스트를 안 받는다. 되돌리는 값.
 #:
-#: 6.3 -> 26.0. 마찰음과 목소리 **사이의 골**을 메우는 게 이 값이다. 실측 /사/ 의
+#: 6.3 -> 100.0. 마찰음과 목소리 **사이의 골**을 메우는 게 이 값이다. 실측 /사/ 의
 #: 4 kHz 이상 포락선은 마찰음 정점 대비 0.122~0.123 까지만 내려갔다가 발성과
 #: 함께 다시 오르는데, 6.3 에서는 0.082(24 kHz) / 0.041(44.1 kHz) 로 훨씬 깊었다.
+#: (26 -> 100 은 다이폴 기울기를 10 -> 16 dB/oct 로 올리면서 `fricative_gain` 의
+#:  다이폴 상쇄가 그만큼 커진 몫이다. 이 상수의 뜻이 바로 그 상쇄를 되돌리는
+#:  것이라 함께 움직인다 — HANDOFF §6.3 의 기준화 문제와 같은 뿌리다.)
 #: 그 골이 깊으면 마찰음이 끊겼다가 목소리가 새로 시작하는 것처럼 들린다.
 #: (예전에 2.5 까지 내렸던 건 목소리가 200 ms 에 걸쳐 부풀어 오르던 시절의
 #:  보정이다 — 그때는 전이 기식이 모음보다 커 보였다. 발성 기동을 고친 뒤
 #:  `aerodynamics.oscillation_buildup` 그 이유가 사라졌다.)
-ASPIRATION_GAIN = 26.0
+ASPIRATION_GAIN = 100.0
 
 
 def wants_aero(seg: dict) -> bool:
@@ -292,7 +302,7 @@ def aero_drive(seg: dict, t: int, frame_rate: float, glottal_area=None) -> dict:
     src_tilt = aac.source_tilt_shift(u, ac_area)
     # 앞니 다이폴의 **세기**는 제트가 정한다(주파수가 아니라). 협착이 목표
     # 자세에 못 미치면 제트가 느려 다이폴이 약해지고 앞공동 극이 드러난다.
-    teeth = aac.obstacle_strength(ac_area, glottal_area=ag_t)
+    teeth = aac.obstacle_strength(ac_area, glottal_area=ag_t, flow=u)
     return {"env": env, "cent": cent, "src_tilt": src_tilt, "teeth": teeth,
             "asp_share": asp_share,
             "asp": asp / asp.amax().clamp_min(1e-9),
@@ -442,7 +452,7 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
             # 공진기(좁은 봉우리)가 아니라 이 광대역 상승이라, 협착이 목표에
             # 못 미쳐 제트가 느릴 때 이것도 같이 약해져야 앞공동 극이 드러난다.
             # 시변 텐서로 주면 (1,T,NB) 가 되고, 상수면 예전대로 (NB,) 다.
-            _dpo = float(seg.get("dipole_db_oct", 10.0))
+            _dpo = float(seg.get("dipole_db_oct", DIPOLE_DB_PER_OCT))
             dip = aac.obstacle_dipole_bands(NB, a.sample_rate, _dpo)
             nb = nb * (dip if dip.dim() == 3 else dip.reshape(1, 1, -1))
         aero_env = aero_cent = aero_tilt = aero_teeth = None
@@ -499,7 +509,7 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
                 # 확 튀어나온다" 고 한 게 이것이다.
                 if phone in OBSTACLE_SIBILANTS and seg.get("obstacle_dipole", True):
                     nb = nb * _dipole_jet_correction(
-                        NB, a.sample_rate, float(seg.get("dipole_db_oct", 10.0)),
+                        NB, a.sample_rate, float(seg.get("dipole_db_oct", DIPOLE_DB_PER_OCT)),
                         aero_teeth)
             else:
                 # 단순 경로: 유량 포락선을 직접 준다.
@@ -815,7 +825,7 @@ def build_segment(seg: dict, prof: VoiceProfile, cfg: Config) -> dict:
                 # 그 전환이 전이에 레벨 점프를 만들어 연결이 끊겼다.
                 if phone in OBSTACLE_SIBILANTS and seg.get("obstacle_dipole", True):
                     nb = nb * _dipole_jet_correction(
-                        NB, a.sample_rate, float(seg.get("dipole_db_oct", 10.0)),
+                        NB, a.sample_rate, float(seg.get("dipole_db_oct", DIPOLE_DB_PER_OCT)),
                         aero_teeth)
                 c["noise_bands"] = (nb * env).contiguous()
                 c["noise_entry"] = torch.full((1, t, 1), float(K) + 6.0)

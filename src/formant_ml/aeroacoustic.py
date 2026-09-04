@@ -137,16 +137,38 @@ def area_centroid_scale(area: torch.Tensor, a_ref: torch.Tensor | float | None =
     return (a_ref / area.clamp_min(1e-6)).clamp(1e-3, 1.0) ** exp
 
 
-#: 제트 속도가 기준 자세의 이 비율까지 떨어지면 앞니 다이폴이 사실상 사라진다.
-#: Shadle(1985/1990) 의 장애물 소스는 제트가 앞니를 때려서 생기므로, 협착이 덜
-#: 극단적이어서 제트가 느리면 다이폴도 약해진다. 지수 2 는 다이폴 소스 세기가
-#: 속도의 거듭제곱으로 붙는다는 것(단극보다 가파르다)에서 온다.
-OBSTACLE_JET_EXP = 1.0
+#: 앞니 다이폴이 협착 **면적비**에 붙는 거듭제곱 (기하 효율).
+#:
+#: 속도 의존은 이제 `OBSTACLE_VEL_EXP` 가 따로 담당한다(Curle 의 U^6 법칙).
+#: 여기 남은 건 "협착이 넓으면 제트가 굵고 퍼져서 앞니라는 국소 장애물을 때리는
+#: 효율이 떨어진다" 는 **기하** 몫이고, 깔끔한 법칙이 없어 실측으로 맞춘다.
+#:
+#: 1.0 -> 2.5. 짧은 CV 의 '사' 는 뒤따르는 모음을 예기해 협착이 목표까지 못 가고
+#: (undershoot) 다이폴이 약해져 앞공동 극(5.3 kHz)이 드러나야 한다. 측정한
+#: 마찰음 무게중심(음절 / 긴 /s/ 중앙):
+#:     실측      6341, 5709 / 8770, 9461 Hz
+#:     지수 1.0  7592 / 9084   <- 음절이 1.3~1.9 kHz 높다(언더슈트 부족)
+#:     지수 2.0  6582 / 9348
+#:     **2.5**   6280 / 9338   <- 둘 다 실측 범위 안
+#:     지수 3.0  6071 / 9346
+OBSTACLE_JET_EXP = 2.5
+
+
+#: 앞니 다이폴이 제트 **속도**에 붙는 거듭제곱.
+#:
+#: Curle(1955)/Lighthill 의 공력음향: 고체 경계가 있는 흐름의 **다이폴** 방사
+#: 파워는 U^6, 경계가 없는 사중극(분포 난류)은 U^8, 단극은 U^4 다. 마찰음에서
+#: 우리가 이미 쓰는 진폭 ½ρv² 는 단극에 해당하고(파워 U^4), 앞니 다이폴은
+#: 파워 U^6 = 진폭 U^3 이므로, **다이폴의 상대 세기는 U^(3-2) = U^1** 이다.
+OBSTACLE_VEL_EXP = 1.0
 
 
 def obstacle_strength(area: torch.Tensor, a_ref: float | None = None,
                       glottal_area: torch.Tensor | float = 0.12,
-                      exp: float | None = None) -> torch.Tensor:
+                      exp: float | None = None,
+                      flow: torch.Tensor | None = None,
+                      v_ref: torch.Tensor | float | None = None,
+                      vel_exp: float | None = None) -> torch.Tensor:
     """앞니(장애물) 공진의 세기 0~1. 기준 자세에서 1.0.
 
     치찰음 지문은 **길게 끈 /s/** 에서 적합됐다. 거기서는 혀가 목표 자세
@@ -168,12 +190,28 @@ def obstacle_strength(area: torch.Tensor, a_ref: float | None = None,
     제트가 모서리에 부딪히는 구조다). 그래서 면적비로 잡는다:
 
         g = (a_ref / Ac)^exp,  단 1 을 넘지 않는다
+
+    **속도항은 따로 곱한다**(`flow` 를 주면). 위 경고는 "속도가 **면적**을 판별
+    하지 못한다" 는 뜻이고 그건 여전히 맞다 — 폐압이 일정할 때 이야기다.
+    그런데 지속 마찰음의 포락선은 이제 **호흡압**이 만들고(HANDOFF §5.8b),
+    압력이 오르는 250 ms 동안 제트 속도가 실제로 크게 변한다. 그 구간에서
+    다이폴은 단극보다 가파르게 커져야 한다(Curle: 파워 U^6 대 U^4, 즉 진폭
+    U^3 대 U^2 → 상대 세기 U^1). 그게 **고역의 페이드 인**이다.
+
+    이게 없으면 소스의 모양이 토큰 내내 고정돼 대역들이 다 같이 올라온다.
+    측정(-6 dB 도달 시각의 대역 간 폭): 합성 90 ms, 실측 296~430 ms.
     """
     if a_ref is None:
         a_ref = TONGUE_A_MIN
     if exp is None:
         exp = OBSTACLE_JET_EXP        # 호출 시점에 읽는다(기본인자 고정 방지)
-    return (torch.as_tensor(float(a_ref)) / area.clamp_min(1e-6)).clamp(0.0, 1.0) ** exp
+    g = (torch.as_tensor(float(a_ref)) / area.clamp_min(1e-6)).clamp(0.0, 1.0) ** exp
+    if flow is None:
+        return g
+    ve = OBSTACLE_VEL_EXP if vel_exp is None else vel_exp
+    v = particle_velocity(flow, area)
+    vr = v.amax() if v_ref is None else torch.as_tensor(float(v_ref))
+    return g * (v / vr.clamp_min(1e-6)).clamp(0.0, 1.0) ** ve
 
 
 def glottal_drop_fraction(glottal_area: torch.Tensor,
