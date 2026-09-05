@@ -101,3 +101,25 @@ def voicing(y, sr, hop_ms=10.0, win_ms=25.0, fmin=60.0, fmax=400.0):
     return per, f0
 
 
+
+
+def spectral_envelope(y, sr, n_fft=2048, quefrency=40, hop_ms=10.0,
+                      win_ms=25.0):
+    """켑스트럼 리프터링으로 하모닉 미세구조를 지운 로그 스펙트럼 포락선.
+
+    반환 (log|H| (n_fft//2+1,), f (n_fft//2+1,)). 프레임 평균을 낸다.
+    포먼트 하나로 요약하지 않고 **모양 전체**를 쓰기 위한 것이다 — 측지가
+    만드는 극-영점 쌍은 "F3 가 몇 Hz" 로는 표현되지 않는다.
+    """
+    fr, _ = frames(y, sr, win_ms, hop_ms)
+    S = np.abs(np.fft.rfft(fr, n_fft, axis=1))
+    logS = np.log(S + 1e-9)
+    cep = np.fft.irfft(logS, n_fft, axis=1)
+    cep[:, quefrency:n_fft - quefrency] = 0.0
+    env = np.fft.rfft(cep, n_fft, axis=1).real
+    return env.mean(axis=0), np.linspace(0, sr / 2, S.shape[1])
+
+
+def warp_envelope(env, f, ratio):
+    """성도 길이 정규화: 주파수축을 ratio 배로 늘린다(남성 -> 여성)."""
+    return np.interp(f, f * ratio, env)

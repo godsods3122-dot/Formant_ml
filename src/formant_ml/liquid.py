@@ -138,13 +138,48 @@ def liquid_area(seconds: float, h0_points, cfg: Config = DEFAULT,
 # ------------------------------------------------------------------ 음절 렌더
 def posture_area(name: str, n_sec: int) -> torch.Tensor:
     """자세 이름 -> 면적함수. 모음이면 모음, 유음이면 유음 자세."""
-    from .presets import LIQUID_AREA_20, VOWEL_AREA_20
+    from .presets import LIQUID_POSTURE_20, VOWEL_AREA_20
     if n_sec == 20:
-        if name in LIQUID_AREA_20:
-            return torch.tensor(LIQUID_AREA_20[name], dtype=torch.float32)
+        if name in LIQUID_POSTURE_20:
+            return torch.tensor(LIQUID_POSTURE_20[name]["area"],
+                                dtype=torch.float32)
         if name in VOWEL_AREA_20:
             return torch.tensor(VOWEL_AREA_20[name], dtype=torch.float32)
     return vowel_area(n_sec, name)
+
+
+ZERO_OFF_BW = 20000.0     # 대역폭을 키우면 r -> 0 이라 D/Ddc -> 1 (영점이 사라진다)
+
+
+def posture_zeros(keyframes, t: int, n_zeros: int = 2):
+    """자세 궤적의 반공명 (freq (1,T,Z), bw (1,T,Z)).
+
+    측지는 혀끝이 구개에 닿아 기류가 옆으로 갈라질 때만 생긴다. 모음 자세에는
+    측지가 없으므로 대역폭을 크게 밀어 응답을 평탄하게 만든다. 자세 사이는
+    **로그 주파수·로그 대역폭**에서 보간한다 — 닿는 순간 위상학이 바뀌는
+    사건이라 대역폭이 넓은 쪽에서 좁은 쪽으로 빠르게 조여든다.
+    """
+    from .presets import LIQUID_POSTURE_20
+    fs, bs = [], []
+    for _, name in keyframes:
+        p = LIQUID_POSTURE_20.get(name)
+        if p is None:
+            fs.append([3000.0] * n_zeros)
+            bs.append([ZERO_OFF_BW] * n_zeros)
+        else:
+            fs.append(list(p["zero_hz"])[:n_zeros])
+            bs.append(list(p["zero_bw"])[:n_zeros])
+    fs = torch.log(torch.tensor(fs, dtype=torch.float32))
+    bs = torch.log(torch.tensor(bs, dtype=torch.float32))
+    pos = torch.tensor([p for p, _ in keyframes], dtype=torch.float32)
+    x = torch.linspace(0, 1, t)
+    i = torch.searchsorted(pos, x.clamp(pos[0], pos[-1])).clamp(1, len(pos) - 1)
+    p0, p1 = pos[i - 1], pos[i]
+    w = ((x - p0) / (p1 - p0).clamp_min(1e-6)).clamp(0, 1)
+    w = (w * w * (3.0 - 2.0 * w)).unsqueeze(-1)
+    fz = torch.exp(fs[i - 1] * (1 - w) + fs[i] * w).unsqueeze(0)
+    bw = torch.exp(bs[i - 1] * (1 - w) + bs[i] * w).unsqueeze(0)
+    return fz.contiguous(), bw.contiguous()
 
 
 def posture_gain(keyframes, t: int) -> torch.Tensor:
@@ -235,7 +270,8 @@ def liquid_syllable(seconds: float, keyframes, h0_points, cfg: Config = DEFAULT,
             seg = seg.clamp_min(lateral_area_cm2)
         area[0, :, start:start + n_masses] = seg
     contact = out["contact"][: t * hop].reshape(t, hop).amax(dim=1)
-    return area.contiguous(), contact, posture_gain(keyframes, t)
+    return (area.contiguous(), contact, posture_gain(keyframes, t),
+            posture_zeros(keyframes, t))
 
 
 def contact_dynamics(contact: torch.Tensor, hop: int, sample_rate: int,

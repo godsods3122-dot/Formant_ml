@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import torch
 
-from .dsp.filters import resonator_stage_responses
+from .dsp.filters import antiresonator_response, resonator_stage_responses
 from .dsp.tract import tract_response
 
 
@@ -81,3 +81,75 @@ def peaks_of(area: torch.Tensor, sample_rate: int = 24000, n: int = 4,
     out = [float(f[i]) for i in range(1, n_freq - 1)
            if H[i] > H[i - 1] and H[i] > H[i + 1]]
     return [round(v) for v in out[:n]]
+
+
+def fit_area_with_zeros(target_db, f_grid, n_sections: int = 20,
+                        n_zeros: int = 2, sample_rate: int = 24000,
+                        steps: int = 2000, lr: float = 0.05,
+                        smooth: float = 0.002, fmin: float = 200.0,
+                        fmax: float = 6000.0, a_min: float = 0.15,
+                        a_max: float = 11.0, rho: float = 0.99,
+                        seed: int = 0):
+    """면적함수와 **반공명(영점)** 을 실측 스펙트럼 포락선에 함께 맞춘다.
+
+    왜 함께 맞춰야 하는가
+    ---------------------
+    유음은 기류가 혀 옆으로 갈라져 나가고, 혀 위/뒤의 막힌 공간이 **측지(側枝)**
+    가 된다. 측지는 극이 아니라 **영점**을 만든다 — 실측 /ㄹ/ 포락선에서
+    2100 Hz 와 3800 Hz 의 깊은 골이 그것이고, 2800 Hz 봉우리가 도드라지는 것은
+    양옆의 그 골 때문이다.
+
+    전극(all-pole) 적합만으로는 골을 못 만든다. 그래서 봉우리도 안 서고,
+    합성이 실측보다 2400~3200 Hz 에서 15 dB 낮았다.
+    영점을 나중에 따로 얹으면 이중계산이 되어 맞춰 둔 극을 부순다(겪었다).
+    **함께** 풀어야 한다.
+
+    target_db: 목표 로그 포락선 [dB], f_grid 위. 평균은 알아서 뺀다.
+    반환 (area (n_sections,), zero_hz (n_zeros,), zero_bw (n_zeros,)).
+    """
+    f = torch.as_tensor(f_grid, dtype=torch.float32)
+    t_db = torch.as_tensor(target_db, dtype=torch.float32)
+    band = (f >= fmin) & (f <= fmax)
+    t = t_db / 8.686                                    # dB -> ln
+    t = t - t[band].mean()
+    w = 1.0 / (f + 300.0)
+    w = (w / w[band].mean())[band]
+    n_freq = len(f)
+
+    torch.manual_seed(seed)
+    z = torch.zeros(n_sections, requires_grad=True)
+    # 영점 초기값은 실측 골 근처에 둔다 (2 kHz, 4 kHz)
+    zf = torch.tensor([2.0, 4.0][:n_zeros], requires_grad=True)     # kHz
+    zb = torch.tensor([-0.5] * n_zeros, requires_grad=True)         # logit
+    opt = torch.optim.Adam([z, zf, zb], lr=lr)
+    for _ in range(steps):
+        area = a_min + (a_max - a_min) * torch.sigmoid(z)
+        H = tract_response(area.reshape(1, 1, -1), sample_rate, n_freq,
+                           rho=rho)
+        fz = zf.clamp(0.3, sample_rate / 2000.0 * 0.95) * 1000.0
+        bw = 80.0 + 600.0 * torch.sigmoid(zb)
+        H = H * antiresonator_response(fz.reshape(1, 1, -1),
+                                       bw.reshape(1, 1, -1),
+                                       sample_rate, n_freq)
+        log_h = torch.log(H.abs()[0, 0].clamp_min(1e-6))
+        log_h = log_h - log_h[band].mean()
+        loss = (w * (log_h[band] - t[band]).pow(2)).mean()
+        loss = loss + smooth * (z[1:] - z[:-1]).pow(2).mean() * n_sections
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+    area = (a_min + (a_max - a_min) * torch.sigmoid(z)).detach()
+    fz = (zf.clamp(0.3, sample_rate / 2000.0 * 0.95) * 1000.0).detach()
+    bw = (80.0 + 600.0 * torch.sigmoid(zb)).detach()
+    return area, fz, bw
+
+
+def response_db(area, zero_hz=None, zero_bw=None, sample_rate: int = 24000,
+                n_freq: int = 1025, rho: float = 0.99):
+    """면적(+영점)이 내는 로그 응답 [dB]. 맞았는지 재는 용도."""
+    H = tract_response(area.reshape(1, 1, -1), sample_rate, n_freq, rho=rho)
+    if zero_hz is not None:
+        H = H * antiresonator_response(zero_hz.reshape(1, 1, -1),
+                                       zero_bw.reshape(1, 1, -1),
+                                       sample_rate, n_freq)
+    return 20.0 * torch.log10(H.abs()[0, 0].clamp_min(1e-6))

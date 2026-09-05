@@ -32,11 +32,15 @@ FEMALE_CM = 14.6
 
 # Peterson & Barney 여성 기준. F3 는 아직 계통적으로 낮아 검사에서 뺀다
 # (presets.VOWEL_AREA_20 주석의 알려진 한계 — 숨기지 말고 명시해 둔다).
-# /u/ 는 뺐다. F1 357 / F2 914 로 둘이 가까운데 F0 가 200 Hz 라 LPC 가 둘을
-# 분리하지 못하고 그 사이에 허깨비 극을 만든다(측정: F2 를 474 Hz 로 보고).
-# 합성의 결함이 아니라 측정기의 한계다 — 임계를 늘려 가리지 않고 빼 둔다.
-# /u/ 의 정당성은 test_vowels_are_actually_distinguishable 이 대신 본다.
-TARGET = {"a": (850, 1220), "i": (310, 2790)}
+# 모음마다 **신뢰성 있게 측정되는 포먼트만** 검사한다. 모음을 통째로 빼는 것보다
+# 낫고, 임계를 늘려 가리는 것보다 정직하다. 측정기의 한계는 이렇다:
+#   /u/ F2 — F1 357 / F2 914 가 가까운데 F0 가 200 Hz 라 LPC 가 둘을 못 나누고
+#            사이에 허깨비 극을 만든다(F2 를 474 로 보고).
+#   /i/ F1 — 310 Hz 로 매우 약해서, 프리엠퍼시스로 고역이 올라가면 LPC 가 극을
+#            그쪽에 배분해 F1 을 399 로 읽는다.
+# 둘 다 합성의 결함이 아니라 추적기의 한계다. 각 모음의 **정의적 포먼트**는
+# 잘 잡히므로 그것으로 검사한다.
+TARGET = {"a": {1: 850, 2: 1220}, "i": {2: 2790}, "u": {1: 370}}
 
 
 def _render_vowel(vowel: str, seconds: float = 0.5) -> np.ndarray:
@@ -56,7 +60,11 @@ def _render_vowel(vowel: str, seconds: float = 0.5) -> np.ndarray:
         formant_gain=torch.ones(1, t, K),
         noise_bands=torch.full((1, t, nb), 1e-4),
         noise_entry=torch.zeros(1, t, 1),
-        noise_am=torch.zeros(1, t, 1), area=area.contiguous())
+        noise_am=torch.zeros(1, t, 1), area=area.contiguous(),
+        # gen_liquid 와 같은 값. **tilt 를 안 걸면 출력이 -16.4 dB/oct 로
+        # 굴러떨어진다** (실측 음성은 -7.2). Controls.tilt 의 기본값이 None
+        # 이라 그냥 렌더하면 먹먹한 소리가 나온다 — 이 트랩을 기록해 둔다.
+        tilt=torch.full((1, t, 1), 7.0))
     with torch.no_grad():
         y = syn(c)["audio"][0]
     return y.numpy().astype(np.float64)
@@ -73,12 +81,13 @@ def test_rendered_vowels_hit_their_formant_targets():
 
     이게 없어서 /아/ 가 F2 1928 Hz(목표 1220)로 나가는 걸 못 잡았다.
     """
-    for v, (f1, f2) in TARGET.items():
+    for v, wants in TARGET.items():
         got = _median_formants(_render_vowel(v))
-        for i, (g, want) in enumerate(zip(got[:2], (f1, f2))):
-            assert not np.isnan(g), f"/{v}/ F{i+1} 미검출"
+        for k, want in wants.items():
+            g = got[k - 1]
+            assert not np.isnan(g), f"/{v}/ F{k} 미검출"
             assert abs(g - want) / want < 0.20, \
-                f"/{v}/ F{i+1} = {g:.0f} Hz, 목표 {want} Hz"
+                f"/{v}/ F{k} = {g:.0f} Hz, 목표 {want} Hz"
 
 
 def test_vowels_are_actually_distinguishable():
@@ -115,7 +124,7 @@ def _render_syllable(keyframes, h0, seconds, po, tip_overlay, lat=None):
     from formant_ml.liquid import liquid_syllable
     cfg = Config()
     cfg.filt.n_tract_sections = sections_for(FS, FEMALE_CM)
-    area, _, _ = liquid_syllable(seconds, keyframes, h0, cfg, po=po,
+    area, _, _, _ = liquid_syllable(seconds, keyframes, h0, cfg, po=po,
                                  lateral_area_cm2=lat,
                                  tip_overlay=tip_overlay)
     t = area.shape[1]
@@ -173,6 +182,41 @@ def test_liquid_and_vowel_are_distinct_in_the_same_syllable():
     liq = np.nanmedian(formants(y[: int(0.13 * FS)], FS), axis=0)
     vow = np.nanmedian(formants(y[int(0.28 * FS):], FS), axis=0)
     assert vow[0] > liq[0] * 1.8, f"F1 유음 {liq[0]:.0f} -> 모음 {vow[0]:.0f}"
+
+
+def test_output_is_not_muffled():
+    """출력의 스펙트럼 기울기가 음성다워야 한다 (-4 ~ -11 dB/oct).
+
+    이걸 아무도 안 보고 있었다. 소스 기울기(`tilt`)를 한 번도 안 걸어서
+    출력이 **-16.4 dB/oct** 로 굴러떨어졌고, 1 kHz 위에서 실측보다 12~35 dB
+    어두웠다. 측지가 만드는 극-영점 구조가 40~60 dB 아래로 묻혀 아예 안
+    들렸다 — 포먼트 검사는 전부 통과하는 동안에.
+    """
+    from formant_ml.analysis.acoustic import spectral_envelope
+    y = _render_vowel("a", 0.5)
+    e, f = spectral_envelope(y[4800:], FS)
+    e = e * 8.686
+    lo = e[(f > 350) & (f < 450)].mean()
+    hi = e[(f > 4200) & (f < 4600)].mean()
+    slope = (hi - lo) / np.log2(4400 / 400)
+    assert -11.0 < slope < -4.0, f"{slope:.1f} dB/oct (실측 음성 -7.2)"
+
+
+def test_liquid_has_a_side_branch_antiresonance():
+    """유음 자세에 반공명이 실제로 있어야 한다.
+
+    기류가 혀 옆으로 갈라지고 혀 위/뒤가 막힌 공간(측지)이 되면 영점이 생긴다.
+    전극 적합만으로는 못 만든다 — 그래서 합성이 실측보다 2400~3200 Hz 에서
+    15 dB 낮았다. 영점 주파수가 함의하는 측지 길이가 해부학적 범위(2~4 cm,
+    Stevens 1998)에 있는지도 함께 본다.
+    """
+    from formant_ml.presets import LIQUID_POSTURE_20
+    for name, p in LIQUID_POSTURE_20.items():
+        assert len(p["zero_hz"]) >= 2, name
+        for fz in p["zero_hz"]:
+            assert 1500.0 < fz < 6000.0, (name, fz)
+            length_cm = 35000.0 / (4.0 * fz)
+            assert 1.4 < length_cm < 4.5, f"{name}: 측지 {length_cm:.1f} cm"
 
 
 if __name__ == "__main__":

@@ -44,6 +44,10 @@ def build(cfg: Config, t: int, area, f0_pts, lateral=None, level=None,
         noise_bands=torch.full((1, t, nb), 2e-4),
         noise_entry=torch.zeros(1, t, 1),
         noise_am=torch.full((1, t, 1), 0.15),
+        # 소스 스펙트럼 기울기. 안 걸면 출력이 -16.4 dB/oct 로 굴러떨어져
+        # 실측(-7.2)보다 1 kHz 위에서 12~35 dB 어둡다 — 측지가 만드는 구조가
+        # 40~60 dB 아래로 묻혀 아예 안 들린다. 측정으로 고른 값이다.
+        tilt=torch.full((1, t, 1), 7.0),
         area=area, tract_rho=rho,
     )
     if lateral is not None:
@@ -71,12 +75,15 @@ def main() -> None:
         # 설측음은 자세가 이미 협착을 담고 있으므로 혀끝을 덧씌우지 않는다.
         if tip_overlay is None:
             tip_overlay = lateral is None
-        area, contact, pgain = liquid_syllable(
+        area, contact, pgain, (zf, zb) = liquid_syllable(
             seconds, keyframes, h0_pts, cfg, po=po, n_masses=n_masses,
             lateral_area_cm2=(lateral or {}).pop("area_cm2", None)
             if lateral else None, tip_overlay=tip_overlay)
         t = area.shape[1]
         f0 = f0 or [(0.0, 215.0), (1.0, 180.0)]
+        # 측지 반공명은 자세 궤적에서 나온다 — 면적과 **함께** 적합한 것이라
+        # 이중계산이 아니다. 모음 자세에서는 대역폭이 커져 저절로 꺼진다.
+        c_zero = (zf, zb)
         mix = None
         # 반공명은 지금 끈다. 자세 면적함수를 **실측 포먼트에 맞춰** 풀었으므로
         # 측면 통로의 효과가 이미 극 배치에 들어가 있다(LPC 가 실제 음성의
@@ -92,9 +99,8 @@ def main() -> None:
         lvl, rho = contact_dynamics(contact[:t], cfg.audio.hop_size, sr,
                                     level_drop_db=level or 3.0)
         lvl = lvl * pgain            # 자세별 세기 보정 (측정값, presets)
-        c = build(cfg, t, area, f0,
-                  lateral if (lateral or {}).get("explicit_zeros") else None,
-                  lvl, mix, rho)
+        c = build(cfg, t, area, f0, None, lvl, mix, rho)
+        c.antiformant_freq, c.antiformant_bw = c_zero
         with torch.no_grad():
             y = syn(c)["audio"]
         save_wav(os.path.join(args.out, name), y, sr)
