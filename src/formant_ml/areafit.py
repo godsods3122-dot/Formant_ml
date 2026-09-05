@@ -31,7 +31,7 @@ def target_response(freqs, bws, sample_rate: int, n_freq: int) -> torch.Tensor:
 
 def fit_area(freqs, bws=None, n_sections: int = 24, sample_rate: int = 24000,
              n_freq: int = 513, steps: int = 1500, lr: float = 0.08,
-             smooth: float = 0.15, fmax: float = 5000.0,
+             smooth: float = 0.002, fmax: float = 4200.0,
              a_min: float = 0.15, a_max: float = 11.0, rho: float = 0.99,
              seed: int = 0, verbose: bool = False) -> torch.Tensor:
     """목표 포먼트를 내는 면적함수 (n_sections,) [cm^2]. 성문 -> 입술.
@@ -47,6 +47,11 @@ def fit_area(freqs, bws=None, n_sections: int = 24, sample_rate: int = 24000,
     band = f_grid <= fmax
     log_t = torch.log(H_t.clamp_min(1e-6))
     log_t = log_t - log_t[band].mean()
+    # 주파수 가중. 균등가중으로 0~5 kHz 를 맞추면 고역 빈 수가 많아 F1 배치가
+    # 묻히고(/아/ F1 이 850 목표에 727 에서 멈춘다), 대역을 2.5 kHz 로 좁히면
+    # 이번엔 F3 가 풀려 3492 로 날아간다. 1/f 가중이 셋을 한꺼번에 잡는다.
+    w = 1.0 / (f_grid + 300.0)
+    w = (w / w[band].mean())[band]
 
     torch.manual_seed(seed)
     z = torch.zeros(n_sections, requires_grad=True)
@@ -57,7 +62,7 @@ def fit_area(freqs, bws=None, n_sections: int = 24, sample_rate: int = 24000,
                            rho=rho).abs()[0, 0]
         log_h = torch.log(H.clamp_min(1e-6))
         log_h = log_h - log_h[band].mean()
-        loss = (log_h[band] - log_t[band]).pow(2).mean()
+        loss = (w * (log_h[band] - log_t[band]).pow(2)).mean()
         loss = loss + smooth * (z[1:] - z[:-1]).pow(2).mean() * n_sections
         opt.zero_grad(set_to_none=True)
         loss.backward()

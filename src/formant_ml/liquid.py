@@ -133,3 +133,83 @@ def liquid_area(seconds: float, h0_points, cfg: Config = DEFAULT,
     t = area.shape[1]
     contact = out["contact"][: t * hop].reshape(t, hop).amax(dim=1)
     return area, contact, traj
+
+
+# ------------------------------------------------------------------ 음절 렌더
+def posture_area(name: str, n_sec: int) -> torch.Tensor:
+    """자세 이름 -> 면적함수. 모음이면 모음, 유음이면 유음 자세."""
+    from .presets import LIQUID_AREA_20, VOWEL_AREA_20
+    if n_sec == 20:
+        if name in LIQUID_AREA_20:
+            return torch.tensor(LIQUID_AREA_20[name], dtype=torch.float32)
+        if name in VOWEL_AREA_20:
+            return torch.tensor(VOWEL_AREA_20[name], dtype=torch.float32)
+    return vowel_area(n_sec, name)
+
+
+def posture_track(keyframes, t: int, n_sec: int) -> torch.Tensor:
+    """[(위치 0~1, 자세이름), ...] -> 면적함수 궤적 (1, T, N).
+
+    **로그 면적에서 보간한다.** 선형으로 섞으면 0.3 cm^2 와 6 cm^2 의 중간이
+    3.15 로 나와 협착이 순식간에 풀린다. 면적은 기하적으로 변하는 양이다.
+
+    이것이 축 3 이다 — 혀끝만이 아니라 **성도 전체 모양**이 자세 사이를
+    움직인다. 이게 없으면 혀끝이 앞쪽 몇 단만 건드리므로 실측의
+    F1 294 -> 761 Hz 같은 전이가 나오지 않는다.
+    """
+    pos = torch.tensor([p for p, _ in keyframes], dtype=torch.float32)
+    mats = torch.stack([torch.log(posture_area(n, n_sec).clamp_min(1e-3))
+                        for _, n in keyframes])                 # (K, N)
+    x = torch.linspace(0, 1, t)
+    i = torch.searchsorted(pos, x.clamp(pos[0], pos[-1])).clamp(1, len(pos) - 1)
+    p0, p1 = pos[i - 1], pos[i]
+    w = ((x - p0) / (p1 - p0).clamp_min(1e-6)).clamp(0, 1)
+    # 자세 전이는 부드럽게 (근육은 계단으로 움직이지 않는다)
+    w = (w * w * (3.0 - 2.0 * w)).unsqueeze(-1)
+    return torch.exp(mats[i - 1] * (1 - w) + mats[i] * w).unsqueeze(0)
+
+
+def liquid_syllable(seconds: float, keyframes, h0_points, cfg: Config = DEFAULT,
+                    po: float = 2000.0, n_masses: int = 5,
+                    lateral_area_cm2: float | None = None,
+                    tip_overlay: bool = True,
+                    tip: TipParams | None = None):
+    """자세 궤적 + 혀끝 제스처 -> (면적 (1,T,N), 접촉 (T,), 혀끝 궤적).
+
+    자세 궤적이 성도 전체를 움직이고, 그 위에 혀끝이 협착을 덧씌운다.
+    두 층을 분리하는 이유는 Hwang et al.(2019) 이 잰 것 때문이다 — 혀몸과
+    설근은 독립 손잡이가 아니라 관상 폐쇄 위치에서 따라 나온다. 그래서
+    자세 하나를 고르면 혀몸까지 같이 정해진다.
+
+    `tip_overlay` 를 조심해서 써야 한다. 자세 면적함수는 **실측 포먼트에 맞춰
+    푼 것**이라 그 자세의 협착을 이미 담고 있다. 그 위에 혀끝 폐쇄를 또 곱하면
+    이중계산이 되어 적합이 깨진다 — 측정: 설측음 자세는 316/1412/2795 를 내는데
+    덧씌우고 렌더하니 222/676/1470 이 나왔다.
+
+    * 설측음: `False`. 중앙 폐쇄와 측면 통로가 이미 자세에 들어 있다.
+    * 탄음/전동음: `True`. 완전 폐쇄는 자세로 표현 못 한다(폐쇄 중에는
+      방사음이 없으므로 포먼트를 잴 수도 없다). 혀끝이 그 구간을 만든다.
+    """
+    sr, hop = cfg.audio.sample_rate, cfg.audio.hop_size
+    n_sec = cfg.filt.n_tract_sections
+    n = int(seconds * sr / hop) * hop
+    p = tip or TipParams()
+    p = TipParams(**{**p.__dict__, "po": po})
+    out = simulate_tip_chain(gesture(n, h0_points, sr), p, n_masses, sr,
+                             oversample=4)
+    t = n // hop
+    base = posture_track(keyframes, t, n_sec)                   # (1, T, N)
+    traj = out["traj"]
+    g = traj[: t * hop].reshape(t, hop, n_masses).amin(dim=1)
+    area = base.clone()
+    if tip_overlay:
+        u = (g / 0.25).clamp(0.0, 1.0)
+        close = u * u * (3.0 - 2.0 * u)                         # smoothstep
+        start = n_sec - LIP_MARGIN - n_masses
+        seg = area[0, :, start:start + n_masses]
+        seg = (seg * close).clamp_min(1e-3)
+        if lateral_area_cm2 is not None:
+            seg = seg.clamp_min(lateral_area_cm2)
+        area[0, :, start:start + n_masses] = seg
+    contact = out["contact"][: t * hop].reshape(t, hop).amax(dim=1)
+    return area.contiguous(), contact, traj
