@@ -1137,6 +1137,32 @@ def render(score: dict, prof: VoiceProfile | None = None, cfg: Config | None = N
         return synth(ctrl, generator=gen)["audio"]
 
 
+def render_with_controls(score: dict, prof: VoiceProfile | None = None,
+                         cfg: Config | None = None, seed: int | None = None):
+    """스크립트 -> (파형, 제어). **인코더 지도학습의 교사 데이터**를 만든다.
+
+    성도 역문제는 부정형이라 오디오 손실만으로는 해가 하나로 모이지 않고,
+    성도를 잘 추정해 주는 외부 모델도 없다. 대신 여기서는 **정답 제어를 아는
+    데이터를 무한히 만들 수 있다** — 물리에서 유도한 제어 궤적으로 렌더한
+    음성이 그것이다. (오디오, 제어) 쌍을 그대로
+    `models.losses.control_supervision_loss` 에 넣으면 된다.
+
+    주의: 교사와 학생이 **같은 `cfg`** 를 써야 프레임이 정렬된다. 프로파일의
+    샘플레이트(me.json 은 44.1 kHz)와 학습 `cfg`(기본 24 kHz)가 다르면
+    프레임 수가 어긋나므로, 교사 렌더도 학습 `cfg` 로 돌려야 한다.
+    """
+    cfg = cfg or Config()
+    prof = prof or VoiceProfile()
+    ctrl = build_controls(score, prof, cfg)
+    synth = PhysicalVoiceSynth(cfg, tract_mode=score.get("tract", "formant"))
+    gen = None
+    if seed is not None or "seed" in score:
+        gen = torch.Generator().manual_seed(int(score.get("seed", seed or 0)))
+    with torch.no_grad():
+        audio = synth(ctrl, generator=gen)["audio"]
+    return audio, ctrl
+
+
 def load_score(path: str) -> dict:
     with open(path, encoding="utf-8") as f:
         text = f.read()

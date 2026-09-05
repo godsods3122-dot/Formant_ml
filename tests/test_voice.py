@@ -1136,19 +1136,6 @@ def test_syllable_fricative_level_matches_profile():
     assert abs(got - want) < 4.0, f"목표 {want:+.1f} dB, 실제 {got:+.1f} dB"
 
 
-if __name__ == "__main__":
-    fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
-    failed = 0
-    for fn in fns:
-        try:
-            fn()
-            print(f"  PASS  {fn.__name__}")
-        except Exception as e:                                   # noqa: BLE001
-            failed += 1
-            print(f"  FAIL  {fn.__name__}: {e}")
-    print(f"\n{len(fns) - failed}/{len(fns)} 통과")
-    sys.exit(1 if failed else 0)
-
 def test_breath_is_broadband_not_a_low_blob():
     """숨소리는 광대역이어야 한다 — 저역 덩어리가 아니라.
 
@@ -1176,3 +1163,17 @@ def test_breath_is_broadband_not_a_low_blob():
     assert share(500, 1500) < 30.0, (f"숨소리가 F1/F2 에 몰려 있다: "
                                      f"{share(500, 1500):.1f} % (예전 87.2)")
     assert share(1500, 8000) > 55.0, f"숨소리 몸통이 {share(1500, 8000):.1f} % 뿐"
+
+
+if __name__ == "__main__":
+    fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
+    failed = 0
+    for fn in fns:
+        try:
+            fn()
+            print(f"  PASS  {fn.__name__}")
+        except Exception as e:                                   # noqa: BLE001
+            failed += 1
+            print(f"  FAIL  {fn.__name__}: {e}")
+    print(f"\n{len(fns) - failed}/{len(fns)} 통과")
+    sys.exit(1 if failed else 0)

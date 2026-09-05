@@ -280,7 +280,10 @@ class PhysicalVoiceSynth(nn.Module):
 
         # 성문 기식 경로: 치찰음 필터를 거치지 않고 성도 **전체**를 통과한다.
         asp_out = None
-        if c.aspiration_bands is not None and float(c.aspiration_bands.abs().max()) > 1e-8:
+        # 분기 판정일 뿐 기울기 경로가 아니다 -> detach (인코더가 기식을 내면서
+        # requires_grad 텐서가 들어오게 됐다).
+        if c.aspiration_bands is not None and \
+                float(c.aspiration_bands.detach().abs().max()) > 1e-8:
             bw_a = c.formant_bw
             if c.noise_bw_scale is not None:
                 bw_a = bw_a * c.noise_bw_scale.clamp_min(1.0)

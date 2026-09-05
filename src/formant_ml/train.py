@@ -56,6 +56,12 @@ def main() -> None:
                     help="잔차 에너지 페널티. 낮추면 신경망이 물리모델을 대체하기 시작한다")
     ap.add_argument("--w-noise", type=float, default=5e-3,
                     help="유성 구간 노이즈 억제(보조). --w-period 가 주 방어선이다")
+    ap.add_argument("--profile", default=None,
+                    help="화자 프로파일 json. 상위 포먼트를 실측에 묶는 앵커로 쓴다")
+    ap.add_argument("--w-anchor", type=float, default=0.0,
+                    help="상위 포먼트 앵커 세기. --profile 이 있어야 동작한다")
+    ap.add_argument("--anchor-start", type=int, default=3,
+                    help="몇 번째 포먼트부터 묶을지. F1~F3 은 모음이 정하므로 자유")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--workers", type=int, default=2)
     ap.add_argument("--log-every", type=int, default=50)
@@ -71,9 +77,17 @@ def main() -> None:
                     num_workers=args.workers,
                     persistent_workers=args.workers > 0)
     enc, syn = build(cfg, args.tract, args.device)
+    # 성도 '고정'은 상수가 아니라 **앵커**로 표현한다. 상위 포먼트(F4+)는 성도
+    # 길이가 정하므로 같은 화자 안에서 거의 상수다 — 별도의 성도 추정 모델
+    # 없이도 프로파일 실측만으로 역문제의 자유도를 줄일 수 있다.
+    anchor_hz = None
+    if args.profile:
+        from .voice import VoiceProfile
+        anchor_hz = list(VoiceProfile.load(args.profile).formants)
     loss_fn = VoiceLoss(w_phase=args.w_phase, w_rps=args.w_rps, w_band=args.w_band,
                         w_period=args.w_period, w_noise=args.w_noise,
-                        w_residual=args.w_residual,
+                        w_residual=args.w_residual, w_anchor=args.w_anchor,
+                        anchor_hz=anchor_hz, anchor_start=args.anchor_start,
                         sample_rate=cfg.audio.sample_rate, hop=cfg.audio.hop_size)
     res = ResidualCorrector(cfg).to(args.device) if args.residual else None
     # 난류 소스의 학습 파라미터(스펙트럼 사전 / 변조 스펙트럼)도 함께 최적화한다.

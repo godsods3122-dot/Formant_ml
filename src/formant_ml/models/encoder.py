@@ -58,7 +58,13 @@ class ControlEncoder(nn.Module):
         self.head_noise = nn.Linear(d, Nb + 5)
         self.head_allpass = nn.Linear(d, 2 * Na)       # 성도 군지연
         self.head_disp = nn.Linear(d, 2 * Nd)          # 하모닉 위상차(위상차 파라미터)
-        self.head_sib = nn.Linear(d, 8)                # 치찰음 극-영점 + 스커트
+        # 치찰음: 앞공동 극-영점 + 스커트(8) + 앞니 다이폴 3개.
+        # 앞니 공명(teeth_*)이 없으면 "긴 /s/ 는 앞니 공명(10 kHz), 짧은 '사' 는
+        # 앞공동 극(5.3 kHz)" 이라는 실측 대비를 신경망이 만들 수 없다.
+        self.head_sib = nn.Linear(d, 11)
+        # 성문 기식(무성 마찰음의 성문 잡음 + 유성 구간의 숨소리). 이게 없으면
+        # 마찰음↔모음 골(§5.7a)과 성문 개대 타이밍(§5.7b)이 학습 밖에 남는다.
+        self.head_asp = nn.Linear(d, Nb + 1)
         self.head_area = nn.Linear(d, Ns)
         self.K, self.Ka, self.Na, self.Nb, self.Ns, self.Nd = K, Ka, Na, Nb, Ns, Nd
 
@@ -119,8 +125,25 @@ class ControlEncoder(nn.Module):
         # 봉우리 양옆 스커트 기울기 — 뾰족한 삼각형이냐 둥근 돔이냐를 정한다
         s_lo = 45.0 * torch.sigmoid(sb[..., 6:7])
         s_hi = -20.0 * torch.sigmoid(sb[..., 7:8])
-        sib = SibilantParams(sp_f, sp_bw, sz_f, sz_bw, s_tilt, s_mix, rough,
-                             s_lo, s_hi)
+        # 앞니(장애물) 공명은 **반드시 앞공동 극보다 위**다 — 제트가 협착을
+        # 빠져나온 뒤 더 짧은 틈에서 울리기 때문이다. 극/영점 순서를 강제한
+        # 것과 같은 이유로 비율로 묶는다. 실측 비율은 1.31(긴 /s/)~1.90('사').
+        t_f = sp_f * (1.0 + 1.6 * torch.sigmoid(sb[..., 8:9]))
+        t_bw = scale_sigmoid(sb[..., 9:10], 150.0, 3000.0)
+        # 다이폴 세기 0~1 — `aeroacoustic.obstacle_strength` 의 치역과 같다.
+        t_gain = torch.sigmoid(sb[..., 10:11])
+        # 키워드로 넘긴다. 위치 인자로 넘기면 7번째가 slope_lo 라서 roughness 가
+        # 스커트 자리에, slope_hi(음수)가 teeth_f 자리에 들어간다(실제로 그랬다).
+        sib = SibilantParams(pole_f=sp_f, pole_bw=sp_bw, zero_f=sz_f, zero_bw=sz_bw,
+                             tilt=s_tilt, mix=s_mix, slope_lo=s_lo, slope_hi=s_hi,
+                             teeth_f=t_f, teeth_bw=t_bw, teeth_gain=t_gain,
+                             roughness=rough)
+
+        # 성문 기식 대역. 무성 마찰음에서는 성대가 열려 있어도 성문에서
+        # 난류가 나므로 voicing 으로 게이팅하지 않는다(§6.11).
+        asp = self.head_asp(h)
+        asp_bands = (exp_sigmoid(asp[..., : self.Nb], max_value=1.0)
+                     * torch.sigmoid(asp[..., self.Nb: self.Nb + 1]))
 
         ap = self.head_allpass(h)
         apf = scale_sigmoid(ap[..., : self.Na], 100.0, cfg.audio.sample_rate * 0.45)
@@ -141,6 +164,7 @@ class ControlEncoder(nn.Module):
             formant_freq=freq, formant_bw=bw, formant_gain=gain,
             noise_bands=bands, noise_entry=entry, noise_am=am, noise_rough=rough,
             noise_bw_scale=bw_scale, noise_back_leak=back_leak,
+            aspiration_bands=asp_bands,
             tilt=tilt, jitter=jitter, shimmer=shimmer,
             disp_freq=dpf, disp_radius=dpr,
             antiformant_freq=af, antiformant_bw=ab,
