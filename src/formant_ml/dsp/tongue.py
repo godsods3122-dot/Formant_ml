@@ -19,20 +19,14 @@
 전동음의 접촉 횟수를 우리가 세지 않는다. 방정식이 센다. 실제 전동음이 압력이
 모자라면 탄음으로 무너지는 것(Solé 2002)도 같은 이유로 자동으로 나온다.
 
-**현재 상태 (2026-09-05 측정): 접근음·탄음 분기는 검증되었고 전동음 분기는 아직
-아니다.** 탄음은 접촉 1 회 · 폐쇄 37.7 ms 로 실측대(20~50 ms, Cathcart 2012 의
-"약 1/24 초")에 들어온다. 접근음은 접촉 0 회. 그러나 유지 자세에서 나오는
-자가진동은 25~35 Hz 가 아니라 느린 가지(8~16 Hz)와 빠른 가지(64~80 Hz)로 갈리고
-그 사이가 비어 있다 — 목표 대역이 정확히 그 틈에 있다. 접촉 감쇠를 올리면 진동이
-30 Hz 로 모이는 게 아니라 아예 죽는다(측정: cd=80 에서 접촉 1 회).
+**현재 상태 (2026-09-05 측정): 단일 질량 `simulate_tip` 은 접근음·탄음까지만
+낸다. 전동음은 다질량 `simulate_tip_chain` 에서 나온다 (최소 3 질량).** 탄음은 접촉 1 회 · 폐쇄 37.7 ms 로 실측대(20~50 ms, Cathcart 2012 의
+"약 1/24 초")에 들어오고, 접근음은 접촉 0 회다. 그러나 유지 자세에서는 자가진동이
+25~35 Hz 가 아니라 느린 가지(8~16 Hz)와 빠른 가지(64~80 Hz)로 갈리고 그 사이가
+빈다. 접촉 감쇠를 올리면 30 Hz 로 모이는 게 아니라 진동이 아예 죽는다.
 
-원인은 파라미터가 아니라 **구조**다. 혀끝을 질량 하나로 두었기 때문이다.
-`vocalfold.py` 의 서두에 이미 적혀 있는 것과 같은 이유다 — 흡입이 닫는
-inward-striking 계는 준정상 베르누이 + 단일 질량으로는 순 에너지를 못 받아
-자가진동하지 않는다. 성대가 수직 위상차(mucosal wave) 때문에 2 질량이 필요하듯,
-혀끝도 **앞뒤 위상차**가 필요하다. 근거도 있다: Cathcart(2012)는 flap 이
-back-to-front 로 움직인다고 보고한다. 다음 작업은 혀끝을 후단-전단 2 질량으로
-바꾸는 것이고, 그러면 `simulate()` 와 같은 구조가 된다.
+원인은 파라미터가 아니라 **구조**다 — 질량이 하나뿐이라 앞뒤 위상차가 없다.
+`simulate_tip_chain` 이 그것을 고친다.
 
 측면 통로(설측음)는 여기서 다루지 않는다. 그건 혀끝 운동이 아니라 **혀 옆의
 개구**이고, 음향적으로는 극-영점으로 나타나므로 `filters.antiresonator_response`
@@ -65,6 +59,12 @@ class TipParams:
     collision: float = 3.0       # 구개 접촉 시 강성 배수
     collision_damp: float = 15.0 # 접촉 감쇠 배수. 조직은 비탄성이라 튀지 않는다
     mu: float = 1.86e-4          # 공기 점성계수 [g/(cm*s)]
+    # 앞뒤 물성 기울기 (다질량 모델 전용). 혀끝은 앞으로 갈수록 얇고 무르다 —
+    # 뒤는 설체에 붙어 있고 앞은 자유단이다. 이 기울기가 앞뒤 위상차를 만든다.
+    # 균일하게 두면 협착이 이동하지 않아 계는 **절대 떨지 않는다**(측정 확인).
+    mass_ratio: float = 0.2      # 전단/후단 질량비
+    stiff_ratio: float = 0.1     # 전단/후단 강성비
+    depth_ratio: float = 0.2     # 전단/후단 두께비
     gap_floor: float = 2e-4      # 수치 안정용 최소 간극 [cm]
 
 
@@ -173,3 +173,102 @@ def gesture(n_samples: int, points, sample_rate: int = 24000,
     h0, h1 = hs[i - 1], hs[i]
     w = ((t - t0) / (t1 - t0).clamp_min(1e-9)).clamp(0, 1)
     return h0 + (h1 - h0) * w
+
+
+# ---------------------------------------------------------------- 다질량 혀끝
+def simulate_tip_chain(
+    h0: torch.Tensor,
+    params: TipParams = TipParams(),
+    n_masses: int = 5,
+    sample_rate: int = 24000,
+    oversample: int = 8,
+    coupling: float = 0.04,
+    device=None,
+    dtype=torch.float64,
+):
+    """혀끝을 **앞뒤 방향**으로 n 개 질량으로 나눈 모델. 전동음이 여기서 나온다.
+
+    왜 하나로는 안 되는가
+    ---------------------
+    단일 질량으로 만든 `simulate_tip` 은 접근음(접촉 0)과 탄음(접촉 1)은 내지만
+    전동음의 극한주기를 못 낸다(측정: 8~16 Hz 와 64~80 Hz 로 갈리고 25~35 Hz 가
+    빈다). 이유는 `vocalfold.py` 의 것과 같다 — 흡입이 닫는 계는 위상차가 없으면
+    기류에서 순 에너지를 못 받는다. 성대는 그 위상차가 **수직**(점막파)이고,
+    혀끝은 **앞뒤**다. Cathcart(2012)가 flap 의 back-to-front 운동을 보고한 것이
+    바로 이 축이다.
+
+    압력 분포는 `vocalfold.simulate_stack` 의 규칙을 그대로 쓴다: 최소 단면의
+    **상류(후방)** 는 구강압 Po, **하류(전방)** 는 대기압. 기류는 입 안쪽에서
+    치경 협착을 지나 앞으로 나가므로, 후단이 상류다.
+
+    분할 규칙도 같다. n 조각으로 나누면 질량도 강성도 1/n 로 준다(ω 가 n 과
+    무관해야 한다). 이웃 결합 kc 만 이산 라플라시안의 Δx² 를 상쇄하려고 n 에
+    비례해 키운다.
+
+    반환 dict: gap (n_samples,) 최소 간극, area, flow, contact,
+               traj (n_samples, n_masses) 각 마디의 간극.
+    """
+    p = params
+    n = int(h0.shape[-1])
+    nm = int(n_masses)
+    dt = 1.0 / (sample_rate * oversample)
+    h0 = h0.to(device=device, dtype=dtype)
+
+    idx = torch.arange(nm, device=device, dtype=dtype)      # 0 = 후단(상류)
+    frac = idx / max(nm - 1, 1)                             # 0 = 후단, 1 = 전단
+
+    # 앞뒤 물성 기울기. 균일한 사슬은 협착이 한 자리에 고정되어 (수렴형↔발산형
+    # 교대가 없어) 순 에너지를 못 받는다. 성대에서 m1≠m2, d1≠d2 가 하는 일과 같다.
+    def _grade(base, ratio):
+        return base * (1.0 + (ratio - 1.0) * frac)
+
+    scale = 2.0 / nm                                        # simulate_stack 규약
+    m = _grade(p.mass, p.mass_ratio) * scale
+    k = _grade(p.stiffness, p.stiff_ratio) * scale
+    d = _grade(p.depth, p.depth_ratio) * scale
+    kc = p.stiffness * coupling * nm / 2.0
+    c = 2.0 * p.damping_ratio * (m * k).sqrt()
+    force_area = p.width * d
+    sqrt_2po_rho = (2.0 * p.po / p.rho) ** 0.5
+
+    h = h0[0].clone().repeat(nm)
+    h[0] = h[0] + 0.002                                     # 대칭 깨기
+    v = torch.zeros(nm, device=device, dtype=dtype)
+
+    gap = torch.zeros(n, device=device, dtype=dtype)
+    flow = torch.zeros(n, device=device, dtype=dtype)
+    traj = torch.zeros(n, nm, device=device, dtype=dtype)
+
+    out = 0
+    for step in range(n * oversample):
+        tgt = h0[min(out, n - 1)]
+        a = p.width * h
+        amin, imin = a.min(0)
+        open_ = (amin > 0).to(dtype)
+
+        # 협착 상류(후방)만 Po 를 받고 하류는 대기압. 최소 단면 자체는 0 이 된다.
+        upstream = (idx <= imin).to(dtype)
+        press = p.po * upstream * (
+            1.0 - open_ * (amin / a.abs().clamp_min(1e-6)) ** 2)
+        press = press * (a > 0).to(dtype)
+
+        touching = (h < 0).to(dtype)
+        col = touching * (-p.collision * k * h - p.collision_damp * c * v)
+
+        hl = torch.cat([h[:1], h[:-1]])
+        hr = torch.cat([h[1:], h[-1:]])
+        f = (-c * v - k * (h - tgt) - kc * (2.0 * h - hl - hr)
+             + col + force_area * press)
+        v = v + dt * f / m
+        h = h + dt * v
+
+        if step % oversample == 0:
+            gap[out] = amin / p.width
+            flow[out] = amin.clamp_min(0.0) * sqrt_2po_rho
+            traj[out] = h
+            out += 1
+            if out >= n:
+                break
+
+    return {"gap": gap, "area": (p.width * gap).clamp_min(0.0), "flow": flow,
+            "contact": (gap <= 0).to(dtype), "traj": traj}

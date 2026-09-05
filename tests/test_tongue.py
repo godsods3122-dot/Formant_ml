@@ -12,8 +12,8 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from formant_ml.dsp.tongue import (TipParams, contact_events, gesture,
-                                   simulate_tip)
+from formant_ml.dsp.tongue import (TipParams, contact_events, contact_rate,
+                                   gesture, simulate_tip, simulate_tip_chain)
 
 FS = 24000
 DUR = 0.35
@@ -88,6 +88,105 @@ def test_closed_tip_shuts_the_flow_off():
     touching = out["contact"] > 0
     assert bool(touching.any())
     assert float(out["flow"][touching].max()) == 0.0
+
+
+
+
+# ------------------------------------------------- 다질량 혀끝 (전동음이 나온다)
+TRILL_HOLD = 0.03      # 좁은 유지 자세 [cm]
+PO_SPEECH = 8000.0     # 발화 중 구강압 (~8 cmH2O)
+PO_TAP = 2000.0        # 탄음은 폐쇄가 짧아 압력이 안 쌓인다 (~2 cmH2O)
+
+
+def _chain(points, nm=5, dur=0.25, **kw):
+    n = int(dur * FS)
+    return simulate_tip_chain(gesture(n, points, FS), TipParams(**kw), nm, FS,
+                              oversample=4)
+
+
+def test_single_mass_tip_never_self_oscillates():
+    """질량 하나짜리 혀끝은 좁게 잡아도 자가진동하지 않는다.
+
+    이것이 전동음이 안 나오던 이유였다. 흡입이 닫는 계는 위상차가 없으면
+    기류에서 순 에너지를 못 받는다 (vocalfold.py 서두와 같은 이유).
+    """
+    out = _chain([(0.0, TRILL_HOLD), (0.25, TRILL_HOLD)], nm=1)
+    assert contact_events(out["contact"]) == 0
+
+
+def test_two_masses_are_not_enough():
+    """질량 2 개는 자가진동은 하지만 진동수가 너무 빠르다 — 실측대를 벗어난다.
+
+    측정: n=2 -> 48 Hz, n>=3 -> 28 Hz (전동음 실측 25~35 Hz).
+    2 개는 이웃이 하나뿐이라 결합 강성이 파동을 만드는 게 아니라 두 점을
+    붙였다 뗐다 할 뿐이고, 파동을 낼 만큼 결합을 풀면 고차 모드로 뛴다.
+    """
+    r = contact_rate(_chain([(0.0, TRILL_HOLD), (0.25, TRILL_HOLD)],
+                            nm=2)["contact"], FS)
+    assert r > 40.0, f"{r:.1f} Hz — n=2 가 실측대에 들어오면 이 주석이 틀린 것이다"
+
+
+def test_three_or_more_masses_hit_the_measured_trill_rate():
+    """질량 3 개 이상에서 진동수가 실측대 25~35 Hz 에 들어온다."""
+    for nm in (3, 5, 8):
+        r = contact_rate(_chain([(0.0, TRILL_HOLD), (0.25, TRILL_HOLD)],
+                                nm=nm)["contact"], FS)
+        assert 25.0 <= r <= 35.0, f"n={nm}: {r:.1f} Hz"
+
+
+def test_trill_rate_does_not_drift_with_mass_count():
+    """질량 수를 늘려도 진동수가 흐르면 안 된다 (분할 규칙이 맞다는 검사).
+
+    m 과 k 를 함께 1/n 로 줄이지 않으면 F0 가 질량 수에 끌려간다 —
+    vocalfold.simulate_stack 주석이 기록한 실패다.
+    """
+    rates = [contact_rate(_chain([(0.0, TRILL_HOLD), (0.25, TRILL_HOLD)],
+                                 nm=nm)["contact"], FS) for nm in (3, 5, 8)]
+    assert max(rates) - min(rates) <= 4.0, rates
+
+
+def test_contact_travels_from_back_to_front():
+    """접촉이 후단에서 시작해 전단으로 진행해야 한다.
+
+    이건 우리가 넣은 게 아니라 방정식이 내는 **예측**이고, Cathcart(2012)가
+    초음파로 flap 의 back-to-front 운동을 보고한 것과 방향이 같다.
+    """
+    out = _chain([(0.0, 0.02), (0.30, 0.02)], nm=8, dur=0.30)
+    tr, start = out["traj"], int(0.12 * FS)
+    firsts = []
+    for i in range(tr.shape[1]):
+        hit = (tr[start:, i] <= 0).nonzero()
+        assert len(hit) > 0, f"마디 {i} 가 닿지 않았다"
+        firsts.append(float(hit[0]))
+    assert firsts[-1] > firsts[0], firsts          # 전단이 후단보다 늦다
+    assert firsts[len(firsts) // 2] >= firsts[0]   # 중간이 뒤집히지 않는다
+
+
+def test_low_oral_pressure_turns_a_trill_into_a_single_tap():
+    """같은 탄도 제스처라도 구강압이 낮으면 접촉이 한 번뿐이다.
+
+    조음 방식을 고르는 스위치가 없다는 것이 요점이다. 탄음은 폐쇄가 20~50 ms
+    라 압력이 안 쌓이고(Cathcart 2012), 그래서 자가진동이 성립하지 않는다.
+    """
+    dip = [(0.0, 0.30), (0.10, 0.30), (0.115, -0.04), (0.145, -0.04),
+           (0.16, 0.30), (0.25, 0.30)]
+    assert contact_events(_chain(dip, po=PO_TAP)["contact"]) == 1
+    assert contact_events(_chain(dip, po=PO_SPEECH)["contact"]) > 1
+
+
+def test_tap_closure_duration_matches_measurement_in_the_chain():
+    """다질량 모델에서도 폐쇄가 실측대 20~50 ms 안에 있어야 한다."""
+    dip = [(0.0, 0.30), (0.10, 0.30), (0.115, -0.04), (0.145, -0.04),
+           (0.16, 0.30), (0.25, 0.30)]
+    ms = float(_chain(dip, po=PO_TAP)["contact"].sum()) / FS * 1000.0
+    assert 20.0 <= ms <= 50.0, f"{ms:.1f} ms"
+
+
+def test_trill_needs_pressure_to_sustain():
+    """압력이 모자라면 전동음이 성립하지 않는다 (Solé 2002 의 공기역학적 요구)."""
+    hold = [(0.0, TRILL_HOLD), (0.25, TRILL_HOLD)]
+    assert contact_events(_chain(hold, po=PO_SPEECH)["contact"]) > 3
+    assert contact_events(_chain(hold, po=500.0)["contact"]) == 0
 
 
 if __name__ == "__main__":
