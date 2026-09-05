@@ -147,6 +147,25 @@ def posture_area(name: str, n_sec: int) -> torch.Tensor:
     return vowel_area(n_sec, name)
 
 
+def posture_gain(keyframes, t: int) -> torch.Tensor:
+    """자세 궤적의 세기 보정 (1, T, 1). 로그로 보간한다.
+
+    자세를 바꾸는 것만으로 세기가 최대 8.8 dB 흔들린다(측정). 그 상태로
+    폐쇄 감쇠를 넣으면 부호가 뒤집혀 자음이 모음보다 크게 들린다 — 사용자가
+    "혀가 입천장에 닿지 않은 듯하다" 고 한 것이 이것이었다.
+    """
+    from .presets import POSTURE_GAIN_20
+    pos = torch.tensor([p for p, _ in keyframes], dtype=torch.float32)
+    val = torch.log(torch.tensor([POSTURE_GAIN_20.get(n, 1.0)
+                                  for _, n in keyframes], dtype=torch.float32))
+    x = torch.linspace(0, 1, t)
+    i = torch.searchsorted(pos, x.clamp(pos[0], pos[-1])).clamp(1, len(pos) - 1)
+    p0, p1 = pos[i - 1], pos[i]
+    w = ((x - p0) / (p1 - p0).clamp_min(1e-6)).clamp(0, 1)
+    w = w * w * (3.0 - 2.0 * w)
+    return torch.exp(val[i - 1] * (1 - w) + val[i] * w).reshape(1, t, 1)
+
+
 def posture_track(keyframes, t: int, n_sec: int) -> torch.Tensor:
     """[(위치 0~1, 자세이름), ...] -> 면적함수 궤적 (1, T, N).
 
@@ -172,7 +191,7 @@ def posture_track(keyframes, t: int, n_sec: int) -> torch.Tensor:
 def liquid_syllable(seconds: float, keyframes, h0_points, cfg: Config = DEFAULT,
                     po: float = 2000.0, n_masses: int = 5,
                     lateral_area_cm2: float | None = None,
-                    tip_overlay: bool = True,
+                    tip_overlay: bool = True, min_area_cm2: float = 0.08,
                     tip: TipParams | None = None):
     """자세 궤적 + 혀끝 제스처 -> (면적 (1,T,N), 접촉 (T,), 혀끝 궤적).
 
@@ -207,9 +226,43 @@ def liquid_syllable(seconds: float, keyframes, h0_points, cfg: Config = DEFAULT,
         close = u * u * (3.0 - 2.0 * u)                         # smoothstep
         start = n_sec - LIP_MARGIN - n_masses
         seg = area[0, :, start:start + n_masses]
-        seg = (seg * close).clamp_min(1e-3)
+        # **완전히 봉하면 안 된다.** 면적을 0 까지 내리면 해제 순간 전극 응답이
+        # 급변해 모음보다 8 dB 높은 클릭이 생긴다(측정). 실제 탄음은 폐쇄가
+        # 20~50 ms 라 압력이 안 쌓이고 발성이 이어지며, 실측 골은 −5 dB 에
+        # 불과하다 — 음향적으로 봉해지지 않는다. min_area_cm2 가 그 바닥이다.
+        seg = (seg * close).clamp_min(min_area_cm2)
         if lateral_area_cm2 is not None:
             seg = seg.clamp_min(lateral_area_cm2)
         area[0, :, start:start + n_masses] = seg
     contact = out["contact"][: t * hop].reshape(t, hop).amax(dim=1)
-    return area.contiguous(), contact, traj
+    return area.contiguous(), contact, posture_gain(keyframes, t)
+
+
+def contact_dynamics(contact: torch.Tensor, hop: int, sample_rate: int,
+                     level_drop_db: float = 3.0, rho_open: float = 0.99,
+                     rho_closed: float = 0.975, rise_ms: float = 18.0):
+    """접촉 신호 -> (레벨 (1,T,1), 성도 손실 rho (1,T,1)).
+
+    폐쇄는 **사건**이지 완만한 램프가 아니다. 손으로 그린 100 ms 짜리 세기
+    곡선으로는 자음이 자음으로 안 들린다 — 사용자 피드백 "혀가 입천장에 닿지
+    않은 듯한 소리" 가 이것이었다.
+
+    녹음에서 잰 값:
+      * 어두/종성 설측음 : 뒤따르는 모음보다 **5~6 dB** 낮은 구간이 유지된다.
+      * 모음 사이 탄음   : **5~8 dB** 짜리 짧은 골 하나 (20~40 ms). 무음이 아니다
+                           — 폐쇄가 짧아 압력이 안 쌓여 발성이 이어진다.
+
+    두 경로로 낸다. (1) 레벨을 내리고, (2) 성도 손실을 키운다. 후자가 중요하다.
+    설측음은 측지가 에너지를 빼가 대역폭이 넓어지며, 그 감쇠가 "막힌" 음색을
+    만든다. 레벨만 줄이면 그냥 작은 모음이 된다.
+    """
+    t = contact.shape[0]
+    c = contact.to(torch.float32).reshape(1, 1, t)
+    k = max(1, int(rise_ms * sample_rate / 1000.0 / hop))
+    pad = k // 2
+    c = torch.nn.functional.avg_pool1d(
+        torch.nn.functional.pad(c, (pad, k - 1 - pad), mode="replicate"), k, 1)
+    c = c.reshape(t, 1).clamp(0.0, 1.0)[:t]
+    level = (10.0 ** (-level_drop_db / 20.0)) ** c
+    rho = rho_open + (rho_closed - rho_open) * c
+    return level.reshape(1, t, 1), rho.reshape(1, t, 1)

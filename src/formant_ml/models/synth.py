@@ -85,6 +85,8 @@ class Controls:
     antiformant_bw: torch.Tensor | None = None
     sib: SibilantParams | None = None     # 치찰음 극-영점 필터(화자 지문)
     area: torch.Tensor | None = None      # (B, T, N) 도파관 모드에서의 단면적
+    tract_rho: torch.Tensor | None = None # (B, T, 1) 성도 손실. 낮을수록 대역폭이
+    #                                       넓다(설측음/비음처럼 감쇠가 큰 구간).
 
     # ------------------------------------------------------------------ 편의
     def to(self, device) -> "Controls":
@@ -203,14 +205,40 @@ class PhysicalVoiceSynth(nn.Module):
         g = c.noise_back_leak.clamp(0.0, 1.0).to(h_front.dtype)  # (B,T,1) 로 방송된다
         return (1.0 - g) * h_front + g * h_full
 
+    def _src_weight(self, n_freq: int, device):
+        """성문 소스의 스펙트럼 기울기를 흉내낸 가중 (1/f). 정규화용."""
+        key = (n_freq, str(device))
+        if getattr(self, "_swk", None) != key:
+            f = torch.linspace(0.0, self.cfg.audio.sample_rate / 2, n_freq,
+                               device=device)
+            w = 1.0 / (f + 200.0)
+            self._sw = w / w.mean()
+            self._swk = key
+        return self._sw
+
     def _waveguide_paths(self, c: Controls):
         fs, nf = self.cfg.audio.sample_rate, self.n_freq
         area = c.area
-        h_harm = tract_response(area, fs, nf)
+        rho = 0.99 if c.tract_rho is None else c.tract_rho.clamp(0.90, 0.999)
+        h_harm = tract_response(area, fs, nf, rho=rho)
+        # **프레임별 정규화 — 단, 소스 스펙트럼으로 가중해야 한다.**
+        # 전극 도파관은 방사 임피던스가 없어 입술이 좁을수록 Q 가 올라가 응답이
+        # 커진다(실제 물리는 반대다). 정규화하지 않으면 자세를 바꾸는 것만으로
+        # 세기가 흔들린다 — 측정: 유음 자세가 /아/ 보다 3.6~4.1 dB 커서 폐쇄
+        # 감쇠를 삼키고 부호를 뒤집었다.
+        # 그런데 0~12 kHz 균등 RMS 로 정규화해도 안 된다. 성문 소스는 강한
+        # 저역통과라, F1 이 낮은 협착 자세는 소스 에너지가 몰린 곳에 극이 놓여
+        # 출력이 오히려 커진다(측정: 탄음 골이 +7 dB 로 뒤집혔다).
+        # 소스 기울기와 같은 1/f 가중으로 재야 실제 출력 세기가 맞는다.
+        w = self._src_weight(nf, h_harm.device)
+        h_harm = h_harm / (h_harm.abs().pow(2) * w).mean(-1, keepdim=True) \
+            .sqrt().clamp_min(1e-6)
         # 협착(=면적 최소) 지점 하류만 노이즈 경로. 위치는 면적함수에서 직접 얻는다.
         pos = area.mean(dim=1).argmin(dim=-1).clamp(max=area.shape[-1] - 3)
         cut = int(pos.float().mean().item())
-        h_noise = tract_response(area[..., cut:], fs, nf)
+        h_noise = tract_response(area[..., cut:], fs, nf, rho=rho)
+        h_noise = h_noise / (h_noise.abs().pow(2) * w).mean(-1, keepdim=True) \
+            .sqrt().clamp_min(1e-6)
         return h_harm, h_noise
 
     def _shared_response(self, c: Controls, ref: torch.Tensor):
