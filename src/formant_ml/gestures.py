@@ -233,6 +233,12 @@ def whisper(t: int, prof: VoiceProfile, vowel: str = "a", strength: float = 0.6,
     """속삭임: 성대 진동 0, 성문 협착 난류가 성도 전체를 통과."""
     c = base(t, prof, n_formants, n_bands, vowel, sample_rate)
     c["harmonic_amp"] = torch.zeros(1, t, 1)
+    # 기식성 바닥은 **발성 중에만** 있다(base() 의 `aspiration_bands` 주석).
+    # 속삭임은 성대가 안 떨리므로 0 이다 — score.py 가 무성 마찰음에 대해
+    # 이미 같은 판단을 한다. 남겨 두면 속삭임의 난류(아래 noise_bands)와
+    # 별개로 상수 잡음 바닥이 하나 더 깔려, `noise_bw_scale` 을 올려도
+    # 울림이 안 줄어든다(시험: test_noise_bandwidth_scale_reduces_ringing).
+    c["aspiration_bands"] = torch.zeros(1, t, n_bands)
     c["noise_bands"] = band_bump(n_bands, 1600.0, 5000.0, strength, sample_rate
                                  ).reshape(1, 1, -1).expand(1, t, -1).contiguous()
     c["noise_entry"] = _c(t, 0.0)

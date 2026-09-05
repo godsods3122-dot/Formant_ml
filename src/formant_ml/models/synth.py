@@ -25,6 +25,7 @@ from ..config import Config, DEFAULT
 from ..dsp.core import ltv_filter
 from ..dsp.filters import (allpass_response, antiresonator_response,
                            bands_to_response, gated_cascade_response,
+                           higher_pole_correction,
                            lip_radiation_response, resonator_stage_responses)
 from ..dsp.glottal import GlottalSource
 from ..dsp.noise import TurbulenceSource
@@ -167,7 +168,18 @@ class PhysicalVoiceSynth(nn.Module):
         fs, nf = self.cfg.audio.sample_rate, self.n_freq
         stages = resonator_stage_responses(c.formant_freq, c.formant_bw,
                                            c.formant_gain, fs, nf)  # (B,T,K,F)
-        h_harm = stages.prod(dim=2)
+        # 나이퀴스트 위 극들의 몫 (filters.higher_pole_correction 주석 참고).
+        #
+        # **성문 경로에만 건다** (성문 소스와 성문 기식). 난류 경로에도 거는 게 물리적으로는 맞아
+        # 보이지만, 이 레포의 난류원 사전(`noise.TurbulenceSource.spectral_prior`)
+        # 과 `noise_radiation_alpha` 는 렌더된 마찰음이 사람 측정치와 맞도록
+        # **끝에서 끝까지** 맞춘 값들이다. 그 적합이 빠져 있던 고차극 셸프를
+        # 이미 흡수해 놓았으므로, 여기서 또 곱하면 이중 계상이다 — 실제로
+        # 8k->11k 감쇠가 사람 범위(4~8 dB) 밖으로 나가고 마찰음 레벨 시험
+        # 8 개가 깨진다. 난류 쪽까지 물리적으로 바르게 하려면 그 사전을
+        # 셸프 없이 다시 적합해야 하고, 그건 별개의 작업이다.
+        hpc = self._hpc(nf, stages.device, stages.real.dtype)
+        h_harm = stages.prod(dim=2) * hpc
 
         k = stages.shape[2]
         idx = torch.arange(k, device=stages.device, dtype=stages.real.dtype)
@@ -183,6 +195,15 @@ class PhysicalVoiceSynth(nn.Module):
         h_noise = gated_cascade_response(c.formant_freq, bw_n,
                                          c.formant_gain, w, fs, nf)
         return h_harm, h_noise
+
+    def _hpc(self, n_freq: int, device, dtype) -> torch.Tensor:
+        key = (n_freq, str(device), str(dtype))
+        if getattr(self, "_hpck", None) != key:
+            self._hpcv = higher_pole_correction(
+                self.cfg.audio.sample_rate, n_freq,
+                n_poles=self.cfg.filt.higher_poles, device=device, dtype=dtype)
+            self._hpck = key
+        return self._hpcv
 
     def _oral_leak(self, c: Controls, h_front: torch.Tensor) -> torch.Tensor:
         """앞공동 경로 + 구강 전체 경로의 **병렬 합**.
@@ -316,8 +337,11 @@ class PhysicalVoiceSynth(nn.Module):
             if c.noise_bw_scale is not None:
                 bw_a = bw_a * c.noise_bw_scale.clamp_min(1.0)
             full = torch.ones_like(c.formant_freq)
+            # 성문 기식도 성도 **전체**를 지나므로 고차극 보정을 같이 받는다
+            # (`_formant_paths` 의 주석 — 협착 제트 경로만 예외다).
             h_asp = gated_cascade_response(c.formant_freq, bw_a, c.formant_gain,
-                                           full, fs, nf) * shared
+                                           full, fs, nf) * shared \
+                * self._hpc(nf, h_harm.device, h_harm.real.dtype)
             h_asp = h_asp * bands_to_response(
                 c.aspiration_bands * self.noise.spectral_prior(), nf, min_phase=True)
             h_asp = h_asp * self.noise_radiation

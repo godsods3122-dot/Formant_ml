@@ -55,7 +55,7 @@ def track_formants(y: np.ndarray, sr: int = 24000, hop: int = 240,
                    win: int = 1024, n: int = 6, order: int | None = None,
                    fmin: float = 120.0, fmax: float = 9000.0,
                    max_bw: float = 900.0, preemph: float = 0.97,
-                   jump_hz: float = 350.0, bw_neutral: float = 20000.0,
+                   jump_hz: float = 350.0, bw_neutral: float = 80000.0,
                    min_gap_hz: float = 800.0, gap_above_hz: float = 4000.0):
     """(T, n) 포먼트 [Hz] 와 (T, n) 대역폭 [Hz]. 연속 궤적으로 이어 붙인다.
 
@@ -132,13 +132,57 @@ def track_formants(y: np.ndarray, sr: int = 24000, hop: int = 240,
                 row = F[i]
                 prev = np.where(np.isnan(row), prev, row)
             i += direction
+    observed = ~np.isnan(F)
     F, B, found = _fill(F, B, sr)
     F = _space_out(F, min_gap_hz, gap_above_hz, sr)
     B = _tame_bandwidths(F, B)
+    F, B, found = _higher_poles(F, B, found, observed, sr, min_gap_hz)
     # 못 찾은 슬롯은 **극이 없는 것**으로 둔다 — 아래 `_fill` 주석의 정책 (3).
     # `_tame_bandwidths` 뒤에 덮어써야 한다(Fant 기준으로 도로 좁히므로).
     B = np.where(found, B, bw_neutral)
     return F, B
+
+
+def _higher_poles(F, B, found, observed, sr, spacing):
+    """관측된 극 **위쪽** 슬롯을 Fant 의 고차극 보정으로 채운다.
+
+    LPC 는 8~9 kHz 위에서 극을 하나도 못 찾는다(측정: 9 kHz 위 근 0.00 개
+    /프레임). 그 대역은 공명이 아니라 기식 난류이기 때문이다. 그렇다고 그
+    슬롯을 비우면(대역폭 중립) 9.5~12 kHz 가 -16 dB 로 무너진다 — 실제
+    성도에는 그 위로도 극이 계속 서 있고, 모델이 그걸 통째로 빠뜨린 것이다.
+
+    Fant 의 고차극 보정이 정확히 이 자리다: 모델링 대역 위의 극들은 개별로
+    분해되지 않고 **완만한 셸프**로 합쳐진다. 길이 L 의 관은 극이 c/2L
+    (여기서는 `spacing`) 간격으로 서므로, 그 프레임에서 **관측된 가장 높은
+    극**부터 같은 간격으로 열을 연장하고 대역폭은 Fant 경험식을 쓴다.
+    10 kHz 에서 2150 Hz 이므로 Q~4.7 — 휘파람이 아니라 셸프다.
+
+    **이 방법은 예전에 한 번 기각됐다**(`_fill` 주석의 정책 (3)). 그때 실패한
+    이유는 연장 자체가 아니라 그 아래가 틀렸기 때문이다 — 탐욕적 `_assign`
+    이 7~8.5 kHz 에 극 4 개를 몰아 넣어 두었고(순서까지 뒤집힌 채) 그 위에
+    연장을 얹으니 6 개가 됐다. `_assign` 을 순서 보존 DP 로 바꿔 몰림이
+    사라진 뒤에는 연장이 제 몫을 한다.
+    """
+    F, B = F.copy(), B.copy()
+    found = found & np.ones_like(F, bool)
+    t, n = F.shape
+    top = np.where(observed.any(1), observed.shape[1] - 1
+                   - np.argmax(observed[:, ::-1], axis=1), -1)
+    hi = sr * 0.48
+    for i in range(t):
+        s0 = top[i]
+        if s0 < 0:
+            continue
+        f = F[i, s0]
+        for s in range(s0 + 1, n):
+            f = f + spacing
+            if f >= hi:
+                found[i, s] = False
+                continue
+            F[i, s] = f
+            B[i, s] = 50.0 + 20.0 * (f / 1000.0) ** 2 + 10.0 * (f / 1000.0)
+            found[i, s] = True
+    return F, B, found
 
 
 def _space_out(F: np.ndarray, min_gap: float, above: float, sr: int) -> np.ndarray:
@@ -198,30 +242,80 @@ def _tame_bandwidths(F: np.ndarray, B: np.ndarray, lo: float = 0.5,
     return out
 
 
-def _assign(F, B, i, f, bw, prev, n, jump_hz):
-    """한 프레임의 근을 궤적에 배정한다 (순서 보존)."""
-    used = np.zeros(len(f), bool)
-    ptr = 0
+def _assign(F, B, i, f, bw, prev, n, jump_hz,
+            drop_root: float = 2.0, drop_slot: float = 0.5,
+            free_slot: float = 0.5, over_jump: float = 4.0):
+    """한 프레임의 근을 궤적에 배정한다 (순서 보존, 전역 최소비용).
+
+    **탐욕적 배정은 근을 버린다.** 예전 방식은 슬롯을 낮은 쪽부터 훑으며
+    직전 궤적에서 `jump_hz` 안에 있는 첫 근을 집고, 남은 근은 이미 배정된
+    이웃 사이에 빈 슬롯이 있을 때만 끼워 넣었다. 한 번 집은 포인터는 뒤로
+    못 가므로, 앞 슬롯이 근 하나를 가져가 버리면 뒤 슬롯은 자기 근을 영영
+    못 본다. 측정('라' 전체 발화, 활성 프레임):
+
+    | 대역 | LPC 근 | 탐욕 배정 뒤 |
+    |---|---|---|
+    | 0.1~1 kHz | 0.93 | 0.91 |
+    | 1~2.5 kHz | 1.97 | 1.82 |
+    | **2.5~4 kHz** | **1.06** | **0.65** |
+    | 4~7 kHz | 2.79 | 2.35 |
+
+    2.5~4 kHz 에서만 39 % 가 버려진다. 그 대역이 F3/F4 자리이고, 복사합성이
+    거기서 -7 dB 부족했던 것의 원인이다(docs/HANDOFF_LIQUID.md 의 미해결
+    항목). 버려진 극은 `_fill` 이 보간으로 흉내 낼 뿐 되살아나지 않는다.
+
+    그래서 **순서를 지키는 최소비용 정렬**로 바꾼다. 슬롯 열과 근 열은 둘 다
+    주파수 오름차순이므로, 둘 사이의 순서 보존 부분정합은 편집거리와 같은
+    꼴의 DP 로 정확히 푼다 (12 x 9 셀, 프레임당 비용 무시 가능).
+
+    비용은 전부 `jump_hz` 배수로 준다:
+      - 잇기: |f - prev| (직전 궤적이 있을 때). `jump_hz` 를 넘으면 초과분에
+        `over_jump` 배 벌점 — **막지는 않는다.** 막으면 빠르게 움직이는
+        전이(유음이 바로 그것이다)에서 궤적이 통째로 끊긴다.
+      - 직전 궤적이 없는 슬롯에 넣기: `free_slot` x jump_hz (고정)
+      - 근을 버리기: `drop_root` x jump_hz  <- 가장 비싸다
+      - 슬롯을 비우기: `drop_slot` x jump_hz
+    """
+    m = len(f)
+    if m == 0:
+        return
+    big = float("inf")
+    cr = drop_root * jump_hz
+    cs = drop_slot * jump_hz
+    # cost[s][j] = 슬롯 s 에 근 j 를 넣는 비용
+    cost = np.empty((n, m))
     for s in range(n):
         p = prev[s]
         if np.isnan(p):
-            continue
-        while ptr < len(f) and f[ptr] < p - jump_hz:
-            ptr += 1
-        if ptr < len(f) and abs(f[ptr] - p) <= jump_hz:
-            F[i, s], B[i, s] = f[ptr], bw[ptr]
-            used[ptr] = True
-            ptr += 1
-    for j in np.where(~used)[0]:
-        c = f[j]
-        for s in range(n):
-            if not np.isnan(F[i, s]):
+            cost[s] = free_slot * jump_hz
+        else:
+            d = np.abs(f - p)
+            cost[s] = np.where(d <= jump_hz, d,
+                               jump_hz + (d - jump_hz) * over_jump)
+    dp = np.full((n + 1, m + 1), big)
+    back = np.zeros((n + 1, m + 1), np.int8)   # 0 = 정합, 1 = 슬롯 비움, 2 = 근 버림
+    dp[0, 0] = 0.0
+    for s in range(n + 1):
+        for j in range(m + 1):
+            v = dp[s, j]
+            if v == big:
                 continue
-            below = [F[i, k] for k in range(s) if not np.isnan(F[i, k])]
-            above = [F[i, k] for k in range(s + 1, n) if not np.isnan(F[i, k])]
-            if (not below or below[-1] < c) and (not above or above[0] > c):
-                F[i, s], B[i, s] = c, bw[j]
-                break
+            if s < n and v + cs < dp[s + 1, j]:
+                dp[s + 1, j], back[s + 1, j] = v + cs, 1
+            if j < m and v + cr < dp[s, j + 1]:
+                dp[s, j + 1], back[s, j + 1] = v + cr, 2
+            if s < n and j < m and v + cost[s, j] < dp[s + 1, j + 1]:
+                dp[s + 1, j + 1], back[s + 1, j + 1] = v + cost[s, j], 0
+    s, j = n, m
+    while s > 0 or j > 0:
+        b = back[s, j]
+        if b == 0:
+            F[i, s - 1], B[i, s - 1] = f[j - 1], bw[j - 1]
+            s, j = s - 1, j - 1
+        elif b == 1:
+            s -= 1
+        else:
+            j -= 1
 
 
 def _fill(F: np.ndarray, B: np.ndarray, sr: int):

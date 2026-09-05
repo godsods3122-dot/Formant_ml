@@ -100,6 +100,47 @@ def gated_cascade_response(freq, bw, gain, weight, sample_rate: float,
     return torch.polar(torch.exp(acc_mag.clamp(-60.0, 60.0)), acc_ph)
 
 
+def higher_pole_correction(sample_rate: float, n_freq: int,
+                           n_poles: int = 2, spacing: float = 1000.0,
+                           device=None, dtype=None) -> torch.Tensor:
+    """Fant 의 **고차극 보정** — 나이퀴스트 위의 극들이 남기는 상승 셸프.
+
+    캐스케이드는 K 개의 극만 담는다. 실제 성도에는 그 위로도 c/2L 간격으로 극이
+    계속 서 있고, 각각이 모델링 대역 안쪽까지 완만한 상승 이득을 남긴다. 그걸
+    빼면 최상단 극 위가 통째로 무너진다 — DC 정규화 극은 자기 중심 위로
+    -12 dB/oct 씩 떨어지므로, 12 개를 지나면 나이퀴스트 근처가 절벽이 된다.
+    측정(캐스케이드만, '라' 전체 발화): 9.5~12 kHz 가 -15.6 dB.
+
+    이 레포는 그동안 이 자리를 **가짜 극**으로 때우고 있었다. 추적기가 극을
+    7~8.5 kHz 에 몰아 넣고 빈 슬롯을 좁은 대역폭으로 되살린 결과가 우연히
+    비슷한 레벨을 냈을 뿐이고, 그 대가가 사용자가 지적한 "지글거리는 고주파"
+    였다. 몰림을 고치면(`analysis.track._assign`) 이 구멍이 드러난다.
+
+    보정은 아날로그 극쌍의 크기응답을 그대로 쓴다(위상은 건드리지 않는다 —
+    나이퀴스트 위의 극이라 대역 안에서는 거의 선형이다):
+
+        |H_n(f)| = Fn^2 / sqrt((Fn^2 - f^2)^2 + (Bn f)^2)
+
+    Fn 은 나이퀴스트 위로 `spacing` 간격, Bn 은 Fant 경험식이다. n_poles=2 를
+    쓴다 — 24 kHz 에서 11 kHz +17.6 / 8 kHz +7.7 / 5 kHz +2.6 / 1 kHz +0.1 dB 로,
+    측정된 구멍(+16 / +7 / ~0)과 모양이 맞는다. 3 개면 11 kHz 에서 +24 dB 로
+    넘친다.
+
+    **`noise_bw_scale` 로 이 극들까지 넓혀 보았고, 안 된다.** 난류 경로의
+    추가 감쇠를 고차극에도 걸면(bn x6) 셸프가 11 kHz 에서 -3 dB 짜리
+    감쇠기로 뒤집힌다 — Q 가 원래 낮아서 조금만 넓혀도 이득이 1 아래로
+    떨어진다. 속삭임 울림 지표가 0.495 -> 0.558 로 더 나빠졌다.
+    """
+    nyq = sample_rate / 2.0
+    f = torch.linspace(0.0, nyq, n_freq, device=device, dtype=dtype)
+    g = torch.ones_like(f)
+    for k in range(1, n_poles + 1):
+        fn = nyq + (k - 0.5) * spacing
+        bn = 50.0 + 20.0 * (fn / 1000.0) ** 2 + 10.0 * (fn / 1000.0)
+        g = g * (fn ** 2) / torch.sqrt((fn ** 2 - f ** 2) ** 2 + (bn * f) ** 2)
+    return g
+
+
 def antiresonator_response(freq, bw, sample_rate: float, n_freq: int) -> torch.Tensor:
     """반공명(영점) 캐스케이드: 비음의 안티포먼트, 마찰음의 스펙트럼 골."""
     D, Ddc = _pole_pair(freq, bw, sample_rate, n_freq)

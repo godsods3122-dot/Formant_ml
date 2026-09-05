@@ -55,7 +55,8 @@ def analyse(y: np.ndarray, cfg: Config):
     """파형 -> 복사합성에 필요한 프레임별 파라미터."""
     sr, hop = cfg.audio.sample_rate, cfg.audio.hop_size
     win = 1024
-    F, B = track_formants(y, sr, hop, win, n=cfg.filt.n_formants)
+    F, B = track_formants(y, sr, hop, win, n=cfg.filt.n_formants,
+                          bw_neutral=cfg.filt.bw_neutral)
     t = len(F)
     yt = torch.from_numpy(y).float()[None]
     f0, voi = yin_f0(yt, sr, hop)
@@ -175,10 +176,16 @@ def build_controls(a: dict, cfg: Config, jitter: float, shimmer: float,
         # 노이즈는 **연속 비주기성**에 비례한다. 이진 판정에 묶으면 검출이
         # 흔들릴 때마다 마찰음 버스트가 터진다.
         noise_bands=(T(rms * 0.12 * (1.0 - per) ** 2 * hf).reshape(1, t, 1)
-                     * T(oral).reshape(1, 1, nb)
-                     # 기식은 발성의 부산물이다 -> 같은 게이트를 건다
-                     + T(rms * gate * ASPIRATION_FLOOR).reshape(1, t, 1)
-                     ).contiguous(),
+                     * T(oral).reshape(1, 1, nb)).contiguous(),
+        # **유성 기식은 `aspiration_bands` 로 보낸다.** 예전에는 이걸
+        # `noise_bands` 에 더해 두었는데, 그 자리는 협착 제트(구강 마찰)용
+        # 이라 `noise.spectral_prior`/`noise_radiation_alpha` 가 마찰음
+        # 측정치에 맞춰 끝에서 끝까지 적합된 경로다. 성문 난류는 물리가
+        # 다르고(평탄, 성도 전체 통과), 무엇보다 `PhysicalVoiceSynth` 가
+        # 고차극 보정을 **성도 전체를 지나는 경로에만** 걸기 때문에 여기
+        # 있어야 그 보정을 받는다. 기식은 발성의 부산물이므로 같은 게이트다.
+        aspiration_bands=(T(rms * gate * ASPIRATION_FLOOR).reshape(1, t, 1)
+                          * torch.ones(1, 1, nb)).contiguous(),
         # 기식은 **성문**에서 난다 -> 성도 전체를 지난다. 여기를 K*0.7 로 두면
         # 노이즈가 상위 포먼트(5~11 kHz)만 통과해 +33 dB/oct 로 치솟고,
         # 유성 구간에 섞인 2 % 만으로도 고역을 덮어 "쨍한" 소리가 된다.

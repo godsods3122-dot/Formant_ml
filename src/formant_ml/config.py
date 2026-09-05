@@ -54,7 +54,9 @@ class FilterConfig:
     # 1195 Hz(F2 근처) 에서 8227 Hz 로 옮겨 놨다 — 무음 구간에서 8 kHz
     # 휘파람으로 들렸고, 전체 발화에서 저역이 15 dB 묻혔다.
     # 20 kHz 면 r=0.073 이라 응답이 1 에서 ±0.6 dB 안에 든다.
-    bw_neutral: float = 20000.0
+    bw_neutral: float = 80000.0
+    #: 나이퀴스트 위 고차극 보정에 쓸 극 개수 (dsp.filters.higher_pole_correction).
+    higher_poles: int = 2
     ir_size: int = 512            # LTV 필터 임펄스응답 길이
     n_allpass: int = 4            # 성도 위상(군지연) 정형용 올패스 단수
     n_dispersion: int = 3         # 성문 소스 하모닉 위상차(올패스) 단수
