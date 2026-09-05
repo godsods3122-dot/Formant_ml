@@ -37,9 +37,20 @@ def reflection_to_lpc(k: torch.Tensor) -> torch.Tensor:
     return a
 
 
-def bandwidth_expansion(a: torch.Tensor, rho: float = 0.99) -> torch.Tensor:
-    """a_j <- a_j * rho^j : 극점 반지름을 rho배로 줄여 대역폭(손실)을 준다."""
+def bandwidth_expansion(a: torch.Tensor, rho=0.99) -> torch.Tensor:
+    """a_j <- a_j * rho^j : 극점 반지름을 rho배로 줄여 대역폭(손실)을 준다.
+
+    rho 는 스칼라 또는 (B, T, 1) 텐서다. 프레임별로 줄 수 있어야 하는 이유:
+    설측음은 측지(side branch)가 에너지를 빼가서 실제 대역폭이 모음보다 훨씬
+    넓다. 손실을 발화 내내 고정하면 자음 구간이 모음처럼 쨍하게 울려
+    "혀가 입천장에 닿지 않은" 소리가 된다.
+
+    대역폭 환산: BW = -ln(rho) * fs / pi. 24 kHz 에서 rho=0.99 -> 77 Hz,
+    rho=0.975 -> 193 Hz.
+    """
     j = torch.arange(a.shape[-1], device=a.device, dtype=a.dtype)
+    if torch.is_tensor(rho):
+        return a * rho.to(a.dtype) ** j
     return a * rho ** j
 
 
@@ -58,7 +69,7 @@ def lpc_response(a: torch.Tensor, sample_rate: float, n_freq: int,
 
 
 def tract_response(area: torch.Tensor, sample_rate: float, n_freq: int,
-                   rho: float = 0.99, lip_reflection: float = 0.9,
+                   rho=0.99, lip_reflection: float = 0.9,
                    gain: torch.Tensor | None = None) -> torch.Tensor:
     """단면적 함수 -> 성도 전달함수(복소)."""
     k = area_to_reflection(area, lip_reflection)
