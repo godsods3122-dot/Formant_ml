@@ -25,15 +25,17 @@
 ## 빠른 시작
 
 ```bash
-pip install torch numpy scipy soundfile pyyaml
-export PYTHONPATH=src
+# 0) 환경 구축 (venv + 의존성 + editable 설치). PyPI 만 쓴다.
+bash scripts/setup_env.sh && source .venv/bin/activate
+# 스크립트를 쓰지 않는다면:
+#   pip install torch numpy scipy soundfile pyyaml pytest && export PYTHONPATH=src
 
 # 1) 학습 없이, 방정식만으로 소리를 만들어 본다 (out/*.wav)
 python -m formant_ml.demo --out out
 
-# 2) 검증 (물리 엔진 11종 + 목소리 제어 26종)
-python tests/test_dsp.py
-python tests/test_voice.py
+# 2) 검증 92종 (물리 엔진 11 + 목소리 제어 55 + 공기역학 18 + 학습 8)
+python -m pytest tests -q
+# 또는 개별로: python tests/test_dsp.py / test_voice.py / test_aeroacoustic.py
 
 # 3) 스크립트로 원하는 소리를 만든다 (웃음·숨·프라이·속삭임 포함)
 python -m formant_ml.render examples/laugh_and_speech.yaml -o out/line.wav

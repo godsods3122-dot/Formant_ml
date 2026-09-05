@@ -9,8 +9,17 @@ description = "물리 기반(성문 소스 + 성도 공명 + 난류 노이즈) �
 requires-python = ">=3.10"
 dependencies = ["torch>=2.0", "numpy>=1.24", "scipy>=1.10", "soundfile>=0.12"]
 
+# YAML 스크립트(examples/*.yaml)는 pyyaml 이 있어야 읽는다. 없으면 JSON 으로 쓸 수
+# 있으므로 하드 의존이 아니라 extra 로 둔다 (score.py::load_score 참조).
+[project.optional-dependencies]
+yaml = ["pyyaml>=6.0"]
+dev = ["pyyaml>=6.0", "pytest>=7.0"]
+
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 90
