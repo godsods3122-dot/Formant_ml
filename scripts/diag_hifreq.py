@@ -15,15 +15,17 @@ HANDOFF_LIQUID §2 는 "상위 포먼트가 프레임마다 흔들리는데 지�
 
 기준값(사용자 녹음): **원본 1.7~1.9 dB**. 합성이 4 dB 를 넘으면 토막이 보인다.
 
-진단 결과 (2026-09-05)
-----------------------
-범인은 포먼트 궤적도, 대역폭도, 노이즈도, 지터/시머도 아니다.
+진단 결과 (2026-09-05) — 고쳤다
+------------------------------
+범인은 포먼트 궤적도, 대역폭도, 노이즈도, 지터/시머도 아니었다.
 `dsp/core.ltv_filter` 가 **여기신호를 240 샘플 직사각 블록으로 잘라** 각각 다른
-IR 로 컨볼루션한 뒤 겹쳐 더하는 것이다. 창이 없으므로 블록 경계마다 스펙트럼이
+IR 로 컨볼루션한 뒤 겹쳐 더하는 것이었다. 창이 없으므로 블록 경계마다 스펙트럼이
 번지고(직사각 = 주파수축 sinc), 응답이 프레임마다 다르면 그 번짐이 상쇄되지
-않는다. 10 ms 격자의 타일이 그대로 보인다.
+않는다. 10 ms 격자의 타일이 그대로 보였다.
 
-이 스크립트의 --ablate 는 그 근거를 표로 뽑는다.
+지금은 COLA(50 % 중첩 Hann) 교차창을 쓴다. `--ablate` 는 **예전 직사각 구현을
+이 파일 안에 그대로 들고 있어서**(`ltv_rect`) 전후를 나란히 뽑는다 —
+회귀가 생기면 여기서 바로 보인다.
 """
 from __future__ import annotations
 
@@ -77,34 +79,28 @@ def band_db(y: np.ndarray, hop: int = 240, n_fft: int = 1024):
             for lo, hi in ((100, 2500), (2500, 4000), (4000, 7000), (7000, 11000))]
 
 
-# ------------------------------------------------------- 교차창 LTV (시제품)
-def ltv_xfade(x: torch.Tensor, H: torch.Tensor, hop: int,
-              ir_size: int = 512) -> torch.Tensor:
-    """COLA(50 % 중첩 Hann) 교차창 시변 필터. `ltv_filter` 의 대안 시제품.
+# ----------------------------------------------- 예전 구현 (회귀 대조용)
+def ltv_rect(x: torch.Tensor, H: torch.Tensor, hop: int, ir_size: int = 512,
+             tail=None, return_tail: bool = False) -> torch.Tensor:
+    """**고치기 전의** `ltv_filter` — 창 없는 직사각 블록 OLA.
 
-    현행 `ltv_filter` 는 창 없이 직사각 블록을 쓴다. 응답이 고정이면 완전복원이
-    되지만, 프레임마다 다르면 블록 경계의 스펙트럼 번짐이 상쇄되지 않는다.
-    주기적 Hann 은 50 % 중첩에서 합이 정확히 1 이라 응답이 고정이면 여전히
-    완전복원이고(끝 프레임 제외), 변할 때는 부드럽게 넘어간다.
+    여기 남겨 두는 이유는 하나다: `--ablate` 가 전후를 같은 실행에서 재야
+    "정말 이것 때문이었나" 를 다시 물을 필요가 없다. 쓰지 마라.
     """
     b, n = x.shape
     t = H.shape[1]
-    L, n_pad = 2 * hop, t * hop
+    n_pad = t * hop
     if n < n_pad:
         x = TF.pad(x, (0, n_pad - n))
-    xp = TF.pad(x[:, :n_pad], (hop, 2 * hop))
-    fr = xp.unfold(1, L, hop)[:, :t]
-    w = torch.hann_window(L, periodic=True, dtype=x.dtype, device=x.device)
-    wet = fft_convolve(fr * w, response_to_ir(H, ir_size))
-    out = torch.zeros(b, n_pad + 2 * hop + wet.shape[-1], dtype=x.dtype,
-                      device=x.device)
+    wet = fft_convolve(x[:, :n_pad].reshape(b, t, hop),
+                       response_to_ir(H, ir_size))
+    out = torch.zeros(b, n_pad + ir_size - 1, dtype=x.dtype, device=x.device)
     out = out.index_put_(
         (torch.arange(b, device=x.device)[:, None, None],
          (torch.arange(t, device=x.device)[:, None] * hop
           + torch.arange(wet.shape[-1], device=x.device)[None, :])[None]),
         wet, accumulate=True)
-    d = ir_size // 2 + hop
-    return out[:, d:d + n]
+    return out[:, ir_size // 2: ir_size // 2 + n]
 
 
 # ------------------------------------------------------------------- 그림
@@ -164,15 +160,14 @@ def main() -> None:
     a = analyse(y, cfg)
     torch.manual_seed(0)
 
-    def render(xfade: bool, tilt: float = -12.0, **kw):
+    def render(rect: bool = False, tilt: float = 4.0, rd: float = 0.9, **kw):
         orig = S.ltv_filter
-        if xfade:
-            S.ltv_filter = lambda x, H, h, ir_size=512, tail=None, \
-                return_tail=False: ltv_xfade(x, H, h, ir_size)
+        if rect:
+            S.ltv_filter = ltv_rect
         try:
             syn = S.PhysicalVoiceSynth(cfg, tract_mode="formant")
             c = build_controls(a, cfg, kw.get("jit", 0.002), kw.get("shim", 0.02),
-                               tilt, 0.6)
+                               tilt, rd)
             if kw.get("nonoise"):
                 c.noise_bands = torch.zeros_like(c.noise_bands)
             if kw.get("freeze"):
@@ -190,16 +185,17 @@ def main() -> None:
         # 그림 라벨은 ASCII 로 둔다 — matplotlib 기본 폰트에 한글이 없어서
         # 한글 라벨을 쓰면 전부 두부(tofu) 상자로 찍힌다.
         rows = [("original", "원본", y),
-                ("current: rectangular-block OLA", "현행 (직사각 블록 OLA)",
-                 render(False)),
+                ("old: rect-block OLA, tilt=-12", "예전 (직사각 OLA, tilt=-12)",
+                 render(rect=True, tilt=-12.0, rd=0.6)),
                 ("  + noise/jitter/shimmer off", "  + 노이즈/지터/시머 끔",
-                 render(False, nonoise=1, jit=0., shim=0.)),
+                 render(rect=True, tilt=-12.0, rd=0.6, nonoise=1, jit=0., shim=0.)),
                 ("  + formant track frozen", "  + 포먼트 궤적 고정",
-                 render(False, nonoise=1, jit=0., shim=0., freeze=1)),
-                ("cross-faded OLA, tilt=-12", "교차창 OLA, tilt=-12",
-                 render(True)),
-                ("cross-faded OLA, tilt=0", "교차창 OLA, tilt=0",
-                 render(True, tilt=0.0))]
+                 render(rect=True, tilt=-12.0, rd=0.6, nonoise=1, jit=0.,
+                        shim=0., freeze=1)),
+                ("cross-faded OLA, tilt=-12", "교차창 OLA (tilt 는 예전 값)",
+                 render(tilt=-12.0, rd=0.6)),
+                ("now: cross-faded OLA, tilt=+4 Rd=0.9", "현행 (교차창 + 새 tilt/Rd)",
+                 render())]
         print(f"\n{'':28s}  flut(med/p90)   0.1-2.5k  2.5-4k   4-7k   7-11k")
         for _, ko, s in rows:
             s = s / max(abs(s).max(), 1e-9)

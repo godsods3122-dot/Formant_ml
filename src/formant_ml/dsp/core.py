@@ -58,52 +58,92 @@ def response_to_ir(H: torch.Tensor, ir_size: int, window: bool = True) -> torch.
     return ir
 
 
+def ltv_delay(ir_size: int, hop_size: int) -> int:
+    """`ltv_filter` 가 만드는 고정 지연 [샘플].
+
+    IR 중심을 맞추는 `ir_size//2` 에, 교차창이 한 프레임 뒤를 보기 위한
+    `hop_size` 가 더해진다. 스트리밍 지연 계산과 오프라인-스트리밍 정렬이
+    같은 값을 쓰도록 여기 한 곳에 둔다.
+    """
+    return ir_size // 2 + hop_size
+
+
 def ltv_filter(
     x: torch.Tensor,
     H: torch.Tensor,
     hop_size: int,
     ir_size: int = 512,
-    tail: torch.Tensor | None = None,
+    tail: tuple[torch.Tensor, torch.Tensor] | None = None,
     return_tail: bool = False,
 ):
     """시변 필터링. x: (B, N), H: (B, T, n_freq) 복소응답. 반환 (B, N).
 
-    x를 hop_size 길이의 비중첩 프레임으로 자르고, 각 프레임을 해당 프레임의
-    임펄스응답과 컨볼루션한 뒤 overlap-add 한다.
+    **왜 창을 씌우는가 (직사각 블록으로 하면 안 되는 이유).**
+    예전 구현은 x 를 `hop_size` 길이의 **직사각** 블록으로 잘라 각각 그 프레임의
+    IR 로 컨볼루션한 뒤 겹쳐 더했다. 응답이 고정이면 블록의 합이 곧 x 라
+    완전복원이지만, **응답이 프레임마다 다르면 직사각 절단이 만든 스펙트럼
+    번짐(주파수축 sinc)이 상쇄되지 않고 그대로 남는다.** 포먼트가 움직이는
+    구간에서 10 ms 격자의 타일이 스펙트로그램에 찍혔고, 3.5~9 kHz 포락선의
+    프레임간 |Δ| 가 원본 1.9 dB 대비 4.2 dB 로 튀었다.
+    (측정과 재현: `scripts/diag_hifreq.py --ablate`, docs/HANDOFF_LIQUID.md §2)
 
-    스트리밍(`return_tail=True`): 지연 보정을 하지 않고 OLA 꼬리를 그대로
-    돌려준다. 다음 청크의 앞에 그 꼬리를 더하면 결과가 오프라인 합성과
-    **정확히 같다**. 대신 스트림 전체에 `ir_size//2` 샘플의 고정 지연이 남는다
-    (한 번만 생기는 상수 지연이라 실시간 제어에는 문제가 없다).
+    그래서 `2*hop_size` 길이의 **주기적 Hann 창**을 50 % 중첩으로 쓴다. 이 창은
+    50 % 중첩에서 합이 정확히 1(COLA)이라 **응답이 고정이면 여전히 완전복원**
+    이면서, 응답이 변할 때는 인접 프레임의 결과가 부드럽게 교차한다.
+    같은 여기신호·같은 H 로 재면 프레임간 |Δ| 4.25 -> 1.77 dB (원본 1.92).
+    제어율을 4 배로 올려도 직사각을 유지하면 2.76 까지밖에 안 내려간다 —
+    **제어율이 아니라 창이 문제다.**
+
+    한 프레임 뒤를 보게 되므로 고정 지연이 `ir_size//2` 에서
+    `ltv_delay(ir_size, hop_size)` 로 `hop_size` 만큼 늘어난다.
+
+    스트리밍(`return_tail=True`): 지연 보정을 하지 않고 상태를 그대로 돌려준다.
+    상태는 **(OLA 꼬리, 입력 마지막 hop 샘플)** 두 개다 — 교차창은 프레임보다
+    `hop_size` 앞의 입력을 보므로 꼬리만으로는 청크를 이을 수 없다. 그대로
+    다음 호출의 `tail` 에 넣으면 오프라인 합성과 정확히 같은 결과가 나온다.
     """
     b, n = x.shape
     t = H.shape[1]
     n_pad = t * hop_size
     if n < n_pad:
         x = F.pad(x, (0, n_pad - n))
-    frames = x[:, :n_pad].reshape(b, t, hop_size)
+    x = x[:, :n_pad]
 
-    ir = response_to_ir(H, ir_size)                     # (B, T, ir_size)
-    wet = fft_convolve(frames, ir)                      # (B, T, hop+ir-1)
+    # 직전 청크의 마지막 hop 샘플(스트리밍) 또는 0(오프라인)을 앞에 붙인다.
+    hist = tail[1] if tail is not None else \
+        torch.zeros(b, hop_size, dtype=x.dtype, device=x.device)
+    win_len = 2 * hop_size
+    # 오프라인에서는 프레임을 하나 더 돌린다 — 마지막 hop 샘플은 다음 프레임의
+    # 앞창이 있어야 창 합이 1 이 되기 때문이다(없으면 끝이 Hann 으로 페이드아웃).
+    # 스트리밍에서는 그 프레임이 다음 청크의 프레임 0 이므로 더하면 이중계산이다.
+    n_frames = t if return_tail else t + 1
+    xp = torch.cat([hist, x, x.new_zeros(b, win_len)], dim=1)
+    frames = xp.unfold(1, win_len, hop_size)[:, :n_frames]      # (B, T', win)
+    w = torch.hann_window(win_len, periodic=True, dtype=x.dtype, device=x.device)
 
-    out_len = n_pad + ir_size - 1
+    ir = response_to_ir(H, ir_size)                             # (B, T, ir_size)
+    if n_frames > t:                        # 여분 프레임은 마지막 응답을 그대로 쓴다
+        ir = torch.cat([ir, ir[:, -1:]], dim=1)
+    wet = fft_convolve(frames * w, ir)                          # (B, T', win+ir-1)
+
+    out_len = (n_frames - 1) * hop_size + wet.shape[-1]
     out = torch.zeros(b, out_len, dtype=x.dtype, device=x.device)
     out = out.index_put_(
         (
             torch.arange(b, device=x.device)[:, None, None],
-            (torch.arange(t, device=x.device)[:, None] * hop_size
+            (torch.arange(n_frames, device=x.device)[:, None] * hop_size
              + torch.arange(wet.shape[-1], device=x.device)[None, :])[None],
         ),
         wet,
         accumulate=True,
     )
     if tail is not None:
-        m = tail.shape[-1]
-        out = torch.cat([out[:, :m] + tail, out[:, m:]], dim=-1)
+        m = tail[0].shape[-1]
+        out = torch.cat([out[:, :m] + tail[0], out[:, m:]], dim=-1)
     if return_tail:
-        return out[:, :n_pad], out[:, n_pad:]
-    delay = ir_size // 2
-    return out[:, delay : delay + n]
+        return out[:, :n_pad], (out[:, n_pad:], x[:, n_pad - hop_size:])
+    d = ltv_delay(ir_size, hop_size)
+    return out[:, d: d + n]
 
 
 def amp_to_db(x: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:

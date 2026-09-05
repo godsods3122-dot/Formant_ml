@@ -171,10 +171,26 @@ def main() -> None:
     # (원본의 고역도 하모닉이 안 잡힌다) — 생리적 값으로만 낮춘 것이다.
     ap.add_argument("--jitter", type=float, default=0.002)
     ap.add_argument("--shimmer", type=float, default=0.02)
-    # 측정으로 고른 값. tilt=0, Rd=1.2 로 두면 소스가 어두워 4~7 kHz 가
-    # 원본보다 13 dB 낮았다(포락선 오차 10.6 dB). 이 조합에서 3.5 dB.
-    ap.add_argument("--tilt", type=float, default=-12.0)
-    ap.add_argument("--rd", type=float, default=0.6)
+    # **예전 값(tilt=-12, Rd=0.6)은 무효였다.** 그 측정은 `ltv_filter` 의
+    # 직사각 블록이 만든 스펙트럼 번짐을 통해서 한 것이었고, 번짐을 없애자
+    # tilt=-12 는 4~7 kHz 를 30 dB **죽이는** 값으로 드러났다
+    # (docs/HANDOFF_LIQUID.md §2.3).
+    #
+    # 부호도 반대로 알고 있었다. 인수인계 §4.3 의 "값이 클수록 어두워진다" 는
+    # `filters.one_pole_tilt`(저역통과) 이야기고, **여기서 쓰는
+    # `GlottalSource` 의 tilt 는 값이 클수록 밝아진다**(하모닉 k 에
+    # 10^(tilt*log2(k)/20) 을 곱한다). 두 함수의 규약이 반대다.
+    #
+    # 교차창 필터 위에서 4 토큰 실측 대역에너지로 다시 골랐다. tilt 와 Rd 는
+    # 여기서 **사실상 같은 손잡이**다(둘 다 고역 기울기) — tilt=3/Rd=0.6 과
+    # tilt=4/Rd=0.9 가 거의 같은 값을 낸다(0.1~7 kHz 최대오차 1.60 vs 1.73 dB).
+    # 모달 범위 안에 있는 Rd 쪽을 골랐다. 제대로 된 해법은 상수가 아니라
+    # 프레임별 Rd 를 H1-H2 로 추정하는 것이다.
+    # 결과: 0.1~2.5k +0.2 / 2.5~4k -1.7 / 4~7k -0.3 dB.
+    # 7~11 kHz 는 여전히 13.5 dB 부족하다 — 소스 기울기로 메울 수 없는
+    # 결손이고(메우려면 4~7 kHz 가 +6 dB 로 넘친다), 유성 기식이 할 일이다.
+    ap.add_argument("--tilt", type=float, default=4.0)
+    ap.add_argument("--rd", type=float, default=0.9)
     args = ap.parse_args()
 
     cfg = Config()
