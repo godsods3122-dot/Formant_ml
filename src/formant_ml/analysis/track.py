@@ -56,46 +56,76 @@ def track_formants(y: np.ndarray, sr: int = 24000, hop: int = 240,
                    jump_hz: float = 350.0):
     """(T, n) 포먼트 [Hz] 와 (T, n) 대역폭 [Hz]. 연속 궤적으로 이어 붙인다.
 
-    `jump_hz` 보다 멀리 뛰는 근은 그 궤적의 후보로 보지 않는다 — 이것이
-    포먼트끼리 자리를 바꾸는 것을 막는다.
+    **가장 신뢰할 만한 프레임에서 씨를 뿌리고 양방향으로 추적한다.**
+    첫 프레임부터 앞으로만 가면 무음 구간에서 잘못 잡힌 궤적이 끝까지 이어진다
+    — 실제로 슬롯 5 가 무음의 8146 Hz 를 물고 있어서, 모음 구간의 실재 극
+    5118 Hz 가 들어갈 자리를 잃고 통째로 버려졌다(고역이 20 dB 넘게 죽었다).
+
+    한 프레임 안의 배정은 (1) 직전 궤적에 `jump_hz` 안으로 가장 가까운 근을
+    순서를 지켜 이어 붙이고 (2) 남은 근은 **앵커 사이의 빈 자리에만** 넣는다.
+    아무렇게나 채우면 한 궤적이 빠졌을 때 나머지가 한 칸씩 밀려 들어온다
+    (F1 이 한 프레임 빠지자 F2 가 슬롯 0 으로 와서 출력이 11 dB 튀었다).
     """
     order = order or int(2 + sr / 1000)
     x = lfilter([1.0, -preemph], [1.0], y)
-    t = max(0, 1 + (len(x) - win) // hop)
+    t = max(0, 1 + (len(x) - hop * 0 - win) // hop)
+    if t == 0:
+        return np.zeros((0, n)), np.zeros((0, n))
     w = np.hanning(win)
+    cand = [_roots(x[i * hop: i * hop + win] * w, sr, order, fmin, fmax, max_bw)
+            for i in range(t)]
+    energy = np.array([np.sqrt((y[i * hop: i * hop + win] ** 2).mean())
+                       for i in range(t)])
+
     F = np.full((t, n), np.nan)
     B = np.full((t, n), np.nan)
-    prev = None
-    for i in range(t):
-        f, bw = _roots(x[i * hop: i * hop + win] * w, sr, order, fmin, fmax,
-                       max_bw)
-        if not len(f):
+    # 씨 프레임은 **근이 가장 많이 잡힌 곳**으로 고른다(동수면 에너지가 큰 쪽).
+    # 에너지만 보고 고르면 그 프레임이 놓친 극의 슬롯이 통째로 밀려서, 이후
+    # 모든 프레임이 그 밀림을 물려받는다(3318 Hz 가 사라지고 고역이 어두워졌다).
+    nroots = np.array([len(c[0]) for c in cand])
+    score = nroots * 1000.0 + energy / max(energy.max(), 1e-12)
+    seed = int(np.argmax(score))
+    f0, b0 = cand[seed]
+    m = min(n, len(f0))
+    F[seed, :m], B[seed, :m] = f0[:m], b0[:m]
+
+    for direction in (1, -1):
+        prev = F[seed].copy()
+        i = seed + direction
+        while 0 <= i < t:
+            f, bw = cand[i]
+            if len(f):
+                _assign(F, B, i, f, bw, prev, n, jump_hz)
+                row = F[i]
+                prev = np.where(np.isnan(row), prev, row)
+            i += direction
+    return _fill(F, B, sr)
+
+
+def _assign(F, B, i, f, bw, prev, n, jump_hz):
+    """한 프레임의 근을 궤적에 배정한다 (순서 보존)."""
+    used = np.zeros(len(f), bool)
+    ptr = 0
+    for s in range(n):
+        p = prev[s]
+        if np.isnan(p):
             continue
-        if prev is None:
-            m = min(n, len(f))
-            F[i, :m], B[i, :m] = f[:m], bw[:m]
-        else:
-            used = np.zeros(len(f), bool)
-            for s in range(n):
-                if np.isnan(prev[s]):
-                    continue
-                d = np.abs(f - prev[s])
-                d[used] = np.inf
-                j = int(np.argmin(d))
-                if d[j] < jump_hz:
-                    F[i, s], B[i, s] = f[j], bw[j]
-                    used[j] = True
-            # 남은 근을 빈 슬롯에 주파수 순서를 지켜 채운다
-            free = [s for s in range(n) if np.isnan(F[i, s])]
-            for s, j in zip(free, np.where(~used)[0]):
-                F[i, s], B[i, s] = f[j], bw[j]
-        row = F[i]
-        prev = np.where(np.isnan(row), prev if prev is not None else row, row)
-    F, B = _fill(F, B, sr)
-    # 포먼트는 물리적으로 서로 교차하지 않는다. 추적 후 정렬로 남은 튐을 없앤다
-    # (에너지가 죽는 끝단에서 근이 고역으로 튀는 것을 실제로 겪었다).
-    o = np.argsort(F, axis=1)
-    return np.take_along_axis(F, o, 1), np.take_along_axis(B, o, 1)
+        while ptr < len(f) and f[ptr] < p - jump_hz:
+            ptr += 1
+        if ptr < len(f) and abs(f[ptr] - p) <= jump_hz:
+            F[i, s], B[i, s] = f[ptr], bw[ptr]
+            used[ptr] = True
+            ptr += 1
+    for j in np.where(~used)[0]:
+        c = f[j]
+        for s in range(n):
+            if not np.isnan(F[i, s]):
+                continue
+            below = [F[i, k] for k in range(s) if not np.isnan(F[i, k])]
+            above = [F[i, k] for k in range(s + 1, n) if not np.isnan(F[i, k])]
+            if (not below or below[-1] < c) and (not above or above[0] > c):
+                F[i, s], B[i, s] = c, bw[j]
+                break
 
 
 def _fill(F: np.ndarray, B: np.ndarray, sr: int):
