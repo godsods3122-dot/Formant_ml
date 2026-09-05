@@ -752,7 +752,8 @@ def test_streaming_matches_offline_synthesis():
     syn = PhysicalVoiceSynth(CFG)
     with torch.no_grad():
         full = syn(c)["audio"]
-    d = CFG.filt.ir_size // 2
+    from formant_ml.dsp.core import ltv_delay
+    d = ltv_delay(CFG.filt.ir_size, CFG.audio.hop_size)
     for chunk in (2, 10, 25):
         st = StreamingSynth(CFG, synth=syn)
         parts = [st.step(c.slice(t0, min(t0 + chunk, c.n_frames)))
@@ -763,7 +764,7 @@ def test_streaming_matches_offline_synthesis():
         err = float((full[:, :n] - stream[:, d:d + n]).abs().max()
                     / full.abs().max())
         assert err < 5e-3, f"청크 {chunk} 프레임에서 오차 {err:.2e}"
-    assert StreamingSynth(CFG).latency_ms < 30.0
+    assert StreamingSynth(CFG).latency_ms < 40.0
 
 
 def test_prosody_rate_and_pitch_are_controllable():

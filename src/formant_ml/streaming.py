@@ -11,9 +11,11 @@
 
 지연
 ----
-* LTV 필터의 고정 지연  `ir_size/2` = 256 샘플 = 10.7 ms (한 번만 생긴다)
+* LTV 필터의 고정 지연  `dsp.core.ltv_delay` = `ir_size/2 + hop` = 496 샘플
+  = 20.7 ms (한 번만 생긴다). 교차창이 한 프레임 뒤를 보기 때문에 `hop` 이
+  붙는다 — 직사각 블록의 10 ms 격자 타일을 없애는 값이다(core.ltv_filter 주석).
 * 제어 보간용 선행 1 프레임 = 10 ms
-합쳐서 약 21 ms. 대화형 응답에는 충분하다.
+합쳐서 약 31 ms. 대화형 응답에는 충분하다.
 
     st = StreamingSynth(cfg)
     for ctrl_chunk in controller:          # 매 청크의 물리 파라미터
@@ -24,6 +26,7 @@ from __future__ import annotations
 import torch
 
 from .config import Config, DEFAULT
+from .dsp.core import ltv_delay
 from .models.synth import Controls, PhysicalVoiceSynth, cat_controls
 
 
@@ -42,7 +45,8 @@ class StreamingSynth:
 
     @property
     def latency_samples(self) -> int:
-        return self.cfg.filt.ir_size // 2 + self.cfg.audio.hop_size
+        return (ltv_delay(self.cfg.filt.ir_size, self.cfg.audio.hop_size)
+                + self.cfg.audio.hop_size)
 
     @property
     def latency_ms(self) -> float:

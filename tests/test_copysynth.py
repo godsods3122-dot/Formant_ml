@@ -73,6 +73,92 @@ def test_tracked_formants_are_ordered_and_continuous():
     assert jump < 400.0, f"프레임 간 최대 도약 {jump:.0f} Hz"
 
 
+
+
+# --------------------------------------------------------------------------
+# 아래는 **실제 녹음**을 쓰는 검사다. `reference/recordings/` 에 커밋되어 있고,
+# 없으면 건너뛴다. 내부 상태가 아니라 **소리를 재는** 쪽이다 (HANDOFF §0.4).
+
+REC = os.path.join(os.path.dirname(__file__), "..", "reference", "recordings",
+                   "ko_liquid_ra-eulla-ara_male_44k.wav")
+RA = (0.50, 1.02)                       # reference/README.md 의 '라' 구간
+#: copysynth 의 기본값을 그대로 읽는다 (아래 테스트 안에서 import 한다).
+
+
+def _bands_db(y, hop=240, n_fft=1024):
+    """전체 대비 대역별 에너지 [dB]: 0.1~2.5k / 2.5~4k / 4~7k / 7~11k.
+
+    **켑스트럼 포락선의 대역 평균으로 이걸 재지 마라.** 그건 dB 의 평균이라
+    넓은 대역에서 변화를 눌러 버린다 — 기식을 75 배 올려도 7~11 kHz 가
+    안 움직인다는 잘못된 결론을 한 번 냈다(실제로는 10 dB 움직였다).
+    """
+    y = np.asarray(y, dtype=np.float64)
+    t = max(1, 1 + (len(y) - n_fft) // hop)
+    idx = np.arange(n_fft)[None, :] + hop * np.arange(t)[:, None]
+    P = np.abs(np.fft.rfft(y[idx] * np.hanning(n_fft), n_fft, axis=1)) ** 2
+    f = np.fft.rfftfreq(n_fft, 1.0 / FS)
+    tot = P.sum()
+    return np.array([10 * np.log10(P[:, (f >= lo) & (f < hi)].sum() / tot + 1e-12)
+                     for lo, hi in ((100, 2500), (2500, 4000),
+                                    (4000, 7000), (7000, 11000))])
+
+
+def test_resynthesis_matches_the_high_band_of_the_recording():
+    """되합성의 2.5~7 kHz 가 원본과 맞아야 한다 — 소스 기울기가 맞는가.
+
+    한때 `--tilt -12` 가 기본값이었다. 그 값은 `GlottalSource` 에서
+    하모닉 k 에 10^(tilt*log2(k)/20) 을 곱하는데, **부호 규약을 반대로**
+    알고 있었고(§4.3 의 "클수록 어두워진다" 는 `filters.one_pole_tilt` 이야기다)
+    게다가 `(tilt*oct_).clamp(-40, 40)` 이 k≈10(약 1.1 kHz)에서 포화해
+    **그 위 전부를 -40 dB 로 평평하게 눌렀다.** 결과: 2.5~4 kHz 와 4~7 kHz 가
+    원본보다 35 dB 낮았다. 그런데도 당시 측정으로는 문제가 안 보였는데,
+    `ltv_filter` 의 직사각 블록이 만든 가짜 에너지가 그 자리를 메우고 있었기
+    때문이다(그 결함은 test_dsp 가 따로 잡는다).
+
+    지금 값(`TILT`/`RD`)은 copysynth 의 기본값과 같아야 한다 — 기본값을 바꾸면
+    여기도 바꿔라. 4~7 kHz 와 7~11 kHz 는 여기서 보지 않는다: 그 대역은
+    추적기가 극을 못 찾아 남긴 결손이 지배해서, 소스 기울기로 판정할 수 없다
+    (docs/HANDOFF_LIQUID.md §2.7).
+    """
+    if not os.path.exists(REC):
+        return                                  # 기준 녹음이 없으면 건너뛴다
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
+    import torch
+    from formant_ml.analysis.acoustic import load
+    from formant_ml.config import Config
+    from formant_ml.models.synth import PhysicalVoiceSynth
+    from copysynth import (DEFAULT_RD, DEFAULT_TILT, analyse,
+                           build_controls, match_envelope)
+
+    cfg = Config()
+    y, _ = load(REC, FS)
+    y = y[int(RA[0] * FS):int(RA[1] * FS)]
+    y = y / max(np.abs(y).max(), 1e-9)
+
+    a = analyse(y, cfg)
+    torch.manual_seed(0)
+    syn = PhysicalVoiceSynth(cfg, tract_mode="formant")
+    c = build_controls(a, cfg, 0.002, 0.02, DEFAULT_TILT, DEFAULT_RD)
+    with torch.no_grad():
+        o = syn(c)["audio"][0].numpy().astype(np.float64)
+    o = match_envelope(o, a["rms"], cfg.audio.hop_size)
+    d = _bands_db(o / max(np.abs(o).max(), 1e-9)) - _bands_db(y)
+
+    # 이 검사는 **기울기의 총체적 오류**를 잡는 것이지 값을 고정하는 것이 아니다.
+    # 대역별 절대 오차로는 못 잡는다 — 추적기가 남긴 결손(§2.7)이 대역마다
+    # 다르게 섞여 있어서, 발췌 구간에 따라 부호까지 뒤집힌다.
+    # 반면 `tilt` 가 틀리면 오차가 **주파수에 대해 단조롭게** 기울어진다.
+    assert abs(d[0]) < 6.0, (
+        f"0.1~2.5 kHz 가 원본과 {d[0]:+.1f} dB 어긋난다 (소스 기울기를 의심하라)")
+    slope = d[2] - d[0]                      # 저역 -> 4~7 kHz 오차 기울기
+    # 실측: tilt=+6 -> +3.4, +2 -> -14.8, 0 -> -22.7, -6 -> -36.2, -12 -> -42.2.
+    # 클램프는 |tilt| >= 40/log2(n_harmonics) = 5.06 부터 포화하므로,
+    # -30 이면 포화 영역(±6 이상)만 걸러낸다.
+    assert slope > -30.0, (
+        f"소스가 주파수에 따라 {slope:+.1f} dB 무너진다 — tilt 부호나 "
+        f"glottal.py 의 clamp 포화를 의심하라 (§2.2)")
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0
