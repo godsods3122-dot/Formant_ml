@@ -8,4 +8,6 @@ runs/
 /data/
 *.wav
 !docs/**/*.wav
+# 기준 자료는 레포에 둔다 — 계정을 옮겨가며 작업할 때 매번 다시 올리지 않도록.
+!reference/**
 .DS_Store
