@@ -24,7 +24,8 @@ import formant_ml.models.synth as S
 from formant_ml.analysis.acoustic import load
 from formant_ml.config import Config
 from formant_ml.utils import save_wav
-from copysynth import analyse, build_controls, match_envelope
+from copysynth import (DEFAULT_RD, DEFAULT_TILT, analyse, build_controls,
+                       match_envelope)
 from diag_hifreq import ltv_rect
 
 SR=24000; cfg=Config(); HOP=cfg.audio.hop_size  # 24 kHz = 나이퀴스트 12 kHz
@@ -75,7 +76,7 @@ gap=np.zeros(int(0.30*SR))
 for name,(t0,t1) in TOK.items():
     y=raw[int(t0*SR):int(t1*SR)]; y=y/max(abs(y).max(),1e-9)
     before=render(y,True,-12.0,0.6)
-    after =render(y,False,  2.0,1.2)
+    after =render(y,False, DEFAULT_TILT, DEFAULT_RD)   # 기본값을 그대로 읽는다
     n=min(len(y),len(before),len(after))
     trio=rms_match([y[:n].astype(np.float64),before[:n],after[:n]])
     for tag,x in zip(("a_original","b_before","c_after"),trio):

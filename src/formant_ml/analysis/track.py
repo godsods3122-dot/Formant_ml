@@ -55,7 +55,8 @@ def track_formants(y: np.ndarray, sr: int = 24000, hop: int = 240,
                    win: int = 1024, n: int = 6, order: int | None = None,
                    fmin: float = 120.0, fmax: float = 9000.0,
                    max_bw: float = 900.0, preemph: float = 0.97,
-                   jump_hz: float = 350.0, bw_neutral: float = 20000.0):
+                   jump_hz: float = 350.0, bw_neutral: float = 20000.0,
+                   min_gap_hz: float = 800.0, gap_above_hz: float = 4000.0):
     """(T, n) 포먼트 [Hz] 와 (T, n) 대역폭 [Hz]. 연속 궤적으로 이어 붙인다.
 
     **가장 신뢰할 만한 프레임에서 씨를 뿌리고 양방향으로 추적한다.**
@@ -88,6 +89,17 @@ def track_formants(y: np.ndarray, sr: int = 24000, hop: int = 240,
     # 것 자체가 틀렸고, 답은 Fant 의 고차극 보정이다 —
     # docs/HANDOFF_LIQUID.md §2.7.
     order = order or int(2 + sr / 1000)
+    # **`fmax` 를 11 kHz 로 올려 봤고, 안 된다.** 모델링 대역과 맞추는 게
+    # 맞아 보이지만(9 kHz 위에 극이 하나도 안 잡히니), 라우드니스를 맞춘 뒤
+    # **절대** 대역 레벨로 재면 7~9.5 kHz 가 +8.6 -> +18.6 dB 로 오히려 더
+    # 뜬다. 사용자가 탄음에서 들은 "지글거리는 고주파" 가 그 대역이다.
+    # 포락선 **모양** 지표로는 11 kHz 가 나아 보이는데 그게 함정이었다 —
+    # 모양 지표는 프레임 평균을 빼기 때문에 한 대역이 통째로 뜨는 것을 못 본다.
+    # **판정은 절대 레벨로 해라** (`scripts/diag_hifreq.py` 의 주석 참고).
+    #
+    # **차수도 올리지 마라.** 26 -> 36 이면 LPC 가 저역에서 극을 더 쪼개 찾고
+    # 그것들이 12 슬롯을 다 먹어, 최상단 극이 8.4 kHz 에 그치고 그 위가
+    # -92 dB 로 무너진다. 슬롯이 12 개라는 것이 진짜 제약이다.
     x = lfilter([1.0, -preemph], [1.0], y)
     t = max(0, 1 + (len(x) - hop * 0 - win) // hop)
     if t == 0:
@@ -121,11 +133,46 @@ def track_formants(y: np.ndarray, sr: int = 24000, hop: int = 240,
                 prev = np.where(np.isnan(row), prev, row)
             i += direction
     F, B, found = _fill(F, B, sr)
+    F = _space_out(F, min_gap_hz, gap_above_hz, sr)
     B = _tame_bandwidths(F, B)
     # 못 찾은 슬롯은 **극이 없는 것**으로 둔다 — 아래 `_fill` 주석의 정책 (3).
     # `_tame_bandwidths` 뒤에 덮어써야 한다(Fant 기준으로 도로 좁히므로).
     B = np.where(found, B, bw_neutral)
     return F, B
+
+
+def _space_out(F: np.ndarray, min_gap: float, above: float, sr: int) -> np.ndarray:
+    """고역에서 극이 서로 겹쳐 쌓이는 것을 막는다 (물리적 최소 간격).
+
+    길이 L 의 관은 포먼트가 c/2L 간격으로 선다 — 17.5 cm, c=350 m/s 면 1 kHz.
+    그런데 추적기는 전체 발화에서 **7.3~8.5 kHz 안에 극 4 개**를 넣어 놓았고,
+    그중 하나는 순서까지 뒤집혀 있었다(8482 다음이 8373). 성도가 그럴 수는
+    없다. 그 무더기가 7~9.5 kHz 에 혹을 만들고(사용자 지적: 탄음의 "지글거리는
+    고주파"), 위쪽 슬롯을 다 써 버려 9.5 kHz 위는 절벽이 된다.
+
+    **저역에는 걸지 않는다.** F1/F2 가 647 Hz 밖에 안 떨어진 프레임이 실제로
+    있고(/u/ 는 357/914 로 557 Hz), 거기에 균일 간격을 걸면 실재하는 F2 를
+    밀어 버린다. 몰림은 고역에서만 일어난다.
+
+    측정 (전체 발화, 라우드니스 맞춘 절대 대역 오차):
+
+    | min_gap | 7~9.5 kHz | 9.5~12 kHz | RMS |
+    |---|---|---|---|
+    | 없음 | +6.95 | -23.91 | 12.1 |
+    | 600 | +1.11 | -5.85 | 7.3 |
+    | **800** | **-0.88** | **-1.28** | **7.0** |
+    | 1000 | -0.78 | +10.08 | 8.6 |
+    | 1200 | +2.57 | +28.70 | 14.8 |
+
+    800 Hz 는 공칭 간격(1 kHz)의 0.8 배다 — '균일관보다 조금 촘촘한 것까지는
+    허용하되, 1.1 kHz 안에 4 개는 안 된다'.
+    """
+    F = F.copy()
+    hi = sr * 0.48
+    for s in range(1, F.shape[1]):
+        g = np.where(F[:, s - 1] >= above, min_gap, 0.0)
+        F[:, s] = np.maximum(F[:, s], F[:, s - 1] + g)
+    return np.minimum(F, hi)
 
 
 def _tame_bandwidths(F: np.ndarray, B: np.ndarray, lo: float = 0.5,

@@ -82,8 +82,7 @@ def test_tracked_formants_are_ordered_and_continuous():
 REC = os.path.join(os.path.dirname(__file__), "..", "reference", "recordings",
                    "ko_liquid_ra-eulla-ara_male_44k.wav")
 RA = (0.50, 1.02)                       # reference/README.md 의 '라' 구간
-#: copysynth 의 기본 소스 기울기. 바꾸면 여기도 같이 바꿔라.
-TILT, RD = 2.0, 1.2
+#: copysynth 의 기본값을 그대로 읽는다 (아래 테스트 안에서 import 한다).
 
 
 def _bands_db(y, hop=240, n_fft=1024):
@@ -128,7 +127,8 @@ def test_resynthesis_matches_the_high_band_of_the_recording():
     from formant_ml.analysis.acoustic import load
     from formant_ml.config import Config
     from formant_ml.models.synth import PhysicalVoiceSynth
-    from copysynth import analyse, build_controls, match_envelope
+    from copysynth import (DEFAULT_RD, DEFAULT_TILT, analyse,
+                           build_controls, match_envelope)
 
     cfg = Config()
     y, _ = load(REC, FS)
@@ -138,7 +138,7 @@ def test_resynthesis_matches_the_high_band_of_the_recording():
     a = analyse(y, cfg)
     torch.manual_seed(0)
     syn = PhysicalVoiceSynth(cfg, tract_mode="formant")
-    c = build_controls(a, cfg, 0.002, 0.02, TILT, RD)
+    c = build_controls(a, cfg, 0.002, 0.02, DEFAULT_TILT, DEFAULT_RD)
     with torch.no_grad():
         o = syn(c)["audio"][0].numpy().astype(np.float64)
     o = match_envelope(o, a["rms"], cfg.audio.hop_size)
