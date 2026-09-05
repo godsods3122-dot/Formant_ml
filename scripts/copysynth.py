@@ -91,6 +91,10 @@ def analyse(y: np.ndarray, cfg: Config):
     return dict(freq=F, bw=B, f0=f0, periodicity=per, hf=hf, rms=rms, t=t)
 
 
+#: 이 레벨(발화 최대 대비 dB) 아래에서는 성문 소스를 끈다. build_controls 주석 참고.
+SILENCE_GATE_DB = -30.0
+
+
 def build_controls(a: dict, cfg: Config, jitter: float, shimmer: float,
                    tilt: float, rd: float):
     t, K = a["t"], cfg.filt.n_formants
@@ -100,7 +104,16 @@ def build_controls(a: dict, cfg: Config, jitter: float, shimmer: float,
         return torch.from_numpy(np.asarray(x, dtype=np.float32))
 
     freq = T(a["freq"]).clamp(cfg.filt.f_min, cfg.filt.f_max)[None]
-    bw = T(a["bw"]).clamp(cfg.filt.bw_min, cfg.filt.bw_max)[None]
+    # 대역폭 상한은 **슬롯마다 다르다.**
+    #  - 실제로 잡힌 극: `bw_max`(800). 이걸 풀면 안 된다 — `_tame_bandwidths`
+    #    의 상한(Fant x2.5)이 10 kHz 에서 5375 Hz 라, 풀어 두면 고역 극이
+    #    프레임마다 있다 없다 하고 짧은 토큰에서 대역오차가 커진다.
+    #  - 추적기가 못 찾은 슬롯: `bw_neutral` 그대로 둔다. bw_max 로 자르면
+    #    '극 없음' 이 10.8 kHz 짜리 Q=13.5 공명으로 되살아난다
+    #    (config.bw_neutral 과 track._fill 주석).
+    bwv = np.asarray(a["bw"], dtype=np.float32)
+    bw = T(np.where(bwv >= cfg.filt.bw_neutral * 0.5, cfg.filt.bw_neutral,
+                    np.clip(bwv, cfg.filt.bw_min, cfg.filt.bw_max)))[None]
     rms = a["rms"] / max(a["rms"].max(), 1e-9)
     per = a["periodicity"]
     hf = a["hf"]
@@ -111,11 +124,28 @@ def build_controls(a: dict, cfg: Config, jitter: float, shimmer: float,
     fb = np.linspace(0.0, cfg.audio.sample_rate / 2, nb)
     shape = (1.0 / (1.0 + (fb / 700.0) ** 2)) ** 0.9
     shape = shape / shape.max()
+    # **발성이 아예 없는 프레임에서는 성문 소스를 끈다.**
+    # 진폭은 원칙적으로 측정된 세기를 그대로 따른다(유성도로 곱해서 끄면 검출
+    # 실패가 그대로 진폭 구멍이 된다 — 유음에서 겪었다). 다만 발화 사이의
+    # **무음**은 다르다: 거기엔 발성이 없고 남은 것은 녹음실 잡음인데, 지금
+    # 코드는 rms 가 1 % 라도 남아 있으면 성문 소스를 그 필터에 통과시킨다.
+    # 그런데 무음 프레임의 포먼트 추적 결과는 신호가 아니라 잡음 바닥에 맞춘
+    # 것이라 아무 뜻이 없고, 실제로 극이 8 kHz 부근에 몰린다. 결과는 발화
+    # 사이사이의 **8 kHz 삐 소리**였다(사용자 지적: "불필요한 노이즈").
+    #
+    # 그래서 **유성도가 아니라 절대 레벨**로 끈다. 유음의 세기 골은 뒤 모음보다
+    # 5~8 dB 낮을 뿐이므로(§3.2) -30 dB 문턱과는 한참 떨어져 있어 안전하다.
+    # 측정(무음 구간 스펙트럼, 그 구간 총에너지 대비):
+    #   4~7 kHz  -8.2 -> -29.9 dB,  7~11 kHz  -12.1 -> -24.2 dB (원본 -23.1)
+    # 유성 구간은 그대로다(대역별 변화 0.1~1.1 dB).
+    # 문턱은 -24 ~ -36 dB 에서 결과가 같다 — 운 좋은 한 점이 아니라 평평한 구간.
+    lvl = 20.0 * np.log10(rms + 1e-9)
+    u = np.clip((lvl - SILENCE_GATE_DB) / 10.0, 0.0, 1.0)
+    gate = (u * u * (3.0 - 2.0 * u)).astype(np.float32)      # smoothstep
+
     return Controls(
         f0=T(a["f0"]).reshape(1, t, 1),
-        # 진폭은 **측정된 세기**를 그대로 따른다. 유성도로 곱해서 끄면
-        # 검출 실패가 그대로 진폭 구멍이 된다.
-        harmonic_amp=T(rms).reshape(1, t, 1),
+        harmonic_amp=T(rms * gate).reshape(1, t, 1),
         rd=torch.full((1, t, 1), rd),
         formant_freq=freq, formant_bw=bw,
         formant_gain=torch.ones(1, t, K),
@@ -171,26 +201,27 @@ def main() -> None:
     # (원본의 고역도 하모닉이 안 잡힌다) — 생리적 값으로만 낮춘 것이다.
     ap.add_argument("--jitter", type=float, default=0.002)
     ap.add_argument("--shimmer", type=float, default=0.02)
-    # **예전 값(tilt=-12, Rd=0.6)은 무효였다.** 그 측정은 `ltv_filter` 의
-    # 직사각 블록이 만든 스펙트럼 번짐을 통해서 한 것이었고, 번짐을 없애자
-    # tilt=-12 는 4~7 kHz 를 30 dB **죽이는** 값으로 드러났다
-    # (docs/HANDOFF_LIQUID.md §2.3).
+    # **두 번 다시 골랐다. 값을 바꿀 때는 아래 조건을 그대로 쓰라.**
     #
-    # 부호도 반대로 알고 있었다. 인수인계 §4.3 의 "값이 클수록 어두워진다" 는
-    # `filters.one_pole_tilt`(저역통과) 이야기고, **여기서 쓰는
-    # `GlottalSource` 의 tilt 는 값이 클수록 밝아진다**(하모닉 k 에
-    # 10^(tilt*log2(k)/20) 을 곱한다). 두 함수의 규약이 반대다.
+    # 1 차(tilt=-12/Rd=0.6): `ltv_filter` 의 직사각 블록이 만든 가짜 에너지를
+    #    통해서 잰 값이라 무효였다(§2.3). 부호 규약도 반대로 알고 있었다 —
+    #    §4.3 의 "값이 클수록 어두워진다" 는 `filters.one_pole_tilt` 이야기고,
+    #    여기 `GlottalSource` 의 tilt 는 **값이 클수록 밝아진다**.
+    # 2 차(tilt=+4/Rd=0.9): `track._fill` 의 가짜 극 2 개가 7~11 kHz 를
+    #    +25.6 dB 올려 둔 상태에서 잰 값이라 역시 무효였다.
     #
-    # 교차창 필터 위에서 4 토큰 실측 대역에너지로 다시 골랐다. tilt 와 Rd 는
-    # 여기서 **사실상 같은 손잡이**다(둘 다 고역 기울기) — tilt=3/Rd=0.6 과
-    # tilt=4/Rd=0.9 가 거의 같은 값을 낸다(0.1~7 kHz 최대오차 1.60 vs 1.73 dB).
-    # 모달 범위 안에 있는 Rd 쪽을 골랐다. 제대로 된 해법은 상수가 아니라
-    # 프레임별 Rd 를 H1-H2 로 추정하는 것이다.
-    # 결과: 0.1~2.5k +0.2 / 2.5~4k -1.7 / 4~7k -0.3 dB.
-    # 7~11 kHz 는 여전히 13.5 dB 부족하다 — 소스 기울기로 메울 수 없는
-    # 결손이고(메우려면 4~7 kHz 가 +6 dB 로 넘친다), 유성 기식이 할 일이다.
-    ap.add_argument("--tilt", type=float, default=4.0)
-    ap.add_argument("--rd", type=float, default=0.9)
+    # 3 차(현재): 가짜 극을 고친 뒤, **무음을 포함한 전체 발화 5.8 초**로 골랐다.
+    # 짧은 토큰만 보면 안 된다 — 무음 구간의 결함이 안 보이고, 추적기가 전역
+    # 씨 프레임을 쓰기 때문에 발췌와 전체의 결과가 서로 다르다.
+    # tilt 와 Rd 는 사실상 같은 손잡이다(둘 다 고역 기울기). 제대로 된 해법은
+    # 상수가 아니라 프레임별 Rd 를 H1-H2 로 추정하는 것이다.
+    #
+    # 결과(원본 대비): 0.1~2.5k -0.2 / 2.5~4k -11.9 / 4~7k -1.5 / 7~11k +7.8 dB.
+    # 2.5~4 kHz 의 구멍은 **기울기로 못 메운다** — 어느 tilt/Rd 조합에서도
+    # 남는다. 추적기가 그 대역에서 극을 하나 빠뜨리는 것이고,
+    # docs/HANDOFF_LIQUID.md §2.7 이 그 이야기다.
+    ap.add_argument("--tilt", type=float, default=2.0)
+    ap.add_argument("--rd", type=float, default=1.2)
     args = ap.parse_args()
 
     cfg = Config()

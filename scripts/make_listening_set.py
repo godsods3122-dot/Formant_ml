@@ -27,7 +27,7 @@ from formant_ml.utils import save_wav
 from copysynth import analyse, build_controls, match_envelope
 from diag_hifreq import ltv_rect
 
-SR=24000; cfg=Config(); HOP=cfg.audio.hop_size
+SR=24000; cfg=Config(); HOP=cfg.audio.hop_size  # 24 kHz = 나이퀴스트 12 kHz
 REC="reference/recordings/ko_liquid_ra-eulla-ara_male_44k.wav"
 OUT="out/listen"; os.makedirs(OUT,exist_ok=True)
 TOK={"1_ra":(0.50,1.02),"2_eulla":(1.58,2.55),"3_ara":(3.20,3.86),
@@ -75,7 +75,7 @@ gap=np.zeros(int(0.30*SR))
 for name,(t0,t1) in TOK.items():
     y=raw[int(t0*SR):int(t1*SR)]; y=y/max(abs(y).max(),1e-9)
     before=render(y,True,-12.0,0.6)
-    after =render(y,False,  4.0,0.9)
+    after =render(y,False,  2.0,1.2)
     n=min(len(y),len(before),len(after))
     trio=rms_match([y[:n].astype(np.float64),before[:n],after[:n]])
     for tag,x in zip(("a_original","b_before","c_after"),trio):

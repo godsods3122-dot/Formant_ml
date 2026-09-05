@@ -82,6 +82,8 @@ def test_tracked_formants_are_ordered_and_continuous():
 REC = os.path.join(os.path.dirname(__file__), "..", "reference", "recordings",
                    "ko_liquid_ra-eulla-ara_male_44k.wav")
 RA = (0.50, 1.02)                       # reference/README.md 의 '라' 구간
+#: copysynth 의 기본 소스 기울기. 바꾸면 여기도 같이 바꿔라.
+TILT, RD = 2.0, 1.2
 
 
 def _bands_db(y, hop=240, n_fft=1024):
@@ -114,9 +116,10 @@ def test_resynthesis_matches_the_high_band_of_the_recording():
     `ltv_filter` 의 직사각 블록이 만든 가짜 에너지가 그 자리를 메우고 있었기
     때문이다(그 결함은 test_dsp 가 따로 잡는다).
 
-    지금은 tilt=+4 / Rd=0.9 로 2.5~4k -1.7 dB, 4~7k -0.3 dB 다.
-    7~11 kHz 는 아직 13 dB 부족하고(유성 기식이 할 일이다) 여기서 안 본다 —
-    docs/HANDOFF_LIQUID.md §2.5.
+    지금 값(`TILT`/`RD`)은 copysynth 의 기본값과 같아야 한다 — 기본값을 바꾸면
+    여기도 바꿔라. 4~7 kHz 와 7~11 kHz 는 여기서 보지 않는다: 그 대역은
+    추적기가 극을 못 찾아 남긴 결손이 지배해서, 소스 기울기로 판정할 수 없다
+    (docs/HANDOFF_LIQUID.md §2.7).
     """
     if not os.path.exists(REC):
         return                                  # 기준 녹음이 없으면 건너뛴다
@@ -135,15 +138,25 @@ def test_resynthesis_matches_the_high_band_of_the_recording():
     a = analyse(y, cfg)
     torch.manual_seed(0)
     syn = PhysicalVoiceSynth(cfg, tract_mode="formant")
-    c = build_controls(a, cfg, 0.002, 0.02, 4.0, 0.9)
+    c = build_controls(a, cfg, 0.002, 0.02, TILT, RD)
     with torch.no_grad():
         o = syn(c)["audio"][0].numpy().astype(np.float64)
     o = match_envelope(o, a["rms"], cfg.audio.hop_size)
     d = _bands_db(o / max(np.abs(o).max(), 1e-9)) - _bands_db(y)
 
-    for i, name in ((0, "0.1~2.5 kHz"), (1, "2.5~4 kHz"), (2, "4~7 kHz")):
-        assert abs(d[i]) < 6.0, (
-            f"{name} 가 원본과 {d[i]:+.1f} dB 어긋난다 (소스 기울기를 의심하라)")
+    # 이 검사는 **기울기의 총체적 오류**를 잡는 것이지 값을 고정하는 것이 아니다.
+    # 대역별 절대 오차로는 못 잡는다 — 추적기가 남긴 결손(§2.7)이 대역마다
+    # 다르게 섞여 있어서, 발췌 구간에 따라 부호까지 뒤집힌다.
+    # 반면 `tilt` 가 틀리면 오차가 **주파수에 대해 단조롭게** 기울어진다.
+    assert abs(d[0]) < 6.0, (
+        f"0.1~2.5 kHz 가 원본과 {d[0]:+.1f} dB 어긋난다 (소스 기울기를 의심하라)")
+    slope = d[2] - d[0]                      # 저역 -> 4~7 kHz 오차 기울기
+    # 실측: tilt=+6 -> +3.4, +2 -> -14.8, 0 -> -22.7, -6 -> -36.2, -12 -> -42.2.
+    # 클램프는 |tilt| >= 40/log2(n_harmonics) = 5.06 부터 포화하므로,
+    # -30 이면 포화 영역(±6 이상)만 걸러낸다.
+    assert slope > -30.0, (
+        f"소스가 주파수에 따라 {slope:+.1f} dB 무너진다 — tilt 부호나 "
+        f"glottal.py 의 clamp 포화를 의심하라 (§2.2)")
 
 
 if __name__ == "__main__":

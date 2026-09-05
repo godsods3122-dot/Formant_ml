@@ -55,7 +55,7 @@ def track_formants(y: np.ndarray, sr: int = 24000, hop: int = 240,
                    win: int = 1024, n: int = 6, order: int | None = None,
                    fmin: float = 120.0, fmax: float = 9000.0,
                    max_bw: float = 900.0, preemph: float = 0.97,
-                   jump_hz: float = 350.0):
+                   jump_hz: float = 350.0, bw_neutral: float = 20000.0):
     """(T, n) 포먼트 [Hz] 와 (T, n) 대역폭 [Hz]. 연속 궤적으로 이어 붙인다.
 
     **가장 신뢰할 만한 프레임에서 씨를 뿌리고 양방향으로 추적한다.**
@@ -68,6 +68,25 @@ def track_formants(y: np.ndarray, sr: int = 24000, hop: int = 240,
     아무렇게나 채우면 한 궤적이 빠졌을 때 나머지가 한 칸씩 밀려 들어온다
     (F1 이 한 프레임 빠지자 F2 가 슬롯 0 으로 와서 출력이 11 dB 튀었다).
     """
+    # 차수: 고전 경험식은 fs[kHz] + 2~4 (24 kHz -> 26) 이고, 그건 극쌍 13 개다.
+    # 그런데 이 레포는 나이퀴스트까지 **포먼트 12 개**를 모델링한다(config 주석:
+    # 1 kHz 당 1 개). 12 개를 담으려면 극쌍 12 개가 온전히 포먼트에 가야 하는데,
+    # 13 쌍으로는 소스 기울기와 영점이 먹을 여유가 없어서 상위 슬롯이 서로
+    # 겹치거나 빈다(측정: fmax=9000/order=26 에서 7~11 kHz 에 극 6 개가 몰리고
+    # 그중 둘은 순서가 뒤집혔다). 극쌍 16 개(order 32)면 12 개를 채우고도 남는다.
+    # 고전 경험식 fs[kHz] + 2 (24 kHz -> 26, 극쌍 13 개).
+    #
+    # **이 값을 올려 보고 싶어질 것이다. 재 봤고, 안 된다.** 이 레포는
+    # 나이퀴스트까지 포먼트 12 개를 모델링하는데(config 주석: 1 kHz 당 1 개),
+    # 차수를 32~36 으로 올리면 LPC 가 저역에서 극을 더 쪼개 찾고 그것들이
+    # 12 슬롯을 다 먹는다. 그러면 최상단 극이 8.4 kHz 에 그쳐 그 위가 통째로
+    # 비고, 7~11 kHz 가 -92 dB 로 무너진다(측정: '라' 토큰, order 28 -> 36 에서
+    # -56 -> -98 dB). fmax 를 11 kHz 로 올려도 같은 문제가 남는다.
+    #
+    # 진짜 문제는 차수가 아니라 **구조**다. 8 kHz 위에는 LPC 가 안정적으로
+    # 찾을 극이 없다(그 대역은 공명이 아니라 기식 노이즈다). 극으로 맞추려는
+    # 것 자체가 틀렸고, 답은 Fant 의 고차극 보정이다 —
+    # docs/HANDOFF_LIQUID.md §2.7.
     order = order or int(2 + sr / 1000)
     x = lfilter([1.0, -preemph], [1.0], y)
     t = max(0, 1 + (len(x) - hop * 0 - win) // hop)
@@ -101,8 +120,12 @@ def track_formants(y: np.ndarray, sr: int = 24000, hop: int = 240,
                 row = F[i]
                 prev = np.where(np.isnan(row), prev, row)
             i += direction
-    F, B = _fill(F, B, sr)
-    return F, _tame_bandwidths(F, B)
+    F, B, found = _fill(F, B, sr)
+    B = _tame_bandwidths(F, B)
+    # 못 찾은 슬롯은 **극이 없는 것**으로 둔다 — 아래 `_fill` 주석의 정책 (3).
+    # `_tame_bandwidths` 뒤에 덮어써야 한다(Fant 기준으로 도로 좁히므로).
+    B = np.where(found, B, bw_neutral)
+    return F, B
 
 
 def _tame_bandwidths(F: np.ndarray, B: np.ndarray, lo: float = 0.5,
@@ -155,16 +178,47 @@ def _assign(F, B, i, f, bw, prev, n, jump_hz):
 
 
 def _fill(F: np.ndarray, B: np.ndarray, sr: int):
-    """결측을 메우고 가볍게 평활한다.
+    """결측을 메우고 가볍게 평활한다. 반환 (F, B, found).
 
     **빈 슬롯을 0 으로 두면 안 된다.** 합성기가 f_min 으로 클램프해서 저역에
     가짜 공명기를 만들고, 그 하나하나가 -12 dB/oct 씩 감쇠를 더한다. 실제로
     빈 슬롯 4 개가 150 Hz 짜리 유령 극 4 개가 되어 고역을 40 dB 죽였다.
-    못 찾은 슬롯은 **나이퀴스트 근처에 넓은 대역폭**으로 둬서 무해하게 만든다.
+
+    빈 슬롯을 무엇으로 채울지 **세 가지를 다 재 봤다.** 다음 사람이 같은 순서로
+    헤매지 않도록 결과를 적어 둔다(전체 발화 5.8 초, 무음 포함, 원본 대비):
+
+    | 정책 | 0.1~2.5 kHz | 7~11 kHz | 무음 총에너지 |
+    |---|---|---|---|
+    | (1) 0.45*fs 에 '넓은' 극 | **-15.1** | **-0.1** | **-14.8** |
+    | (2) 중립 (= 극 없음) | -0.3 | -16.2 | -25.1 |
+    | (3) 포먼트 열의 연장 | -16.6 | -0.1 | -15.0 |
+    | (원본) | -0.3 | -35.2 | -30.8 |
+
+    (1) 은 **무해하지 않다.** `_tame_bandwidths` 와 `filt.bw_max`(800) 를 지나면서
+    Q=13.5 짜리 진짜 공명이 된다. 그런 극 2 개가 7~11 kHz 를 +25.6 dB 올리고
+    캐스케이드의 최대점을 1195 Hz 에서 8227 Hz 로 옮겨 놨다 — 무음 구간에서
+    8 kHz 휘파람이 들렸고 발화 전체에서 저역이 15 dB 묻혔다.
+
+    (3) 은 물리적으로는 맞는 발상이다(길이 L 의 관은 포먼트가 c/2L 간격으로
+    고르게 선다). 짧은 토큰에서는 실제로 크게 좋아졌다(7~11 kHz 오차 41.7 ->
+    8.3 dB). **그런데 전체 발화에서는 (1) 만큼 나쁘다.** 이유는 슬롯이 비어서가
+    아니라, 추적기가 이미 7~8.5 kHz 에 극 4 개를 몰아 넣어 두었기 때문이다
+    (게다가 그중 둘은 순서가 뒤집혀 있다: 8482 다음이 8373). 그 위에 연장을
+    얹으면 6 개가 된다. **연장이 틀린 게 아니라, 그 아래가 이미 틀렸다.**
+
+    그래서 지금은 (2) 를 쓴다. 사용자가 실제로 듣는 조건(무음 포함 전체 발화)
+    에서 유일하게 저역을 되살리는 정책이다. 대신 짧은 발췌에서는 7~11 kHz 가
+    빈다. 둘 다 해결하려면 추적기의 상위 슬롯 배정을 먼저 고쳐야 한다 —
+    docs/HANDOFF_LIQUID.md §2.7.
+
+    극이 '없는' 것은 **대역폭이 아주 넓은 것**이다(r = exp(-pi*BW/fs) -> 0).
+    여기서는 `found` 마스크만 돌려주고, 실제 중립화는 호출부가
+    `_tame_bandwidths` **뒤에** 한다(안 그러면 다듬기가 도로 좁힌다).
     """
     F, B = F.copy(), B.copy()
     t, n = F.shape
     idx = np.arange(t)
+    found = ~np.isnan(F).all(axis=0)          # 한 프레임이라도 잡힌 슬롯
     dead = sr * 0.45
     for s in range(n):
         for A, spare in ((F, dead), (B, 1200.0)):
@@ -182,4 +236,4 @@ def _fill(F: np.ndarray, B: np.ndarray, sr: int):
                                  axis=0)
                 fix = (~ok)[1:-1]
                 A[1:-1, s] = np.where(fix, med3, col[1:-1])
-    return F, B
+    return F, B, found
