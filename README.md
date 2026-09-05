@@ -23,7 +23,7 @@
 - 진행 중인 /s/ 치찰음 작업 인수인계: [`docs/HANDOFF.md`](docs/HANDOFF.md)
 - 진행 중인 /ㄹ/ 문헌 조사: [`docs/RIEUL.md`](docs/RIEUL.md)
 - **유음·복사합성 인수인계: [`docs/HANDOFF_LIQUID.md`](docs/HANDOFF_LIQUID.md)**
-  (고역이 '토막' 으로 끊기는 원인 진단은 그 문서 §2)
+  — 고역 결함 세 라운드(§2), 어떤 지표를 믿을 것인가(§2.1), 다음 할 일(§5)
 
 ## 빠른 시작
 
@@ -36,8 +36,8 @@ bash scripts/setup_env.sh && source .venv/bin/activate
 # 1) 학습 없이, 방정식만으로 소리를 만들어 본다 (out/*.wav)
 python -m formant_ml.demo --out out
 
-# 2) 검증 92종 (물리 엔진 11 + 목소리 제어 55 + 공기역학 18 + 학습 8)
-python -m pytest tests -q
+# 2) 검증 (물리 엔진 + 목소리 제어 + 공기역학 + 학습 + 복사합성)
+python -m pytest tests -q          # 127 passed, 1 xfailed (알려진 결손)
 # 또는 개별로: python tests/test_dsp.py / test_voice.py / test_aeroacoustic.py
 
 # 3) 스크립트로 원하는 소리를 만든다 (웃음·숨·프라이·속삭임 포함)
