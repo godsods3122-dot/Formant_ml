@@ -148,7 +148,12 @@ def _fill(F: np.ndarray, B: np.ndarray, sr: int):
                 col[:] = spare          # 무해한 극: 아주 높고 아주 넓다
             elif ok.sum() < t:
                 col[:] = np.interp(idx, idx[ok], col[ok])
-            if t >= 3:
-                A[1:-1, s] = np.median(
-                    np.stack([col[:-2], col[1:-1], col[2:]]), axis=0)
+            # 3점 중앙값은 **결측을 보간한 자리에만** 건다. 모든 프레임에 걸면
+            # 실제 전이까지 뭉개져서 스펙트럼 변화율이 원본의 절반이 된다
+            # (사용자 지적: "전이가 너무 부드럽다").
+            if t >= 3 and (~ok).any():
+                med3 = np.median(np.stack([col[:-2], col[1:-1], col[2:]]),
+                                 axis=0)
+                fix = (~ok)[1:-1]
+                A[1:-1, s] = np.where(fix, med3, col[1:-1])
     return F, B

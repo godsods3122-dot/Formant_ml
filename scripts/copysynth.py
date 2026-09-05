@@ -87,7 +87,7 @@ def analyse(y: np.ndarray, cfg: Config):
     ok = ~np.isnan(fv)
     f0 = (np.interp(np.arange(t), np.arange(t)[ok], fv[ok]) if ok.any()
           else np.full(t, med))
-    f0 = _smooth(np.clip(f0, cfg.source.f0_min, cfg.source.f0_max), 5)
+    f0 = _smooth(np.clip(f0, cfg.source.f0_min, cfg.source.f0_max), 3)
     return dict(freq=F, bw=B, f0=f0, periodicity=per, hf=hf, rms=rms, t=t)
 
 
@@ -168,8 +168,10 @@ def main() -> None:
     ap.add_argument("--to", dest="t1", type=float, default=None)
     ap.add_argument("--jitter", type=float, default=0.006)
     ap.add_argument("--shimmer", type=float, default=0.04)
-    ap.add_argument("--tilt", type=float, default=0.0)
-    ap.add_argument("--rd", type=float, default=1.2)
+    # 측정으로 고른 값. tilt=0, Rd=1.2 로 두면 소스가 어두워 4~7 kHz 가
+    # 원본보다 13 dB 낮았다(포락선 오차 10.6 dB). 이 조합에서 3.5 dB.
+    ap.add_argument("--tilt", type=float, default=-12.0)
+    ap.add_argument("--rd", type=float, default=0.6)
     args = ap.parse_args()
 
     cfg = Config()
