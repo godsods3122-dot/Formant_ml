@@ -23,6 +23,7 @@
 - 진행 중인 /s/ 치찰음 작업 인수인계: [`docs/HANDOFF.md`](docs/HANDOFF.md)
 - 진행 중인 /ㄹ/ 문헌 조사: [`docs/RIEUL.md`](docs/RIEUL.md)
 - **유음·복사합성 인수인계: [`docs/HANDOFF_LIQUID.md`](docs/HANDOFF_LIQUID.md)**
+  (고역이 '토막' 으로 끊기는 원인 진단은 그 문서 §2)
 
 ## 빠른 시작
 
