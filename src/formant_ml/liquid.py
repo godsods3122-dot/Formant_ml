@@ -39,52 +39,73 @@ def side_branch_zero(length_cm: float) -> float:
 
 def lateral_antiformants(t: int, supra_cm: float = 3.0, inter_cm: float = 2.2,
                          bw_supra: float = 300.0, bw_inter: float = 500.0,
-                         mix: float = 1.0):
+                         mix=1.0):
     """설측음의 반공명 2 개 -> (freq (1,T,2), bw (1,T,2)).
 
     supra_cm : 설상공(supralingual). 지배적인 반공진.
     inter_cm : 치간 통로. 좌우 비대칭일 때 중요해진다.
-    mix      : 0 이면 반공명을 끈다(설측음이 아닌 구간).
+    mix      : 스칼라 또는 (T,) 프레임별 0~1. **반드시 설측 구간에만 켜야 한다.**
+               발화 전체에 걸어 두었더니 모음의 F3 까지 눌려 3050 -> 1890 Hz 로
+               내려갔다(측정). 반공명은 옆 통로가 열려 있는 동안만 존재한다.
 
     기본값의 영점은 각각 2917 Hz, 3977 Hz — 문헌의 2000~5000 Hz 대역 안이다.
+    끄는 방법은 대역폭을 키우는 것이다: BW -> 무한이면 r = exp(-pi*BW/fs) -> 0 이라
+    D/Ddc -> 1 로 응답이 정확히 평탄해진다.
     """
     fz = torch.tensor([side_branch_zero(supra_cm), side_branch_zero(inter_cm)])
-    bw = torch.tensor([bw_supra, bw_inter])
-    # mix<1 이면 영점을 나이퀴스트 밖으로 밀어 효과를 없앤다(응답이 1 로 수렴).
+    bw0 = torch.tensor([bw_supra, bw_inter])
+    m = (mix if torch.is_tensor(mix)
+         else torch.full((t,), float(mix))).clamp(1e-3, 1.0).reshape(1, t, 1)
     fz = fz.reshape(1, 1, 2).expand(1, t, 2).contiguous()
-    bw = (bw.reshape(1, 1, 2).expand(1, t, 2).contiguous()
-          / max(mix, 1e-3))
+    bw = (bw0.reshape(1, 1, 2) / m).expand(1, t, 2).contiguous()
     return fz, bw
 
 
 def tip_to_area(tip_gap: torch.Tensor, base_area: torch.Tensor,
-                hop: int, n_masses: int, width_cm: float = 1.2,
+                hop: int, n_masses: int, gap_open_cm: float = 0.25,
                 lip_margin: int = LIP_MARGIN,
                 floor_cm2: float = 1e-3) -> torch.Tensor:
     """혀끝 마디별 간극 (N_samples, n_masses) -> 면적함수 (1, T, N_sections).
 
-    base_area: (N_sections,) 모음의 바탕 면적함수 (성문 -> 입술).
-    혀끝이 차지하는 전방 구간만 덮어쓰고 나머지는 모음 그대로 둔다.
-    협착이므로 바탕과 혀끝 중 **좁은 쪽**을 취한다.
+    **간극을 면적으로 바로 환산하면 안 된다.** 처음에 `면적 = 폭 x 간극` 으로
+    두었더니, 혀끝이 '열린' 상태(간극 0.30 cm)에서도 앞쪽 단면이 0.36 cm^2 로
+    묶여서 모음이 통째로 빨대를 통과한 소리가 됐다 — 측정: /아/ 목표
+    F1 730 / F2 1220 인데 합성이 395 / 715 로 나왔다.
+
+    실제로는 혀끝이 구개에서 2~3 mm 만 떨어져도 더 이상 최협착이 아니고,
+    그 지점의 단면적은 **모음 자신의 기하**가 정한다. 그래서 혀끝은 면적을
+    *만드는* 게 아니라 모음의 면적을 *깎는다*:
+
+        a = base * smoothstep(gap / gap_open)
+
+    간극 0 -> 완전 폐쇄, gap_open 이상 -> 모음 그대로.
     """
     n_sec = base_area.shape[-1]
     t = tip_gap.shape[0] // hop
-    # 샘플률 -> 프레임률 (프레임 평균이 아니라 **최솟값**: 협착은 순간의 최솟값이
-    # 음향을 지배하고, 평균을 쓰면 접촉이 통째로 사라진다)
+    # 샘플률 -> 프레임률. 평균이 아니라 **최솟값**: 협착은 순간의 최솟값이
+    # 음향을 지배하고, 평균을 쓰면 접촉이 통째로 사라진다.
     g = tip_gap[: t * hop].reshape(t, hop, n_masses).amin(dim=1)   # (T, n_masses)
-    tip_area = (width_cm * g).clamp_min(floor_cm2)                 # (T, n_masses)
+
+    u = (g / gap_open_cm).clamp(0.0, 1.0)
+    close = u * u * (3.0 - 2.0 * u)                                # smoothstep
 
     area = base_area.reshape(1, 1, n_sec).expand(1, t, n_sec).clone()
     start = n_sec - lip_margin - n_masses
     assert start >= 1, "혀끝 마디가 성도보다 길다"
     seg = area[0, :, start:start + n_masses]
-    area[0, :, start:start + n_masses] = torch.minimum(seg, tip_area)
+    area[0, :, start:start + n_masses] = (seg * close).clamp_min(floor_cm2)
     return area.contiguous()
 
 
 def vowel_area(n_sec: int, vowel: str = "a") -> torch.Tensor:
-    """모음의 바탕 면적함수 (성문 -> 입술). presets 의 것을 그대로 쓴다."""
-    from .presets import area_function
+    """모음의 바탕 면적함수 (성문 -> 입술).
+
+    20 단(여성)에는 목표 포먼트에 맞춰 푼 면적함수를 쓴다. 손으로 그린 쪽은
+    /아/ 의 F2 가 실측보다 700 Hz 높아 한국어 모음으로 들리지 않았다.
+    """
+    from .presets import VOWEL_AREA_20, area_function
+    if n_sec == 20 and vowel in VOWEL_AREA_20:
+        return torch.tensor(VOWEL_AREA_20[vowel], dtype=torch.float32)
     return area_function(vowel, n_sec)
 
 
@@ -106,7 +127,7 @@ def liquid_area(seconds: float, h0_points, cfg: Config = DEFAULT,
                              oversample=4)
     traj = out["traj"]
     base = vowel_area(n_sec, vowel)
-    area = tip_to_area(traj, base, hop, n_masses, p.width)
+    area = tip_to_area(traj, base, hop, n_masses)
     if lateral_area_cm2 is not None:
         area = area.clamp_min(lateral_area_cm2)
     t = area.shape[1]

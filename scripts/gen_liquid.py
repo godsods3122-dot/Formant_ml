@@ -27,7 +27,8 @@ from formant_ml.utils import ramp, save_wav
 FEMALE_TRACT_CM = 14.6
 
 
-def build(cfg: Config, t: int, area, f0_pts, lateral=None, level=None):
+def build(cfg: Config, t: int, area, f0_pts, lateral=None, level=None,
+          lat_mix=None):
     """도파관 모드용 Controls. formant_* 는 이 경로에서 안 쓰이지만 필수 필드다."""
     K, nb = cfg.filt.n_formants, cfg.noise.n_bands
     amp = torch.ones(1, t, 1) if level is None else ramp(t, level)
@@ -45,7 +46,9 @@ def build(cfg: Config, t: int, area, f0_pts, lateral=None, level=None):
         area=area,
     )
     if lateral is not None:
-        fz, bw = lateral_antiformants(t, **lateral)
+        # 반공명은 **옆 통로가 열려 있는 동안만** 존재한다. 발화 전체에 걸면
+        # 모음의 F3 까지 눌린다(측정: 3050 -> 1890 Hz).
+        fz, bw = lateral_antiformants(t, mix=lat_mix, **lateral)
         c["antiformant_freq"], c["antiformant_bw"] = fz, bw
     return Controls(**c)
 
@@ -71,7 +74,14 @@ def main() -> None:
                                        if lateral else None)
         t = area.shape[1]
         f0 = f0 or [(0.0, 215.0), (1.0, 185.0)]
-        c = build(cfg, t, area, f0, lateral, level)
+        # 설측 구간 = 혀끝이 닿아 있는 구간. 경계를 매끄럽게 3 프레임 번지게 한다.
+        mix = None
+        if lateral is not None:
+            m = contact[:t].to(torch.float32).reshape(1, 1, -1)
+            m = torch.nn.functional.avg_pool1d(
+                torch.nn.functional.pad(m, (2, 2), mode="replicate"), 5, 1)
+            mix = m.reshape(-1).clamp(0.0, 1.0)
+        c = build(cfg, t, area, f0, lateral, level, mix)
         with torch.no_grad():
             y = syn(c)["audio"]
         save_wav(os.path.join(args.out, name), y, sr)
