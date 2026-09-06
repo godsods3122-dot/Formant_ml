@@ -62,7 +62,8 @@ def test_nasal_coupling_adds_pole_and_zero_and_off_is_identity():
                                          nasal_f=280, nasal_z=1700), 60)
     d = H1 - H0
     assert d[(f > 1600) & (f < 1800)].min() < -4        # 넓고 얕은 노치 (A/B 계측)
-    assert d[(f > 240) & (f < 320)].max() > 0
+    # 머머는 저역통과다: 200 Hz 부근이 1 kHz 부근보다 상대적으로 살아 있다
+    assert d[(f > 180) & (f < 260)].mean() > d[(f > 900) & (f < 1100)].mean() + 6
     f, H2 = _impulse_response(tr, _ctrl(60, f1=350, f2=1400, f3=2600, velum=0.0), 60)
     assert np.abs(H2 - H0).max() < 1e-6
 
