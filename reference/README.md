@@ -28,9 +28,8 @@
 | 아라 #1 | 3.20 | 3.86 |
 | 아라 #2 | 5.36 | 6.08 |
 
-화자 정규화(남성 -> 목표 여성)는 본인 /아/ 761/1222/2492 와 목표 여성 /아/
-850/1220/2810 의 포먼트별 비 **1.117 / 0.998 / 1.128** 을 쓴다.
-자세한 것은 [`../docs/HANDOFF_LIQUID.md`](../docs/HANDOFF_LIQUID.md) §3.2.
+화자 정규화(남성 -> 목표 여성)는 **화자 본인의 /아/** 를 기준으로 포먼트별 비를
+구해 적용한다 — 단일 상수 스케일링보다 낫다.
 
 ## papers/ — 전부 오픈액세스 (재배포 가능)
 
@@ -41,10 +40,11 @@
 | `Cathcart2012_alveolar-tap-articulatory-variation.pdf` | Cathcart, *UC Berkeley PhonLab Annual Report* 8(8), 2012. DOI 10.5070/P79n00618c | eScholarship 공개 |
 | `Ying2026_lateral-channel-F3-modulation_EMA.pdf` | Ying, *Speech Communication* 176:103345 | **CC BY 4.0** |
 
-각 논문에서 뽑아 쓴 수치와 그 한계는
-[`../docs/RIEUL.md`](../docs/RIEUL.md) §1, 요약은
-[`../docs/HANDOFF_LIQUID.md`](../docs/HANDOFF_LIQUID.md) §3.1 에 있다.
+각 논문에서 뽑아 쓴 수치와 **그 한계**는 [`../docs/RIEUL.md`](../docs/RIEUL.md)
+§1 에 있다. 이 녹음을 직접 재는 것은 `scripts/analyze_liquid.py` 로 한다.
 
-**이 세션의 작업 환경은 웹 전문 접근이 전부 막혀 있었다**(WebFetch/직접 HTTP 가
-전 도메인 차단). 그래서 논문을 파일로 받아야 했다. 다음 사람도 같은 제약이면
-여기 있는 PDF 가 그대로 쓰인다.
+**웹 접근은 부분적이다.** 검색은 되는데 학술 도메인(seas.ucla.edu,
+journals.linguisticsociety.org, pmc.ncbi.nlm.nih.gov 등)은 전송 프록시가 막는다.
+그래서 원문은 여기 PDF 로 두는 것이 여전히 맞다. 못 구한 원문(Narayanan et al.
+1997, Stevens 1998, Zhang & Espy-Wilson 2004)의 수치는 Ying(2026) 이 요약한
+것을 **인용의 인용임을 명시하고** 옮겨 적었다 — `docs/RIEUL.md` §1.

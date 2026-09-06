@@ -87,7 +87,7 @@ def analyse(y: np.ndarray, cfg: Config):
     ok = ~np.isnan(fv)
     f0 = (np.interp(np.arange(t), np.arange(t)[ok], fv[ok]) if ok.any()
           else np.full(t, med))
-    f0 = _smooth(np.clip(f0, cfg.source.f0_min, cfg.source.f0_max), 3)
+    f0 = _smooth(np.clip(f0, cfg.source.f0_min, cfg.source.f0_max), 5)
     return dict(freq=F, bw=B, f0=f0, periodicity=per, hf=hf, rms=rms, t=t)
 
 
@@ -166,15 +166,10 @@ def main() -> None:
     ap.add_argument("-o", "--out", default="out/recon.wav")
     ap.add_argument("--from", dest="t0", type=float, default=None)
     ap.add_argument("--to", dest="t1", type=float, default=None)
-    # 실측 정상 음성 범위(지터 0.2~0.5 %, 시머 2~4 %). 이전 0.006/0.04 는
-    # 그보다 높았다. 고역 하모닉을 뭉갠다고 의심했으나 지표로는 기각됐다
-    # (원본의 고역도 하모닉이 안 잡힌다) — 생리적 값으로만 낮춘 것이다.
-    ap.add_argument("--jitter", type=float, default=0.002)
-    ap.add_argument("--shimmer", type=float, default=0.02)
-    # 측정으로 고른 값. tilt=0, Rd=1.2 로 두면 소스가 어두워 4~7 kHz 가
-    # 원본보다 13 dB 낮았다(포락선 오차 10.6 dB). 이 조합에서 3.5 dB.
-    ap.add_argument("--tilt", type=float, default=-12.0)
-    ap.add_argument("--rd", type=float, default=0.6)
+    ap.add_argument("--jitter", type=float, default=0.006)
+    ap.add_argument("--shimmer", type=float, default=0.04)
+    ap.add_argument("--tilt", type=float, default=0.0)
+    ap.add_argument("--rd", type=float, default=1.2)
     args = ap.parse_args()
 
     cfg = Config()

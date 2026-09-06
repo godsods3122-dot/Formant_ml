@@ -13,8 +13,6 @@ from __future__ import annotations
 import numpy as np
 from scipy.signal import lfilter
 
-from .extract import fant_bandwidth
-
 
 def _lpc(x: np.ndarray, order: int):
     r = np.correlate(x, x, "full")[len(x) - 1:][: order + 1]
@@ -101,31 +99,7 @@ def track_formants(y: np.ndarray, sr: int = 24000, hop: int = 240,
                 row = F[i]
                 prev = np.where(np.isnan(row), prev, row)
             i += direction
-    F, B = _fill(F, B, sr)
-    return F, _tame_bandwidths(F, B)
-
-
-def _tame_bandwidths(F: np.ndarray, B: np.ndarray, lo: float = 0.5,
-                     hi: float = 2.5, max_ratio: float = 1.6) -> np.ndarray:
-    """LPC 근의 대역폭을 물리적 범위로 묶고 **변화율을 제한**한다.
-
-    LPC 근의 대역폭은 못 믿는다. 실측에서 F3 의 BW 가 연속 프레임에서
-    849 -> 33 -> 779 -> 71 Hz 로 뛰었다. 33 Hz 는 Q=79 짜리 면도날 공명이라
-    스펙트로그램에 밝은 줄로 찍히고(사용자가 "2500 쯤 강한 진폭" 이라고 지적),
-    849 Hz 프레임에서는 원본보다 +10.8 dB 튄다. 매 프레임 공명의 예리함이
-    무작위로 뒤집히는 것이 고역이 지저분한 원인이다.
-
-    Fant 경험식을 기준으로 [lo, hi] 배 안에 묶고, 프레임 사이 변화를
-    `max_ratio` 배 이내로 제한한다. 주파수는 건드리지 않는다 — 그쪽은 믿을
-    만하고(포먼트 오차가 작다), 대역폭만 문제다.
-    """
-    ref = 50.0 + 20.0 * (F / 1000.0) ** 2 + 10.0 * (F / 1000.0)
-    out = np.clip(B, ref * lo, ref * hi)
-    for i in range(1, len(out)):
-        out[i] = np.clip(out[i], out[i - 1] / max_ratio, out[i - 1] * max_ratio)
-    for i in range(len(out) - 2, -1, -1):
-        out[i] = np.clip(out[i], out[i + 1] / max_ratio, out[i + 1] * max_ratio)
-    return out
+    return _fill(F, B, sr)
 
 
 def _assign(F, B, i, f, bw, prev, n, jump_hz):
@@ -174,12 +148,7 @@ def _fill(F: np.ndarray, B: np.ndarray, sr: int):
                 col[:] = spare          # 무해한 극: 아주 높고 아주 넓다
             elif ok.sum() < t:
                 col[:] = np.interp(idx, idx[ok], col[ok])
-            # 3점 중앙값은 **결측을 보간한 자리에만** 건다. 모든 프레임에 걸면
-            # 실제 전이까지 뭉개져서 스펙트럼 변화율이 원본의 절반이 된다
-            # (사용자 지적: "전이가 너무 부드럽다").
-            if t >= 3 and (~ok).any():
-                med3 = np.median(np.stack([col[:-2], col[1:-1], col[2:]]),
-                                 axis=0)
-                fix = (~ok)[1:-1]
-                A[1:-1, s] = np.where(fix, med3, col[1:-1])
+            if t >= 3:
+                A[1:-1, s] = np.median(
+                    np.stack([col[:-2], col[1:-1], col[2:]]), axis=0)
     return F, B
