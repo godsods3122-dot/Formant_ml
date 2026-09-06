@@ -2,6 +2,19 @@
 
 형식: [Keep a Changelog](https://keepachangelog.com/ko/1.1.0/). 버전 규칙: `docs/VERSIONING.md`.
 
+## [0.2.2] — 2026-09-06
+
+### Fixed (같은 화자 A/B 로 찾은 장치 결함, ADR 0009)
+- **모음 4~8 kHz 가 35~60 dB 어두웠다** — DC 정규화 공명기 11 개의 곱이 6 kHz −27 / 10 kHz −85 dB.
+  나이퀴스트까지 극을 채워 완결(표본화된 관). 실측 남성 /아/ 1/3 oct 오차 4.1 dB.
+- 비음 머머 중 마찰·버스트 (연구개 열림을 무시한 구강 유량), 3 kHz 저역통과가 머머 고역을 −80 dB 로 죽인 것.
+- /s/ 중 성문 기식이 1~3 kHz 를 10 dB 채운 것 (기식 ∝ ΔPg 선형).
+- 마찰 소스 혹(Strouhal 0.2 → 장애물 0.5·v/d, Q 0.5), 앞공동 대역폭.
+
+### Added
+- `profiles/user_male.json`, `scripts/ab_male.py` — 같은 화자 A/B (녹음 조각 / 합성 wav 짝 + 계측표).
+- 성도 float64 경로.
+
 ## [0.2.1] — 2026-09-06
 
 ### Added

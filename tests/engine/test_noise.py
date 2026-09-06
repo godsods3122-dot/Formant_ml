@@ -46,7 +46,7 @@ def test_frication_silent_open_and_loud_closed():
     y = c["source"][0].numpy()
     f = np.fft.rfftfreq(len(y), 1 / FS); Y = np.abs(np.fft.rfft(y)) ** 2
     hi = Y[(f > 13000)].sum() / Y[(f > 2000) & (f < 6000)].sum()
-    assert hi < 0.3                                        # 소스는 13 kHz 위에서 절벽
+    assert hi < 1.0                                        # 소스는 13 kHz 위가 2~6 kHz 보다 작다
 
 
 def test_template_bank_modulation_and_growth():

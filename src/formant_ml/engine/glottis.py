@@ -147,8 +147,9 @@ class GlottalSource(nn.Module):
         # 협착에서 떨어지고(Po/Ps = Ag²/(Ag²+Ac²), v1 §5.3) 성문 제트는 느려진다 — /s/ 동안
         # 성문 기식이 1~6 kHz 를 채우던 원인(측정: 앞공동 경로와 같은 크기).
         a_c = c["a_c"].clamp_min(1e-3)
-        dp_g = ps.clamp_min(0.0) * a_c ** 2 / (a_c ** 2 + ag_dc ** 2)
-        asp = (1.0 - add) ** 2 * torch.sqrt(dp_g) * c["aspiration"]
+        frac = a_c ** 2 / (a_c ** 2 + ag_dc ** 2)                  # ΔPg/Ps
+        # 세기는 ΔPg 에 선형 (√ 로 두면 /s/ 중 기식이 실측보다 10 dB 크다 — 같은 화자 A/B).
+        asp = (1.0 - add) ** 2 * frac * torch.sqrt(ps.clamp_min(0.0)) * c["aspiration"]
         return dict(f0=f0, amp=amp, amp_raw=amp_raw, rd=rd, ag_dc=ag_dc, asp=asp, pth=pth)
 
     # ---------------------------------------------------------- 파형

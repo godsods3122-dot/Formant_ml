@@ -58,7 +58,7 @@ def test_nasal_murmur_level_and_spectrum(eng, prof):
     fs = 48000
     m = y[int(0.06 * fs):int(0.10 * fs)]; v = y[int(0.20 * fs):int(0.30 * fs)]
     lvl = 20 * np.log10(np.sqrt((m ** 2).mean()) / np.sqrt((v ** 2).mean()))
-    assert -14 < lvl < -3                          # 계측 −5..−7 dB
+    assert -16 < lvl < -3                          # 계측 −5..−10 dB
     band, _ = _bands(m)
     assert band(2000, 4000) < -25 and band(1000, 2000) > -45
 

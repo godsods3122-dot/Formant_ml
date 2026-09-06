@@ -38,7 +38,7 @@ class SpeakerProfile:
         obstacle=0.8, back_leak=0.08))
     # 비음
     nasal: dict = field(default_factory=lambda: dict(
-        pole_hz=280.0, zero_hz={"m": 2300.0, "n": 2500.0, "ng": 3000.0},
+        pole_hz=200.0, zero_hz={"m": 3000.0, "n": 2500.0, "ng": 3000.0},
         murmur_db=-6.0, gain=1.1, dur_ms=70, transition_ms=70))
     # 운율/시간
     timing: dict = field(default_factory=lambda: dict(

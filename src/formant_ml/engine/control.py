@@ -41,7 +41,7 @@ _P: list[ParamSpec] = [
     ParamSpec("f0_target", "Hz", 50.0, 800.0, 0.0, True, "0 이 아니면 tension 대신 F0 직접 지정"),
     ParamSpec("f0_scale", "ratio", 0.5, 2.0, 1.0, True, "F0 배율(억양). 토큰이 주로 만진다"),
     ParamSpec("rd_offset", "Rd", -1.5, 1.5, 0.0, False, "LF Rd 오프셋(음질: -압착 / +기식)"),
-    ParamSpec("tilt", "dB/oct", -12.0, 12.0, 0.0, False, "소스 추가 기울기 @1 kHz"),
+    ParamSpec("tilt", "dB/oct", -12.0, 12.0, 2.0, False, "소스 추가 기울기 @1 kHz (실측 적합 +2)"),
     ParamSpec("jitter", "ratio", 0.0, 0.05, 0.004, False, "주기 요동"),
     ParamSpec("shimmer", "ratio", 0.0, 0.2, 0.03, False, "진폭 요동"),
     ParamSpec("aspiration", "0-1", 0.0, 1.0, 1.0, False, "성문 난류 배율(물리량 위에 곱)"),

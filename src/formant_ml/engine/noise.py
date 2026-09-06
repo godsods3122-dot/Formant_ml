@@ -73,7 +73,7 @@ class FricationNoise(nn.Module):
     """협착 공기역학 -> 마찰 소스 (샘플률). 색은 여기서 **소스 스펙트럼**까지만."""
 
     def __init__(self, fs: float, hop: int, mod_depth: float = 0.25,
-                 amp_ref: float = 0.15, lp_ratio: float = 5.0):
+                 amp_ref: float = 0.062, lp_ratio: float = 8.0):
         super().__init__()
         self.fs, self.hop = float(fs), int(hop)
         self.mod_depth = mod_depth
@@ -104,7 +104,11 @@ class FricationNoise(nn.Module):
         a_c = up(c["a_c"]); ps = up(c["p_sub"])
         agf = ag_dc                                      # 프레임률 (B, T_all)
         ag_s = up(agf)
+        # 연구개가 열리면 기류는 코로 빠진다. 구강 협착을 지나는 유량과 구강압 축적은 (1−velum) 배.
+        # (비음의 구강 폐쇄 a_c≈0.02 에서 Re=3700 짜리 마찰 + 방전 버스트가 나던 것 — 측정)
+        oral = (1.0 - c["velum"]).clamp(0.0, 1.0)
         u, _ = series_flow(ps, ag_s, a_c)
+        u = u * up(oral)
         # 구강압 저장 → 해제 시 방전 (파열음·파찰음의 버스트). 프레임률 1 차 계.
         #   닫힘(a_c < ~0.05): Po → Ps (τ 15 ms). 열림: Po → 정상값 (τ 6 ms).
         #   버스트 유량 = 저장된 초과압의 방전. ㅈ/ㅊ 개시가 10 ms 안에 −70→−30 dB 로 서는 것(계측).
@@ -115,7 +119,7 @@ class FricationNoise(nn.Module):
         po = state.get("po", po_ss[:, 0] * 0.0)
         burst, po_hist = [], []
         for i in range(t_all):
-            tgt = closed[:, i] * c["p_sub"][:, i] + (1 - closed[:, i]) * po_ss[:, i]
+            tgt = (closed[:, i] * c["p_sub"][:, i] + (1 - closed[:, i]) * po_ss[:, i]) * oral[:, i]
             tau = 0.015 * closed[:, i] + 0.006 * (1 - closed[:, i])
             po = po + dt * (tgt - po) / tau
             po_hist.append(po)
@@ -130,7 +134,9 @@ class FricationNoise(nn.Module):
                  * (0.1 / a_c.clamp_min(0.02)))
         drive = drive + burst_env ** 3 * (0.1 / a_c.clamp_min(0.02))   # 버스트: 방전 속도의 세제곱
         env = drive * torch.exp(self.log_amp) * up(c["fric_gain"])
-        f_peak = (0.2 * v / d.clamp_min(1e-3)).clamp(500.0, 0.45 * fs)     # Strouhal
+        # 장애물(앞니) 소스의 혹은 자유 제트의 Strouhal 정점보다 높고 넓다(Shadle). 같은 화자 A/B 에서
+        # St=0.2 그대로 두면 1~3 kHz 가 10~12 dB 과했다. 정점 ×2.5, Q 0.5.
+        f_peak = (0.5 * v / d.clamp_min(1e-3)).clamp(800.0, 0.45 * fs)
         # 느린 1/f^β 변조 (제트 사행) + 유성 구간에서는 성문 개방기 AM
         mod, zmod = slow_modulation(
             noise.white("mod", frame0, t_all, b, ps.dtype, ps.device), fs / hop,
@@ -144,7 +150,7 @@ class FricationNoise(nn.Module):
         am = 1.0 - 0.5 * voiced[:, :n] * (frac < 0.35).float()   # 폐쇄기에 유량 감소
         white = noise.white("fric", frame0 * hop, n, b, ps.dtype, ps.device)
         # 소스 스펙트럼: Strouhal 정점의 넓은 혹 (2차 대역통과, Q≈0.7) — 시변 계수
-        r = torch.exp(-math.pi * (f_peak / 0.7) / fs)
+        r = torch.exp(-math.pi * (f_peak / 0.5) / fs)
         a1 = -2.0 * r * torch.cos(2 * math.pi * f_peak / fs)
         a2 = r * r
         g = (1.0 - r)                                              # 대략적 피크 정규화
@@ -163,7 +169,7 @@ class AspirationNoise(nn.Module):
     """성문 기식: 포락선은 glottis 가 물리로 준다. 여기서는 색(완만한 고역 셸프)만."""
 
     def __init__(self, fs: float, hop: int, corner_hz: float = 3000.0, floor: float = 0.3,
-                 amp_ref: float = 0.05):
+                 amp_ref: float = 0.3):      # 실측 남성 /아/ HNR 22 dB, 4~8 kHz 대역에 적합 (2026-09-06)
         super().__init__()
         self.fs, self.hop = float(fs), int(hop)
         self.corner, self.floor = corner_hz, floor

@@ -147,10 +147,10 @@ class Builder:
         closure = 0.060
         fric = 0.110 if aspirated else 0.080
         t0 = self.t
-        front = self.p.sib_front_len_cm * 1.6
+        front = self.p.sib_front_len_cm * 1.25     # 계측: ㅈ/ㅊ 정점 4~6.4 kHz (남성, /s/ 6 kHz)
         adduct = 0.10 if tense else (0.03 if aspirated else 0.07)
         self.add(t0, p_sub=self.ps, adduction=adduct, a_c=0.0, c_place=0.88, back_leak=S["back_leak"],
-                 front_len=front, obstacle=0.5, fric_gain=4.0 if aspirated else 3.2,   # 계측: ㅈ 모음 −4..−9, ㅊ −5 dB
+                 front_len=front, obstacle=0.5, fric_gain=6.0 if aspirated else 4.5,   # 계측: ㅈ 모음 −4..−9, ㅊ −3.5 dB
                  f1=350 * 1.35, f2=v2 * 1.1, f3=v3, tract_gain=0.85)
         t1 = t0 + closure
         self.add(t1, a_c=0.0, adduction=adduct)
@@ -158,9 +158,10 @@ class Builder:
         self.add(t1 + fric * 0.7, adduction=adduct)                      # 마찰 동안 성문 벌림 유지
         self.add(t1 + fric, a_c=0.35 if aspirated else 0.6)
         self.add(t1 + fric + 0.02, a_c=3.0, obstacle=0.0, front_len=0.0, back_leak=0.3,
-                 adduction=0.6 if not aspirated else 0.2, fric_gain=1.0)
-        if aspirated:
-            self.add(t1 + fric + 0.08, adduction=0.6)                    # 기식 뒤에 성문이 닫힌다
+                 adduction=0.6 if not aspirated else 0.05, fric_gain=1.0)
+        if aspirated:                                                    # 협착이 열린 채 성문이 늦게 닫힌다 → /h/ 기식
+            self.add(t1 + fric + 0.06, adduction=0.05)
+            self.add(t1 + fric + 0.11, adduction=0.6)
         self.add(t1 + fric + 0.05, f1=v1, f2=v2, f3=v3, tract_gain=1.0)
         self.t = t1 + fric
         return self
@@ -173,19 +174,22 @@ class Builder:
         tr = self.ms(N["transition_ms"])
         nz = N["zero_hz"][place]
         f2 = {"m": 1100.0, "n": 1400.0, "ng": 1900.0}[place]
+        gain = N["gain"] * N.get("place_gain", {"m": 2.8, "n": 1.0, "ng": 1.2})[place]   # A/B: ㅁ 이 ㄴ 보다 크다
+        N = dict(N, gain=gain)
         t0 = self.t
         if coda:                                                          # 모음 → 비음
             a1, a2, a3 = self.V(prev_vowel)
             self.add(t0 - tr, f1=a1, f2=a2, f3=a3, velum=0.0, tract_gain=1.0)
-            self.add(t0, velum=1.0, f1=300.0, f2=f2, f3=2600.0, tract_gain=N["gain"], a_c=0.02,
-                     nasal_f=N["pole_hz"], nasal_z=nz)
-            self.add(t0 + dur, velum=1.0, f1=300.0, tract_gain=N["gain"], a_c=0.02)
+            self.add(t0, velum=1.0, f1=300.0, f2=f2, f3=2600.0, bw1=300, bw2=400, bw3=500,
+                     tract_gain=N["gain"], a_c=0.02, nasal_f=N["pole_hz"], nasal_z=nz)
+            self.add(t0 + dur, velum=1.0, f1=300.0, bw1=300, bw2=400, bw3=500, tract_gain=N["gain"], a_c=0.02)
             self.t = t0 + dur
             return self
+        # 머머의 극은 무겁게 감쇠된다(계측: 0.5~1.3 kHz 가 총 대비 −26~−31 dB, 봉우리 없음)
         self.add(t0, p_sub=self.ps, adduction=0.6, velum=1.0, nasal_f=N["pole_hz"], nasal_z=nz,
-                 f1=300.0, f2=f2, f3=2600.0, tract_gain=N["gain"], a_c=0.02)
-        self.add(t0 + dur, velum=1.0, f1=300.0, tract_gain=N["gain"], a_c=0.02)
-        self.add(t0 + dur + tr, velum=0.0, f1=v1, f2=v2, f3=v3, tract_gain=1.0, a_c=3.0)
+                 f1=250.0, f2=f2, f3=2600.0, bw1=300, bw2=400, bw3=500, tract_gain=N["gain"], a_c=0.02)
+        self.add(t0 + dur, velum=1.0, f1=250.0, bw1=300, bw2=400, bw3=500, tract_gain=N["gain"], a_c=0.02)
+        self.add(t0 + dur + tr, velum=0.0, f1=v1, f2=v2, f3=v3, bw1=0, bw2=0, bw3=0, tract_gain=1.0, a_c=3.0)
         self.t = t0 + dur
         return self
 

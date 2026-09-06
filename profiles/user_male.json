@@ -1,0 +1,24 @@
+{
+ "name": "user_male",
+ "sex": "male",
+ "tract_length_cm": 17.0,
+ "f0_nominal": 116.0,
+ "f0_lo": 70.0,
+ "f0_hi": 260.0,
+ "p_sub": 7.5,
+ "vowels": {
+  "a": [650, 1130, 2250], "eo": [560, 1000, 2400], "o": [450, 850, 2450],
+  "u": [330, 850, 2300], "eu": [400, 1400, 2300], "i": [300, 2200, 2900],
+  "e": [480, 1900, 2500], "ae": [560, 1800, 2500]
+ },
+ "lateral": {"f": [340, 1450, 2550], "zeros": [2900, 4000], "zero_bw": 350, "gain": 1.05,
+             "hold_ms": 100, "release_ms": 90, "level_db": -4.5},
+ "tap": {"f": [330, 1350, 2400], "approach_ms": 15, "closure_ms": 18, "release_ms": 20,
+         "gain": 0.75, "dip_db": -5.0, "transient_amp": 0.0},
+ "sibilant": {"peak_hz": 6000.0, "level_db": -14.0, "lax_level_db": -14.0, "tense_level_db": -8.0,
+              "dur_ms": 150, "tense_dur_ms": 90, "a_min": 0.10, "obstacle": 1.0, "back_leak": 0.02},
+ "nasal": {"pole_hz": 200.0, "zero_hz": {"m": 3000.0, "n": 2500.0, "ng": 3000.0},
+           "murmur_db": -6.0, "gain": 1.3, "place_gain": {"m": 2.8, "n": 1.0, "ng": 1.2}, "dur_ms": 70, "transition_ms": 80},
+ "timing": {"vowel_ms": 250, "final_vowel_ms": 400, "silence_ms": 50},
+ "notes": {"source": "reference/recordings/ko_nasal-sibilant_na-ma-sa-ja-cha_male.wav + ko_liquid_ra-eulla-ara_male_44k.wav (docs/MEASUREMENTS.md §2, §3). 같은 화자 A/B 용 — 목표 화자가 아니다."}
+}
