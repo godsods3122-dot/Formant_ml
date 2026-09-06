@@ -91,11 +91,14 @@ class GlottalSource(nn.Module):
 
     def __init__(self, fs: float, hop: int, speaker: str = "female",
                  n_rd: int = 24, n_harm: int | None = None, k_growth: float = 0.25,
-                 cycles_decay: float = 3.0, f0_min: float = 50.0):
+                 cycles_decay: float = 3.0, f0_min: float = 50.0,
+                 f0_range: tuple[float, float, float] | None = None):
         super().__init__()
         self.fs, self.hop = float(fs), int(hop)
         self.k_growth, self.cycles_decay = k_growth, cycles_decay
-        if speaker == "female":
+        if f0_range is not None:
+            self.f0_lo, self.f0_hi, self.f0_nom = map(float, f0_range)
+        elif speaker == "female":
             self.f0_lo, self.f0_hi, self.f0_nom = 110.0, 440.0, 220.0
         else:
             self.f0_lo, self.f0_hi, self.f0_nom = 65.0, 260.0, 120.0
@@ -140,7 +143,12 @@ class GlottalSource(nn.Module):
         amp = (amp_raw - seed).clamp_min(0.0) / (1.0 - seed)
         rd = (0.3 + 2.4 * (1.0 - add) ** 1.5 + c["rd_offset"]).clamp(0.3, 2.7)
         ag_dc = 0.02 + 0.5 * (1.0 - add) ** 2.5                    # 정적 성문 면적 cm² (모달 ≈0.07 → U≈250 cm³/s)
-        asp = (1.0 - add) ** 2 * torch.sqrt(ps.clamp_min(0.0)) * c["aspiration"]
+        # 성문 난류는 **성문 양단의 압력 강하**로 난다. 구강 협착이 있으면 압력의 대부분이
+        # 협착에서 떨어지고(Po/Ps = Ag²/(Ag²+Ac²), v1 §5.3) 성문 제트는 느려진다 — /s/ 동안
+        # 성문 기식이 1~6 kHz 를 채우던 원인(측정: 앞공동 경로와 같은 크기).
+        a_c = c["a_c"].clamp_min(1e-3)
+        dp_g = ps.clamp_min(0.0) * a_c ** 2 / (a_c ** 2 + ag_dc ** 2)
+        asp = (1.0 - add) ** 2 * torch.sqrt(dp_g) * c["aspiration"]
         return dict(f0=f0, amp=amp, amp_raw=amp_raw, rd=rd, ag_dc=ag_dc, asp=asp, pth=pth)
 
     # ---------------------------------------------------------- 파형
@@ -226,6 +234,6 @@ class GlottalSource(nn.Module):
         voiced = (amp > 1e-3).float()
         asp_env = asp * (1.0 + 0.7 * voiced * (open_phase - 0.5))
         return dict(du=du, phase=phase, asp_env=asp_env.clamp_min(0.0),
-                    amp=amp, f0=f0, ag_dc=up(st["ag_dc"]), voiced=voiced,
+                    amp=amp, f0=f0, ag_dc=up(st["ag_dc"]), ag_dc_frames=st["ag_dc"], voiced=voiced,
                     physiology=st, amp_last=st["amp_raw"][:, t - 1], state=state,
                     phase_last=phase64[:, -1:])

@@ -55,6 +55,10 @@ classDiagram
     +reset()
   }
   class ControlTrack { +values: ndarray(T,P) +frame_ms +events: list +__getitem__(name) +clamp() +to_tensor() }
+  class SpeakerProfile { +tract_length_cm +f0_nominal/lo/hi +vowels +lateral +tap +sibilant +nasal +timing +load()/save() +sib_front_len_cm }
+  class Builder { +vowel() +lateral() +tap() +sibilant() +affricate() +nasal() +build() ControlTrack }
+  Builder --> SpeakerProfile
+  VoiceEngine --> SpeakerProfile : f0 range, tract length
   class ParamSpec { +name +unit +lo +hi +default +log +doc }
   class GlottalSource { +physiology(c) dict +forward(c, phase0, rps) dict +threshold(f0, add) +lf_coef: buffer }
   class FricationNoise { +log_beta +log_knee +log_amp +log_lp_ratio +forward(c, ag_dc, phase, voiced) dict }
@@ -155,7 +159,8 @@ src/formant_ml/
     nn.py            shifted softplus 블록
     tokens.py        감정 토큰
     voice.py         VoiceEngine
-    phones.py        한국어 음소 제스처 (여성 기본값)
+    phones.py        한국어 음소 제스처 (구조만; 숫자는 프로파일)
+    profile.py       SpeakerProfile — 화자 한 명 = JSON 한 장 (profiles/*.json)
   dsp/, models/, …   v1 (0.1.x) — 동결. 참고용. 새 기능을 넣지 않는다.
 tests/engine/        v2 성질 테스트
 docs/adr/            결정 기록

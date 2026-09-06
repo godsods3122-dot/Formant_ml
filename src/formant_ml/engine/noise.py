@@ -73,7 +73,7 @@ class FricationNoise(nn.Module):
     """협착 공기역학 -> 마찰 소스 (샘플률). 색은 여기서 **소스 스펙트럼**까지만."""
 
     def __init__(self, fs: float, hop: int, mod_depth: float = 0.25,
-                 amp_ref: float = 0.012, lp_ratio: float = 5.0):
+                 amp_ref: float = 0.15, lp_ratio: float = 5.0):
         super().__init__()
         self.fs, self.hop = float(fs), int(hop)
         self.mod_depth = mod_depth
@@ -89,7 +89,7 @@ class FricationNoise(nn.Module):
     def forward(self, c: dict, ag_dc: torch.Tensor, glottal_phase: torch.Tensor,
                 voiced: torch.Tensor, noise=None, frame0: int = 0,
                 state: dict | None = None, emit: int | None = None) -> dict:
-        """c: 프레임률 (B,T) dict (p_sub, a_c, obstacle, fric_gain).
+        """c: 프레임률 (B,T) dict (p_sub, a_c, obstacle, fric_gain). ag_dc: **프레임률** (B,T) 성문 면적.
 
         noise: NoiseBank (위치 기반), frame0: 청크의 첫 프레임, state: 필터 상태(스트리밍).
         반환: source (B,N) 마찰 소스 파형, env (B,N), f_peak (B,N), reynolds, flow, state
@@ -102,12 +102,33 @@ class FricationNoise(nn.Module):
         state = {} if state is None else state
         up = lambda v: frames_to_samples(v.unsqueeze(-1), hop)[..., 0][:, :n]
         a_c = up(c["a_c"]); ps = up(c["p_sub"])
-        u, _ = series_flow(ps, ag_dc[:, :n], a_c)
+        agf = ag_dc                                      # 프레임률 (B, T_all)
+        ag_s = up(agf)
+        u, _ = series_flow(ps, ag_s, a_c)
+        # 구강압 저장 → 해제 시 방전 (파열음·파찰음의 버스트). 프레임률 1 차 계.
+        #   닫힘(a_c < ~0.05): Po → Ps (τ 15 ms). 열림: Po → 정상값 (τ 6 ms).
+        #   버스트 유량 = 저장된 초과압의 방전. ㅈ/ㅊ 개시가 10 ms 안에 −70→−30 dB 로 서는 것(계측).
+        closed = torch.clamp((0.06 - c["a_c"]) / 0.04, 0.0, 1.0)
+        closed = closed * closed * (3 - 2 * closed)
+        po_ss = c["p_sub"] * agf ** 2 / (agf ** 2 + c["a_c"].clamp_min(1e-3) ** 2)   # 정상 구강압
+        dt = hop / fs
+        po = state.get("po", po_ss[:, 0] * 0.0)
+        burst, po_hist = [], []
+        for i in range(t_all):
+            tgt = closed[:, i] * c["p_sub"][:, i] + (1 - closed[:, i]) * po_ss[:, i]
+            tau = 0.015 * closed[:, i] + 0.006 * (1 - closed[:, i])
+            po = po + dt * (tgt - po) / tau
+            po_hist.append(po)
+            burst.append((po - po_ss[:, i]).clamp_min(0.0) * (1 - closed[:, i]))
+        burst = torch.stack(burst, 1)
+        state["po"] = po_hist[t - 1]                     # 상태는 내보내는 마지막 프레임 기준
+        burst_env = up(torch.sqrt(burst.clamp_min(0.0) / CMH2O)) * 3.0     # 초과압 → 속도 배율
         re, v, d = reynolds(u, a_c)
         # Stevens: 소스 압력 ∝ ρ·v³·√A. Re = v·d/ν ∝ v·√A 이므로 같은 Re 에서 v³√A ∝ Re³/A —
         # 넓은 통로(모음 자세)는 같은 Re 라도 조용하다. (Re²−Re_c²)^1.5/(A/A_ref), A_ref=0.1 cm².
         drive = (((re ** 2 - RE_CRIT ** 2).clamp_min(0.0) / RE_REF ** 2) ** 1.5
                  * (0.1 / a_c.clamp_min(0.02)))
+        drive = drive + burst_env ** 3 * (0.1 / a_c.clamp_min(0.02))   # 버스트: 방전 속도의 세제곱
         env = drive * torch.exp(self.log_amp) * up(c["fric_gain"])
         f_peak = (0.2 * v / d.clamp_min(1e-3)).clamp(500.0, 0.45 * fs)     # Strouhal
         # 느린 1/f^β 변조 (제트 사행) + 유성 구간에서는 성문 개방기 AM
@@ -121,7 +142,6 @@ class FricationNoise(nn.Module):
         mod = 1.0 + self.mod_depth * up(mod)
         frac = glottal_phase[:, :n] / (2 * math.pi)
         am = 1.0 - 0.5 * voiced[:, :n] * (frac < 0.35).float()   # 폐쇄기에 유량 감소
-        ag_dc = ag_dc[:, :n]
         white = noise.white("fric", frame0 * hop, n, b, ps.dtype, ps.device)
         # 소스 스펙트럼: Strouhal 정점의 넓은 혹 (2차 대역통과, Q≈0.7) — 시변 계수
         r = torch.exp(-math.pi * (f_peak / 0.7) / fs)

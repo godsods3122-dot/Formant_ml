@@ -58,7 +58,7 @@ _P: list[ParamSpec] = [
     # --- 협착 / 마찰 노이즈 (물리) ---------------------------------------
     ParamSpec("a_c", "cm2", 0.0, 8.0, 3.0, False, "구강 최협착 단면적. 작을수록 마찰"),
     ParamSpec("c_place", "0-1", 0.0, 1.0, 0.9, False, "협착 위치 (0 성문 ~ 1 입술). 앞공동 길이"),
-    ParamSpec("front_len", "cm", 0.3, 6.0, 0.0, False, "앞공동 길이 직접 지정(0 이면 c_place 로)"),
+    ParamSpec("front_len", "cm", 0.3, 6.0, 0.0, True, "앞공동 길이 직접 지정(0 이면 c_place 로). 0↔값은 보간하지 않는다"),
     ParamSpec("obstacle", "0-1", 0.0, 1.0, 0.0, False, "제트가 장애물(앞니)을 때리는 정도(다이폴)"),
     ParamSpec("fric_gain", "ratio", 0.0, 4.0, 1.0, False, "마찰 노이즈 배율(물리량 위에 곱)"),
     ParamSpec("back_leak", "0-1", 0.0, 1.0, 0.3, False, "마찰음이 뒤공동/성도 전체로 새는 비율"),

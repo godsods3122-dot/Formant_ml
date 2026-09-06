@@ -2,6 +2,24 @@
 
 형식: [Keep a Changelog](https://keepachangelog.com/ko/1.1.0/). 버전 규칙: `docs/VERSIONING.md`.
 
+## [0.2.1] — 2026-09-06
+
+### Added
+- `engine/profile.py` `SpeakerProfile` + `profiles/yang_female.json` — 여성 화자 문장 녹음 계측값 (ADR 0008).
+- `docs/MEASUREMENTS.md`, `scripts/measure_ref.py` — 여성 문장 / 사용자 비음·치찰음 녹음 계측표.
+- 구강압 저장·방전 버스트 (파열/파찰 개시 물리), `phones.affricate` (ㅈ/ㅊ/ㅉ), `phones.nasal(coda=)`,
+  구 "이리닐씨리래" 데모, 청취 세트 9 종 (`scripts/v2_listen.py --profile`).
+- `tviir.peak_coeffs` (극-영점 봉우리), 비강 3 kHz 저역통과.
+
+### Changed
+- 음절 길이 300 → 120~140 ms (계측). 탄음 골 깊이·길이는 프로파일. 탄음 과도음 템플릿 기본 0.
+- 성문 기식은 성문 양단 압력 강하 √ΔPg 에 비례 (협착 중 기식이 1~6 kHz 를 채우던 것).
+- `front_len` 은 0=끔 규약(영차 유지). 마찰 세기 보정: `fric_gain=1` ⇒ 모음 대비 −11 dB.
+
+### Fixed
+- 스트리밍에서 구강압 상태가 프레임 성문 면적 대신 첫 샘플을 쓰던 것.
+- 경음/파찰음의 내전이 발성 게이트를 넘어 유성음이 되던 것.
+
 ## [0.2.0] — 2026-09-06
 
 ### Added

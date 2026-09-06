@@ -222,6 +222,21 @@ def notch_coeffs(f_hz, bw_zero_hz, fs: float, pole_ratio: float = 4.0):
     return g + 0.0 * b1, g * b1, g * b2, a1, a2
 
 
+def peak_coeffs(f_hz, bw_pole_hz, fs: float, zero_ratio: float = 3.0):
+    """극-영점 쌍 봉우리 (비강 극). 노치의 역: 같은 각도의 더 넓은 영점쌍으로 나눠 먼 대역은 1.
+
+    DC 정규화 공명기를 250 Hz 에 그냥 끼우면 그 위가 −12 dB/oct 로 굴러떨어져 비음 머머의
+    1~2 kHz 가 −57 dB 가 됐다(측정; 실측은 −20). 봉우리 높이 ≈ zero_ratio (9.5 dB @3).
+    """
+    rp = pole_radius(bw_pole_hz, fs)
+    rz = pole_radius(bw_pole_hz * zero_ratio, fs)
+    cs = _cos(TWO_PI * f_hz / fs)
+    b1, b2 = -2.0 * rz * cs, rz * rz
+    a1, a2 = -2.0 * rp * cs, rp * rp
+    g = (1.0 + a1 + a2) / (1.0 + b1 + b2)
+    return g + 0.0 * b1, g * b1, g * b2, a1, a2
+
+
 def allpass_coeffs(f_hz, r, fs: float):
     """2차 올패스: |H| ≡ 1, 군지연만 바꾼다(위상차 필터).
 

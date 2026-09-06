@@ -39,8 +39,8 @@ def test_frication_silent_open_and_loud_closed():
     N = 200 * HOP
     ph = torch.zeros(1, N); vo = torch.zeros(1, N)
     with torch.no_grad():
-        o = n(_ctrl(200, p_sub=7.5, a_c=3.0), torch.full((1, N), 0.07), ph, vo)   # 모달 성문 + 모음
-        c = n(_ctrl(200, p_sub=7.5, a_c=0.10), torch.full((1, N), 0.46), ph, vo)  # 벌린 성문 + /s/
+        o = n(_ctrl(200, p_sub=7.5, a_c=3.0), torch.full((1, 200), 0.07), ph, vo)   # 모달 성문 + 모음
+        c = n(_ctrl(200, p_sub=7.5, a_c=0.10), torch.full((1, 200), 0.46), ph, vo)  # 벌린 성문 + /s/
     assert float(o["source"].abs().max()) < 1e-6
     assert float(c["source"].pow(2).mean()) > 0
     y = c["source"][0].numpy()

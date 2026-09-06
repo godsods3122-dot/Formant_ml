@@ -26,7 +26,7 @@ import torch.nn as nn
 from .control import N_ALLPASS, N_FORMANTS, frames_to_samples
 from .noise import C_SOUND
 from .tviir import (allpass_coeffs, antiresonator_coeffs, first_difference_coeffs,
-                    notch_coeffs, resonator_coeffs, tv_biquad)
+                    lowpass_coeffs, notch_coeffs, peak_coeffs, resonator_coeffs, tv_biquad)
 
 
 class VocalTract(nn.Module):
@@ -128,8 +128,12 @@ class VocalTract(nn.Module):
             return x
         v = self._up(c["velum"]).clamp(1e-3, 1.0)
         f_p, f_z = self._up(c["nasal_f"]), self._up(c["nasal_z"])
-        x, state["np"] = tv_biquad(x, *resonator_coeffs(f_p, 100.0 / v, self.fs), zi=state.get("np"))
-        x, state["nz"] = tv_biquad(x, *notch_coeffs(f_z, 150.0 / v, self.fs), zi=state.get("nz"))
+        x, state["np"] = tv_biquad(x, *peak_coeffs(f_p, 100.0 / v, self.fs), zi=state.get("np"))
+        x, state["nz"] = tv_biquad(x, *notch_coeffs(f_z, 500.0 / v, self.fs, 3.0), zi=state.get("nz"))
+        # 비강 벽·비갑개의 손실은 고역에서 크다: 머머의 2~3 kHz 가 −40 dB (남성 녹음 계측).
+        # 완만한 2 차 저역통과, 차단 주파수는 velum→0 에서 나이퀴스트 근처로 물러나 항등이 된다.
+        f_lp = 3000.0 + (0.45 * self.fs - 3000.0) * (1.0 - v)
+        x, state["nl"] = tv_biquad(x, *lowpass_coeffs(f_lp, 0.5, self.fs), zi=state.get("nl"))
         return x * (1.0 - 0.2 * v)                      # 비강 벽 손실
 
     def _lateral(self, x, c, state):
