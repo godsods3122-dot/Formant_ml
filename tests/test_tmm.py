@@ -282,6 +282,27 @@ def test_series_argument_stays_in_the_validated_range():
     assert worst < 25.0, f"|z| 최대 {worst:.2f} — 급수 항 수를 늘려야 한다"
 
 
+def test_works_for_both_float_precisions():
+    """면적의 dtype 이 float32 든 float64 든 돌아가야 한다.
+
+    `freq` 는 `freq_grid` 가 만들고 `area` 는 호출부가 준다. 둘의 dtype 이
+    다르면 `torch.complex` 가 그대로 터진다 — 역산 실험에서 numpy 기본값
+    (float64) 면적을 넣었다가 실제로 겪었다. 면적이 최적화 변수이므로
+    dtype 은 면적 쪽으로 통일한다.
+    """
+    for dtype, want in ((torch.float32, torch.complex64),
+                        (torch.float64, torch.complex128)):
+        h = tract_transfer(torch.full((1, 1, 24), 3.0, dtype=dtype), FS, 257)
+        assert h.dtype == want
+        assert torch.isfinite(h.abs()).all()
+    # 두 정밀도의 결과가 서로 맞아야 한다 (수치오차 범위)
+    a32 = torch.full((1, 1, 24), 3.0, dtype=torch.float32)
+    a64 = torch.full((1, 1, 24), 3.0, dtype=torch.float64)
+    d = (20 * torch.log10(tract_transfer(a32, FS, 257).abs() + 1e-30)
+         - 20 * torch.log10(tract_transfer(a64, FS, 257).abs() + 1e-30))
+    assert float(d.abs().max()) < 0.01, f"정밀도에 따라 {float(d.abs().max()):.3f} dB 다르다"
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

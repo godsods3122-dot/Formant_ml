@@ -124,7 +124,7 @@ def radiation_impedance(freq: torch.Tensor, area: torch.Tensor) -> torch.Tensor:
     극한이 맞는지: ω→0 이면 z→0(개방단, Γ→−1), ω→∞ 이면 z→1(무반사, Γ→0).
     """
     a = (area.clamp_min(1e-9) / math.pi).sqrt()                  # 등가 반지름
-    k = (2.0 * math.pi / SOUND_SPEED) * freq                     # (F,)
+    k = ((2.0 * math.pi / SOUND_SPEED) * freq).to(area.dtype)    # (F,)
     x = (2.0 * k) * a                                            # (..., F)
     x = x.clamp_min(1e-9)
     r = 1.0 - 2.0 * _bessel_j1(x) / x
@@ -193,7 +193,10 @@ def _series_shunt(freq: torch.Tensor, area: torch.Tensor, losses: TubeLosses):
     이 형태의 감쇠상수는 α = ½(R_v/Z_c + G_t·Z_c) = (1/(a·c))·√(ωμ/2ρ)·
     (1 + (γ−1)/√Pr) 로, Kirchhoff 경계층 감쇠와 같다(같은 물리를 다르게 쓴 것).
     """
-    w = 2.0 * math.pi * freq                                     # (F,)
+    # **dtype 을 면적 쪽으로 통일한다.** freq 와 area 의 dtype 이 다르면
+    # torch.complex 가 그대로 터진다(float64 면적 + float32 주파수에서 실제로
+    # 겪었다). 면적이 최적화 변수이므로 그쪽을 기준으로 맞추는 것이 맞다.
+    w = (2.0 * math.pi * freq).to(area.dtype)                    # (F,)
     a = (area.clamp_min(1e-9) / math.pi).sqrt()                  # 반지름 (...,1)
     circ = 2.0 * math.pi * a                                     # 둘레
     zero = torch.zeros(a.shape[:-1] + w.shape, dtype=a.dtype, device=a.device)
