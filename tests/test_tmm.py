@@ -194,6 +194,94 @@ def test_transfer_is_differentiable_wrt_area():
     assert g is not None and torch.isfinite(g).all() and g.abs().sum() > 0
 
 
+def test_matches_an_independent_ode_integration():
+    """**독립 기준과 대조한다** — 전송선 ODE 를 RK4 로 직접 적분한 값.
+
+        dP/dx = −Z'·U,   dU/dx = −Y'·P
+
+    전달행렬은 이 ODE 의 (구간별 상수 계수에 대한) 해석해다. 그러니 잘게
+    적분한 값과 **정확히** 같아야 한다. 이 검사가 필요한 이유는, 예전 판이
+    손실 k 와 무손실 특성임피던스 ρc/A 를 섞어 써서 첨두 −40 dB 이내의
+    들리는 대역에서 최대 9.5 dB 틀렸는데도 다른 검사(균일관·섭동·대역폭)를
+    전부 통과했기 때문이다. **고전 결과만으로는 이 종류의 오류가 안 잡힌다.**
+    """
+    from scipy.special import j1, struve
+    from formant_ml.dsp.tmm import (GAMMA, MU, PRANDTL, RHO, WALL_MASS,
+                                    WALL_RESISTANCE)
+
+    length, n_freq, sub = 17.5, 257, 120
+    f = np.linspace(0.0, FS / 2, n_freq)
+    f[0] = 1e-6
+    w = 2 * np.pi * f
+
+    def reference(area):
+        n = len(area)
+        seg = length / n
+
+        def zy(A):
+            a = math.sqrt(A / math.pi)
+            circ = 2 * math.pi * a
+            zp = (circ / A ** 2) * np.sqrt(w * RHO * MU / 2.0) + 1j * w * RHO / A
+            yp = ((circ / (RHO * SOUND_SPEED ** 2)) * (GAMMA - 1.0)
+                  * np.sqrt(w * MU / (2 * RHO * PRANDTL))
+                  + circ / (WALL_RESISTANCE + 1j * w * WALL_MASS)
+                  + 1j * w * A / (RHO * SOUND_SPEED ** 2))
+            return zp, yp
+
+        a_l = area[-1]
+        x = 2 * (w / SOUND_SPEED) * math.sqrt(a_l / math.pi)
+        z_norm = (1 - 2 * j1(x) / x) + 1j * (2 * struve(1, x) / x)
+        p = z_norm * (RHO * SOUND_SPEED / a_l)
+        u = np.ones_like(p)
+        for i in range(n - 1, -1, -1):
+            zp, yp = zy(area[i])
+            h = seg / sub
+            for _ in range(sub):                 # 입술 -> 성문 (부호 반전)
+                def der(pp, uu):
+                    return zp * uu, yp * pp
+                k1 = der(p, u)
+                k2 = der(p + h / 2 * k1[0], u + h / 2 * k1[1])
+                k3 = der(p + h / 2 * k2[0], u + h / 2 * k2[1])
+                k4 = der(p + h * k3[0], u + h * k3[1])
+                p = p + h / 6 * (k1[0] + 2 * k2[0] + 2 * k3[0] + k4[0])
+                u = u + h / 6 * (k1[1] + 2 * k2[1] + 2 * k3[1] + k4[1])
+        return (1.0 / u) * (1j * w)
+
+    rng = np.random.default_rng(0)
+    cases = {
+        "균일관": np.full(24, 3.0),
+        "모음형": np.array([1.0] * 8 + [0.4] * 4 + [3.0] * 6 + [6.0] * 6),
+        "무작위": rng.uniform(0.15, 8.0, 32),
+    }
+    for name, area in cases.items():
+        ref = reference(area)
+        got = tract_transfer(torch.tensor(area, dtype=torch.float64).reshape(1, 1, -1),
+                             FS, n_freq)[0, 0].numpy()
+        m_ref = 20 * np.log10(np.abs(ref) + 1e-30)
+        audible = (m_ref - m_ref.max()) > -40          # 들리는 대역만 본다
+        err = np.abs(20 * np.log10(np.abs(got) + 1e-30) - m_ref)[audible].max()
+        assert err < 0.05, f"{name}: ODE 적분과 {err:.3f} dB 차이"
+
+
+def test_series_argument_stays_in_the_validated_range():
+    """cos/sinc 정급수의 인자 |z| 가 항 수로 감당되는 범위 안에 있어야 한다.
+
+    |z| = |k·(단면 길이)|² 다. 단면을 잘게 쪼개거나 손실을 키우면 커진다.
+    12 항 급수는 |z| ≤ 25 까지도 항 크기가 1e-10 이므로 넉넉하지만, 그
+    가정이 조용히 깨지지 않도록 상한을 검사로 박아 둔다.
+    """
+    from formant_ml.dsp.tmm import _series_shunt
+    f = torch.linspace(0.0, FS / 2, 1025, dtype=torch.float64)
+    worst = 0.0
+    for n_sections in (20, 40, 64):
+        seg = 17.5 / n_sections
+        for a in (0.01, 0.1, 1.0, 3.0, 8.0):
+            zp, yp = _series_shunt(f, torch.full((1, 1, 1), a, dtype=torch.float64),
+                                   TubeLosses(True, True))
+            worst = max(worst, float((-(zp * seg) * (yp * seg)).abs().max()))
+    assert worst < 25.0, f"|z| 최대 {worst:.2f} — 급수 항 수를 늘려야 한다"
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

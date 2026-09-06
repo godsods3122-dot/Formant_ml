@@ -29,6 +29,22 @@ p ∝ jω·U_lips 이고, 그 jω 가 흔히 말하는 "입술 방사 +6 dB/oct"
 `dsp/glottal.py` 의 LF 모델은 유량의 **미분**을 내므로 그쪽 경로에는 이 jω 가
 이미 들어 있다 — 두 번 걸지 않도록 `radiation_derivative` 로 끌 수 있다.
 
+전송선 형식으로 쓴다
+-------------------
+단면마다 단위길이당 **직렬 임피던스 Z'** 와 **병렬 어드미턴스 Y'** 를 만들고,
+전달행렬을 그 둘로만 쓴다. 파수는 k² = −Z'Y' 로만 나타나고 **k 를 만들지
+않는다**(`_entire_cos_sinc` 주석). 두 가지가 동시에 해결된다:
+
+1. k = √(k²) 를 만들면 손실이 있을 때 ω=0 에 분지점이 생겨 **기울기가 NaN**
+   이 된다. 한때 주파수를 1e-3 Hz 로 클램프해서 피했는데, 그건 특이점을 안
+   밟은 것이지 없앤 게 아니다(모델을 DC 근처에서 조용히 바꾼다).
+2. **더 중요한 것**: 예전 판은 손실 k 와 함께 특성임피던스를 무손실값
+   ρc/A 로 썼다. 손실 관의 올바른 값은 Z_c = ωρ/(A·k) = √(Z'/Y') 다.
+   전송선 형식으로 쓰면 이 불일치가 원천적으로 생길 수 없다.
+   전송선 ODE 를 RK4 로 직접 적분한 독립 기준과 대조하면, 현재 식은
+   **0.0000 dB**, 예전 식은 최대 **9.5 dB** 틀렸다 — 그것도 첨두 −40 dB 이내,
+   즉 들리는 대역에서다. (`test_matches_an_independent_ode_integration`)
+
 단위는 CGS (cm, g, s). 이 레포의 다른 모듈과 같다.
 """
 from __future__ import annotations
@@ -54,6 +70,10 @@ WALL_RESISTANCE = 1600.0     # [dyn*s/cm^3]
 WALL_MASS = 1.5              # [g/cm^2]
 
 _SERIES_TERMS = 24           # J1 / StruveH1 정급수 항 수 (§ _bessel_j1 주석)
+#: cos(√z)/sinc(√z) 정급수 항 수. 실제 |z| 상한이 0.9 라 8 항이면 이미 1e-14 인데,
+#: 단면을 아주 잘게 쪼개거나 손실을 키울 여지를 두어 12 로 둔다.
+#: `test_tmm.test_series_argument_stays_in_the_validated_range` 가 상한을 지킨다.
+_COS_TERMS = 12
 
 
 def _bessel_j1(x: torch.Tensor) -> torch.Tensor:
@@ -127,39 +147,78 @@ class TubeLosses:
     yielding_wall: bool = True
 
 
-def _propagation(freq: torch.Tensor, area: torch.Tensor, losses: TubeLosses):
-    """(복소 파수 k, 복소 특성임피던스 Z) 를 낸다. 손실이 여기 들어간다.
+def _entire_cos_sinc(z: torch.Tensor, n_terms: int = _COS_TERMS):
+    """(cos(√z), sinc(√z)) 를 z 의 **정급수**로. √z 를 만들지 않는다.
 
-    freq: (F,), area: (..., 1)  ->  둘 다 (..., F) 복소
+    왜 이렇게 하는가 — 이게 이 모듈에서 제일 중요한 수치 결정이다.
+
+    전달행렬에 파수 k 는 `cos(kl)` 과 `sin(kl)` 로만 들어가고, 둘 다 k 의
+    **짝함수**로 쓸 수 있다(cos 는 그 자체로, sin 은 sinc = sin(kl)/(kl) 로).
+    즉 답은 k² 에만 의존하는데, k = √(k²) 를 굳이 만들면 **없던 분지점이
+    생긴다.** 손실이 있으면 k² ∝ ω 라 ω=0 에서 dk/dω ∝ 1/√ω 로 발산하고,
+    자동미분이 그걸 타고 내려와 **기울기 전체가 NaN** 이 된다.
+
+    한때 주파수 격자를 1e-3 Hz 로 클램프해서 피했는데, 그건 특이점을 없앤 게
+    아니라 안 밟은 것이다(모델을 DC 근처에서 조용히 바꾼다). 급수로 쓰면
+    특이점이 **식에서 사라진다** — 클램프가 필요 없다.
+
+        cos(√z)  = Σ (−1)^n z^n / (2n)!
+        sinc(√z) = Σ (−1)^n z^n / (2n+1)!
+
+    둘 다 정함수라 z 전체에서 수렴한다. 실제 |z| 는 (|k|·단면길이)² 이고
+    이 레포의 범위에서 1 을 넘지 않는다(테스트가 확인한다). 16 항이면
+    |z|=25 에서도 항 크기가 1e-10 이다.
     """
-    w = 2.0 * math.pi * freq
-    a = (area.clamp_min(1e-9) / math.pi).sqrt()                  # 반지름
-    k0 = w / SOUND_SPEED
-    kc = torch.complex(k0.expand(a.shape[:-1] + k0.shape).clone(),
-                       torch.zeros_like(k0).expand(a.shape[:-1] + k0.shape).clone())
-    z0 = RHO * SOUND_SPEED / area.clamp_min(1e-9)                # (..., 1)
-    zc = torch.complex(z0.expand(a.shape[:-1] + k0.shape).clone(),
-                       torch.zeros_like(z0).expand(a.shape[:-1] + k0.shape).clone())
+    c = torch.ones_like(z)
+    s = torch.ones_like(z)
+    tc = torch.ones_like(z)
+    ts = torch.ones_like(z)
+    for n in range(1, n_terms):
+        tc = -tc * z / ((2 * n - 1) * (2 * n))
+        ts = -ts * z / ((2 * n) * (2 * n + 1))
+        c = c + tc
+        s = s + ts
+    return c, s
+
+
+def _series_shunt(freq: torch.Tensor, area: torch.Tensor, losses: TubeLosses):
+    """단위길이당 (직렬 임피던스 Z', 병렬 어드미턴스 Y'). freq: (F,), area: (...,1)
+
+    전송선 형식으로 쓰면 손실이 전부 이 둘 안에 들어가고, 파수는 k² = −Z'Y'
+    로만 나타난다. **k 를 만들 필요가 없다** (`_entire_cos_sinc` 주석).
+
+        Z' = jωρ/A + R_v          (관성 + 점성 경계층)
+        Y' = jωA/(ρc²) + G_t + Y_w (압축성 + 열전도 경계층 + 벽 진동)
+
+    이 형태의 감쇠상수는 α = ½(R_v/Z_c + G_t·Z_c) = (1/(a·c))·√(ωμ/2ρ)·
+    (1 + (γ−1)/√Pr) 로, Kirchhoff 경계층 감쇠와 같다(같은 물리를 다르게 쓴 것).
+    """
+    w = 2.0 * math.pi * freq                                     # (F,)
+    a = (area.clamp_min(1e-9) / math.pi).sqrt()                  # 반지름 (...,1)
+    circ = 2.0 * math.pi * a                                     # 둘레
+    zero = torch.zeros(a.shape[:-1] + w.shape, dtype=a.dtype, device=a.device)
+
+    z_re = zero.clone()
+    z_im = (w * RHO / area.clamp_min(1e-9)).expand_as(zero).clone()
+    y_re = zero.clone()
+    y_im = (w * area.clamp_min(1e-9) / (RHO * SOUND_SPEED ** 2)).expand_as(zero).clone()
 
     if losses.viscothermal:
-        # Kirchhoff 경계층 감쇠 [Np/cm]:
-        #   α = (1/(r·c))·sqrt(ω·μ/(2ρ))·(1 + (γ−1)/sqrt(Pr))
-        alpha = (torch.sqrt(w * MU / (2.0 * RHO))
-                 * (1.0 + (GAMMA - 1.0) / math.sqrt(PRANDTL))
-                 / (a * SOUND_SPEED))
-        kc = kc - 1j * alpha.to(kc.dtype)
+        root = torch.sqrt(w * RHO * MU / 2.0)                    # (F,)
+        z_re = z_re + (circ / area.clamp_min(1e-9) ** 2) * root
+        y_re = y_re + (circ / (RHO * SOUND_SPEED ** 2)) * (GAMMA - 1.0) \
+            * torch.sqrt(w * MU / (2.0 * RHO * PRANDTL))
+
+    zp = torch.complex(z_re, z_im)
+    yp = torch.complex(y_re, y_im)
 
     if losses.yielding_wall:
-        # 벽 어드미턴스 Y_w = S_wall / (R_w + jωM_w) 를 관 벽에 분포시킨다.
-        # 전파상수에 미치는 영향(1차): k^2 -> k^2 − jωρ·Y_w/A  (Flanagan 1972)
-        circumference = 2.0 * math.pi * a
-        yw = circumference / torch.complex(
-            torch.full_like(w, WALL_RESISTANCE).expand(a.shape[:-1] + w.shape).clone(),
-            (w * WALL_MASS).expand(a.shape[:-1] + w.shape).clone())
-        k2 = kc * kc - 1j * (RHO * w).to(kc.dtype) * yw / area.clamp_min(1e-9)
-        kc = torch.sqrt(k2)
-        kc = torch.where(kc.real < 0, -kc, kc)        # 물리적 분지 선택
-    return kc, zc
+        # 벽 어드미턴스 Y_w = 둘레 / (R_w + jωM_w) 를 병렬 가지에 더한다.
+        yw = circ.to(zp.dtype) / torch.complex(
+            torch.full_like(zero, WALL_RESISTANCE),
+            (w * WALL_MASS).expand_as(zero).clone())
+        yp = yp + yw
+    return zp, yp
 
 
 def tract_transfer(area: torch.Tensor, sample_rate: float, n_freq: int,
@@ -184,11 +243,6 @@ def tract_transfer(area: torch.Tensor, sample_rate: float, n_freq: int,
     losses = losses or TubeLosses()
     b, t, n = area.shape
     f = freq_grid(n_freq, sample_rate, device=area.device, dtype=area.dtype)
-    # **DC 를 0 으로 두면 안 된다.** f=0 에서 파수 k 가 0 이 되고, 벽 손실이
-    # 켜져 있으면 k = sqrt(k²) 의 미분이 거기서 발산해서 **기울기 전체가
-    # NaN** 이 된다(역추정에 쓸 것이므로 치명적이다). DC 빈의 값은 어차피
-    # 방사 미분 jω 가 0 으로 만들므로, 아주 작은 값으로 밀어도 무해하다.
-    f = f.clamp_min(1e-3)
     seg = length_cm / n
 
     a_l = area[..., -1:]                                        # 입술 단면
@@ -198,13 +252,17 @@ def tract_transfer(area: torch.Tensor, sample_rate: float, n_freq: int,
     else:
         zr = torch.zeros(b, t, n_freq, dtype=torch.complex64, device=area.device)
 
-    p = zr                                                       # 입술: U=1, P=Z_r
+    # 입술에서 U=1 로 두면 P=Z_rad. 거기서 성문 쪽으로 2-벡터를 옮긴다.
+    #   [P_in]   [ cos(kl)      Z'·l·sinc(kl) ] [P_out]
+    #   [U_in] = [ Y'·l·sinc(kl)   cos(kl)    ] [U_out]
+    # k² = −Z'Y' 이므로 (kl)² = −Z'Y'l² 이고, cos·sinc 는 그 값의 정함수다.
+    p = zr
     u = torch.ones_like(p)
-    for i in range(n - 1, -1, -1):                               # 입술 -> 성문
-        kc, zc = _propagation(f, area[..., i:i + 1], losses)
-        kl = kc * seg
-        cs, sn = torch.cos(kl), torch.sin(kl)
-        p, u = cs * p + 1j * zc * sn * u, 1j * sn / zc * p + cs * u
+    for i in range(n - 1, -1, -1):
+        zp, yp = _series_shunt(f, area[..., i:i + 1], losses)
+        zl, yl = zp * seg, yp * seg
+        cs, sc = _entire_cos_sinc(-zl * yl)                      # (kl)² = −Z'Y'l²
+        p, u = cs * p + zl * sc * u, yl * sc * p + cs * u
 
     h = 1.0 / u                                                  # U_lips / U_glottis
     if radiation_derivative:
