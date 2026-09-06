@@ -181,14 +181,21 @@ def track_from_keyframes(keyframes: list[dict], seconds: float | None = None,
 
 
 def frames_to_samples(x: torch.Tensor, hop: int) -> torch.Tensor:
-    """프레임률 (B, T, C) -> 샘플률 (B, T·hop, C) 선형 보간 (마지막 프레임은 유지)."""
+    """프레임률 (B, T, C) -> 샘플률 (B, T·hop, C) 선형 보간 (마지막 프레임은 유지).
+
+    정수 인덱스 산술로 한다 — `F.interpolate(align_corners=True)` 는 좌표를
+    s·(T)/(T·hop) 로 계산해 T 에 따라 반올림이 달라지고, 그 1e-4 의 좌표 오차가
+    고 Q 공명기를 지나며 스트리밍/오프라인 불일치(1e-3)로 커졌다(측정).
+    """
     b, t, c = x.shape
-    if t == 1:
-        return x.expand(b, hop, c)
-    xx = torch.cat([x, x[:, -1:]], dim=1).transpose(1, 2)              # (B, C, T+1)
-    y = torch.nn.functional.interpolate(xx, size=t * hop + 1, mode="linear",
-                                        align_corners=True)
-    return y[..., : t * hop].transpose(1, 2)
+    n = t * hop
+    s = torch.arange(n, device=x.device)
+    i0 = torch.div(s, hop, rounding_mode="floor")
+    w = ((s - i0 * hop).to(x.dtype) / hop).view(1, n, 1)
+    i1 = (i0 + 1).clamp(max=t - 1)
+    x0 = x[:, i0]                                   # (B, N, C)
+    x1 = x[:, i1]
+    return x0 + (x1 - x0) * w
 
 
 def frames_to_samples_np(x: np.ndarray, hop: int) -> np.ndarray:

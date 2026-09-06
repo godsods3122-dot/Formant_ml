@@ -98,7 +98,7 @@ class VoiceEngine(nn.Module):
             mix = frames_to_samples(c["residual_mix"].unsqueeze(-1), hop)[..., 0][:, :n]
             r = self.residual.apply(y, heads, mix, state=st["residual"])
             y, st["residual"] = r["audio"], r["state"]
-        st["phase"] = g["phase"][:, -1:]
+        st["phase"] = g["phase_last"]
         st["amp"] = g["amp_last"]
         st["glottis"], st["fric"], st["asp"] = g["state"], fr["state"], asp["state"]
         st["tract"] = out["state"]

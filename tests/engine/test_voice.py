@@ -27,7 +27,7 @@ def test_streaming_equals_offline(eng):
     off = eng.render(tr)
     chunks = np.concatenate(list(eng.stream(tr, chunk_ms=17)))
     assert chunks.shape == off.shape
-    assert np.abs(chunks - off).max() < 1e-3 * np.abs(off).max()
+    assert np.abs(chunks - off).max() < 1e-4 * np.abs(off).max()
 
 
 def test_tap_makes_a_short_dip_with_continuous_voicing(eng):

@@ -191,20 +191,33 @@ class GlottalSource(nn.Module):
         f0 = f0 * (1.0 + jit * zs[..., 0])
         amp = amp * (1.0 + shm * zs[..., 1]).clamp_min(0.0)
         # 위상 누적은 float64 로 (float32 cumsum 오차 × 하모닉 차수가 청크 경계에서 보인다)
-        phase = torch.cumsum(2 * math.pi * f0.double() / fs, dim=-1)
+        phase64 = torch.cumsum(2 * math.pi * f0.double() / fs, dim=-1)
         if phase0 is not None:
-            phase = phase + phase0.double()
-        phase = torch.remainder(phase, 2 * math.pi).to(f0.dtype)
-        # 하모닉 가산합성 (배치·시간·하모닉). 메모리를 위해 시간축을 조각낸다.
+            phase64 = phase64 + phase0.double()
+        phase64 = torch.remainder(phase64, 2 * math.pi)
+        phase = phase64.to(f0.dtype)                  # 상태(phase_last)는 float64 로 넘긴다:
+        #                                               float32 위상 2e-7 rad × 하모닉 100 = 2e-5 rad 가 청크 경계에서 보였다
+        # 하모닉 가산합성. **하모닉마다 순차 누적**한다 — (B,N,K).sum(-1) 은 텐서 크기에 따라
+        # 축약 순서가 달라 float32 반올림이 청크 의존이 되고(3e-6), 그것이 고 Q 성도를 지나며
+        # 스트리밍/오프라인 차이 1e-3 로 커졌다(측정). 순차 누적은 청크와 무관하고 메모리도 작다.
         coef = self._lf_coeffs(rd)                                 # (B,N,K)
+        mag, ang = coef.abs(), torch.angle(coef)
         k = self.k_idx
-        fk = f0.unsqueeze(-1) * k                                  # (B,N,K)
-        mask = torch.sigmoid((0.95 * fs / 2 - fk) / (0.02 * fs / 2))
-        gain = 10.0 ** (tilt.unsqueeze(-1) * torch.log2(fk.clamp_min(1.0) / 1000.0) / 20.0)
-        ph = phase.unsqueeze(-1) * k + torch.angle(coef)
-        if rps is not None:
-            ph = ph + rps
-        du = (2.0 * coef.abs() * mask * gain * torch.cos(ph)).sum(-1) * amp
+        f_nyq, width = 0.95 * fs / 2, 0.02 * fs / 2
+        f_cut = f_nyq + 6.0 * width                    # 이 위는 마스크를 정확히 0 으로 (청크 무관 상한)
+        log2f0 = torch.log2(f0.clamp_min(1.0) / 1000.0)
+        du = torch.zeros_like(phase)
+        k_max = int(torch.clamp(torch.ceil(f_cut / f0.detach().min().clamp_min(1.0)), 1, len(k)).item())
+        for j in range(k_max):
+            kk = k[j]
+            fk = f0 * kk
+            mask = torch.sigmoid((f_nyq - fk) / width) * (fk <= f_cut)
+            gain = 10.0 ** (tilt * (log2f0 + math.log2(float(kk))) / 20.0)
+            ph = phase * kk + ang[..., j]
+            if rps is not None:
+                ph = ph + rps[..., j]
+            du = du + 2.0 * mag[..., j] * mask * gain * torch.cos(ph)
+        du = du * amp
         # 성문 개방기 (LF: 0 ~ te 가 열림) -> 기식 AM 마스크
         frac = phase / (2 * math.pi)
         open_phase = torch.sin(math.pi * frac.clamp(0, 1) / 0.65).clamp_min(0.0) ** 2
@@ -214,4 +227,5 @@ class GlottalSource(nn.Module):
         asp_env = asp * (1.0 + 0.7 * voiced * (open_phase - 0.5))
         return dict(du=du, phase=phase, asp_env=asp_env.clamp_min(0.0),
                     amp=amp, f0=f0, ag_dc=up(st["ag_dc"]), voiced=voiced,
-                    physiology=st, amp_last=st["amp_raw"][:, t - 1], state=state)
+                    physiology=st, amp_last=st["amp_raw"][:, t - 1], state=state,
+                    phase_last=phase64[:, -1:])

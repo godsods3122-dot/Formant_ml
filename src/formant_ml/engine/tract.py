@@ -39,12 +39,12 @@ class VocalTract(nn.Module):
         self.bw_floor, self.bw_slope = bw_floor, bw_slope
         self.K = n_formants
         f1 = C_SOUND / (4.0 * length_cm)
-        # 나이퀴스트의 70 % 까지만. 이산 공명기는 θ→π 에서 두 극이 서로 붙어 이득이
-        # 제곱으로 뛴다(19.8 kHz 극이 +58 dB: 측정). 연속계에는 없는 현상이다.
+        # 고차 극은 기본 3 개 (10~13 kHz). 더 얹으면 인접 극의 스커트가 곱해져 백색 입력에
+        # +85 dB 가 되고(측정: 6 개에서 이득 44122), 수치 잡음까지 증폭한다. 또 이산 공명기는
+        # θ→π 에서 두 극이 붙어 이득이 제곱으로 뛴다(19.8 kHz 극이 +58 dB) — 0.7·fs/2 상한.
         fixed = [(2 * n - 1) * f1 for n in range(n_formants + 1, 64)
                  if (2 * n - 1) * f1 < 0.70 * fs / 2]
-        if n_extra is not None:
-            fixed = fixed[:n_extra]
+        fixed = fixed[:3 if n_extra is None else n_extra]
         self.register_buffer("uniform_formants",
                              torch.tensor([(2 * n - 1) * f1 for n in range(1, n_formants + 1)]))
         self.register_buffer("extra_formants", torch.tensor(fixed, dtype=torch.float32))
@@ -88,8 +88,8 @@ class VocalTract(nn.Module):
         for i, f in enumerate(self.extra_formants):
             key = f"x{i}"
             fk = f.expand_as(x)
-            x, state[key] = tv_biquad(x, *resonator_coeffs(fk, self.default_bw(fk) * bw_scale,
-                                                           self.fs), zi=state.get(key))
+            bw = torch.clamp(self.default_bw(fk), min=800.0) * bw_scale   # 고역은 벽·점성 손실이 크다
+            x, state[key] = tv_biquad(x, *resonator_coeffs(fk, bw, self.fs), zi=state.get(key))
         return x
 
     def _front_cavity(self, x, c, state):

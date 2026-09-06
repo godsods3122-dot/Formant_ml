@@ -41,7 +41,7 @@ def test_higher_pole_correction_keeps_highs_alive():
     fa, Ha = _impulse_response(a, _ctrl(60, f1=945, f2=1590, f3=2850), 60)
     fb, Hb = _impulse_response(b, _ctrl(60, f1=945, f2=1590, f3=2850), 60)
     m = (fa > 9000) & (fa < 13000)
-    assert Hb[m].mean() > Ha[m].mean() + 10
+    assert Hb[m].mean() > Ha[m].mean() + 6
     assert (fb > 13000).any() and Hb[fb > 15500].max() < Hb[(fb > 800) & (fb < 2000)].max() + 20
 
 
