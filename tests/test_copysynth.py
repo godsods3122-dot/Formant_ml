@@ -108,7 +108,8 @@ def test_resynthesis_matches_the_high_band_of_the_recording():
 
     한때 `--tilt -12` 가 기본값이었다. 그 값은 `GlottalSource` 에서
     하모닉 k 에 10^(tilt*log2(k)/20) 을 곱하는데, **부호 규약을 반대로**
-    알고 있었고(§4.3 의 "클수록 어두워진다" 는 `filters.one_pole_tilt` 이야기다)
+    알고 있었고(§4.3 의 "클수록 어두워진다" 는 부호가 반대인 1 극 저역통과
+    이야기다 — 그 함수는 아무 데서도 안 불려서 지웠다)
     게다가 `(tilt*oct_).clamp(-40, 40)` 이 k≈10(약 1.1 kHz)에서 포화해
     **그 위 전부를 -40 dB 로 평평하게 눌렀다.** 결과: 2.5~4 kHz 와 4~7 kHz 가
     원본보다 35 dB 낮았다. 그런데도 당시 측정으로는 문제가 안 보였는데,
