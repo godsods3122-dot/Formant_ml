@@ -3,27 +3,56 @@
 > **신경망은 파형을 만들지 않는다. 물리모델의 손잡이만 예측한다.**
 > 파형은 성대 방정식, 성도 공명, 난류 노이즈가 만든다.
 
-기존 신경 보코더는 파형(또는 스펙트로그램)을 직접 생성하기 때문에, 실패했을 때
-사람 소리에 없는 종류의 소리 — 위상 흔들림에서 오는 버즈, 업샘플링 에일리어스,
-프레임 경계 클릭 — 를 낸다. 이 레포는 생성 과정을 **음성 생성의 물리**로 바꿔서
-그런 실패 모드가 *구조적으로 발생할 수 없게* 만드는 실험이다.
+**0.2.0 (v2 엔진, `src/formant_ml/engine/`)** — 필터를 전부 **시간영역·샘플 단위 시변 재귀
+필터**로 바꿨다. 상태가 샘플마다 이어지므로 자음처럼 경계조건이 급변해도 위상은 필터 상태의
+연속성으로 보장되고, 과도응답은 방정식이 낸다. v1 이 "라" 에서 실패한 원인(창 없는 블록 OLA,
+영위상 프리에코, 과도응답 부재)은 [`docs/AUDIT_v1.md`](docs/AUDIT_v1.md) 에 있다.
 
 ```
- [ 성문 소스 ]        [ 난류 노이즈 ]           [ 성도 공명 ]        [ 위상 정형 ]
- LF 파형 가산합성  +  학습된 난류 × 성문동기AM →  포먼트 캐스케이드  →  올패스 필터  →  음성
- (또는 2질량 ODE)     (협착 하류 + 치찰음필터)   또는 KL 도파관        (군지연만 변경)
-        ↑                    ↑                       ↑                   ↑
-        └────────── 신경망은 이 파라미터들만 예측한다 ──────────────────┘
+ 압력·내전·긴장 ──> 성문 소스 (LF, 역치·로지스틱 기동) ─────────────┐
+ 협착 면적·위치 ──> 마찰 노이즈 (레이놀즈, 앞공동 극/뒤공동 노치) ───┤
+ 성문 포락선 ─────> 기식 노이즈 ──────────────────────────────────────┼─> 포먼트+올패스 위상차 ─> 비강 ─> 측지 ─> 잔차 보정 ─> 음성
+ 이벤트 ──────────> 과도음 템플릿 (혀 접촉/해제/입 바닥/침) + 변조 ─┘
+                     ▲
+      ms 단위 키프레임 스크립트 (LLM / phones.py) + 감정 토큰 (파라미터 델타 + 마커)
 ```
 
-- 설계와 로드맵: [`docs/PLAN.md`](docs/PLAN.md)
-- 구현된 방정식: [`docs/THEORY.md`](docs/THEORY.md)
-- 선행연구 정리: [`docs/LITERATURE.md`](docs/LITERATURE.md)
-- **목소리를 만들고 조종하는 법: [`docs/VOICE.md`](docs/VOICE.md)**
-- 진행 중인 /s/ 치찰음 작업 인수인계: [`docs/HANDOFF.md`](docs/HANDOFF.md)
-- 진행 중인 /ㄹ/ 문헌 조사: [`docs/RIEUL.md`](docs/RIEUL.md)
+- 아키텍처와 UML: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
+- 결정 기록: [`docs/adr/`](docs/adr/) · 버전 규칙: [`docs/VERSIONING.md`](docs/VERSIONING.md) · [`CHANGELOG.md`](CHANGELOG.md)
+- v1 감사와 기준 녹음 계측: [`docs/AUDIT_v1.md`](docs/AUDIT_v1.md)
+- v1 문서(동결): [`docs/PLAN.md`](docs/PLAN.md) · [`docs/THEORY.md`](docs/THEORY.md) · [`docs/LITERATURE.md`](docs/LITERATURE.md) · [`docs/VOICE.md`](docs/VOICE.md) · [`docs/HANDOFF.md`](docs/HANDOFF.md) · [`docs/RIEUL.md`](docs/RIEUL.md)
 
-## 빠른 시작
+## 빠른 시작 (v2)
+
+```bash
+bash scripts/setup_env.sh && source .venv/bin/activate
+export OMP_NUM_THREADS=2            # 일부 컨테이너에서 torch 4 스레드는 원소별 연산이 1000 배 느리다
+
+python -m pytest tests/engine -q                    # v2 성질 테스트
+python scripts/v2_listen.py --out out/v2 --praat    # 아라/라/사/나 청취 세트 + 측정표
+```
+
+```python
+from formant_ml.engine import VoiceEngine, phones
+from formant_ml.engine.control import track_from_keyframes
+from formant_ml.engine.tokens import TokenRegistry
+
+eng = VoiceEngine()                              # 여성 화자, 48 kHz, 1 ms 제어 프레임
+y = eng.render(phones.ara())                     # 아라 (모음 사이 탄음)
+
+track = track_from_keyframes([                  # ms 단위 물리 factor 스크립트
+    {"t": 0.00, "p_sub": 7.5, "adduction": 0.6, "tension": 0.5, "f1": 945, "f2": 1590, "f3": 2850},
+    {"t": 0.30, "f1": 459, "f2": 1914, "f3": 2907, "lat_z1": 3300},      # 설측음 자세
+    {"t": 0.40, "event": {"name": "tongue_release", "amp": 0.1}},
+    {"t": 0.50, "p_sub": 0.0},
+])
+reg = TokenRegistry(); reg.spawn([...], "angry", name="angry_sigh")     # 학습이 만든 토큰
+reg.apply(track, "angry_sigh", 0.1, 0.3)         # 마커가 남는다 → reg.markers(track) / reg.strip(track)
+for chunk in eng.stream(track, chunk_ms=20):     # 스트리밍 = 오프라인 (상태 연속)
+    ...
+```
+
+## v1 빠른 시작 (0.1.x, 동결)
 
 ```bash
 # 0) 환경 구축 (venv + 의존성 + editable 설치). PyPI 만 쓴다.

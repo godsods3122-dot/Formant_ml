@@ -18,6 +18,9 @@ VENV=${VENV:-.venv}
 echo
 echo "완료. 다음으로:"
 echo "  source $VENV/bin/activate"
-echo "  python -m pytest tests -q                      # 92종 검증"
+echo "  export OMP_NUM_THREADS=2                       # 컨테이너에서 torch 4 스레드는 매우 느리다"
+echo "  python -m pytest tests/engine -q               # v2 성질 테스트"
+echo "  python scripts/v2_listen.py --out out/v2        # v2 청취 세트 + 측정표"
+echo "  python -m pytest tests -q                      # v1 포함 전체"
 echo "  python -m formant_ml.demo --out out            # CPU 약 2분"
 echo "  python scripts/analyze.py out/*.wav"
