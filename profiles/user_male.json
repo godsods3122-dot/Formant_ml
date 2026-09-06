@@ -7,18 +7,136 @@
  "f0_hi": 260.0,
  "p_sub": 7.5,
  "vowels": {
-  "a": [650, 1130, 2250], "eo": [560, 1000, 2400], "o": [450, 850, 2450],
-  "u": [330, 850, 2300], "eu": [400, 1400, 2300], "i": [300, 2200, 2900],
-  "e": [480, 1900, 2500], "ae": [560, 1800, 2500]
+  "a": [
+   650,
+   1130,
+   2250
+  ],
+  "eo": [
+   560,
+   1000,
+   2400
+  ],
+  "o": [
+   450,
+   850,
+   2450
+  ],
+  "u": [
+   330,
+   850,
+   2300
+  ],
+  "eu": [
+   400,
+   1400,
+   2300
+  ],
+  "i": [
+   300,
+   2200,
+   2900
+  ],
+  "e": [
+   480,
+   1900,
+   2500
+  ],
+  "ae": [
+   560,
+   1800,
+   2500
+  ]
  },
- "lateral": {"f": [340, 1450, 2550], "zeros": [2900, 4000], "zero_bw": 350, "gain": 1.05,
-             "hold_ms": 100, "release_ms": 90, "level_db": -4.5},
- "tap": {"f": [330, 1350, 2400], "approach_ms": 15, "closure_ms": 18, "release_ms": 20,
-         "gain": 0.75, "dip_db": -5.0, "transient_amp": 0.0},
- "sibilant": {"peak_hz": 6000.0, "level_db": -14.0, "lax_level_db": -14.0, "tense_level_db": -8.0,
-              "dur_ms": 150, "tense_dur_ms": 90, "a_min": 0.10, "obstacle": 1.0, "back_leak": 0.02},
- "nasal": {"pole_hz": 200.0, "zero_hz": {"m": 3000.0, "n": 2500.0, "ng": 3000.0},
-           "murmur_db": -6.0, "gain": 1.3, "place_gain": {"m": 2.8, "n": 1.0, "ng": 1.2}, "dur_ms": 70, "transition_ms": 80},
- "timing": {"vowel_ms": 250, "final_vowel_ms": 400, "silence_ms": 50},
- "notes": {"source": "reference/recordings/ko_nasal-sibilant_na-ma-sa-ja-cha_male.wav + ko_liquid_ra-eulla-ara_male_44k.wav (docs/MEASUREMENTS.md §2, §3). 같은 화자 A/B 용 — 목표 화자가 아니다."}
+ "lateral": {
+  "f": [
+   340,
+   1450,
+   2550
+  ],
+  "zeros": [
+   2900,
+   4000
+  ],
+  "zero_bw": 350,
+  "gain": 1.05,
+  "hold_ms": 100,
+  "release_ms": 90,
+  "level_db": -4.5
+ },
+ "tap": {
+  "f": [
+   330,
+   1350,
+   2400
+  ],
+  "approach_ms": 15,
+  "closure_ms": 18,
+  "release_ms": 20,
+  "gain": 0.75,
+  "dip_db": -5.0,
+  "transient_amp": 0.0
+ },
+ "sibilant": {
+  "peak_hz": 6000.0,
+  "level_db": -14.0,
+  "lax_level_db": -11.4,
+  "tense_level_db": -6.0,
+  "dur_ms": 150,
+  "tense_dur_ms": 90,
+  "a_min": 0.1,
+  "obstacle": 0.15,
+  "back_leak": 0.1,
+  "locus": [
+   400.0,
+   1700.0,
+   2500.0
+  ],
+  "abduct_lead_ms": 35,
+  "abduct_lag_ms": 55,
+  "affricate_level_db": -3.4,
+  "aspirated_level_db": -3.3
+ },
+ "nasal": {
+  "poles": [
+   350.0,
+   1200.0,
+   2000.0
+  ],
+  "damp": 1.2,
+  "gain": 1.0,
+  "zero_hz": {
+   "m": 1100.0,
+   "n": 1500.0,
+   "ng": 2400.0
+  },
+  "murmur_db": -10.0,
+  "dur_ms": 70,
+  "velum_lead_ms": 60,
+  "velum_lag_ms": 90,
+  "closure_ms": 35,
+  "release_ms": 18,
+  "f_murmur": [
+   350.0,
+   1100.0,
+   2400.0
+  ],
+  "place_gain": {
+   "m": 2.0,
+   "n": 1.0,
+   "ng": 1.2
+  }
+ },
+ "timing": {
+  "vowel_ms": 250,
+  "final_vowel_ms": 400,
+  "silence_ms": 50
+ },
+ "notes": {
+  "source": "reference/recordings/ko_nasal-sibilant_na-ma-sa-ja-cha_male.wav + ko_liquid_ra-eulla-ara_male_44k.wav (docs/MEASUREMENTS.md §2, §3). 같은 화자 A/B 용 — 목표 화자가 아니다.",
+  "nasal": "병렬 비강 분기 (ADR 0010). 극·영점은 엔진 닫힌고리 적합 — 실측 머머 포락선(M 난·맘 ×2)과 150~5000 Hz 에서 rms 2.3 dB. zfrac 0.8, damp 1.2. 영점은 폐쇄 위치(측지 길이)로 흩었다: 문헌 m 750~1250 / n 1450~2200 / ŋ ~3000.",
+  "sibilant_voicing": "성문 제스처가 협착보다 35 ms 먼저 열리고 55 ms 늦게 닫힌다 (ADR 0011). 실측: 마찰 진입에서 HNR 이 35 ms 에 걸쳐 꺼지고, 해제 뒤 고역 잡음이 50~70 ms 더 이어진다 — bibitan 1300~1420 ms, 2795~2915 ms.",
+  "sibilant": " | 0.2.3: 소스는 광대역(셸프 −9 dB @1 kHz) + 정점 1.4 배 저역통과. 봉우리는 앞공동 극이 만든다. 실측 남성 ㅅ 7 대역 rms 3.2 dB (ADR 0011).",
+  "sibilant_level": "level_db = 마찰 정상부가 뒤따르는 모음보다 몇 dB (실측 A/B 창 자동 검출). 기준점 phones.SIB_REF_DB."
+ }
 }

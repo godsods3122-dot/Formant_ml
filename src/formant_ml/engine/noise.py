@@ -73,7 +73,8 @@ class FricationNoise(nn.Module):
     """협착 공기역학 -> 마찰 소스 (샘플률). 색은 여기서 **소스 스펙트럼**까지만."""
 
     def __init__(self, fs: float, hop: int, mod_depth: float = 0.25,
-                 amp_ref: float = 0.062, lp_ratio: float = 8.0):
+                 amp_ref: float = 0.062, lp_ratio: float = 1.4,
+                 source_hf_shelf_db: float = -9.0):
         super().__init__()
         self.fs, self.hop = float(fs), int(hop)
         self.mod_depth = mod_depth
@@ -81,6 +82,9 @@ class FricationNoise(nn.Module):
         # 다이폴(+6)·방사(+6) 를 합쳐도 그 위에서 −6 dB/oct 로 떨어지게 한다
         # (실측 /s/ 는 13~14 kHz 위에서 절벽처럼 떨어진다 — v1 HANDOFF §6.10).
         self.log_lp_ratio = nn.Parameter(torch.tensor(math.log(lp_ratio)))
+        # 실측 적합 (남성 ㅅ ×3, 0.6~20 kHz 7 대역, rms 3.2 dB): 셸프 −9 dB, lp_ratio 1.4,
+        # back_leak 0.10, 앞공동 대역폭 500+0.12f, 장애물 다이폴 0 (ADR 0011).
+        self.source_hf_shelf_db = source_hf_shelf_db
         # 학습 파라미터: 변조 스펙트럼 기울기/꺾임, 소스 세기 보정
         self.log_beta = nn.Parameter(torch.tensor(math.log(2.0)))
         self.log_knee = nn.Parameter(torch.tensor(math.log(8.0)))
@@ -149,14 +153,26 @@ class FricationNoise(nn.Module):
         frac = glottal_phase[:, :n] / (2 * math.pi)
         am = 1.0 - 0.5 * voiced[:, :n] * (frac < 0.35).float()   # 폐쇄기에 유량 감소
         white = noise.white("fric", frame0 * hop, n, b, ps.dtype, ps.device)
-        # 소스 스펙트럼: Strouhal 정점의 넓은 혹 (2차 대역통과, Q≈0.7) — 시변 계수
-        r = torch.exp(-math.pi * (f_peak / 0.5) / fs)
-        a1 = -2.0 * r * torch.cos(2 * math.pi * f_peak / fs)
-        a2 = r * r
-        g = (1.0 - r)                                              # 대략적 피크 정규화
-        src, state["bp"] = tv_biquad(white, g, torch.zeros_like(g), -g, a1, a2, zi=state.get("bp"))
-        f_lp = (f_peak * torch.exp(self.log_lp_ratio)).clamp(1000.0, 0.45 * fs)
-        src, state["lp"] = tv_biquad(src, *lowpass_coeffs(f_lp, 0.707, fs), zi=state.get("lp"))
+        # 난류 소스의 스펙트럼.
+        #
+        # 초판은 Strouhal 정점에 2 차 대역통과(Q 0.5)를 걸었다. 그러면 정점 아래가 −6 dB/oct
+        # 로 떨어져 1~2 kHz 가 실측보다 15 dB 낮았다(같은 화자 A/B). 실측 /s/ 는 정점 아래가
+        # **완만한 어깨**다: 5~8 kHz 정점 대비 1~2 kHz 가 −17 dB, 2~3 kHz 가 −22 dB.
+        #
+        # 물리적으로도 그쪽이 맞다. 마찰음의 스펙트럼 정점을 만드는 것은 소스가 아니라
+        # **앞공동 공진**이고(Stevens: 소스는 광대역), 소스 자신은 에디 크기가 정하는
+        # 모서리 위에서만 떨어진다. 그래서 여기서는
+        #   백색 → 기울기(tilt, 학습) → 정점의 lp_ratio 배에서 2 차 저역통과
+        # 로 두고, 봉우리는 tract 의 앞공동 극이 만들게 한다.
+        # 소스의 고역 셸프 (1 kHz 모서리). 실측 적합값 −9 dB: 광대역 백색보다 조금 어둡다.
+        shelf = self.source_hf_shelf_db
+        src = white
+        if abs(float(shelf)) > 1e-6:
+            a = math.exp(-2 * math.pi * 1000.0 / fs)
+            g_hi = 10.0 ** (shelf / 20.0)
+            hp, state["tl"] = tv_biquad(src, 0.5 * (1 + a), -0.5 * (1 + a), 0.0, -a, 0.0,
+                                        zi=state.get("tl"))
+            src = src + (g_hi - 1.0) * hp
         # 장애물(앞니) 다이폴: +6 dB/oct 성분을 obstacle 비율로 섞는다 (Curle)
         obst = up(c["obstacle"])
         dip, state["dip"] = tv_biquad(src, *first_difference_coeffs(1.0, src), zi=state.get("dip"))

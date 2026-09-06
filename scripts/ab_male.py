@@ -24,14 +24,52 @@ from formant_ml.engine import EngineConfig, VoiceEngine, phones  # noqa: E402
 from formant_ml.engine.profile import SpeakerProfile  # noqa: E402
 
 REC = "reference/recordings/ko_nasal-sibilant_na-ma-sa-ja-cha_male.wav"
-# (음절, 녹음 구간, 정상부 구간(상대), 자음 구간(상대))
+# (음절, 녹음 구간, 자음 종류). 비교 창은 **신호에서 찾는다** — 합성과 녹음의 시간축이
+# 다르므로 고정 창을 쓰면 한쪽만 전이를 물어 20 dB 짜리 가짜 차이가 난다(실제로 겪었다).
 CLIPS = {
-    "na": (0.20, 0.90, (0.25, 0.55), (0.08, 0.14)),
-    "ma": (7.10, 7.80, (0.25, 0.55), (0.06, 0.12)),
-    "sa": (14.15, 14.95, (0.40, 0.70), (0.11, 0.23)),
-    "ja": (19.30, 20.10, (0.35, 0.65), (0.10, 0.20)),
-    "cha": (24.40, 25.20, (0.40, 0.70), (0.10, 0.22)),
+    "na": (0.20, 0.90, "nasal"), "ma": (7.10, 7.80, "nasal"),
+    "sa": (14.15, 14.95, "fric"), "ja": (19.30, 20.10, "fric"),
+    "cha": (24.40, 25.20, "fric"),
 }
+
+
+def find_windows(y, kind, fs=48000, step=0.005):
+    """자음 정상부와 모음 정상부의 구간을 신호에서 찾는다.
+
+    fric : 3~16 kHz 포락선이 최대의 −6 dB 이상인 최장 구간의 가운데 60 %
+    nasal: 저역(0.1~0.5k)이 살아 있으면서 중역(0.8~2.5k)이 최대보다 12 dB 낮은 최장 구간
+    모음 : 자음이 끝난 뒤 중역이 최대의 −6 dB 이상인 최장 구간의 가운데 60 %
+    """
+    n = int(0.02 * fs); hop = int(step * fs)
+    idx = np.arange(0, len(y) - n, hop)
+    F = np.fft.rfftfreq(n, 1 / fs)
+    S = np.stack([np.abs(np.fft.rfft(y[i:i + n] * np.hanning(n))) ** 2 for i in idx])
+    band = lambda a, b: 10 * np.log10(S[:, (F >= a) & (F < b)].sum(1) + 1e-30)
+    lo, mid, hi = band(100, 500), band(800, 2500), band(3000, 16000)
+
+    def longest(mask):
+        best = (0, 0, 0); s = None
+        for i, m in enumerate(list(mask) + [False]):
+            if m and s is None:
+                s = i
+            elif not m and s is not None:
+                if i - s > best[0]:
+                    best = (i - s, s, i - 1)
+                s = None
+        return best[1], best[2]
+
+    if kind == "fric":
+        a, b = longest(hi > hi.max() - 6)
+    else:
+        a, b = longest((mid < mid.max() - 12) & (lo > lo.max() - 12))
+    c0, c1 = idx[a] / fs, idx[b] / fs
+    d = (c1 - c0) * 0.2
+    con = (c0 + d, c1 - d) if c1 - c0 > 0.04 else (c0, c1)
+    va, vb = longest((mid > mid.max() - 6) & (idx / fs > c1))
+    v0, v1 = idx[va] / fs, idx[vb] / fs
+    d = (v1 - v0) * 0.2
+    vow = (v0 + d, v1 - d) if v1 - v0 > 0.05 else (v0, v1)
+    return vow, con
 FS = 48000
 
 
@@ -72,7 +110,7 @@ def main():
     g = np.gcd(sr, FS); rec = resample_poly(rec, FS // g, sr // g)
     builders = {"na": lambda: phones.na(prof), "ma": lambda: phones.ma(prof), "sa": lambda: phones.sa(prof),
                 "ja": lambda: phones.ja(prof), "cha": lambda: phones.cha(prof)}
-    for syl, (t0, t1, vow, con) in CLIPS.items():
+    for syl, (t0, t1, kind) in CLIPS.items():
         if args.only and syl not in args.only:
             continue
         a = rec[int(t0 * FS):int(t1 * FS)]
@@ -81,12 +119,14 @@ def main():
         a = a / (np.abs(a).max() + 1e-9) * 0.7; b = b / (np.abs(b).max() + 1e-9) * 0.7
         sf.write(os.path.join(args.out, f"{syl}_A_rec.wav"), a, FS)
         sf.write(os.path.join(args.out, f"{syl}_B_syn.wav"), b, FS)
-        print(f"\n=== {syl} ===  (A 녹음 {t0}-{t1}s / B 합성 {len(b) / FS:.2f}s)")
-        va, vb = a[int(vow[0] * FS):int(vow[1] * FS)], b[int(vow[0] * FS):int(vow[1] * FS)]
+        vowA, conA = find_windows(a, kind); vowB, conB = find_windows(b, kind)
+        print(f"\n=== {syl} ===  A 자음 {conA[0]*1000:.0f}~{conA[1]*1000:.0f} 모음 {vowA[0]*1000:.0f}~{vowA[1]*1000:.0f}"
+              f" / B 자음 {conB[0]*1000:.0f}~{conB[1]*1000:.0f} 모음 {vowB[0]*1000:.0f}~{vowB[1]*1000:.0f} ms")
+        va = a[int(vowA[0] * FS):int(vowA[1] * FS)]; vb = b[int(vowB[0] * FS):int(vowB[1] * FS)]
         print(f" 모음 정상부 HNR  A {hnr(va, FS):5.1f}  B {hnr(vb, FS):5.1f}")
         print(" 모음 1/3oct A", row(third_oct(va, FS)))
         print("            B", row(third_oct(vb, FS)))
-        ca, cb = a[int(con[0] * FS):int(con[1] * FS)], b[int(con[0] * FS):int(con[1] * FS)]
+        ca = a[int(conA[0] * FS):int(conA[1] * FS)]; cb = b[int(conB[0] * FS):int(conB[1] * FS)]
         la = 20 * np.log10(np.sqrt((ca ** 2).mean()) / np.sqrt((va ** 2).mean()) + 1e-12)
         lb = 20 * np.log10(np.sqrt((cb ** 2).mean()) / np.sqrt((vb ** 2).mean()) + 1e-12)
         print(f" 자음 레벨(모음 대비) A {la:5.1f} dB  B {lb:5.1f} dB")

@@ -35,11 +35,19 @@ class SpeakerProfile:
     # 치찰음 지문 (앞공동 정점 등)
     sibilant: dict = field(default_factory=lambda: dict(
         peak_hz=8000.0, level_db=-11.0, dur_ms=130, tense_dur_ms=70, a_min=0.10,
-        obstacle=0.8, back_leak=0.08))
+        obstacle=0.15, back_leak=0.10, locus=[470.0, 1900.0, 2900.0],
+        lax_level_db=-11.0, tense_level_db=-6.0, affricate_level_db=-7.0,
+        aspirated_level_db=-4.5,
+        abduct_lead_ms=35, abduct_lag_ms=55))
     # 비음
+    # 비음: 병렬 비강 분기의 극 3 개 + 폐쇄 위치가 정하는 측지 영점. 시간 상수는 실측.
     nasal: dict = field(default_factory=lambda: dict(
-        pole_hz=200.0, zero_hz={"m": 3000.0, "n": 2500.0, "ng": 3000.0},
-        murmur_db=-6.0, gain=1.1, dur_ms=70, transition_ms=70))
+        poles=[350.0, 1200.0, 2000.0], damp=1.2, gain=1.0,
+        zero_hz={"m": 1100.0, "n": 1500.0, "ng": 2400.0},
+        murmur_db=-10.0, dur_ms=70,
+        velum_lead_ms=60, velum_lag_ms=90, closure_ms=35, release_ms=18,
+        place_gain={"m": 2.0, "n": 1.0, "ng": 1.2},
+        f_murmur=[300.0, 1100.0, 2400.0]))
     # 운율/시간
     timing: dict = field(default_factory=lambda: dict(
         vowel_ms=150, final_vowel_ms=220, silence_ms=50))

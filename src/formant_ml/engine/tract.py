@@ -94,6 +94,15 @@ class VocalTract(nn.Module):
         self.log_extra_bw = nn.Parameter(torch.tensor(0.0))
         self.log_front_bw = nn.Parameter(torch.tensor(0.0))
         self.extra_bw_floor = 800.0
+        self.front_bw_slope = 0.12      # 앞공동 극의 대역폭 = 500 + 이 값 × f (실측 적합)
+        self.nasal_zfrac = 0.80         # 측지 영점의 대역폭 = fz × 이 값 (깊이·폭)
+        self.nasal_gain = 1.60          # 머머가 모음보다 −7 dB (실측 M −6.7) 이 되는 값
+        # 비강도 관이다 — 극 3 개로 자르면 2 kHz 위가 −60 dB 로 무너진다(측정). 인두+비강
+        # 20 cm 의 c/2L ≈ 875 Hz 간격으로 나이퀴스트까지 채운다 (ADR 0009 와 같은 이유).
+        nsp = C_SOUND / (2.0 * 20.0)
+        self.register_buffer("nasal_extra", torch.tensor(
+            [2400.0 + k * nsp for k in range(1, 64) if 2400.0 + k * nsp < 0.70 * fs / 2],
+            dtype=torch.float32))
         self.extra_bw_slope = 0.20                       # 고차 극 손실 (벽·점성·방사·횡모드). 실측 /아/ 적합
         self.use_hpc = False
         self.register_buffer("hpc", torch.zeros(1))
@@ -117,7 +126,7 @@ class VocalTract(nn.Module):
             f = torch.where(f > 0, f, self.uniform_formants[k - 1].to(f.dtype).expand_as(f))
             bw = c[f"bw{k}"]
             bw = torch.where(bw >= 20.0, bw, self.default_bw(f))   # 20 Hz 미만 = 기본
-            if k == 1:                                   # 비강 결합은 F1 을 넓힌다
+            if k == 1:      # 연구개가 열리면 F1 이 넓어진다 (에너지가 비강으로 샌다)
                 bw = bw + 120.0 * c["velum"]
             out.append((self._up(f), self._up(bw)))
         return out
@@ -156,7 +165,7 @@ class VocalTract(nn.Module):
         fl = c["front_len"]
         l_front = self._up(torch.where(fl > 0, fl, (1.0 - c["c_place"]) * L).clamp(0.3, L))
         f_p = (C_SOUND / (4.0 * l_front)).clamp(500.0, 0.45 * self.fs)     # 1/4 파장
-        bw_p = (500.0 + 0.10 * f_p) * torch.exp(self.log_front_bw)     # A/B: 좁으면 8~13 kHz 가 10 dB 모자란다
+        bw_p = (500.0 + self.front_bw_slope * f_p) * torch.exp(self.log_front_bw)
         l_back = (L - l_front).clamp_min(1.0)
         f_z = (C_SOUND / (2.0 * l_back)).clamp(300.0, 0.45 * self.fs)      # 뒤공동 반공진
         bw_z = 250.0 + 0.1 * f_z
@@ -177,38 +186,57 @@ class VocalTract(nn.Module):
             x, state[f"ap{k}"] = tv_biquad(x, *allpass_coeffs(f, r, self.fs), zi=state.get(f"ap{k}"))
         return x
 
-    def _nasal(self, x, c, state):
-        """연구개 개방 velum ∈ [0,1]: 극(nasal_f)·영점(nasal_z) 의 대역폭을 1/velum 로.
+    def _nasal_branch(self, x, c, state):
+        """비강 분기 — 성문 소스에서 **갈라져 나와 콧구멍으로 방사**된다 (병렬 경로).
 
-        velum→0 이면 r→0 이라 두 응답 모두 정확히 1 (끊김 없이 사라진다).
+        v1·v2 초판은 비강을 구강 캐스케이드 **뒤에 얹은 필터**로 두었다. 그러면 구강이
+        닫힐 때(tract_gain·a_c) 저역까지 같이 죽어 모음↔비음 경계가 계단이 된다.
+        실측(같은 화자, 5 ms): 80~300 Hz 는 모음과 머머 사이에서 **±2 dB 로 연속**이고
+        0.8~2.5 kHz 만 8~11 dB 떨어진다. 병렬 분기라야 그 성질이 나온다.
+
+        구조 (Fant 1960 / Fujimura 1962 의 표준):
+            인두 + 비강의 극 3 개  ×  닫힌 구강이 만드는 **측지 영점** 1 개
+        영점 주파수는 폐쇄 위치가 정한다 — 구강 측지가 길수록(ㅁ) 낮고 짧을수록(ㅇ) 높다.
+        비강은 점막 손실이 커서 대역폭이 넓다(`nasal_damp`).
+
+        모음의 **비음화**는 따로 만들지 않는다. 연구개가 열린 채 구강도 열려 있으면 두
+        분기가 그냥 더해지고, 그 간섭이 F1 부근의 극-영점 쌍으로 나타난다.
         """
-        if float(c["velum"].detach().max()) <= 1e-3:
-            return x
-        v = self._up(c["velum"]).clamp(1e-3, 1.0)
-        f_p, f_z = self._up(c["nasal_f"]), self._up(c["nasal_z"])
-        # 1/3 옥타브 계측(같은 화자 A/B): ㄴ 머머는 1.3 kHz 위가 −30~−42 dB 로 **평탄**하고 깊은 골이
-        # 없다. ㅁ 은 1.6~4 kHz 가 넓게 −40~−50 (5 kHz −35). → 봉우리 +6 dB, 넓고 얕은 노치(−6 dB),
-        # 저역통과는 두지 않는다 (3 kHz LP 는 머머 고역을 −80 dB 로 죽였다).
-        x, state["np"] = tv_biquad(x, *peak_coeffs(f_p, 120.0 / v, self.fs, 1.5), zi=state.get("np"))
-        x, state["nz"] = tv_biquad(x, *notch_coeffs(f_z, 900.0 / v, self.fs, 1.6), zi=state.get("nz"))
-        # 머머는 강한 저역통과다: 실측 ㄴ 머머가 130 → 800 Hz 에서 −25 dB (≈ −10 dB/oct). 1 극 저역통과
-        # 400 Hz (velum→0 이면 차단이 무한대로 물러난다). 3 kHz 위는 실측이 녹음 잡음 바닥이라 근거 없음.
-        fc = 400.0 / v
-        r = torch.exp(-2 * math.pi * fc.clamp(max=0.45 * self.fs) / self.fs)
-        x, state["nlp"] = tv_biquad(x, 1.0 - r, torch.zeros_like(r), torch.zeros_like(r), -r,
-                                    torch.zeros_like(r), zi=state.get("nlp"))
-        return x * (1.0 - 0.2 * v)                      # 비강 벽 손실
+        if float(c["velum"].detach().max()) <= 1e-4:
+            return torch.zeros_like(x)
+        d = self._up(c["nasal_damp"])
+        y = x
+        for i, (key, bw) in enumerate((("nasal_f", 130.0), ("nasal_f2", 300.0),
+                                       ("nasal_f3", 500.0))):
+            f = self._up(c[key])
+            y, state[f"nb{i}"] = tv_biquad(y, *resonator_coeffs(f, bw * d, self.fs),
+                                           zi=state.get(f"nb{i}"))
+        for j, f in enumerate(self.nasal_extra):
+            fk = f.to(y.dtype).expand_as(y)
+            y, state[f"nx{j}"] = tv_biquad(
+                y, *resonator_coeffs(fk, (300.0 + 0.25 * fk) * d, self.fs), zi=state.get(f"nx{j}"))
+        fz = self._up(c["nasal_z"])
+        y, state["nbz"] = tv_biquad(y, *antiresonator_coeffs(fz, fz * self.nasal_zfrac * d,
+                                                             self.fs), zi=state.get("nbz"))
+        return y * self.nasal_gain * self._up(c["nasal_gain"])
 
     def _lateral(self, x, c, state):
+        """설측음의 측지 영점 2 개. 깊이는 `lat_mix` 로 **연속으로** 켜고 끈다.
+
+        mix→0 이면 대역폭이 발산해 노치가 사라진다(응답이 정확히 1). 주파수를 0 으로 껐다
+        켜는 방식은 로그 파라미터의 영차 유지 때문에 한 프레임에 도약하고, 그 계수 도약이
+        필터 상태와 만나 클릭이 된다.
+        """
+        mix = self._up(c["lat_mix"]).clamp(1e-3, 1.0)
+        if float(c["lat_mix"].detach().max()) <= 1e-3:
+            return x
         for k in (1, 2):
             fz = c[f"lat_z{k}"]
             if float(fz.detach().max()) <= 0.0:
                 continue
-            bw = c["lat_bw"]
-            # 영점이 없는 구간(0)은 대역폭을 매우 넓게 -> 노치 깊이 0 -> 응답 1
-            bw = torch.where(fz > 0, bw, torch.full_like(bw, 2.0e5))
             fz = torch.where(fz > 0, fz, torch.full_like(fz, 3000.0))
-            x, state[f"lz{k}"] = tv_biquad(x, *notch_coeffs(self._up(fz), self._up(bw), self.fs),
+            bw = self._up(c["lat_bw"]) / mix
+            x, state[f"lz{k}"] = tv_biquad(x, *notch_coeffs(self._up(fz), bw, self.fs),
                                            zi=state.get(f"lz{k}"))
         return x
 
@@ -230,14 +258,29 @@ class VocalTract(nn.Module):
         fr_r, state["rf"] = tv_biquad(fr, *first_difference_coeffs(1.0, fr), zi=state.get("rf"))
         leak = up(c["back_leak"])
         x_g = du + asp_r + leak * fr_r
+        # 구강 게이트는 **입력에** 건다. 출력에 걸면 폐쇄 동안에도 캐스케이드가 소스를 그대로
+        # 받아 울리고, 해제 순간 그 저장된 에너지가 50 배로 풀려 12 배짜리 클릭이 났다(측정).
+        # 입력을 막으면 공진기는 제 대역폭으로 1~2 ms 만에 잦아들고, 해제에서는 다시 울려
+        # 오르는 데 시간이 걸린다 — 실측의 "중역이 45 ms 에 걸쳐 올라온다" 가 그것이다.
+        # 두 분기는 **유량을 나눠 갖는다**. 연구개 포트와 구강이 동시에 열려 있으면(비음화
+        # 모음) 각자 절반씩이고, 구강이 닫히면 전부 비강으로 간다(머머). 나누지 않으면
+        # 비음화 구간에서 두 경로가 그대로 더해져 12 배짜리 봉우리가 났다(측정).
+        vel = up(c["velum"]).clamp(0.0, 1.0)
+        opn = up(c["oral_open"]).clamp(0.0, 1.0)
+        tot = (vel + opn).clamp_min(1e-3)
+        oral, nas = opn / tot, vel / tot
         tracks = self._formant_tracks(c)
-        y_g = self._extra_cascade(self._cascade(x_g, tracks, state, "f"), state)
+        y_g = self._extra_cascade(self._cascade(x_g * oral, tracks, state, "f"), state)
         if self.use_hpc:
             y_g = self._hpc(y_g, state)
-        y_f = self._front_cavity((1.0 - leak) * fr_r, c, state)
+        y_f = self._front_cavity((1.0 - leak) * fr_r * oral, c, state)
+        # 비강도 같은 이유로 **입력에** 건다. 출력에 걸면 연구개가 닫힌 동안에도 분기가
+        # 소스를 받아 울리고, 열리는 순간 그 에너지가 통째로 튀어나온다(측정: 12 배 클릭).
+        y_n = self._nasal_branch(x_g * nas, c, state)
         y = y_g + y_f
         y = self._allpass(y, c, state)
-        y = self._nasal(y, c, state)
+        y = y + y_n
         y = self._lateral(y, c, state)
         y = y * up(c["tract_gain"])
-        return dict(audio=y.to(dt_in), glottal_path=y_g.to(dt_in), front_path=y_f.to(dt_in), state=state)
+        return dict(audio=y.to(dt_in), glottal_path=y_g.to(dt_in), front_path=y_f.to(dt_in),
+                    nasal_path=y_n.to(dt_in), state=state)

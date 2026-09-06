@@ -14,6 +14,12 @@ from .control import ControlTrack, track_from_keyframes
 from .profile import DEFAULT_PROFILE, SpeakerProfile
 
 
+# 마찰 세기의 기준점: `fric_gain = 1` 일 때 마찰음이 뒤따르는 모음보다 몇 dB 인가.
+# 소스 스펙트럼을 실측에 맞춰 바꿀 때마다 이 값이 움직이므로 **한 곳에** 둔다.
+# 재보는 법: profiles 의 level_db 를 이 값으로 두고 scripts/ab_male.py 의 "자음 레벨" 을 읽는다.
+SIB_REF_DB = -25.2
+
+
 class Builder:
     """키프레임을 시간순으로 쌓는다. 파라미터별 독립 시간축."""
 
@@ -25,7 +31,8 @@ class Builder:
         self.f0 = float(f0_hz or self.p.f0_nominal)
         self.ps = float(p_sub or self.p.p_sub)
         self.add(0.0, p_sub=0.0, adduction=0.6, tension=0.5, f0_target=self.f0,
-                 a_c=3.0, c_place=0.9, velum=0.0, tract_gain=1.0, obstacle=0.0, back_leak=0.3)
+                 a_c=3.0, c_place=0.9, velum=0.0, oral_open=1.0, tract_gain=1.0,
+                 obstacle=0.0, back_leak=0.3)
 
     # ---------------------------------------------------------- 저수준
     def add(self, t, **kw):
@@ -66,17 +73,17 @@ class Builder:
         release = self.ms(L["release_ms"]) if release is None else release
         z1, z2 = L["zeros"]
         t0 = self.t
+        self.add(t0 - 0.03, lat_z1=z1, lat_z2=z2, lat_mix=0.0)        # 영점 자리는 미리 잡아 둔다
         self.add(t0, p_sub=self.ps, adduction=0.6, a_c=0.6, c_place=0.85,
                  f1=l1, f2=l2, f3=l3, bw1=60, bw2=140, bw3=240,
-                 lat_z1=z1, lat_z2=z2, lat_bw=L["zero_bw"], tract_gain=L["gain"])
+                 lat_z1=z1, lat_z2=z2, lat_bw=L["zero_bw"], lat_mix=1.0, tract_gain=L["gain"])
         if L.get("transient_amp", 0.0) > 0 and onset:
             self.event(t0 + 0.004, "tongue_contact", amp=L["transient_amp"])
         t1 = t0 + hold
-        self.add(t1, f1=l1, f2=l2, f3=l3, lat_z1=z1, lat_z2=z2, tract_gain=L["gain"],
-                 a_c=0.6, bw1=60, bw2=140, bw3=240)
-        self.add(t1 - 0.012, f3=l3, lat_bw=L["zero_bw"])              # F3 먼저 출발
-        self.add(t1 + release * 0.6, f3=v3, lat_bw=4000.0)
-        self.add(t1 + release * 0.6 + 0.001, lat_z1=0.0, lat_z2=0.0)
+        self.add(t1, f1=l1, f2=l2, f3=l3, lat_z1=z1, lat_z2=z2, lat_mix=1.0,
+                 tract_gain=L["gain"], a_c=0.6, bw1=60, bw2=140, bw3=240)
+        self.add(t1 - 0.012, f3=l3)                                   # F3 먼저 출발
+        self.add(t1 + release * 0.6, f3=v3, lat_mix=0.0)              # 측지가 연속으로 닫힌다
         self.add(t1 + release, f1=v1, f2=v2, tract_gain=1.0, a_c=3.0,
                  bw1=0.0, bw2=0.0, bw3=0.0, c_place=0.9)
         self.t = t1 + release
@@ -110,87 +117,116 @@ class Builder:
         return self
 
     def sibilant(self, next_vowel="a", tense=False, dur=None):
-        """/ㅅ, ㅆ/: 성문을 벌리고 혀가 협착을 만든다. 마찰 세기는 레이놀즈가 정한다.
+        """/ㅅ, ㅆ/ — **성문 제스처와 구강 제스처가 서로 다른 시간축을 갖는다.**
 
-        포락선(계측): 상승 ~30 ms, 고원, 하강 ~15 ms. 정점 주파수는 앞공동 길이(프로파일).
-        경음은 짧고 크다(성문 개대 작음 → adduction 을 덜 내린다).
+        v2 초판은 성문 개대를 마찰 구간에 맞춰 열고 닫았다. 그래서 마찰과 발성이 서로
+        모르는 두 사건이 되고("따로 논다"), 마찰이 끝나는 순간 소리가 갈아 끼워졌다.
+
+        실측(같은 화자, 5 ms 프레임):
+          * 마찰로 들어갈 때 유성도(HNR)가 **35 ms 에 걸쳐** 9 → 0 dB 로 꺼진다.
+          * 마찰이 끝나면 발성은 15~20 ms 만에 돌아오는데,
+            **고역 잡음은 그 뒤로 50~70 ms 더 이어지며 감쇠한다**(기식 꼬리).
+          * 그동안 중역(0.8~2.5 kHz)은 55 ms 에 걸쳐 올라온다 (혀가 협착을 푸는 시간).
+
+        그래서 성문은 협착보다 **먼저 열리고 늦게 닫힌다**(Löfqvist & Yoshioka 가 무성
+        마찰음에서 관찰한 순서). 기식 꼬리는 우리가 그리지 않는다 — 성문이 아직 열려 있고
+        협착이 풀려 ΔPg 가 커지므로 `glottis` 의 기식 항이 저절로 낸다.
         """
         S = self.p.sibilant
         v1, v2, v3 = self.V(next_vowel)
         dur = self.ms(S["tense_dur_ms" if tense else "dur_ms"]) if dur is None else dur
         lvl = S.get("tense_level_db", S["level_db"]) if tense else S.get("lax_level_db", S["level_db"])
-        gain = 10 ** ((lvl - (-11.0)) / 20.0)             # fric_gain=1 ⇒ 모음 대비 −11 dB (보정 기준)
-        l1, l2, l3 = 350 * 1.35, 0.5 * (1750 * 1.15) + 0.5 * v2, v3     # 치경 로커스
-        t0 = self.t
+        gain = 10 ** ((lvl - SIB_REF_DB) / 20.0)
+        l1, l2, l3 = S.get("locus", [470.0, 1800.0, 2700.0])
+        l2 = 0.5 * l2 + 0.5 * v2                       # 로커스는 뒤따르는 모음 쪽으로 당겨진다
         rise, fall = 0.040, 0.018
-        adduct = 0.10 if tense else 0.06        # 발성 게이트(0.10) 아래: 무성
-        # 혀는 침묵 동안 이미 다가와 있다(a_c 0.35). 레이놀즈 구동이 (Re²−Re_c²)^1.5 라 마지막
-        # 접근에서 급히 서므로, 넓은 데서 출발하면 개시가 10 ms 짜리 계단이 된다(측정).
-        self.add(t0, p_sub=self.ps, adduction=adduct, a_c=0.35, c_place=0.91, back_leak=S["back_leak"],
-                 front_len=self.p.sib_front_len_cm, obstacle=S["obstacle"], fric_gain=gain,
+        # 경음은 성문을 덜 벌리고 빨리 닫는다 (Cho·Jun·Ladefoged 2002: /s'/ 의 성문 개대가 작다)
+        adduct = 0.10 if tense else 0.06
+        lead = self.ms(S.get("abduct_lead_ms", 35))
+        lag = self.ms(S.get("abduct_lag_ms", 25 if tense else 55))
+        t0 = self.t
+        self.add(t0 - lead, adduction=0.6)                        # 성문이 먼저 열리기 시작
+        self.add(t0, p_sub=self.ps, adduction=adduct, a_c=0.35, c_place=0.91,
+                 back_leak=S["back_leak"], front_len=self.p.sib_front_len_cm,
+                 obstacle=S["obstacle"], fric_gain=gain, oral_open=1.0,
                  f1=l1, f2=l2, f3=l3, tract_gain=0.9)
         self.add(t0 + rise, a_c=S["a_min"])
         self.add(t0 + dur - fall, a_c=S["a_min"], adduction=adduct)
-        self.add(t0 + dur, a_c=3.0, adduction=0.5, obstacle=0.0, front_len=0.0, back_leak=0.3)
-        self.add(t0 + dur + 0.045, adduction=0.6, f1=v1, f2=v2, f3=v3, tract_gain=1.0, fric_gain=1.0)
+        self.add(t0 + dur, a_c=3.0, obstacle=0.0, front_len=0.0, back_leak=0.3, fric_gain=gain)
+        self.add(t0 + dur + lag, adduction=0.6, fric_gain=1.0)    # 성문은 늦게 닫힌다 → 기식 꼬리
+        self.add(t0 + dur + 0.055, f1=v1, f2=v2, f3=v3, tract_gain=1.0)
         self.t = t0 + dur
         return self
 
     def affricate(self, next_vowel="a", aspirated=False, tense=False):
-        """/ㅈ, ㅊ, ㅉ/: 폐쇄(구강압 축적) → 방전 버스트(10 ms 안에 선다) → 감쇠 마찰 → 모음.
+        """/ㅈ, ㅊ, ㅉ/ — 폐쇄(구강압 축적) → 방전 버스트 → 마찰 → 기식 → 모음.
 
-        정점 주파수는 치경구개라 /s/ 보다 앞공동이 길다(계측 ~5 kHz, 남성) → 길이 ×1.5.
-        ㅊ 은 해제 뒤 성문이 늦게 닫혀 기식이 길다.
+        실측: 개시가 10 ms 안에 −70 → −30 dB 로 서고, 그 뒤 100 ms 에 걸쳐 감쇠한다.
+        ㅊ 의 해제 뒤 스펙트럼은 100 Hz~5 kHz 가 거의 **평탄**했다 — 마찰이 아니라 성문
+        기식이 지배한다는 뜻이다. 그래서 격음은 성문을 협착보다 훨씬 늦게 닫는다.
         """
         S = self.p.sibilant
         v1, v2, v3 = self.V(next_vowel)
         closure = 0.060
         fric = 0.110 if aspirated else 0.080
-        t0 = self.t
-        front = self.p.sib_front_len_cm * 1.25     # 계측: ㅈ/ㅊ 정점 4~6.4 kHz (남성, /s/ 6 kHz)
+        front = self.p.sib_front_len_cm * 1.25
         adduct = 0.10 if tense else (0.03 if aspirated else 0.07)
-        self.add(t0, p_sub=self.ps, adduction=adduct, a_c=0.0, c_place=0.88, back_leak=S["back_leak"],
-                 front_len=front, obstacle=0.5, fric_gain=6.0 if aspirated else 4.5,   # 계측: ㅈ 모음 −4..−9, ㅊ −3.5 dB
-                 f1=350 * 1.35, f2=v2 * 1.1, f3=v3, tract_gain=0.85)
+        lag = self.ms(20 if tense else (110 if aspirated else 55))
+        lvl = S.get("aspirated_level_db" if aspirated else "affricate_level_db", -7.0)
+        gain = 10 ** ((lvl - SIB_REF_DB) / 20.0)
+        l1, l2, l3 = S.get("locus", [470.0, 1800.0, 2700.0])
+        t0 = self.t
+        self.add(t0 - 0.035, adduction=0.6, oral_open=1.0)
+        self.add(t0, p_sub=self.ps, adduction=adduct, a_c=0.0, c_place=0.88,
+                 back_leak=S["back_leak"], front_len=front, obstacle=0.5,
+                 fric_gain=gain, oral_open=0.02,
+                 f1=l1, f2=0.5 * l2 + 0.5 * v2, f3=l3, tract_gain=0.85)
         t1 = t0 + closure
-        self.add(t1, a_c=0.0, adduction=adduct)
-        self.add(t1 + 0.004, a_c=0.10)                                   # 급한 해제
-        self.add(t1 + fric * 0.7, adduction=adduct)                      # 마찰 동안 성문 벌림 유지
+        self.add(t1, a_c=0.0, adduction=adduct, oral_open=0.02)
+        self.add(t1 + 0.004, a_c=0.10, oral_open=1.0)                    # 급한 해제
         self.add(t1 + fric, a_c=0.35 if aspirated else 0.6)
-        self.add(t1 + fric + 0.02, a_c=3.0, obstacle=0.0, front_len=0.0, back_leak=0.3,
-                 adduction=0.6 if not aspirated else 0.05, fric_gain=1.0)
-        if aspirated:                                                    # 협착이 열린 채 성문이 늦게 닫힌다 → /h/ 기식
-            self.add(t1 + fric + 0.06, adduction=0.05)
-            self.add(t1 + fric + 0.11, adduction=0.6)
+        self.add(t1 + fric + 0.02, a_c=3.0, obstacle=0.0, front_len=0.0, back_leak=0.3, fric_gain=gain)
+        self.add(t1 + fric + lag, adduction=0.6, fric_gain=1.0)
         self.add(t1 + fric + 0.05, f1=v1, f2=v2, f3=v3, tract_gain=1.0)
         self.t = t1 + fric
         return self
 
     def nasal(self, place="n", next_vowel="a", dur=None, coda=False, prev_vowel="a"):
-        """비음: 연구개 개방 + 구강 폐쇄. 머머 레벨/전이는 프로파일(계측: −6 dB, 70 ms)."""
+        """비음 — 두 제스처가 **서로 다른 시간축**을 갖는다 (실측이 시킨 구조).
+
+          (1) 연구개 개방 `velum`  : 폐쇄보다 **먼저 열리고**(선행 비음화) 해제 뒤에도
+                                     한참 닫힌다(후행 비음화). 60 / 90 ms.
+          (2) 구강 폐쇄 `oral_open`: 35 ms 에 닫히고 18 ms 에 열린다 (실측: 중역이
+                                     내려가는 데 45 ms, 되돌아오는 데 15 ms).
+
+        두 경로가 병렬이라 저역은 끊기지 않는다. 폐쇄 위치는 **측지 영점**으로만 들어간다
+        (ㅁ 1250 / ㄴ 1700 / ㅇ 2400 Hz) — 머머의 포먼트를 place 마다 손으로 그리지 않는다.
+        """
         N = self.p.nasal
         v1, v2, v3 = self.V(next_vowel)
+        a1, a2, a3 = self.V(prev_vowel)
         dur = self.ms(N["dur_ms"]) if dur is None else dur
-        tr = self.ms(N["transition_ms"])
+        lead, lag = self.ms(N["velum_lead_ms"]), self.ms(N["velum_lag_ms"])
+        clo, rel = self.ms(N["closure_ms"]), self.ms(N["release_ms"])
         nz = N["zero_hz"][place]
-        f2 = {"m": 1100.0, "n": 1400.0, "ng": 1900.0}[place]
-        gain = N["gain"] * N.get("place_gain", {"m": 2.8, "n": 1.0, "ng": 1.2})[place]   # A/B: ㅁ 이 ㄴ 보다 크다
-        N = dict(N, gain=gain)
-        t0 = self.t
-        if coda:                                                          # 모음 → 비음
-            a1, a2, a3 = self.V(prev_vowel)
-            self.add(t0 - tr, f1=a1, f2=a2, f3=a3, velum=0.0, tract_gain=1.0)
-            self.add(t0, velum=1.0, f1=300.0, f2=f2, f3=2600.0, bw1=300, bw2=400, bw3=500,
-                     tract_gain=N["gain"], a_c=0.02, nasal_f=N["pole_hz"], nasal_z=nz)
-            self.add(t0 + dur, velum=1.0, f1=300.0, bw1=300, bw2=400, bw3=500, tract_gain=N["gain"], a_c=0.02)
-            self.t = t0 + dur
-            return self
-        # 머머의 극은 무겁게 감쇠된다(계측: 0.5~1.3 kHz 가 총 대비 −26~−31 dB, 봉우리 없음)
-        self.add(t0, p_sub=self.ps, adduction=0.6, velum=1.0, nasal_f=N["pole_hz"], nasal_z=nz,
-                 f1=250.0, f2=f2, f3=2600.0, bw1=300, bw2=400, bw3=500, tract_gain=N["gain"], a_c=0.02)
-        self.add(t0 + dur, velum=1.0, f1=250.0, bw1=300, bw2=400, bw3=500, tract_gain=N["gain"], a_c=0.02)
-        self.add(t0 + dur + tr, velum=0.0, f1=v1, f2=v2, f3=v3, bw1=0, bw2=0, bw3=0, tract_gain=1.0, a_c=3.0)
-        self.t = t0 + dur
+        m1, m2, m3 = N["f_murmur"]
+        # 구강 측지의 공명(닫힌 구강)이 머머의 구강 성분을 만든다. 폐쇄 위치가 뒤일수록 짧다.
+        oral_f2 = {"m": 950.0, "n": 1350.0, "ng": 1800.0}[place]
+        # 폐쇄 위치별 세기 (실측 A/B: ㅁ 머머가 ㄴ 보다 3 dB 크다). 비강 분기에만 곱한다.
+        ngain = N["gain"] * N.get("place_gain", {"m": 2.0, "n": 1.0, "ng": 1.2})[place]
+        t0 = self.t                                        # 구강 폐쇄가 완성되는 시각
+        self.add(t0 - clo - lead, velum=0.0)               # 연구개는 폐쇄보다 먼저 열린다
+        self.add(t0 - clo, velum=0.9, nasal_f=N["poles"][0], nasal_f2=N["poles"][1],
+                 nasal_f3=N["poles"][2], nasal_z=nz, nasal_damp=N["damp"], nasal_gain=ngain,
+                 f1=a1 if not coda else a1, f2=a2, f3=a3, oral_open=1.0)
+        self.add(t0, velum=1.0, oral_open=0.02, p_sub=self.ps, adduction=0.6,
+                 f1=m1, f2=oral_f2, f3=m3, bw1=250, bw2=350, bw3=450, tract_gain=1.0)
+        t1 = t0 + dur
+        self.add(t1, velum=1.0, oral_open=0.02, f1=m1, f2=oral_f2, f3=m3,
+                 bw1=250, bw2=350, bw3=450)
+        self.add(t1 + rel, oral_open=1.0, f1=v1, f2=v2, f3=v3, bw1=0, bw2=0, bw3=0)
+        self.add(t1 + lag, velum=0.0)                      # 후행 비음화: 천천히 닫힌다
+        self.t = t1 + rel
         return self
 
     def build(self, tail=None) -> ControlTrack:

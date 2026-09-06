@@ -22,7 +22,7 @@ flowchart LR
     FC["포먼트 캐스케이드 K=8<br/>+ 고차 극 보정"]
     FR["앞공동 극 + 뒤공동 노치"]
     AP["올패스 위상차 체인"]
-    NS["비강 극·노치 (velum)"]
+    NS["비강 **병렬 분기**<br/>극 3+꼬리 × 측지 영점"]
     LT["측지 노치 ×2"]
   end
   RS["ResidualCorrector<br/>shifted-softplus TCN → ±6 dB 최소위상 EQ + 템플릿 게이트"]
@@ -32,7 +32,8 @@ flowchart LR
   FN -- back_leak --> FC
   FN -- "(1−back_leak)" --> FR
   TB --> FR
-  FC & FR --> AP --> NS --> LT --> RS --> OUT["음성 (B, N)"]
+  FC & FR --> AP --> LT --> SUM["+ (유량 분배: oral_open / velum)"] --> RS --> OUT["음성 (B, N)"]
+  G -- "× velum" --> NS --> SUM
   TV["tviir.tv_biquad<br/>결합 스캔 / numba"] -.-> FC & FR & AP & NS & LT & RS
 ```
 

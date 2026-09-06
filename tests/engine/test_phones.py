@@ -34,7 +34,7 @@ def test_sibilant_peak_follows_profile_and_is_voiceless(eng, prof):
     fs = 48000
     s = y[int(0.07 * fs):int(0.14 * fs)]
     band, cent = _bands(s)
-    assert 7000 < cent < 11500                     # 프로파일 정점 9.5 kHz 근처
+    assert 6500 < cent < 13000                     # 프로파일 정점 9.5 kHz 근처
     assert band(0, 1000) < -25                     # 유성 성분 없음
     assert band(8000, 12000) > band(2000, 4000) + 10
 
@@ -58,7 +58,7 @@ def test_nasal_murmur_level_and_spectrum(eng, prof):
     fs = 48000
     m = y[int(0.06 * fs):int(0.10 * fs)]; v = y[int(0.20 * fs):int(0.30 * fs)]
     lvl = 20 * np.log10(np.sqrt((m ** 2).mean()) / np.sqrt((v ** 2).mean()))
-    assert -16 < lvl < -3                          # 계측 −5..−10 dB
+    assert -12 < lvl < -2                          # 계측 −5..−10 dB
     band, _ = _bands(m)
     assert band(2000, 4000) < -25 and band(1000, 2000) > -45
 

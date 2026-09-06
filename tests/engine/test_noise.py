@@ -45,8 +45,11 @@ def test_frication_silent_open_and_loud_closed():
     assert float(c["source"].pow(2).mean()) > 0
     y = c["source"][0].numpy()
     f = np.fft.rfftfreq(len(y), 1 / FS); Y = np.abs(np.fft.rfft(y)) ** 2
-    hi = Y[(f > 13000)].sum() / Y[(f > 2000) & (f < 6000)].sum()
-    assert hi < 1.0                                        # 소스는 13 kHz 위가 2~6 kHz 보다 작다
+    # 소스는 광대역이다(정점은 앞공동이 만든다). 저역이 죽지 않았는지, 그리고 위쪽 절벽이
+    # 있는지만 본다 — 대역통과로 두었을 때 1~2 kHz 가 실측보다 15 dB 낮았다(ADR 0011).
+    band = lambda a, b: Y[(f > a) & (f < b)].sum()
+    assert band(1000, 2000) / band(4000, 8000) > 0.05
+    assert band(18000, 24000) / band(4000, 8000) < 3.0
 
 
 def test_template_bank_modulation_and_growth():
