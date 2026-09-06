@@ -44,10 +44,17 @@ def build(cfg: Config, t: int, area, f0_pts, lateral=None, level=None,
         noise_bands=torch.full((1, t, nb), 2e-4),
         noise_entry=torch.zeros(1, t, 1),
         noise_am=torch.full((1, t, 1), 0.15),
-        # 소스 스펙트럼 기울기. 안 걸면 출력이 -16.4 dB/oct 로 굴러떨어져
-        # 실측(-7.2)보다 1 kHz 위에서 12~35 dB 어둡다 — 측지가 만드는 구조가
-        # 40~60 dB 아래로 묻혀 아예 안 들린다. 측정으로 고른 값이다.
-        tilt=torch.full((1, t, 1), 7.0),
+        # 소스 스펙트럼 기울기 **0** — LF 소스를 그대로 쓴다.
+        #
+        # 예전 값 7.0 은 "안 걸면 고역이 굴러떨어진다" 를 근거로 골랐는데, 그건
+        # 성도 쪽 결손(고역 손실이 없어 응답 최대점이 늘 최상단에 서던 것)을
+        # 소스에서 되갚은 것이었다 — 두 오차가 서로를 가리고 있었다.
+        # tilt 는 H1 기준 옥타브당 dB 라 7.0 이면 10 kHz 근처가 **+40 dB**
+        # (클램프 상한)까지 밀린다. 측정: 소스만 재면 0-1k -> 8-11.5k 기울기가
+        # tilt=0 에서 -50.8 dB(=-12 dB/oct, 교과서 값), tilt=7 에서 -17.4 dB.
+        # 성도에 f^2 대역폭 성장을 넣고(dsp/tract.frequency_loss) 이 값을 0 으로
+        # 되돌리니 모음 대역 오차가 19.4 -> 8.7 dB 로 내려갔다.
+        tilt=torch.zeros(1, t, 1),
         area=area, tract_rho=rho,
     )
     if lateral is not None:

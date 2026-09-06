@@ -66,7 +66,7 @@ def render_ra():
         formant_bw=torch.full((1, t, K), 90.0), formant_gain=torch.ones(1, t, K),
         noise_bands=torch.full((1, t, nb), 2e-4),
         noise_entry=torch.zeros(1, t, 1), noise_am=torch.full((1, t, 1), 0.15),
-        tilt=torch.full((1, t, 1), 7.0), area=area, tract_rho=rho)
+        tilt=torch.zeros(1, t, 1), area=area, tract_rho=rho)
     c.antiformant_freq, c.antiformant_bw = zf, zb
     with torch.no_grad():
         out = syn(c)
@@ -124,49 +124,58 @@ def comb(y, ref):
 
 
 # ------------------------------------------------------------------ 3) OLA 인공물
-def ltv_crossfaded(x, H, hop, ir_size):
-    """같은 응답을 50 % 겹침 Hann 교차창으로 OLA. 비교 기준일 뿐이다."""
+def ltv_rect_block(x, H, hop, ir_size):
+    """되돌리기 전의 구현 — 창도 보간도 없는 직사각 블록 OLA. 비교 기준이다."""
     b, n = x.shape
     t = H.shape[1]
-    L = 2 * hop
-    IR = response_to_ir(H, ir_size)
-    w = torch.hann_window(L).reshape(1, 1, L)
-    xp = torch.nn.functional.pad(x[:, :t * hop], (hop // 2, hop))
-    fr = torch.stack([xp[:, i * hop:i * hop + L] for i in range(t)], 1) * w
-    wet = fft_convolve(fr, IR)
-    o = torch.zeros(b, t * hop + L + ir_size)
+    wet = fft_convolve(x[:, :t * hop].reshape(b, t, hop), response_to_ir(H, ir_size))
+    o = torch.zeros(b, t * hop + ir_size)
     for i in range(t):
         o[:, i * hop:i * hop + wet.shape[-1]] += wet[:, i]
-    d = ir_size // 2 + hop // 2
-    return o[:, d:d + n]
+    return o[:, ir_size // 2:ir_size // 2 + n]
+
+
+def ltv_exact(x, H, hop, ir_size):
+    """엄밀한 시변 컨볼루션 y[n] = sum_k h_{n-k}[k] x[n-k] (무차별 계산).
+
+    h_m 은 프레임 임펄스응답을 샘플마다 선형보간한 것이다. 느리지만 정확해서
+    블록 구현이 무엇을 더하고 있는지 재는 잣대가 된다.
+    """
+    ir = response_to_ir(H, ir_size)[0].numpy()
+    t = H.shape[1]
+    n = t * hop
+    xs = x[0, :n].numpy()
+    u = ((np.arange(n) % hop) + 0.5) / hop
+    i = np.arange(n) // hop
+    j = np.minimum(i + 1, t - 1)
+    y = np.zeros(n + ir_size)
+    for k in range(ir_size):
+        y[k:k + n] += ((1 - u) * ir[i, k] + u * ir[j, k]) * xs
+    return y[ir_size // 2:ir_size // 2 + n]
 
 
 def ola_artifact(cfg, out):
     hop, ir = cfg.audio.hop_size, cfg.filt.ir_size
-    a = ltv_filter(out["source"], out["h_harm"], hop, ir)[0].numpy()
-    b = ltv_crossfaded(out["source"], out["h_harm"], hop, ir)[0].numpy()
-    n = min(len(a), len(b))
-    a, b = a[:n], b[:n]
-    d = a - ((a @ b) / (b @ b + 1e-20)) * b
-    print("=== 3. 창 없는 블록 OLA 가 만드는 인공물 (교차창 OLA 대비 차이) ===")
+    x, H = out["source"], out["h_harm"]
+    n = H.shape[1] * hop
+    ref = ltv_exact(x, H, hop, ir)
+    now = ltv_filter(x, H, hop, ir)[0, :n].numpy()
+    old = ltv_rect_block(x, H, hop, ir)[0, :n].numpy()
+    print("=== 3. 시변 필터가 만드는 인공물 (엄밀한 시변 컨볼루션 대비) ===")
+    print("   대역        옛 블록 OLA    현재 구현")
     for lo, hi in BANDS[:-1]:
-        print(f"   {lo // 1000}-{hi // 1000}k: 인공물 {band_db(d, lo, hi):7.1f}"
-              f"  신호 {band_db(a, lo, hi):7.1f}"
-              f"  차 {band_db(d, lo, hi) - band_db(a, lo, hi):+6.1f} dB")
-    print(f"   전체 {10 * np.log10((d ** 2).mean() / (a ** 2).mean()):.1f} dB")
-    T = len(d) // hop
-    per = (d[:T * hop] ** 2).reshape(T, hop)
-    prof = per.mean(0) / per.mean()
-    print("   프레임 안 위치별 인공물 분포(240 샘플 -> 8 구간): " +
-          " ".join(f"{v:.2f}" for v in prof.reshape(8, -1).mean(1)))
-    fe = 10 * np.log10(per.mean(1) + 1e-20)
-    top = sorted(np.argsort(fe)[-6:])
-    print("   가장 큰 프레임: " +
-          " ".join(f"{i * hop / FS:.3f}s({fe[i]:.0f}dB)" for i in top))
-    return d
+        r = band_db(ref, lo, hi)
+        print(f"   {lo // 1000:2d}-{hi // 1000:<2d}k  "
+              f"{band_db(old - ref, lo, hi) - r:+10.1f} dB {band_db(now - ref, lo, hi) - r:+11.1f} dB")
+    for lab, y in [("옛 블록 OLA", old), ("현재 구현", now)]:
+        e = y - ref
+        tot = 10 * np.log10((e ** 2).mean() / (ref ** 2).mean())
+        per = (e[:len(e) // hop * hop] ** 2).reshape(-1, hop)
+        print(f"   {lab}: 전체 {tot:+.1f} dB, 프레임 안 분포 " +
+              " ".join(f"{v:.2f}" for v in (per.mean(0) / per.mean()).reshape(8, -1).mean(1)))
+    return old - ref
 
 
-# ------------------------------------------------------------------ 4) 위상
 def phase_at_strike(cfg, out):
     hop = cfg.audio.hop_size
     H = out["h_harm"][0]

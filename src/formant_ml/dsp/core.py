@@ -68,8 +68,21 @@ def ltv_filter(
 ):
     """시변 필터링. x: (B, N), H: (B, T, n_freq) 복소응답. 반환 (B, N).
 
-    x를 hop_size 길이의 비중첩 프레임으로 자르고, 각 프레임을 해당 프레임의
-    임펄스응답과 컨볼루션한 뒤 overlap-add 한다.
+    x를 hop_size 길이의 비중첩 프레임으로 자르고, 각 프레임을 **그 프레임과 다음
+    프레임의 임펄스응답 사이를 지나가며** 컨볼루션한 뒤 overlap-add 한다.
+
+    프레임마다 응답 하나를 그대로 쓰면(창 없는 블록 처리) 응답이 바뀌는 순간
+    경계에서 파형이 불연속이 되고, 그 계단이 상쇄되지 않는 광대역 에너지로 남는다
+    (측정: 유음 "라" 에서 전체 -15.9 dB, 8~11.5 kHz -14.6 dB, ㄹ 해제 프레임에서는
+    신호보다 3~6 dB 아래. 인공물이 프레임 앞머리에 몰려 100 Hz 틱 열이 된다).
+
+    그래서 블록 안에서 임펄스응답을 선형보간한다:
+
+        y[n] = ((1-u) x)*h_i + (u x)*h_{i+1},   u = (n+0.5)/hop
+
+    블록 끝에서 h_{i+1} 에 도달하고 다음 블록은 h_{i+1} 에서 시작하므로 **경계에서
+    유효 응답이 연속**이다. 응답이 프레임 간에 일정하면 (1-u)+u = 1 이라 결과가
+    이전 구현과 정확히 같다 — 정상 구간의 소리는 바뀌지 않는다.
 
     스트리밍(`return_tail=True`): 지연 보정을 하지 않고 OLA 꼬리를 그대로
     돌려준다. 다음 청크의 앞에 그 꼬리를 더하면 결과가 오프라인 합성과
@@ -84,7 +97,14 @@ def ltv_filter(
     frames = x[:, :n_pad].reshape(b, t, hop_size)
 
     ir = response_to_ir(H, ir_size)                     # (B, T, ir_size)
-    wet = fft_convolve(frames, ir)                      # (B, T, hop+ir-1)
+    # 다음 프레임의 응답. 마지막 프레임은 이어질 응답을 모르므로 유지한다
+    # (스트리밍에서는 청크 경계마다 이 유지가 생기지만, 한 블록 안에서
+    #  인접 프레임 응답의 차이만큼이라 오차가 프레임 하나에 갇힌다).
+    ir_next = torch.cat([ir[:, 1:], ir[:, -1:]], dim=1)
+    u = (torch.arange(hop_size, device=x.device, dtype=x.dtype) + 0.5) / hop_size
+    u = u.reshape(1, 1, hop_size)
+    wet = (fft_convolve(frames * (1.0 - u), ir)
+           + fft_convolve(frames * u, ir_next))        # (B, T, hop+ir-1)
 
     out_len = n_pad + ir_size - 1
     out = torch.zeros(b, out_len, dtype=x.dtype, device=x.device)

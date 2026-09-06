@@ -312,12 +312,19 @@ class PhysicalVoiceSynth(nn.Module):
         # requires_grad 텐서가 들어오게 됐다).
         if c.aspiration_bands is not None and \
                 float(c.aspiration_bands.detach().abs().max()) > 1e-8:
-            bw_a = c.formant_bw
-            if c.noise_bw_scale is not None:
-                bw_a = bw_a * c.noise_bw_scale.clamp_min(1.0)
-            full = torch.ones_like(c.formant_freq)
-            h_asp = gated_cascade_response(c.formant_freq, bw_a, c.formant_gain,
-                                           full, fs, nf) * shared
+            if self.tract_mode == "waveguide":
+                # 도파관 모드에서 "성도 전체" 는 곧 h_harm 이다. 포먼트 캐스케이드를
+                # 쓰면 이 경로에서만 formant_freq 를 읽는데, 도파관 경로에서 그건
+                # 쓰이지 않는 자리표시자(500~6000 Hz 등간격)라 기식이 없는 극에
+                # 물든다. 성문 기식은 하모닉과 **같은 성도**를 지나야 한다.
+                h_asp = h_harm
+            else:
+                bw_a = c.formant_bw
+                if c.noise_bw_scale is not None:
+                    bw_a = bw_a * c.noise_bw_scale.clamp_min(1.0)
+                full = torch.ones_like(c.formant_freq)
+                h_asp = gated_cascade_response(c.formant_freq, bw_a,
+                                               c.formant_gain, full, fs, nf) * shared
             h_asp = h_asp * bands_to_response(
                 c.aspiration_bands * self.noise.spectral_prior(), nf, min_phase=True)
             h_asp = h_asp * self.noise_radiation

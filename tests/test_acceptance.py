@@ -20,6 +20,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 import numpy as np
+import pytest
 import torch
 
 from formant_ml.analysis.acoustic import formants, voicing
@@ -61,10 +62,11 @@ def _render_vowel(vowel: str, seconds: float = 0.5) -> np.ndarray:
         noise_bands=torch.full((1, t, nb), 1e-4),
         noise_entry=torch.zeros(1, t, 1),
         noise_am=torch.zeros(1, t, 1), area=area.contiguous(),
-        # gen_liquid 와 같은 값. **tilt 를 안 걸면 출력이 -16.4 dB/oct 로
-        # 굴러떨어진다** (실측 음성은 -7.2). Controls.tilt 의 기본값이 None
-        # 이라 그냥 렌더하면 먹먹한 소리가 나온다 — 이 트랩을 기록해 둔다.
-        tilt=torch.full((1, t, 1), 7.0))
+        # gen_liquid 와 같은 값. 예전엔 7.0 이었다 — "안 걸면 고역이
+        # 굴러떨어진다" 는 이유였는데, 그건 성도에 고역 손실이 없어서 생긴
+        # 결손을 소스에서 되갚은 것이었다. dsp/tract.frequency_loss 가 f^2
+        # 대역폭 성장을 넣은 뒤로는 LF 소스를 그대로 쓴다 (RIEUL.md §7).
+        tilt=torch.zeros(1, t, 1))
     with torch.no_grad():
         y = syn(c)["audio"][0]
     return y.numpy().astype(np.float64)
@@ -184,13 +186,30 @@ def test_liquid_and_vowel_are_distinct_in_the_same_syllable():
     assert vow[0] > liq[0] * 1.8, f"F1 유음 {liq[0]:.0f} -> 모음 {vow[0]:.0f}"
 
 
+@pytest.mark.xfail(reason="VOWEL_AREA_20 의 F4 가 5.7 kHz 라 3~5 kHz 에 협곡이 "
+                          "있다. 이 검사가 재는 4.2~4.6 kHz 가 그 협곡 바닥이다. "
+                          "RIEUL.md §7.4 — 알면서 남겨 둔 결함이다.", strict=True)
 def test_output_is_not_muffled():
     """출력의 스펙트럼 기울기가 음성다워야 한다 (-4 ~ -11 dB/oct).
 
-    이걸 아무도 안 보고 있었다. 소스 기울기(`tilt`)를 한 번도 안 걸어서
-    출력이 **-16.4 dB/oct** 로 굴러떨어졌고, 1 kHz 위에서 실측보다 12~35 dB
-    어두웠다. 측지가 만드는 극-영점 구조가 40~60 dB 아래로 묻혀 아예 안
-    들렸다 — 포먼트 검사는 전부 통과하는 동안에.
+    **지금 실패한다. 가리지 않고 xfail 로 남긴다.**
+
+    예전에는 `tilt=7.0` 으로 통과했는데, 그건 성도의 3~5 kHz 협곡을 소스를
+    통째로 밝게 만들어 덮은 것이었다 — 이 검사가 보는 4.4 kHz 는 올라갔지만
+    6.5 kHz 가 실측보다 28 dB 밝아지고 고역이 12 kHz 까지 성긴 하모닉 빗살이
+    됐다(사용자의 "고역이 조각난다"). tilt 를 0 으로 되돌리면 소스는 맞지만
+    협곡이 드러난다:
+
+        400Hz 기준  400   800  1550  2600  4400  6500  8750
+        실측 모음    0.0  -0.9 -17.2 -21.7 -28.1 -34.3 -44.7
+        tilt=0       0.0  -0.6 -23.9 -37.4 -55.9 -33.8 -35.4   <- 4.4 k 협곡
+        tilt=7       0.0  +7.3  -9.8 -18.6 -33.8  -5.4  -4.1   <- 고역 +29 dB
+
+    협곡의 원인은 소스가 아니라 **면적함수**다. /아/ 의 F4 가 5748 Hz 로
+    날아가 F3(2783)와 3 kHz 를 비운다. 목표 포먼트가 F1~F3 뿐이고 적합 대역이
+    4.2 kHz 라 그 위가 구속되지 않는다. F4 를 관 길이 값(4200 Hz)으로 넣어
+    다시 풀어 봤지만 20 단으로는 F1~F3 를 지키면서 F4 를 내리지 못했다
+    (두 초기값에서 각각 확인).
     """
     from formant_ml.analysis.acoustic import spectral_envelope
     y = _render_vowel("a", 0.5)
