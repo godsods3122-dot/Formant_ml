@@ -371,24 +371,7 @@ def cycle_rate(flow: torch.Tensor, sample_rate: int = 24000) -> float:
 
 
 def flow_to_excitation(flow: torch.Tensor) -> torch.Tensor:
-    """유량 U(t) -> 유량미분 dU/dt. 최대 |값| 1 로 정규화.
-
-    **"LF 소스와 동일 규격" 이 아니다.** 예전 독스트링이 그렇게 적혀 있었는데,
-    같은 성도 캐스케이드로 통과시켜 재 보면 이 여기신호가 `dsp.glottal` 의
-    LF 소스(Rd=1.0, tilt=0)보다 훨씬 밝다:
-
-    | 대역 | 물리 성대 − LF |
-    |---|---|
-    | 1~2.5 kHz | +13.9 dB |
-    | 2.5~4 kHz | +13.7 dB |
-    | 4~7 kHz | +24.9 dB |
-    | 7~11 kHz | +28.8 dB |
-
-    이유는 이 모델의 폐쇄가 LF 파형보다 급해서다(접촉 강성이 붙는 순간 유량이
-    거의 계단으로 끊긴다). 그래서 **둘을 그냥 바꿔 끼우면 안 된다** — 합성기의
-    `tilt`·기식 세기·대역 균형이 전부 LF 위에서 골라져 있다. 물리 성대를
-    소리 경로에 넣으려면 그 상수들을 함께 다시 골라야 한다.
-    """
+    """유량 U(t) -> 유량미분 dU/dt (입술 방사 효과 포함, LF 소스와 동일 규격)."""
     d = torch.zeros_like(flow)
     d[1:] = flow[1:] - flow[:-1]
     m = d.abs().max().clamp_min(1e-9)

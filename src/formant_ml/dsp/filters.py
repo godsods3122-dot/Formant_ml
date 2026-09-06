@@ -121,6 +121,13 @@ def allpass_response(freq, radius, sample_rate: float, n_freq: int) -> torch.Ten
     return (num / den).prod(dim=2)
 
 
+def one_pole_tilt(tilt_db: torch.Tensor, sample_rate: float, n_freq: int) -> torch.Tensor:
+    """스펙트럼 기울기(성문 소스의 spectral tilt). tilt_db: (B, T) 나이퀴스트 감쇠량."""
+    a = torch.exp(-torch.nn.functional.softplus(tilt_db) * 0.05).unsqueeze(-1)
+    z1, _ = _z_powers(n_freq, sample_rate, tilt_db.device, tilt_db.dtype)
+    return ((1.0 - a) / (1.0 - a * z1))
+
+
 def lip_radiation_response(sample_rate: float, n_freq: int, alpha: float = 0.98,
                            device=None) -> torch.Tensor:
     """입술 방사 = 미분기 근사 H(z) = 1 - alpha z^-1. (1, 1, n_freq)
@@ -190,7 +197,7 @@ def tilt_response(tilt_db_per_oct: torch.Tensor, sample_rate: float, n_freq: int
                   hi_db: float = 40.0) -> torch.Tensor:
     """스펙트럼 기울기 (실수 이득, 영위상). tilt: (B, T, 1) dB/oct, 1 kHz 기준.
 
-    1 극 저역통과는 고정된 -6 dB/oct 모양만 낼 수 있어서 6~12 kHz 를
+    `one_pole_tilt` 은 한 극점의 고정된 -6 dB/oct 모양만 낼 수 있어서 6~12 kHz 를
     따로 올리거나 내릴 수 없다. 여기서는 log 주파수에 대한 직선(=옥타브당 dB)이라
     고역만 정확히 원하는 만큼 조절할 수 있다. (고역 부족 문제의 직접 손잡이)
 

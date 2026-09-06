@@ -24,7 +24,7 @@ import torch
 
 from formant_ml.analysis.acoustic import formants, voicing
 from formant_ml.config import Config, sections_for
-from formant_ml.presets import vowel_area
+from formant_ml.liquid import vowel_area
 from formant_ml.models.synth import Controls, PhysicalVoiceSynth
 
 FS = 24000
@@ -61,7 +61,7 @@ def _render_vowel(vowel: str, seconds: float = 0.5) -> np.ndarray:
         noise_bands=torch.full((1, t, nb), 1e-4),
         noise_entry=torch.zeros(1, t, 1),
         noise_am=torch.zeros(1, t, 1), area=area.contiguous(),
-        # **tilt 를 안 걸면 출력이 -16.4 dB/oct 로
+        # gen_liquid 와 같은 값. **tilt 를 안 걸면 출력이 -16.4 dB/oct 로
         # 굴러떨어진다** (실측 음성은 -7.2). Controls.tilt 의 기본값이 None
         # 이라 그냥 렌더하면 먹먹한 소리가 나온다 — 이 트랩을 기록해 둔다.
         tilt=torch.full((1, t, 1), 7.0))
@@ -105,6 +105,85 @@ def test_voiced_output_is_actually_periodic():
     assert 150.0 < float(np.median(f0[per > 0.5])) < 260.0
 
 
+def test_lateral_antiformants_do_not_leak_into_the_vowel():
+    """반공명은 설측 구간에만 걸려야 한다.
+
+    발화 전체에 걸었더니 모음의 F3 가 3050 -> 1890 Hz 로 눌렸다. 옆 통로가
+    닫힌 구간에는 영점이 존재하지 않는다.
+    """
+    from formant_ml.liquid import lateral_antiformants
+    t = 40
+    mix = torch.zeros(t)                       # 전 구간 설측음 아님
+    fz, bw = lateral_antiformants(t, mix=mix)
+    from formant_ml.dsp.filters import antiresonator_response
+    H = antiresonator_response(fz, bw, FS, 513)
+    assert float((H.abs() - 1.0).abs().max()) < 0.05, "꺼져도 응답이 평탄하지 않다"
+
+
+def _render_syllable(keyframes, h0, seconds, po, tip_overlay, lat=None):
+    from formant_ml.liquid import liquid_syllable
+    cfg = Config()
+    cfg.filt.n_tract_sections = sections_for(FS, FEMALE_CM)
+    area, _, _, _ = liquid_syllable(seconds, keyframes, h0, cfg, po=po,
+                                 lateral_area_cm2=lat,
+                                 tip_overlay=tip_overlay)
+    t = area.shape[1]
+    K, nb = cfg.filt.n_formants, cfg.noise.n_bands
+    syn = PhysicalVoiceSynth(cfg, tract_mode="waveguide")
+    c = Controls(
+        f0=torch.full((1, t, 1), 200.0), harmonic_amp=torch.ones(1, t, 1),
+        rd=torch.full((1, t, 1), 1.1),
+        formant_freq=torch.linspace(500, 6000, K).reshape(1, 1, -1)
+                          .expand(1, t, K).contiguous(),
+        formant_bw=torch.full((1, t, K), 90.0),
+        formant_gain=torch.ones(1, t, K),
+        noise_bands=torch.full((1, t, nb), 1e-4),
+        noise_entry=torch.zeros(1, t, 1),
+        noise_am=torch.zeros(1, t, 1), area=area)
+    with torch.no_grad():
+        return syn(c)["audio"][0].numpy().astype(np.float64)
+
+
+# 사용자 녹음에서 잰 뒤 화자 정규화한 값 (presets.LIQUID_AREA_20 주석 참조)
+LIQUID_TARGET = (328, 1457)          # 어두 설측음 F1/F2
+
+
+def test_rendered_lateral_matches_the_measured_liquid():
+    """렌더된 설측음 구간의 F1/F2 가 실측(정규화) 목표의 15 % 안이어야 한다.
+
+    여기서 두 가지 이중계산이 걸린다. 자세 면적함수는 실측 포먼트에 맞춰 푼
+    것이라 그 자세의 협착을 이미 담고 있는데,
+      (1) 그 위에 혀끝 폐쇄를 또 곱하면 316/1412/2795 -> 222/676/1470,
+      (2) 그 위에 이론 측지 영점을 또 걸면 316/1412/2795 -> 294/578/1227
+    로 무너진다. 둘 다 실제로 겪었고, 이 검사가 그 재발을 막는다.
+    """
+    y = _render_syllable(
+        [(0.0, "l_onset"), (0.55, "l_onset"), (0.75, "a"), (1.0, "a")],
+        [(0.0, -0.05), (0.20, -0.05), (0.26, 0.30), (0.32, 0.30)],
+        0.32, 1200.0, tip_overlay=False)
+    F = formants(y[: int(0.16 * FS)], FS)
+    got = np.nanmedian(F, axis=0)[:2]
+    for i, (g, want) in enumerate(zip(got, LIQUID_TARGET)):
+        assert not np.isnan(g), f"F{i+1} 미검출"
+        assert abs(g - want) / want < 0.15, \
+            f"설측음 F{i+1} = {g:.0f} Hz, 목표 {want} Hz"
+
+
+def test_liquid_and_vowel_are_distinct_in_the_same_syllable():
+    """한 음절 안에서 유음과 모음이 구별되어야 한다.
+
+    자세 궤적(축 3)이 없으면 혀끝만 앞쪽 몇 단을 건드리므로 F1 이 거의 안
+    움직인다 — 실측은 345 -> 739 Hz 로 두 배 넘게 뛴다.
+    """
+    y = _render_syllable(
+        [(0.0, "l_onset"), (0.35, "l_onset"), (0.50, "a"), (1.0, "a")],
+        [(0.0, -0.05), (0.16, -0.05), (0.22, 0.30), (0.45, 0.30)],
+        0.45, 1200.0, tip_overlay=False)
+    liq = np.nanmedian(formants(y[: int(0.13 * FS)], FS), axis=0)
+    vow = np.nanmedian(formants(y[int(0.28 * FS):], FS), axis=0)
+    assert vow[0] > liq[0] * 1.8, f"F1 유음 {liq[0]:.0f} -> 모음 {vow[0]:.0f}"
+
+
 def test_output_is_not_muffled():
     """출력의 스펙트럼 기울기가 음성다워야 한다 (-4 ~ -11 dB/oct).
 
@@ -121,6 +200,23 @@ def test_output_is_not_muffled():
     hi = e[(f > 4200) & (f < 4600)].mean()
     slope = (hi - lo) / np.log2(4400 / 400)
     assert -11.0 < slope < -4.0, f"{slope:.1f} dB/oct (실측 음성 -7.2)"
+
+
+def test_liquid_has_a_side_branch_antiresonance():
+    """유음 자세에 반공명이 실제로 있어야 한다.
+
+    기류가 혀 옆으로 갈라지고 혀 위/뒤가 막힌 공간(측지)이 되면 영점이 생긴다.
+    전극 적합만으로는 못 만든다 — 그래서 합성이 실측보다 2400~3200 Hz 에서
+    15 dB 낮았다. 영점 주파수가 함의하는 측지 길이가 해부학적 범위(2~4 cm,
+    Stevens 1998)에 있는지도 함께 본다.
+    """
+    from formant_ml.presets import LIQUID_POSTURE_20
+    for name, p in LIQUID_POSTURE_20.items():
+        assert len(p["zero_hz"]) >= 2, name
+        for fz in p["zero_hz"]:
+            assert 1500.0 < fz < 6000.0, (name, fz)
+            length_cm = 35000.0 / (4.0 * fz)
+            assert 1.4 < length_cm < 4.5, f"{name}: 측지 {length_cm:.1f} cm"
 
 
 if __name__ == "__main__":

@@ -153,14 +153,8 @@ class PhysicalVoiceSynth(nn.Module):
             a.sample_rate, a.hop_size, cfg.noise.n_bands,
             init_corner_hz=cfg.noise.source_corner_hz,
             init_slope_db_oct=cfg.noise.source_slope_db_oct)
-        # **하모닉 경로에는 방사 버퍼가 없다.** 예전에는 `self.radiation` 을
-        # alpha=0 으로 만들어 들고 있었는데, alpha=0 은 H(z)=1 이라 항등이고
-        # `forward` 에서 쓰이지도 않았다(버퍼를 1e-6 으로 망가뜨려도 출력이
-        # 한 표본도 안 변한다 — 재 봤다). 이름만 남아서 "하모닉 경로에도 방사가
-        # 걸린다" 는 오해를 만들었고, 실제로 그 오해로 소스 측정에서 방사를
-        # 두 번 빼는 실수를 했다. LF 소스가 유량의 **미분**을 직접 내므로
-        # 하모닉 경로에 방사는 이미 들어 있다 — 그래서 없는 것이 맞다.
-        #
+        self.register_buffer(
+            "radiation", lip_radiation_response(a.sample_rate, self.n_freq, 0.0))
         # 난류 경로 전용 방사 (config.NoiseConfig.noise_radiation_alpha 주석 참고).
         self.register_buffer(
             "noise_radiation",
