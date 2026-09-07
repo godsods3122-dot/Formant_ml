@@ -168,6 +168,12 @@ class CopySynthFitter:
         self._last_pulse = float("nan")
         self.sizes = list(FFT_SIZES)
 
+        # 녹음의 원래 나이퀴스트. **손실에서 그 위를 보면 안 된다.**
+        # 44.1 kHz 녹음을 48 kHz 로 올리면 22.05~24 kHz 가 정확히 비어 있고, 게다가
+        # 그 아래 16~22 kHz 도 녹음 장비의 안티에일리어싱이 만든 값이다. 그걸 목표로
+        # 두면 적합기가 "저 위를 비워라" 를 물리 파라미터로 달성하려 들고, 그 왜곡이
+        # 8~12 kHz 를 10 dB 어둡게 만들었다(실측: 남성 /사/).
+        self.f_max = min(0.5 * float(sr), 0.5 * self.fs) * 0.90
         if sr != self.fs:
             from scipy.signal import resample_poly
             g = math.gcd(int(sr), int(self.fs))
@@ -214,10 +220,13 @@ class CopySynthFitter:
         # 포락은 **짧은 창**에서 잰다. 1024 (21 ms) 는 F0 240 Hz 의 하모닉을 분해하므로
         # 그 위의 멜은 포락이 아니라 하모닉 정렬을 재게 된다.
         # 256 (5.3 ms, 분해능 187 Hz) 이면 하모닉이 뭉개져 순수한 포락이 남는다.
-        self.mel = mel_bank(MEL_FFT, self.fs, n_mels).to(device)
+        self.mel = mel_bank(MEL_FFT, self.fs, n_mels, fmax=self.f_max).to(device)
+        # 선형 SC 도 같은 상한을 쓴다.
+        self.bin_max = {k: int(math.ceil(self.f_max / (self.fs / k))) + 1 for k in FFT_SIZES}
         with torch.no_grad():
-            self.tgt_S = {k: _stft(self.target, k, self.wins[k]).abs() for k in FFT_SIZES}
-            self.tgt_M = self.mel @ self.tgt_S[MEL_FFT]
+            self.tgt_S = {k: _stft(self.target, k, self.wins[k]).abs()[:, :self.bin_max[k]]
+                          for k in FFT_SIZES}
+            self.tgt_M = self.mel[:, :self.tgt_S[MEL_FFT].shape[1]] @ self.tgt_S[MEL_FFT]
             self.tgt_Mdb = self._db(self.tgt_M)
             self.db_floor = float(self.tgt_Mdb.max()) - DB_RANGE
         self.calibrate_gain()
@@ -328,15 +337,15 @@ class CopySynthFitter:
         sc_sum, per = 0.0, {}
         Smel = None
         for k in self.sizes:
-            Sp = _stft(y, k, self.wins[k]).abs()
+            Sp = _stft(y, k, self.wins[k]).abs()[:, :self.bin_max[k]]
             if k == MEL_FFT:
                 Smel = Sp
             sc = self._sc(self.tgt_S[k], Sp)
             sc_sum = sc_sum + sc
             per[k] = float(100.0 * (1.0 - sc.detach()))
         if Smel is None:
-            Smel = _stft(y, MEL_FFT, self.wins[MEL_FFT]).abs()
-        Mp = self.mel @ Smel
+            Smel = _stft(y, MEL_FFT, self.wins[MEL_FFT]).abs()[:, :self.bin_max[MEL_FFT]]
+        Mp = self.mel[:, :Smel.shape[1]] @ Smel
         m = min(Mp.shape[-1], self.tgt_M.shape[-1])
         Mp, Mt = Mp[..., :m], self.tgt_M[..., :m]
         a = self._db(Mt).clamp_min(self.db_floor)
