@@ -53,6 +53,8 @@ def main() -> None:
     ap.add_argument("--frame-ms", type=float, default=1.0)
     ap.add_argument("--global-iters", type=int, default=200)
     ap.add_argument("--stage-iters", type=int, default=100)
+    ap.add_argument("--phase-iters", type=int, default=200,
+                    help="마지막 위상 단계. 0 이면 끔 (크기만 맞춘다)")
     ap.add_argument("--lr-global", type=float, default=None,
                     help="생략하면 짧은 탐침으로 자동 선택 (구간마다 맞는 값이 다르다)")
     ap.add_argument("--lr-frame", type=float, default=0.04)
@@ -88,7 +90,7 @@ def main() -> None:
     fit = CopySynthFitter(eng, seg, sr, track, phase_weight=a.phase)
     kw = {} if a.lr_global is None else {"lr_global": a.lr_global}
     rep = fit.fit_staged(global_iters=a.global_iters, stage_iters=a.stage_iters,
-                         lr_frame=a.lr_frame, **kw)
+                         lr_frame=a.lr_frame, phase_iters=a.phase_iters, **kw)
     print(rep)
 
     out = fit.render()

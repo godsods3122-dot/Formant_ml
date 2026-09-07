@@ -546,7 +546,7 @@ class CopySynthFitter:
 
     def fit_staged(self, global_iters: int = 200, stage_iters: int = 150,
                    lr_global=(0.015, 0.03, 0.05, 0.09), lr_frame: float = 0.04,
-                   phase_iters: int = 0, phase_w: float = 3.0,
+                   phase_iters: int = 200, phase_w: float = 3.0,
                    verbose: bool = True, log_every: int = 50) -> FitReport:
         """전역 스칼라 -> 제어 격자를 성기게에서 촘촘하게, 창도 함께 늘려 가며."""
         if verbose:
@@ -568,6 +568,9 @@ class CopySynthFitter:
                 print(f"  2.{si + 1} 단계  격자 {grid:g} ms ({tc} 점)  창 {sizes}")
             rep = self.fit(stage_iters, lr_frame * (0.75 ** si), log_every, verbose,
                            sizes=sizes)
+        # **위상 단계는 기본이다.** 크기만 맞추면 위상은 물리가 강제하는 곳에서만 맞는다.
+        # 실측(코퍼스 150 ms 창 4 개): 조화 SNR +3.3/+1.0/+3.5/−2.6 -> +24.7/+16.5/+12.9/+16.2,
+        # 위상 모양 오차 7.6/29.9/65.5/25.4° -> 3.4/17.8/32.6/16.4°. 포락은 안 나빠졌다.
         if phase_iters > 0:
             self.phase_weight = phase_w
             if verbose:

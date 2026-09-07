@@ -3,8 +3,8 @@
  "sex": "female",
  "tract_length_cm": 14.6,
  "f0_nominal": 240.0,
- "f0_lo": 150.0,
- "f0_hi": 520.0,
+ "f0_lo": 120.0,
+ "f0_hi": 580.0,
  "p_sub": 7.5,
  "vowels": {
   "a": [
