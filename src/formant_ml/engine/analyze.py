@@ -115,6 +115,9 @@ def f0_from_pulses(pulses: np.ndarray, t_grid: np.ndarray, f0_lo: float,
     return np.interp(t_grid, tm, f0)
 
 
+FRICATIVE_HL_DB = 0.0      # 고역(3~16k)/저역(0.1~1k) 비가 이보다 크면 마찰로 본다
+
+
 def smooth_track(x: np.ndarray, med: int, avg: int) -> np.ndarray:
     """중앙값 -> 이동평균. 프레임별 독립 추정의 흔들림을 지운다.
 
@@ -178,6 +181,7 @@ def analyze(y: np.ndarray, sr: int, prof: SpeakerProfile, hop: int,
     vals = np.tile(default_vector(), (n, 1))
     rms_db = np.zeros(n)
     voi = np.zeros(n, dtype=bool)
+    rband = np.zeros(n)
     f0_last = prof.f0_nominal
     # 무성 구간에서 유지할 자세. **첫 프레임이 무성일 수 있으므로** 프로파일의 중립
     # 모음으로 씨앗을 준다 — 그러지 않으면 무성 첫 프레임의 잡음 봉우리를 끝까지 끌고 간다.
@@ -249,6 +253,7 @@ def analyze(y: np.ndarray, sr: int, prof: SpeakerProfile, hop: int,
             vals[i, INDEX[f"bw{k}"]] = bwv
         # 마찰: 고역/저역 비가 크면 협착이 좁다 (초기값일 뿐, 적합이 다듬는다)
         r = 10 * np.log10(hi / lo)
+        rband[i] = r
         vals[i, INDEX["a_c"]] = float(np.clip(3.0 * 10 ** (-(r + 10) / 25.0), 0.06, 3.0))
         vals[i, INDEX["front_len"]] = prof.sib_front_len_cm
 
@@ -272,9 +277,16 @@ def analyze(y: np.ndarray, sr: int, prof: SpeakerProfile, hop: int,
         slow = smooth_track(rms_db, max(3, int(round(75.0 / fm_ms)) | 1),
                             max(2, int(round(150.0 / fm_ms))))
     vals[:, INDEX["p_sub"]] = np.clip(3.0 + 5.0 * (slow + 60) / 40.0, 0.0, 16.0)
-    # 빠른 성분은 **구강 폐쇄**의 표현이다. 무성 구간의 세기는 소스(마찰)가 정하므로
-    # 여기서 이득을 깎으면 안 된다 — 그건 `fric_gain` 의 몫이다.
-    fast = np.where(voi, np.clip(10.0 ** ((rms_db - slow) / 20.0), 0.05, 4.0), 1.0)
+    # 빠른 성분은 **구강 폐쇄**의 표현이다. 다만 마찰 구간에서는 세기를 소스가 정하므로
+    # 거기서 이득을 깎으면 안 된다 — 그건 `fric_gain` 의 몫이다.
+    #
+    # **무성이라는 것만으로 마찰이라고 보면 안 된다.** 비음 머머는 유성인데 약해서
+    # 피치 검출이 자주 놓치고(실측: 남 /나/ 300 프레임 중 176 이 무성으로 잡혔다),
+    # 그걸 마찰로 오인하면 폐쇄의 세기 골이 통째로 사라진다. 마찰은 **고역/저역비**로
+    # 가른다: 실측 무성부 r 중앙값이 /ㅆ/ +16.2, /ㅅ/ +15.9 인데 비음 머머는 −26.2 이라
+    # 0 dB 로 깨끗이 갈린다.
+    fric = (~voi) & (rband > FRICATIVE_HL_DB)
+    fast = np.where(fric, 1.0, np.clip(10.0 ** ((rms_db - slow) / 20.0), 0.05, 4.0))
     vals[:, INDEX["tract_gain"]] = fast
     tr = ControlTrack(vals, frame_ms=1000.0 * hop / sr)
     # 프레임률에 맞춰 평활. 5 ms 프레임이면 창 수를 줄인다.
@@ -301,6 +313,7 @@ def analyze(y: np.ndarray, sr: int, prof: SpeakerProfile, hop: int,
                               np.abs(t_grid - pulses[k - 1])) < 0.02
         tr["f0_target"] = np.where(near, pf, tr["f0_target"])
     tr.voiced = voi
+    tr.fricative = fric
     if pulses is not None and len(pulses):
         rel = pulses - t0
         tr.pulses = rel[(rel >= 0.0) & (rel < n * step)]

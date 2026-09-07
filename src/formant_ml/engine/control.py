@@ -105,6 +105,8 @@ class ControlTrack:
     pulses: np.ndarray = field(default_factory=lambda: np.zeros(0))
     # 프레임별 유성 여부. 분석이 채운다 — 적합기가 마찰 이득을 따로 보정하는 데 쓴다.
     voiced: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=bool))
+    # 프레임별 마찰 여부(무성 + 고역 우세). 폐쇄와 마찰은 다르게 다뤄야 한다.
+    fricative: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=bool))
 
     @property
     def n_frames(self) -> int:

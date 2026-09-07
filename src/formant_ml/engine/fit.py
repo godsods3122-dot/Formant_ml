@@ -184,7 +184,9 @@ class CopySynthFitter:
         self.track = ControlTrack(init.values.copy(), init.frame_ms, list(init.events),
                                   pulses=np.asarray(getattr(init, "pulses", np.zeros(0))).copy(),
                                   voiced=np.asarray(getattr(init, "voiced",
-                                                            np.zeros(0, dtype=bool))).copy())
+                                                            np.zeros(0, dtype=bool))).copy(),
+                                  fricative=np.asarray(getattr(init, "fricative",
+                                                               np.zeros(0, dtype=bool))).copy())
         self.track["residual_mix"] = 0.0
         n = self.track.n_frames * self.hop
         t = np.zeros(n)
@@ -303,7 +305,12 @@ class CopySynthFitter:
         voi = np.asarray(getattr(self.track, "voiced", np.zeros(0, dtype=bool)))
         if voi.shape[0] != self.n_frames:
             voi = np.zeros(0, dtype=bool)
-        unv = ~voi if voi.size else np.zeros(0, dtype=bool)
+        # `fric_gain` 은 **마찰 프레임**에서만 잰다. 폐쇄(비음 머머 등)를 섞으면
+        # 조용한 구간까지 마찰로 메우려 든다.
+        fri = np.asarray(getattr(self.track, "fricative", np.zeros(0, dtype=bool)))
+        if fri.shape[0] != self.n_frames:
+            fri = ~voi if voi.size else np.zeros(0, dtype=bool)
+        unv = fri
         with torch.no_grad():
             self.eng.reset()
             y = self.eng(self.control(), self.track.events, 0.0)["audio"]
