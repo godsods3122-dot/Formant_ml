@@ -1,0 +1,28 @@
+# LLM 이 문맥을 보고 `prosody` 블록만 갈아끼우는 것을 상정한 예제.
+# timeline(무엇을 말하나)과 prosody(어떻게 말하나)가 분리되어 있다.
+#   PYTHONPATH=src python -m formant_ml.render examples/conversational.yaml -o out/talk.wav
+name: 대화형 예제
+seed: 3
+
+prosody:
+  rate: 1.1              # 조금 빠르게
+  pitch_shift: -1.0      # 반음 낮게
+  pitch_range: 1.35      # 억양은 넓게 (설명하는 톤)
+  contour: [[0, 0], [0.35, 3.5], [0.75, 1.0], [1, -3.0]]
+  declination: -2.0      # 평서문
+  breathiness: 0.1
+  breath:
+    capacity_s: 3.5      # 짧게 잡아 두면 숨이 자주 들어간다
+    depth: 0.45
+
+timeline:
+  - {type: syllable, onset: s, vowel: a, dur: 0.42}
+  - {type: glide, vowels: [a, i, u], dur: 0.5}
+  - {type: vowel, vowel: eo, dur: 0.36}
+  - {type: silence, dur: 0.12}
+  - {type: syllable, onset: s, vowel: i, dur: 0.4}
+  - {type: glide, vowels: [e, o], dur: 0.45}
+  - {type: vowel, vowel: a, dur: 0.4}
+  - {type: silence, dur: 0.1}
+  - {type: glide, vowels: [u, eo, a], dur: 0.6}
+  - {type: vowel, vowel: i, dur: 0.45}
