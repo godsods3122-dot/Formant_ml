@@ -64,9 +64,9 @@ class VocalTract(nn.Module):
         # 학습 파라미터: 고차 극 보정의 대역폭 배율(화자 고역 손실), 앞공동 대역폭 배율
         self.log_extra_bw = nn.Parameter(torch.tensor(0.0))
         self.log_front_bw = nn.Parameter(torch.tensor(0.0))
-        # 고역 손실이 커지는 자리. Q 는 10 kHz 에서 ≈1.5, 14 kHz 에서 ≈1 이 된다.
-        self.bw_hf_knee = 10250.0
-        self.bw_hf_width = 1150.0
+        # 고차 극의 손실 (벽·점성·방사·횡모드). Q≈1 — ADR 0012.
+        self.extra_bw_floor = 800.0
+        self.extra_bw_slope = 1.00
         # 앞공동 극의 대역폭 = 500 + 이 값 × f_p. **화자 프로파일이 준다** — 한 상수로
         # 두면 두 화자가 반대로 잡아당긴다. 실측 적합: 남 /ㅅ/ 0.08, 여 /ㅆ/ 0.36.
         self.front_bw_slope = float(front_bw_slope)
@@ -82,25 +82,19 @@ class VocalTract(nn.Module):
 
     # ------------------------------------------------------------ 계수
     def default_bw(self, f):
-        """극의 물리 기본 대역폭. **모든 극이 같은 법칙을 쓴다.**
+        """극의 물리 기본 대역폭 (Klatt: B1 50~80, B4 175~280).
 
-        예전에는 캐스케이드가 `40 + 0.05f`, 고차 극이 `800 + 1.0f` 로 **다른 법칙**을
-        썼다. 그래서 두 무리가 만나는 자리에서 Q 가 18.1 -> 0.92 로 20 배 급변하고,
-        거기에 깊은 골이 생겼다 (실측: 남성 8.5 kHz 에서 −11.5 dB. 그 주파수는
-        `(2K−1)·c/4L` 이라 화자마다 다르다 — 즉 물리가 아니라 코드 상수 K 가 만든
-        인공물이었다).
-
-        손실은 주파수를 따라 **연속으로** 커진다: 벽·점성·방사에 더해 고역에서는
-        평면파 가정이 무너지고 횡모드가 열린다. 그것을 하나의 매끈한 식으로 쓴다.
-
-            B(f) = bw_floor + bw_slope·f + f·σ((f − f_c)/w)
-
-        낮은 쪽은 Klatt 의 포먼트 대역폭(B1 50~80, B4 175~280)을 그대로 두고,
-        10 kHz 부근에서 Q≈1.5, 14 kHz 에서 Q≈1 이 되도록 f_c·w 를 잡았다.
+        고차 극은 이 법칙을 쓰지 않는다 — `_extra_cascade` 가 훨씬 센 감쇠를 쓴다.
+        그 경계에서 Q 가 18 -> 0.9 로 급변하고, 거기에 −11.5 dB 골이 생긴다(실측:
+        남성 8.5 kHz. 그 주파수는 (2K−1)·c/4L 이라 화자마다 다르다 — 코드 상수 K 가
+        만든 인공물이다). **두 법칙을 하나의 매끈한 식으로 합치는 것을 시도했다가
+        되돌렸다**: 고차 극이 날카로워지면서 종속 이득이 8~10 kHz 에서 +33.8 dB 가
+        되고(남성), 복사합성이 그 리프트에 이득을 맞추느라 230 Hz 가 −27 dB 로
+        무너졌다 (남 /사/ 포락 68.6 % -> 11.5 %). 무릎을 첫 고차 극에 묶어 Q≈1 로
+        낮춰도 이번엔 9~13 kHz 를 메우는 힘이 6 dB -> 3.6 dB 로 약해졌다.
+        골은 남은 문제로 MEASUREMENTS §7.6 에 적어 둔다.
         """
-        return (self.bw_floor + self.bw_slope * f
-                + f * torch.sigmoid((f - self.bw_hf_knee) / self.bw_hf_width))
-
+        return self.bw_floor + self.bw_slope * f
     def _up(self, v):
         return frames_to_samples(v.unsqueeze(-1), self.hop)[..., 0][:, :self._n_emit]
 
@@ -133,7 +127,8 @@ class VocalTract(nn.Module):
         for i, f in enumerate(self.extra_formants):
             key = f"x{i}"
             fk = f.to(x.dtype).expand_as(x)
-            bw = self.default_bw(fk) * bw_scale        # 캐스케이드와 **같은 법칙**
+            bw = torch.clamp(self.bw_floor + self.extra_bw_slope * fk,
+                             min=self.extra_bw_floor) * bw_scale
             x, state[key] = tv_biquad(x, *resonator_coeffs(fk, bw, self.fs), zi=state.get(key))
         return x
 
