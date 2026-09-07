@@ -60,8 +60,9 @@ _P: list[ParamSpec] = [
     ParamSpec("c_place", "0-1", 0.0, 1.0, 0.9, False, "협착 위치 (0 성문 ~ 1 입술). 앞공동 길이"),
     ParamSpec("front_len", "cm", 0.3, 6.0, 0.0, True, "앞공동 길이 직접 지정(0 이면 c_place 로). 0↔값은 보간하지 않는다"),
     ParamSpec("obstacle", "0-1", 0.0, 1.0, 0.0, False, "제트가 장애물(앞니)을 때리는 정도(다이폴)"),
-    ParamSpec("fric_gain", "ratio", 0.0, 64.0, 1.0, False,
-              "마찰 노이즈 배율(물리량 위에 곱). 상한 4 였을 때 파찰음이 10 dB 잘렸다"),
+    ParamSpec("fric_gain", "ratio", 0.0, 256.0, 1.0, False,
+              "마찰 노이즈 배율(물리량 위에 곱). 상한 4 -> 파찰음 10 dB 잘림, "
+              "64 -> 남성 /사/ 복사합성이 7 dB 모자람(둘 다 실측). 지금 256 = 48 dB"),
     ParamSpec("back_leak", "0-1", 0.0, 1.0, 0.3, False, "마찰음이 뒤공동/성도 전체로 새는 비율"),
     # --- 측지 / 비강 ---------------------------------------------------------
     ParamSpec("lat_z1", "Hz", 500.0, 8000.0, 0.0, True, "측지 영점 1 (0 이면 끔)"),
@@ -102,6 +103,8 @@ class ControlTrack:
     events: list[dict] = field(default_factory=list)   # 샘플 정확도 과도음 이벤트
     # 성문 폐쇄 시각(초, 트랙 시작 기준). 분석이 채우고 복사합성 적합이 위상 고정에 쓴다.
     pulses: np.ndarray = field(default_factory=lambda: np.zeros(0))
+    # 프레임별 유성 여부. 분석이 채운다 — 적합기가 마찰 이득을 따로 보정하는 데 쓴다.
+    voiced: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=bool))
 
     @property
     def n_frames(self) -> int:

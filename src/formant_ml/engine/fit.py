@@ -178,7 +178,13 @@ class CopySynthFitter:
             from scipy.signal import resample_poly
             g = math.gcd(int(sr), int(self.fs))
             target = resample_poly(target, self.fs // g, int(sr) // g)
-        self.track = ControlTrack(init.values.copy(), init.frame_ms, list(init.events))
+        # **분석이 붙여 준 부가 정보(성문 펄스·유성 마스크)를 같이 옮긴다.** 새로
+        # ControlTrack 을 만들면서 빠뜨리면 조용히 기본값(빈 배열)이 되고, 마찰 이득
+        # 보정이 아무 일도 안 하게 된다 (실측: 남 /사/ 무성부가 −40.8 dB 인 채로 시작).
+        self.track = ControlTrack(init.values.copy(), init.frame_ms, list(init.events),
+                                  pulses=np.asarray(getattr(init, "pulses", np.zeros(0))).copy(),
+                                  voiced=np.asarray(getattr(init, "voiced",
+                                                            np.zeros(0, dtype=bool))).copy())
         self.track["residual_mix"] = 0.0
         n = self.track.n_frames * self.hop
         t = np.zeros(n)
@@ -278,18 +284,47 @@ class CopySynthFitter:
         cols = torch.stack([self._to_val(u[:, i], s) for i, s in enumerate(self.specs)], 1)
         return self.base.clone().index_copy(1, self.cols, cols).unsqueeze(0).to(torch.float32)
 
-    def calibrate_gain(self) -> float:
-        """초기 이득을 RMS 로 닫힌 형태로 준다.
+    def _rms(self, x: torch.Tensor, mask: np.ndarray | None) -> float:
+        if mask is None or not mask.any():
+            return float(x.pow(2).mean().sqrt()) + 1e-12
+        i = np.flatnonzero(np.repeat(mask, self.hop)[:x.shape[-1]])
+        return float(x[..., i].pow(2).mean().sqrt()) + 1e-12
 
-        안 하면 1 회차 수렴도가 −18000 % 에서 시작하고(실측) Adam 이 그것만 수십 회 민다.
+    def calibrate_gain(self) -> float:
+        """초기 이득을 닫힌 형태로 준다. **유성/무성을 따로 맞춘다.**
+
+        하나의 이득만 맞추면 유성과 무성 중 한쪽이 반드시 크게 어긋난다. 마찰 세기는
+        `fric_gain` 이 정하는데 그 초기값이 1.0 이고, 실측과의 차이가 40 dB 를 넘으면
+        경사 하강으로는 못 간다 (한 걸음이 상한 64 = 36 dB 안에서 움직인다). 실제로
+        남 /사/ 는 마찰부가 −42.8 dB 인 채로 시작해 끝까지 못 따라잡았다.
+        그래서 전체 이득은 **유성 프레임**에서, `fric_gain` 은 **무성 프레임**에서
+        각각 닫힌 형태로 준다.
         """
+        voi = np.asarray(getattr(self.track, "voiced", np.zeros(0, dtype=bool)))
+        if voi.shape[0] != self.n_frames:
+            voi = np.zeros(0, dtype=bool)
+        unv = ~voi if voi.size else np.zeros(0, dtype=bool)
         with torch.no_grad():
             self.eng.reset()
             y = self.eng(self.control(), self.track.events, 0.0)["audio"]
-            a = float(y.pow(2).mean().sqrt()) + 1e-12
-            b = float(self.target.pow(2).mean().sqrt()) + 1e-12
-            self.log_gain.copy_(torch.tensor([math.log(b / a)], dtype=torch.float64,
+            m = voi if voi.any() else None
+            r = self._rms(self.target, m) / self._rms(y, m)
+            self.log_gain.copy_(torch.tensor([math.log(r)], dtype=torch.float64,
                                              device=self.device))
+            if unv.any() and "fric_gain" in self.names:
+                self.eng.reset()
+                y = self.eng(self.control(), self.track.events, 0.0)["audio"] * r
+                need = self._rms(self.target, unv) / self._rms(y, unv)
+                j = self.names.index("fric_gain")
+                sp = self.specs[j]
+                g0 = float(self._to_val(self.u0[:, j], sp).median())
+                tgt = float(np.clip(g0 * need, sp.lo + 1e-3, sp.hi - 1e-3))
+                # raw 좌표의 전역 오프셋으로 넣는다 (프레임별 모양은 보존)
+                d = float(self._to_raw(torch.tensor([tgt], dtype=torch.float64), sp)[0]
+                          - self._to_raw(torch.tensor([g0], dtype=torch.float64), sp)[0])
+                self.d[j] = d / max(float(self.d_mask[j]), 1.0) if self.d_mask[j] else 0.0
+                if not self.d_mask[j]:      # fric_gain 은 전역 대상이어야 한다
+                    self.d[j] = d
         return self.gain_db()
 
     # ------------------------------------------------------------ 손실

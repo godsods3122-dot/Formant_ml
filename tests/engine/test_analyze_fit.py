@@ -290,3 +290,54 @@ def test_steady_vowel_keeps_tract_gain_flat():
     tr = analyze(_synthetic_vowel(fs, dur=0.3), fs, DEFAULT_PROFILE, int(0.001 * fs))
     g_db = 20 * np.log10(tr["tract_gain"])
     assert g_db.max() - g_db.min() < 3.0, g_db.max() - g_db.min()
+
+
+def test_unvoiced_frames_do_not_get_formants_from_noise():
+    """무성 구간의 LPC 봉우리를 포먼트로 쓰면 안 된다.
+
+    포먼트는 성문이 성도를 울릴 때만 뜻이 있다. 마찰음에 LPC 를 걸면 잡음의 우연한
+    봉우리가 나오고(실측: 남성 /사/ 마찰부에서 F1 이 3539 → 486 → 2134 Hz), 순서
+    규칙이 그것들을 120 Hz 간격으로 겹쳐 쌓아 4 중 고 Q 극을 만든다. 그 극이 성도
+    종속을 +88 dB 로 만들어 (du rms 0.04 → glottal_path 1028) 적합이 통째로 무너졌다.
+    """
+    fs = 16000
+    v = _synthetic_vowel(fs, dur=0.2)
+    rng = np.random.default_rng(3)
+    noise = rng.standard_normal(int(fs * 0.15)) * np.abs(v).max() * 0.3
+    y = np.concatenate([noise, v])                      # 무성 150 ms + 유성 200 ms
+    tr = analyze(y, fs, DEFAULT_PROFILE, int(0.001 * fs))
+    f1, f2 = tr["f1"], tr["f2"]
+    assert (f2 - f1).min() > 200.0, (f2 - f1).min()     # 포먼트가 겹쳐 쌓이지 않는다
+    assert f1.max() < 1400.0, f1.max()                  # 잡음 봉우리를 F1 으로 집지 않는다
+    assert tr.voiced.shape == (tr.n_frames,)
+    assert not tr.voiced[:100].any()                    # 앞 100 ms 는 무성으로 잡힌다
+    assert tr.voiced[200:].mean() > 0.5                 # 모음은 유성으로 잡힌다
+
+
+def test_subglottal_pressure_survives_an_unvoiced_stretch():
+    """/s/ 동안에도 폐압은 모음과 거의 같다 — 난류가 비효율일 뿐 폐가 쉰 게 아니다.
+
+    무성 구간의 낮은 세기를 폐압에 넣으면 레이놀즈 게이트(비선형) 아래로 떨어져
+    마찰음이 통째로 사라진다 (실측: 남 /사/ 마찰부 −42.8 dB).
+    """
+    fs = 16000
+    v = _synthetic_vowel(fs, dur=0.2)
+    rng = np.random.default_rng(4)
+    quiet = rng.standard_normal(int(fs * 0.15)) * np.abs(v).max() * 0.05
+    tr = analyze(np.concatenate([quiet, v]), fs, DEFAULT_PROFILE, int(0.001 * fs))
+    p = tr["p_sub"]
+    assert p.min() > 5.0, p.min()                        # 무성 구간에서도 안 죽는다
+    assert p.max() - p.min() < 3.0, p.max() - p.min()    # 호흡은 천천히 움직인다
+
+
+def test_fitter_calibrates_voiced_and_unvoiced_levels_separately(_engine):
+    """하나의 이득만 맞추면 유성/무성 중 한쪽이 반드시 어긋난다."""
+    from formant_ml.engine.control import ControlTrack as CT
+    tr = _track(n=120)
+    target = _engine.render(tr)
+    init = CT(tr.values.copy(), tr.frame_ms)
+    init["fric_gain"] = 1.0
+    init.voiced = np.ones(init.n_frames, dtype=bool)
+    f = CopySynthFitter(_engine, target, 48000, init)
+    assert np.asarray(f.track.voiced).shape == (init.n_frames,)   # 마스크가 전달된다
+    assert abs(f.gain_db()) < 40.0
