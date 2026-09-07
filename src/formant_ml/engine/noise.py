@@ -42,7 +42,7 @@ def series_flow(p_sub_cmh2o, a_g, a_c):
     """
     ps = p_sub_cmh2o.clamp_min(0.0) * CMH2O
     inv = 1.0 / a_g.clamp_min(1e-4) ** 2 + 1.0 / a_c.clamp_min(1e-4) ** 2
-    u = torch.sqrt(2.0 * ps / RHO) / torch.sqrt(inv)
+    u = torch.sqrt(2.0 * ps / RHO + 1e-12) / torch.sqrt(inv)   # +eps: 무음(ps=0)에서 기울기 NaN
     dp_c = 0.5 * RHO * (u / a_c.clamp_min(1e-4)) ** 2
     return u, dp_c
 
@@ -51,7 +51,7 @@ def reynolds(u, a_c):
     """협착 제트의 레이놀즈 수. d = 등가 직경 sqrt(4A/π)."""
     a = a_c.clamp_min(1e-4)
     v = u / a
-    d = torch.sqrt(4.0 * a / math.pi)
+    d = torch.sqrt(4.0 * a / math.pi + 1e-12)
     return v * d / NU, v, d
 
 
@@ -62,7 +62,7 @@ def slow_modulation(white_frames: torch.Tensor, fs_frame: float, knee_hz, zi=Non
     청크 경계에 따라 달라져 스트리밍 = 오프라인이 깨진다. 이득은 백색 입력의 출력
     분산이 1 이 되도록 근사 정규화한다.
     """
-    k = float(knee_hz)
+    k = float(knee_hz.detach()) if torch.is_tensor(knee_hz) else float(knee_hz)
     co = lowpass_coeffs(k, 0.707, fs_frame)
     y, zf = tv_biquad(white_frames, *co, zi=zi)
     gain = math.sqrt(fs_frame / (2.0 * math.pi * k))          # 등가 잡음 대역폭 보정
@@ -130,7 +130,7 @@ class FricationNoise(nn.Module):
             burst.append((po - po_ss[:, i]).clamp_min(0.0) * (1 - closed[:, i]))
         burst = torch.stack(burst, 1)
         state["po"] = po_hist[t - 1]                     # 상태는 내보내는 마지막 프레임 기준
-        burst_env = up(torch.sqrt(burst.clamp_min(0.0) / CMH2O)) * 3.0     # 초과압 → 속도 배율
+        burst_env = up(torch.sqrt(burst.clamp_min(0.0) / CMH2O + 1e-12)) * 3.0     # 초과압 → 속도 배율
         re, v, d = reynolds(u, a_c)
         # Stevens: 소스 압력 ∝ ρ·v³·√A. Re = v·d/ν ∝ v·√A 이므로 같은 Re 에서 v³√A ∝ Re³/A —
         # 넓은 통로(모음 자세)는 같은 Re 라도 조용하다. (Re²−Re_c²)^1.5/(A/A_ref), A_ref=0.1 cm².

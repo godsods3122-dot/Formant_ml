@@ -77,14 +77,17 @@ class VocalTract(nn.Module):
         self.length_cm = length_cm
         self.bw_floor, self.bw_slope = bw_floor, bw_slope
         self.K = n_formants
+        self.extra_cap = 0.60
         f1 = C_SOUND / (4.0 * length_cm)
-        # 고차 극은 기본 3 개 (10~13 kHz). 더 얹으면 인접 극의 스커트가 곱해져 백색 입력에
-        # +85 dB 가 되고(측정: 6 개에서 이득 44122), 수치 잡음까지 증폭한다. 또 이산 공명기는
-        # θ→π 에서 두 극이 붙어 이득이 제곱으로 뛴다(19.8 kHz 극이 +58 dB) — 0.7·fs/2 상한.
-        # 표본화된 관은 나이퀴스트까지의 극으로 완결된다(그 위 극은 접혀 들어온다) — 잘라 놓고
-        # FIR 로 되돌리는 방식은 12 kHz 에서 +160 dB 가 필요해 수치적으로 성립하지 않았다.
+        # 고차 극 보정. **나이퀴스트까지 채우면 안 된다.** 이산 공명기는 θ→π 에서 극쌍이
+        # z=−1 의 이중 실극으로 붙고, DC 정규화된 이득이 (1+r)²/(1−r)² 로 뛴다. 실제로
+        # 0.98·fs/2 까지 12 개를 채웠더니 이 종속이 10 kHz 에서 +97 dB, 22 kHz 에서
+        # **+151 dB** 였다(측정). 그게 복사합성에서 7 kHz 위 오차 +14~+22 dB 의 정체다.
+        # Fant 의 고차 극 보정은 원래 "완만히 올라갔다가 내려오는" 몇 dB~10 dB 짜리다.
+        # 그 모양이 나오는 지점: 0.60·fs/2 까지, 대역폭 Q≈1 (고역의 벽·점성·방사·횡모드
+        # 손실). 그러면 DC 0 dB, 4 kHz +4, 10 kHz +13, 22 kHz −0.4 dB 가 된다.
         fixed = [(2 * n - 1) * f1 for n in range(n_formants + 1, 128)
-                 if (2 * n - 1) * f1 < 0.98 * fs / 2]
+                 if (2 * n - 1) * f1 < self.extra_cap * fs / 2]
         if n_extra is not None:
             fixed = fixed[:n_extra]
         self.register_buffer("uniform_formants",
@@ -103,7 +106,7 @@ class VocalTract(nn.Module):
         self.register_buffer("nasal_extra", torch.tensor(
             [2400.0 + k * nsp for k in range(1, 64) if 2400.0 + k * nsp < 0.70 * fs / 2],
             dtype=torch.float32))
-        self.extra_bw_slope = 0.20                       # 고차 극 손실 (벽·점성·방사·횡모드). 실측 /아/ 적합
+        self.extra_bw_slope = 1.00        # 고차 극 손실 (벽·점성·방사·횡모드). Q≈1
         self.use_hpc = False
         self.register_buffer("hpc", torch.zeros(1))
 

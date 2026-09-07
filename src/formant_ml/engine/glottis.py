@@ -126,7 +126,7 @@ class GlottalSource(nn.Module):
         f0 = f0 * (1.0 + 0.04 * over) * c["f0_scale"]
         gate = torch.clamp((add - 0.10) / 0.15, 0.0, 1.0)
         gate = gate * gate * (3 - 2 * gate)                        # 벌린 성문(add≤0.10)은 안 떤다
-        a_star = torch.sqrt(over / pth) * gate
+        a_star = torch.sqrt(over / pth + 1e-12) * gate   # +eps: sqrt(0) 의 기울기가 무한대다
         a_star = a_star / (1.0 + 0.5 * a_star)                     # 포화
         dt = self.hop / self.fs
         seed = 0.02
@@ -149,18 +149,21 @@ class GlottalSource(nn.Module):
         a_c = c["a_c"].clamp_min(1e-3)
         frac = a_c ** 2 / (a_c ** 2 + ag_dc ** 2)                  # ΔPg/Ps
         # 세기는 ΔPg 에 선형 (√ 로 두면 /s/ 중 기식이 실측보다 10 dB 크다 — 같은 화자 A/B).
-        asp = (1.0 - add) ** 2 * frac * torch.sqrt(ps.clamp_min(0.0)) * c["aspiration"]
+        asp = (1.0 - add) ** 2 * frac * torch.sqrt(ps.clamp_min(0.0) + 1e-12) * c["aspiration"]
         return dict(f0=f0, amp=amp, amp_raw=amp_raw, rd=rd, ag_dc=ag_dc, asp=asp, pth=pth)
 
     # ---------------------------------------------------------- 파형
-    def _lf_coeffs(self, rd: torch.Tensor) -> torch.Tensor:
-        """(B,N) Rd -> (B,N,K) 복소 하모닉 계수 (격자 선형보간)."""
+    def _lf_index(self, rd: torch.Tensor):
+        """(B,N) Rd -> (i0, w). 하모닉 계수는 **차수별로** 표에서 뽑는다.
+
+        전에는 (B,N,K) 복소 텐서를 통째로 만들고 루프에서 `[..., j]` 로 잘랐다. 그러면
+        역전파가 차수마다 (B,N,K) 짜리 0 텐서를 만들어 채운다 — K=234, N=19200 이면 한 번에
+        37 MB, 5937 번이면 역전파의 68 % 였다(프로파일). 표를 차수별로 인덱싱하면 (B,N) 이다.
+        """
         g = self.rd_grid
         pos = (rd.clamp(g[0], g[-1]) - g[0]) / (g[-1] - g[0]) * (len(g) - 1)
         i0 = pos.floor().long().clamp(0, len(g) - 2)
-        w = (pos - i0.float()).unsqueeze(-1)
-        c0, c1 = self.lf_coef[i0], self.lf_coef[i0 + 1]
-        return c0 * (1 - w) + c1 * w
+        return i0, pos - i0.to(pos.dtype)
 
     def forward(self, c: dict, phase0: torch.Tensor | None = None,
                 rps: torch.Tensor | None = None, noise=None, frame0: int = 0,
@@ -209,8 +212,7 @@ class GlottalSource(nn.Module):
         # 하모닉 가산합성. **하모닉마다 순차 누적**한다 — (B,N,K).sum(-1) 은 텐서 크기에 따라
         # 축약 순서가 달라 float32 반올림이 청크 의존이 되고(3e-6), 그것이 고 Q 성도를 지나며
         # 스트리밍/오프라인 차이 1e-3 로 커졌다(측정). 순차 누적은 청크와 무관하고 메모리도 작다.
-        coef = self._lf_coeffs(rd)                                 # (B,N,K)
-        mag, ang = coef.abs(), torch.angle(coef)
+        i0, wrd = self._lf_index(rd)                               # (B,N), (B,N)
         k = self.k_idx
         f_nyq, width = 0.95 * fs / 2, 0.02 * fs / 2
         f_cut = f_nyq + 6.0 * width                    # 이 위는 마스크를 정확히 0 으로 (청크 무관 상한)
@@ -220,12 +222,16 @@ class GlottalSource(nn.Module):
         for j in range(k_max):
             kk = k[j]
             fk = f0 * kk
-            mask = torch.sigmoid((f_nyq - fk) / width) * (fk <= f_cut)
+            live = fk <= f_cut
+            if not bool(live.any()):
+                continue
+            cj = self.lf_coef[i0, j] * (1 - wrd) + self.lf_coef[i0 + 1, j] * wrd   # (B,N)
+            mask = torch.sigmoid((f_nyq - fk) / width) * live
             gain = 10.0 ** (tilt * (log2f0 + math.log2(float(kk))) / 20.0)
-            ph = phase * kk + ang[..., j]
+            ph = phase * kk + torch.angle(cj)
             if rps is not None:
                 ph = ph + rps[..., j]
-            du = du + 2.0 * mag[..., j] * mask * gain * torch.cos(ph)
+            du = du + 2.0 * cj.abs() * mask * gain * torch.cos(ph)
         du = du * amp
         # 성문 개방기 (LF: 0 ~ te 가 열림) -> 기식 AM 마스크
         frac = phase / (2 * math.pi)
