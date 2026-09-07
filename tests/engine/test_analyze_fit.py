@@ -341,3 +341,36 @@ def test_fitter_calibrates_voiced_and_unvoiced_levels_separately(_engine):
     f = CopySynthFitter(_engine, target, 48000, init)
     assert np.asarray(f.track.voiced).shape == (init.n_frames,)   # 마스크가 전달된다
     assert abs(f.gain_db()) < 40.0
+
+
+def test_global_lr_is_chosen_by_probe_not_hardcoded(_engine):
+    """전역 단계의 걸음 크기는 **구간마다 다르다** — 짧게 재 보고 고른다.
+
+    실측: 40 ms 탄음은 lr 0.05 에서 포락 60.3 %, 0.02 에서 90.9 % (lr 에 단조).
+    반대로 기울기가 7 dB/oct 틀린 합성 모음은 0.02 로 못 돌아오고 0.05 가 필요하다.
+    """
+    tr = _track()
+    target = _engine.render(tr)
+    bad = ControlTrack(tr.values.copy(), tr.frame_ms)
+    bad["tilt"] = 9.0
+    f = CopySynthFitter(_engine, target, 48000, bad)
+    f.sizes = [256, 512]
+    before = f._snapshot()
+    lr = f.pick_lr_global((0.01, 0.05, 0.2), 25, verbose=False)
+    assert lr in (0.01, 0.05, 0.2)
+    # 탐침은 출발점을 되돌려 놓아야 한다 — 안 그러면 고른 lr 로 다시 못 돈다
+    after = f._snapshot()
+    for a, b in zip(before, after):
+        assert torch.equal(a, b)
+
+
+def test_probe_prefers_the_lr_that_actually_converges(_engine):
+    """탐침이 손실을 실제로 더 내리는 lr 을 고른다 (발산하는 값을 안 고른다)."""
+    tr = _track()
+    target = _engine.render(tr)
+    bad = ControlTrack(tr.values.copy(), tr.frame_ms)
+    bad["tilt"] = 9.0
+    f = CopySynthFitter(_engine, target, 48000, bad)
+    f.sizes = [256, 512]
+    lr = f.pick_lr_global((0.05, 3.0), 25, verbose=False)
+    assert lr == 0.05, lr                     # 3.0 은 발산한다

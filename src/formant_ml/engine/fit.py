@@ -503,13 +503,52 @@ class CopySynthFitter:
             env = fine = db = lv = float("nan"); per = {}
         return FitReport(env, fine, db, per, lv, len(hist), hist)
 
+    def _snapshot(self):
+        return (self.w.detach().clone(), self.d.detach().clone(),
+                self.log_gain.detach().clone(), self.pulse_phi0.detach().clone())
+
+    def _restore(self, snap) -> None:
+        with torch.no_grad():
+            self.w.copy_(snap[0]); self.d.copy_(snap[1])
+            self.log_gain.copy_(snap[2]); self.pulse_phi0.copy_(snap[3])
+
+    def pick_lr_global(self, candidates, iters: int, verbose: bool = True) -> float:
+        """짧은 탐침으로 전역 단계의 lr 을 고른다.
+
+        **구간마다 맞는 걸음 크기가 다르다.** 40 ms 짜리 탄음은 lr 0.05 에서 포락
+        60.3 % 인데 0.02 면 90.9 % 다 (실측, lr 에 단조). 반대로 소스 기울기가 7 dB/oct
+        틀린 합성 모음은 0.02 로는 못 돌아오고 0.05 가 필요하다. 하나로 못 정하므로
+        짧게 재 보고 손실이 가장 낮은 것을 쓴다.
+        """
+        start = self._snapshot()
+        best = (float("inf"), float(candidates[0]))
+        for lr in candidates:
+            self._restore(start)
+            rep = self.fit(iters, float(lr), 10 ** 9, False,
+                           params=[self.d, self.log_gain, self.pulse_phi0], sizes=STAGES[0])
+            if np.isfinite(rep.loss) and rep.loss < best[0]:
+                best = (rep.loss, float(lr))
+            if verbose:
+                print(f"      lr {float(lr):5.3f} -> 손실 {rep.loss:.4f}")
+        self._restore(start)
+        return best[1]
+
     def fit_staged(self, global_iters: int = 200, stage_iters: int = 150,
-                   lr_global: float = 0.05, lr_frame: float = 0.04,
+                   lr_global=(0.015, 0.03, 0.05, 0.09), lr_frame: float = 0.04,
                    verbose: bool = True, log_every: int = 50) -> FitReport:
         """전역 스칼라 -> 제어 격자를 성기게에서 촘촘하게, 창도 함께 늘려 가며."""
         if verbose:
             print(f"  1 단계 전역 {len(self.names)} 스칼라 (이득 {self.gain_db():+.1f} dB)")
-        rep = self.fit(global_iters, lr_global, log_every, verbose,
+        if isinstance(lr_global, (int, float)):
+            lr_global = (float(lr_global),)
+        if len(lr_global) > 1:
+            probe = max(20, global_iters // 4)
+            lr_g = self.pick_lr_global(lr_global, probe, verbose)
+            if verbose:
+                print(f"      -> lr {lr_g:.3f} 선택")
+        else:
+            lr_g = float(lr_global[0])
+        rep = self.fit(global_iters, lr_g, log_every, verbose,
                        params=[self.d, self.log_gain, self.pulse_phi0], sizes=STAGES[0])
         for si, (grid, sizes) in enumerate(zip(GRID_MS, STAGES)):
             tc = self.set_grid(grid)
