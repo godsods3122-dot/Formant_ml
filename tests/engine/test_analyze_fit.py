@@ -3,8 +3,8 @@ import numpy as np
 import pytest
 import torch
 
-from formant_ml.engine.analyze import (envelope_to_lpc, lpc_formants, smooth_track,
-                                       true_envelope)
+from formant_ml.engine.analyze import (analyze, envelope_to_lpc, lpc_formants,
+                                       smooth_track, true_envelope)
 from formant_ml.engine.control import ControlTrack, INDEX, default_vector
 from formant_ml.engine.denoise import denoise, noise_profile, snr_report
 from formant_ml.engine.fit import CopySynthFitter, mel_bank
@@ -259,3 +259,34 @@ def test_loss_ignores_bands_above_the_recording_nyquist(_engine):
     # 같은 신호를 48 kHz 로 주면 상한이 더 높다
     g = CopySynthFitter(_engine, y, 48000, tr)
     assert g.f_max > f.f_max
+
+
+def test_intensity_dip_goes_to_the_tract_not_the_lungs():
+    """빠른 세기 변화는 **구강 방사**(tract_gain)로, 느린 것만 폐압(p_sub)으로.
+
+    폐는 20 ms 만에 압력을 못 바꾼다. 자음의 세기 골(탄음 −9 dB / 40 ms, 비음 폐쇄,
+    파열음)은 구강이 닫혀 방사가 줄어서 생긴다. 전부 p_sub 로 보내면 −9 dB 가
+    −1.1 dB 로 뭉개진다(실측: 여성 탄음에서 p_sub 진폭이 1.05 cmH2O 뿐이었다).
+    """
+    fs = 16000
+    x = _synthetic_vowel(fs, dur=0.4)
+    # 40 ms 짜리 −9 dB 골을 낸다 (탄음 모양)
+    t = np.arange(len(x)) / fs
+    dip = 1.0 - (1.0 - 10 ** (-9.0 / 20.0)) * np.exp(-((t - 0.2) / 0.014) ** 2)
+    y = x * dip
+    prof = DEFAULT_PROFILE
+    tr = analyze(y, fs, prof, int(0.001 * fs))
+    g_db = 20 * np.log10(tr["tract_gain"])
+    p = tr["p_sub"]
+    assert g_db.max() - g_db.min() > 5.0, g_db.max() - g_db.min()   # 골이 이득에 실렸다
+    assert p.max() - p.min() < 1.0, p.max() - p.min()               # 폐압은 거의 안 움직인다
+    lo = int(0.2 * 1000)
+    assert g_db[lo - 5:lo + 5].mean() < g_db[:60].mean() - 4.0      # 골이 제자리에 있다
+
+
+def test_steady_vowel_keeps_tract_gain_flat():
+    """정상 모음에서는 이득이 평탄해야 한다 — 골 검출이 아무 데서나 튀면 안 된다."""
+    fs = 16000
+    tr = analyze(_synthetic_vowel(fs, dur=0.3), fs, DEFAULT_PROFILE, int(0.001 * fs))
+    g_db = 20 * np.log10(tr["tract_gain"])
+    assert g_db.max() - g_db.min() < 3.0, g_db.max() - g_db.min()

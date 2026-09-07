@@ -176,6 +176,7 @@ def analyze(y: np.ndarray, sr: int, prof: SpeakerProfile, hop: int,
     w = np.hanning(win)
     order = order or 14
     vals = np.tile(default_vector(), (n, 1))
+    rms_db = np.zeros(n)
     f0_last = prof.f0_nominal
     for i in range(n):
         t = (i + 0.5) * step
@@ -205,7 +206,7 @@ def analyze(y: np.ndarray, sr: int, prof: SpeakerProfile, hop: int,
         hi = p[(fr >= 3000) & (fr < 16000)].sum() + 1e-20
         vals[i, INDEX["f0_target"]] = f0
         # 세기 -> 폐압. 발성 역치가 3~5 cmH2O 이므로 그 위에서 로그로 편다.
-        vals[i, INDEX["p_sub"]] = np.clip(3.0 + 5.0 * (20 * np.log10(rms) + 60) / 40.0, 0.0, 16.0)
+        rms_db[i] = 20 * np.log10(rms)
         vals[i, INDEX["adduction"]] = np.clip(0.10 + 0.5 * (h + 5) / 25.0, 0.02, 0.85)
         vals[i, INDEX["tension"]] = np.clip(
             np.log(f0 / prof.f0_lo) / np.log(prof.f0_hi / prof.f0_lo), 0.0, 1.0)
@@ -227,7 +228,16 @@ def analyze(y: np.ndarray, sr: int, prof: SpeakerProfile, hop: int,
         r = 10 * np.log10(hi / lo)
         vals[i, INDEX["a_c"]] = float(np.clip(3.0 * 10 ** (-(r + 10) / 25.0), 0.06, 3.0))
         vals[i, INDEX["front_len"]] = prof.sib_front_len_cm
-        vals[i, INDEX["tract_gain"]] = 1.0
+
+    # **세기를 폐압에만 실으면 안 된다.** 폐는 20 ms 만에 압력을 못 바꾼다. 자음의
+    # 세기 골(탄음 −9 dB / 40 ms, 비음 폐쇄, 파열음)은 **구강이 닫혀 방사가 줄어서**
+    # 생긴다. 전부 p_sub 로 보내면 −9 dB 가 −1.1 dB 로 뭉개진다(실측: 여성 탄음에서
+    # p_sub 진폭이 1.05 cmH2O 뿐이었다). 느린 성분(호흡, 150 ms)만 폐압에 싣고
+    # 빠른 성분(조음, 10~40 ms)은 성도 출력 이득으로 보낸다.
+    slow = smooth_track(rms_db, max(3, int(round(75.0 / (1000.0 * hop / sr))) | 1),
+                        max(2, int(round(150.0 / (1000.0 * hop / sr)))))
+    vals[:, INDEX["p_sub"]] = np.clip(3.0 + 5.0 * (slow + 60) / 40.0, 0.0, 16.0)
+    vals[:, INDEX["tract_gain"]] = np.clip(10.0 ** ((rms_db - slow) / 20.0), 0.05, 4.0)
     tr = ControlTrack(vals, frame_ms=1000.0 * hop / sr)
     # 프레임률에 맞춰 평활. 5 ms 프레임이면 창 수를 줄인다.
     fm = tr.frame_ms
@@ -237,8 +247,9 @@ def analyze(y: np.ndarray, sr: int, prof: SpeakerProfile, hop: int,
     for k in range(1, n_formants + 1):
         tr[f"f{k}"] = smooth_track(tr[f"f{k}"], m, a_f)
         tr[f"bw{k}"] = smooth_track(tr[f"bw{k}"], m, a_s)
-    for k in ("f0_target", "p_sub", "adduction", "tension", "a_c"):
+    for k in ("f0_target", "adduction", "tension", "a_c"):
         tr[k] = smooth_track(tr[k], m, a_f)
+    tr["tract_gain"] = smooth_track(tr["tract_gain"], m, max(2, int(round(6.0 / fm))))
     # **F0 는 펄스 열이 우선한다.** 피치 궤적은 프레임마다 독립이라 0.5 % 씩 흔들리고,
     # 위상은 그 누적합이라 200 ms 면 0.24 주기가 어긋난다. 펄스에서 만든 F0 는 그 누적
     # 오차가 원리적으로 없다. 무성 구간에서는 펄스가 없으므로 궤적 값을 그대로 둔다.
