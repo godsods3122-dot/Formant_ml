@@ -30,7 +30,19 @@ export OMP_NUM_THREADS=2            # 일부 컨테이너에서 torch 4 스레�
 
 python -m pytest tests/engine -q                    # v2 성질 테스트
 python scripts/v2_listen.py --out out/v2 --profile profiles/yang_female.json --praat   # 청취 세트 9 종 + 측정표
+
+# 복사합성 — 녹음을 정답으로 두고 물리 파라미터를 역추정한다 (0.3.x 의 주 작업 방식)
+python scripts/copyfit.py data/ref/female_yang_ilin-ilsil.wav \
+    --profile profiles/yang_female.json --from 2.86 --to 3.06 --out out/fit
+# -> out/fit_target.wav / out/fit_fit.wav / out/fit_track.npz / out/fit_report.json
+#    포락 일치 %, 정밀 일치 %, 멜 대역 평균 오차 dB, 대역 에너지 표
+
+python scripts/calibrate_levels.py --write        # 제스처 세기를 프로파일 실측 목표에 맞춘다
 ```
+
+> **지표가 맞는데 소리가 틀리면 지표를 더 만들지 말고 복사합성을 돌려라.** 손으로
+> 작곡하는 방식에는 비교할 정답이 없어서 틀린 곳을 좁힐 수 없다. 이 적합기는 도구이자
+> 진단기다 — 실제로 이걸 돌려서 엔진 결함 다섯 개를 잡았다 (docs/adr/0012, HANDOFF §5.0).
 
 ```python
 from formant_ml.engine import VoiceEngine, phones
