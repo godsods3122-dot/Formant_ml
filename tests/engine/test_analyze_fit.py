@@ -203,3 +203,59 @@ def test_penalty_punishes_out_of_order_formants(_engine):
         f.w[:, i2] = -20.0 / float(f.scale[i2])       # F2 를 F1 아래로
         p1 = float(f.penalty())
     assert p0 < 1e-9 < p1
+
+
+@pytest.mark.parametrize("name", ["f0_target", "p_sub", "f1", "bw1", "a_c", "velum"])
+def test_engine_does_not_raise_on_nan_control(_engine, name):
+    """제어열에 NaN 이 들어와도 엔진은 **예외를 던지지 않는다**.
+
+    던지면 적합기의 "손실이 비유한이면 중단" 가드가 손실을 보기도 전에 죽어서 원인을
+    못 찾는다(실측: `f0` 가 NaN 일 때 하모닉 상한 계산의 `int(NaN)` 에서 터졌다).
+    NaN 은 출력으로 전파되거나(가드가 잡는다) 조건 분기에서 흡수되면 된다.
+    """
+    tr = _track()
+    ctrl = tr.to_tensor()
+    ctrl[0, 10, INDEX[name]] = float("nan")
+    _engine.reset()
+    out = _engine(ctrl, [], 0.0)                    # 던지지 않는 것이 전부다
+    assert out["audio"].shape[1] == tr.n_frames * _engine.cfg.hop
+
+
+def test_fitter_skips_steps_with_nonfinite_gradients(_engine):
+    """비유한 기울기가 나온 회차는 건너뛴다 — Adam 모멘트가 오염되면 되돌릴 수 없다."""
+    tr = _track()
+    f = CopySynthFitter(_engine, _engine.render(tr), 48000, tr)
+    l, _, _, _ = f.loss()
+    l.backward()
+    f.w.grad[0, 0] = float("nan")
+    before = f.w.detach().clone()
+    opt = torch.optim.Adam([f.w], lr=0.1)
+    ps = [f.w]
+    if any(p.grad is not None and not torch.isfinite(p.grad).all() for p in ps):
+        for p in ps:
+            p.grad = None
+    else:
+        opt.step()
+    assert torch.equal(f.w.detach(), before)
+    rep = f.fit(4, 0.05, 999, verbose=False, sizes=(256,))
+    assert np.isfinite(rep.loss)
+
+
+def test_loss_ignores_bands_above_the_recording_nyquist(_engine):
+    """44.1 kHz 녹음을 목표로 주면 손실이 그 나이퀴스트 위를 보지 않는다.
+
+    48 kHz 로 올린 44.1 kHz 신호는 22.05~24 kHz 가 정확히 비어 있다. 그걸 목표로
+    두면 적합기가 "저 위를 비워라" 를 물리 파라미터로 달성하려 든다.
+    """
+    tr = _track()
+    y = _engine.render(tr)
+    from scipy.signal import resample_poly
+    y441 = resample_poly(y, 441, 480)
+    f = CopySynthFitter(_engine, y441, 44100, tr)
+    assert f.f_max == pytest.approx(0.90 * 22050.0)
+    for k in (256, 4096):
+        assert f.tgt_S[k].shape[1] == f.bin_max[k]
+        assert f.bin_max[k] < k // 2 + 1              # 실제로 잘렸다
+    # 같은 신호를 48 kHz 로 주면 상한이 더 높다
+    g = CopySynthFitter(_engine, y, 48000, tr)
+    assert g.f_max > f.f_max

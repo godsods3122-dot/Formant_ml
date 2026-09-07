@@ -223,7 +223,12 @@ class GlottalSource(nn.Module):
         f_cut = f_nyq + 6.0 * width                    # 이 위는 마스크를 정확히 0 으로 (청크 무관 상한)
         log2f0 = torch.log2(f0.clamp_min(1.0) / 1000.0)
         du = torch.zeros_like(phase)
-        k_max = int(torch.clamp(torch.ceil(f_cut / f0.detach().min().clamp_min(1.0)), 1, len(k)).item())
+        # NaN 안전. f0 에 NaN 이 들어오면 ceil(NaN) 이 그대로 통과해 int(NaN) 에서
+        # **예외로 터진다** — 적합기의 "손실이 비유한이면 중단" 가드가 손실을 보기도 전이라
+        # 원인을 못 찾는다. 하모닉 상한만 정하는 값이므로 NaN 은 상한으로 접고, 잘못된
+        # 값은 아래 du 계산에서 NaN 으로 **전파**시켜 가드가 잡게 둔다.
+        f0_min = torch.nan_to_num(f0.detach(), nan=1.0, posinf=1.0).min().clamp_min(1.0)
+        k_max = int(torch.clamp(torch.ceil(f_cut / f0_min), 1, len(k)).item())
         for j in range(k_max):
             kk = k[j]
             fk = f0 * kk
