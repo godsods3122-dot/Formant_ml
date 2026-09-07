@@ -74,3 +74,51 @@ def test_keyframe_track_defaults_before_first_key_and_zero_hold():
     assert tr["lat_z1"][50] == 0.0 and tr["lat_z1"][150] == 3000.0 and tr["lat_z1"][250] == 0.0
     assert 500 < tr["f1"][150] < 800 and tr["f1"][50] == 0.0
     assert abs(tr["f1"][250] - 800.0) < 1e-6
+
+
+def test_residual_is_disabled_where_frication_is_active():
+    """치찰음은 학습에 맡기지 않는다 — 잔차 EQ 가 마찰 구간에 닿으면 안 된다.
+
+    잔차 EQ 는 전 대역·전 구간에 걸리므로 막지 않으면 치찰음 물리가 틀렸을 때
+    신경망이 ±6 dB 로 덮어 버린다. 그러면 물리는 틀린 채로 남고, 학습 데이터에 없는
+    새 발화에서 치찰음이 무너진다. 규칙을 코드가 강제하게 둔다.
+    """
+    import numpy as np
+    from formant_ml.engine.control import ControlTrack, default_vector
+    eng = VoiceEngine(EngineConfig(sample_rate=48000, frame_ms=1.0, residual=True))
+    # 잔차 헤드를 항등이 아니게 만든다 (학습된 상태를 흉내)
+    with torch.no_grad():
+        for p in eng.residual.body.parameters():
+            if p.dim() > 1:
+                p.add_(torch.randn_like(p) * 0.3)
+        eng.residual.head_bias_nonzero = True
+    n = 300
+    v = np.tile(default_vector(), (n, 1))
+    tr = ControlTrack(v, 1.0)
+    tr["p_sub"] = 8.0; tr["f0_target"] = 220.0; tr["residual_mix"] = 1.0
+    tr["f1"] = 700; tr["f2"] = 1400; tr["f3"] = 2600; tr["f4"] = 3600
+    tr["a_c"] = 3.0                                   # 모음 자세: 마찰 없음
+    tr["a_c"][120:200] = 0.08                         # 가운데만 협착 (마찰)
+    tr["adduction"] = 0.6
+    tr["adduction"][120:200] = 0.05
+    tr["fric_gain"] = 6.0
+    tr = tr.clamp()
+    ctrl = tr.to_tensor()
+    eng.reset()
+    out = eng(ctrl, [], 0.0)
+    fr = out["fric"][0]
+    hop = eng.cfg.hop
+    on = (fr.abs() > 0)
+    assert on.any(), "마찰이 실제로 켜져야 검사가 성립한다"
+    # 마찰이 켜진 구간에서는 잔차가 적용되지 않아야 한다:
+    # residual_mix 를 0 으로 둔 렌더와 그 구간의 파형이 같아야 한다.
+    tr2 = ControlTrack(tr.values.copy(), tr.frame_ms)
+    tr2["residual_mix"] = 0.0
+    eng.reset()
+    out2 = eng(tr2.clamp().to_tensor(), [], 0.0)
+    a, b = out["audio"][0], out2["audio"][0]
+    i = torch.nonzero(on).flatten()
+    core = i[(i > i.min() + hop) & (i < i.max() - hop)]     # 경계 팽창 제외한 안쪽
+    assert len(core) > 100
+    d = (a[core] - b[core]).abs().max()
+    assert float(d) < 1e-5, float(d)
