@@ -69,7 +69,10 @@ GLOBAL_PARAMS = frozenset((
 # 묶어 둔다. 약하게 푸는 것은 수준·음질 계열뿐이다.
 PRIOR_W: dict[str, float] = {
     "f0_target": 40.0, "f1": 40.0, "f2": 40.0, "f3": 20.0, "f4": 10.0,
-    "velum": 20.0, "oral_open": 20.0, "nasal_f": 20.0, "nasal_f2": 20.0,
+    # 곁가지는 분석이 못 재는 양이다. 세게 묶으면 적합기가 열지를 못한다 —
+    # 남 /나/ 머머가 "이득 −24 dB 내린 모음" 으로 굳던 원인.
+    "velum": 3.0, "oral_open": 3.0, "lat_mix": 1.0, "lat_bw": 2.0,
+    "nasal_f": 20.0, "nasal_f2": 20.0,
     "nasal_f3": 20.0, "nasal_z": 20.0, "nasal_gain": 10.0, "nasal_damp": 10.0,
     "a_c": 10.0, "obstacle": 10.0, "front_len": 10.0, "back_leak": 5.0,
     "bw1": 2.0, "bw2": 2.0, "bw3": 2.0, "bw4": 2.0,
@@ -92,6 +95,7 @@ STEP: dict[str, float] = {
     "f0_target": 0.15, "f1": 0.25, "f2": 0.25, "f3": 0.3, "f4": 0.3,
     "bw1": 0.5, "bw2": 0.5, "bw3": 0.5, "bw4": 0.5,
     "velum": 0.5, "oral_open": 0.5, "a_c": 0.5, "front_len": 0.3,
+    "lat_mix": 0.5, "lat_bw": 0.3,
     "jitter": 0.5, "shimmer": 0.5,
     "nasal_f": 0.3, "nasal_f2": 0.3, "nasal_f3": 0.3, "nasal_z": 0.3,
 }
@@ -107,6 +111,9 @@ DEFAULT_PARAMS = (
     "tract_gain", "a_c", "fric_gain", "obstacle", "back_leak", "front_len",
     "velum", "oral_open", "nasal_f", "nasal_f2", "nasal_f3", "nasal_z",
     "nasal_damp", "nasal_gain",
+    # 곁가지(side branch)를 적합 대상에 넣는다. 이게 빠져 있으면 설측·비음처럼
+    # 곁가지가 정의적 특징인 조음을 **원리적으로 못 맞춘다** (실측 §8.4).
+    "lat_mix", "lat_bw",
 )
 
 

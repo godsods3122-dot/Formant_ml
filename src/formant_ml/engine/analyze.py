@@ -256,6 +256,17 @@ def analyze(y: np.ndarray, sr: int, prof: SpeakerProfile, hop: int,
         rband[i] = r
         vals[i, INDEX["a_c"]] = float(np.clip(3.0 * 10 ** (-(r + 10) / 25.0), 0.06, 3.0))
         vals[i, INDEX["front_len"]] = prof.sib_front_len_cm
+        # **측지 분기를 켜 둔다(깊이 0 에 가깝게).** 설측음의 정의적 특징은 혀 옆으로
+        # 공기가 흐르며 생기는 반공진인데, 지금까지 `lat_*` 가 전부 0 이라 적합기에
+        # 그걸 만들 수단이 아예 없었다(실측: 설측 위상 오차 89.5°, 사전을 40 -> 0.5 로
+        # 풀어도 변화 없음 — 자유도가 묶인 게 아니라 **없었다**).
+        # 주파수는 로그 파라미터라 0 이면 적합 대상에서 빠지므로 미리 켜고, 깊이만
+        # `lat_mix` 로 0 부근에서 시작한다. 정확히 0 이면 `_lateral` 이 조기 반환해
+        # 기울기가 안 흐르므로 0.05 로 둔다 (대역폭이 20 배로 벌어져 음향 효과는 없다).
+        vals[i, INDEX["lat_z1"]] = float(prof.lateral["zeros"][0])
+        vals[i, INDEX["lat_z2"]] = float(prof.lateral["zeros"][1])
+        vals[i, INDEX["lat_bw"]] = float(prof.lateral["zero_bw"])
+        vals[i, INDEX["lat_mix"]] = 0.05
 
     # **세기를 폐압에만 실으면 안 된다.** 폐는 20 ms 만에 압력을 못 바꾼다. 자음의
     # 세기 골(탄음 −9 dB / 40 ms, 비음 폐쇄, 파열음)은 **구강이 닫혀 방사가 줄어서**
