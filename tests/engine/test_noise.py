@@ -39,14 +39,17 @@ def test_frication_silent_open_and_loud_closed():
     N = 200 * HOP
     ph = torch.zeros(1, N); vo = torch.zeros(1, N)
     with torch.no_grad():
-        o = n(_ctrl(200, p_sub=7.5, a_c=3.0), torch.full((1, N), 0.07), ph, vo)   # 모달 성문 + 모음
-        c = n(_ctrl(200, p_sub=7.5, a_c=0.10), torch.full((1, N), 0.46), ph, vo)  # 벌린 성문 + /s/
+        o = n(_ctrl(200, p_sub=7.5, a_c=3.0), torch.full((1, 200), 0.07), ph, vo)   # 모달 성문 + 모음
+        c = n(_ctrl(200, p_sub=7.5, a_c=0.10), torch.full((1, 200), 0.46), ph, vo)  # 벌린 성문 + /s/
     assert float(o["source"].abs().max()) < 1e-6
     assert float(c["source"].pow(2).mean()) > 0
     y = c["source"][0].numpy()
     f = np.fft.rfftfreq(len(y), 1 / FS); Y = np.abs(np.fft.rfft(y)) ** 2
-    hi = Y[(f > 13000)].sum() / Y[(f > 2000) & (f < 6000)].sum()
-    assert hi < 0.3                                        # 소스는 13 kHz 위에서 절벽
+    # 소스는 광대역이다(정점은 앞공동이 만든다). 저역이 죽지 않았는지, 그리고 위쪽 절벽이
+    # 있는지만 본다 — 대역통과로 두었을 때 1~2 kHz 가 실측보다 15 dB 낮았다(ADR 0011).
+    band = lambda a, b: Y[(f > a) & (f < b)].sum()
+    assert band(1000, 2000) / band(4000, 8000) > 0.05
+    assert band(18000, 24000) / band(4000, 8000) < 3.0
 
 
 def test_template_bank_modulation_and_growth():

@@ -26,6 +26,7 @@ import torch.nn as nn
 from .control import INDEX, PARAM_NAMES, ControlTrack, frames_to_samples
 from .glottis import GlottalSource
 from .noise import AspirationNoise, FricationNoise, TransientTemplateBank
+from .profile import SpeakerProfile
 from .residual import ResidualCorrector
 from .rng import NoiseBank
 from .tract import VocalTract
@@ -47,11 +48,15 @@ class EngineConfig:
 
 
 class VoiceEngine(nn.Module):
-    def __init__(self, cfg: EngineConfig | None = None):
+    def __init__(self, cfg: EngineConfig | None = None, profile: SpeakerProfile | None = None):
         super().__init__()
         self.cfg = cfg or EngineConfig()
+        self.profile = profile
         fs, hop = self.cfg.sample_rate, self.cfg.hop
-        self.glottis = GlottalSource(fs, hop, speaker=self.cfg.speaker)
+        f0r = (profile.f0_lo, profile.f0_hi, profile.f0_nominal) if profile else None
+        if profile:
+            self.cfg.tract_length_cm = profile.tract_length_cm
+        self.glottis = GlottalSource(fs, hop, speaker=self.cfg.speaker, f0_range=f0r)
         self.frication = FricationNoise(fs, hop)
         self.aspiration = AspirationNoise(fs, hop)
         self.transients = TransientTemplateBank(fs)
@@ -84,7 +89,7 @@ class VoiceEngine(nn.Module):
         f0i, s0 = st["frame"], st["frame"] * hop
         g = self.glottis(c, phase0=st["phase"], noise=self.noise, frame0=f0i,
                          amp0=st["amp"], state=st["glottis"], emit=t)
-        fr = self.frication(c, g["ag_dc"], g["phase"], g["voiced"], noise=self.noise,
+        fr = self.frication(c, g["ag_dc_frames"], g["phase"], g["voiced"], noise=self.noise,
                             frame0=f0i, state=st["fric"], emit=t)
         asp = self.aspiration(g["asp_env"], noise=self.noise, sample0=s0, state=st["asp"])
         ev = [dict(e, t=e["t"] - t_offset_s) for e in (events or [])
@@ -105,7 +110,8 @@ class VoiceEngine(nn.Module):
         st["frame"] += t
         return dict(audio=y, du=g["du"], fric=fr["source"], asp=asp["source"], transient=tr,
                     glottal_path=out["glottal_path"], front_path=out["front_path"],
-                    f0=g["f0"], amp=g["amp"], reynolds=fr["reynolds"], state=st)
+                    f0=g["f0"], amp=g["amp"], phase=g["phase"], reynolds=fr["reynolds"],
+                    state=st)
 
     # ------------------------------------------------------------ 편의 API
     @torch.no_grad()

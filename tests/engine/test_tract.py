@@ -48,23 +48,37 @@ def test_higher_pole_correction_keeps_highs_alive():
 def test_lateral_notch_is_local_and_flat_elsewhere():
     tr = VocalTract(FS, HOP)
     f, H0 = _impulse_response(tr, _ctrl(60, f1=459, f2=1914, f3=2907), 60)
-    f, H1 = _impulse_response(tr, _ctrl(60, f1=459, f2=1914, f3=2907, lat_z1=3300, lat_bw=350), 60)
+    f, H1 = _impulse_response(tr, _ctrl(60, f1=459, f2=1914, f3=2907, lat_z1=3300,
+                                       lat_bw=350, lat_mix=1.0), 60)
     d = H1 - H0
     assert d[(f > 3200) & (f < 3400)].min() < -8
     assert abs(d[(f > 300) & (f < 1500)]).max() < 1.0      # 저역은 그대로
     assert abs(d[(f > 8000) & (f < 12000)]).mean() < 1.5   # 고역도 그대로 (DC 정규화 영점의 +25 dB 없음)
 
 
-def test_nasal_coupling_adds_pole_and_zero_and_off_is_identity():
+def test_nasal_branch_is_parallel_and_off_is_identity():
+    """비강은 캐스케이드에 얹은 필터가 아니라 **병렬 분기**다 (ADR 0010).
+
+    * velum=0 이면 출력이 비강 없는 것과 정확히 같다.
+    * velum=1, oral_open=0 (머머) 이면 저역은 살아 있고 중역만 죽는다 —
+      실측에서 80~300 Hz 가 모음과 ±2 dB 로 연속이었던 그 성질.
+    """
     tr = VocalTract(FS, HOP)
-    f, H0 = _impulse_response(tr, _ctrl(60, f1=350, f2=1400, f3=2600), 60)
-    f, H1 = _impulse_response(tr, _ctrl(60, f1=350, f2=1400, f3=2600, velum=1.0,
-                                         nasal_f=280, nasal_z=1700), 60)
-    d = H1 - H0
-    assert d[(f > 1600) & (f < 1800)].min() < -6
-    assert d[(f > 240) & (f < 320)].max() > 0
-    f, H2 = _impulse_response(tr, _ctrl(60, f1=350, f2=1400, f3=2600, velum=0.0), 60)
-    assert np.abs(H2 - H0).max() < 1e-6
+    f, H0 = _impulse_response(tr, _ctrl(60, f1=700, f2=1200, f3=2500), 60)
+    f, Hoff = _impulse_response(tr, _ctrl(60, f1=700, f2=1200, f3=2500, velum=0.0), 60)
+    assert np.abs(Hoff - H0).max() < 1e-6
+    f, Hm = _impulse_response(tr, _ctrl(60, f1=700, f2=1200, f3=2500, velum=1.0,
+                                        oral_open=0.0, nasal_f=350, nasal_f2=1200,
+                                        nasal_f3=2000, nasal_z=1400, nasal_damp=1.2), 60)
+    lo = slice(*np.searchsorted(f, [100, 400]))
+    mid = slice(*np.searchsorted(f, [900, 2500]))
+    assert Hm[lo].mean() > H0[lo].mean() - 8          # 저역은 모음과 비슷하게 남는다
+    # 머머는 모음보다 훨씬 저역 지배적이다 (저역−중역 차이가 크게 벌어진다)
+    assert (Hm[lo].mean() - Hm[mid].mean()) > (H0[lo].mean() - H0[mid].mean()) + 8
+    # 비음화 모음: 구강도 열려 있으면 두 분기가 더해진다 (간섭 = 극-영점 쌍)
+    f, Hn = _impulse_response(tr, _ctrl(60, f1=700, f2=1200, f3=2500, velum=0.6,
+                                        oral_open=1.0, nasal_f=350), 60)
+    assert not np.allclose(Hn, H0, atol=0.5)
 
 
 def test_streaming_state_matches_offline():

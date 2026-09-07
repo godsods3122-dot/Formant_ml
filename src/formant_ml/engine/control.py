@@ -41,7 +41,7 @@ _P: list[ParamSpec] = [
     ParamSpec("f0_target", "Hz", 50.0, 800.0, 0.0, True, "0 이 아니면 tension 대신 F0 직접 지정"),
     ParamSpec("f0_scale", "ratio", 0.5, 2.0, 1.0, True, "F0 배율(억양). 토큰이 주로 만진다"),
     ParamSpec("rd_offset", "Rd", -1.5, 1.5, 0.0, False, "LF Rd 오프셋(음질: -압착 / +기식)"),
-    ParamSpec("tilt", "dB/oct", -12.0, 12.0, 0.0, False, "소스 추가 기울기 @1 kHz"),
+    ParamSpec("tilt", "dB/oct", -12.0, 12.0, 2.0, False, "소스 추가 기울기 @1 kHz (실측 적합 +2)"),
     ParamSpec("jitter", "ratio", 0.0, 0.05, 0.004, False, "주기 요동"),
     ParamSpec("shimmer", "ratio", 0.0, 0.2, 0.03, False, "진폭 요동"),
     ParamSpec("aspiration", "0-1", 0.0, 1.0, 1.0, False, "성문 난류 배율(물리량 위에 곱)"),
@@ -58,17 +58,28 @@ _P: list[ParamSpec] = [
     # --- 협착 / 마찰 노이즈 (물리) ---------------------------------------
     ParamSpec("a_c", "cm2", 0.0, 8.0, 3.0, False, "구강 최협착 단면적. 작을수록 마찰"),
     ParamSpec("c_place", "0-1", 0.0, 1.0, 0.9, False, "협착 위치 (0 성문 ~ 1 입술). 앞공동 길이"),
-    ParamSpec("front_len", "cm", 0.3, 6.0, 0.0, False, "앞공동 길이 직접 지정(0 이면 c_place 로)"),
+    ParamSpec("front_len", "cm", 0.3, 6.0, 0.0, True, "앞공동 길이 직접 지정(0 이면 c_place 로). 0↔값은 보간하지 않는다"),
     ParamSpec("obstacle", "0-1", 0.0, 1.0, 0.0, False, "제트가 장애물(앞니)을 때리는 정도(다이폴)"),
-    ParamSpec("fric_gain", "ratio", 0.0, 4.0, 1.0, False, "마찰 노이즈 배율(물리량 위에 곱)"),
+    ParamSpec("fric_gain", "ratio", 0.0, 64.0, 1.0, False,
+              "마찰 노이즈 배율(물리량 위에 곱). 상한 4 였을 때 파찰음이 10 dB 잘렸다"),
     ParamSpec("back_leak", "0-1", 0.0, 1.0, 0.3, False, "마찰음이 뒤공동/성도 전체로 새는 비율"),
     # --- 측지 / 비강 ---------------------------------------------------------
     ParamSpec("lat_z1", "Hz", 500.0, 8000.0, 0.0, True, "측지 영점 1 (0 이면 끔)"),
     ParamSpec("lat_z2", "Hz", 500.0, 8000.0, 0.0, True, "측지 영점 2"),
     ParamSpec("lat_bw", "Hz", 50.0, 3000.0, 300.0, True, "측지 영점 대역폭"),
-    ParamSpec("velum", "0-1", 0.0, 1.0, 0.0, False, "연구개 개방(비강 결합)"),
-    ParamSpec("nasal_f", "Hz", 150.0, 600.0, 280.0, True, "비강 극"),
-    ParamSpec("nasal_z", "Hz", 400.0, 3000.0, 900.0, True, "비강 영점(구강 폐쇄 위치 의존)"),
+    ParamSpec("lat_mix", "0-1", 0.0, 1.0, 0.0, False,
+              "측지 영점의 깊이 0~1. **주파수를 0 으로 껐다 켜면 안 된다** — 로그 파라미터는"
+              " 영차 유지라 한 프레임에 뛰고, 그 계수 도약이 클릭이 된다(측정: 8 배 스파이크)."),
+    ParamSpec("velum", "0-1", 0.0, 1.0, 0.0, False, "연구개 개방(비강 분기의 출력 비중)"),
+    ParamSpec("oral_open", "0-1", 0.0, 1.0, 1.0, False,
+              "구강 방사 개방도. 0 = 완전 폐쇄(비음·파열음의 폐쇄 구간)"),
+    ParamSpec("nasal_f", "Hz", 150.0, 600.0, 280.0, True, "비강 제 1 극"),
+    ParamSpec("nasal_f2", "Hz", 600.0, 2000.0, 1000.0, True, "비강 제 2 극"),
+    ParamSpec("nasal_f3", "Hz", 1500.0, 4000.0, 2200.0, True, "비강 제 3 극"),
+    ParamSpec("nasal_z", "Hz", 400.0, 4000.0, 1400.0, True,
+              "구강 측지 영점 — 폐쇄 위치가 정한다 (ㅁ 낮고 ㅇ 높다)"),
+    ParamSpec("nasal_damp", "ratio", 0.3, 3.0, 1.0, False, "비강 손실 배율 (대역폭 곱)"),
+    ParamSpec("nasal_gain", "ratio", 0.0, 8.0, 1.0, False, "비강 분기의 출력 배율(폐쇄 위치별 차이)"),
     # --- 과도음 이벤트 / 잔차 ---------------------------------------------------
     ParamSpec("transient", "0-1", 0.0, 1.0, 0.0, False, "과도음 템플릿 트리거 세기(임펄스로 쓴다)"),
     ParamSpec("transient_id", "index", 0.0, 63.0, 0.0, False, "템플릿 번호"),
@@ -89,6 +100,8 @@ class ControlTrack:
     values: np.ndarray
     frame_ms: float = 1.0
     events: list[dict] = field(default_factory=list)   # 샘플 정확도 과도음 이벤트
+    # 성문 폐쇄 시각(초, 트랙 시작 기준). 분석이 채우고 복사합성 적합이 위상 고정에 쓴다.
+    pulses: np.ndarray = field(default_factory=lambda: np.zeros(0))
 
     @property
     def n_frames(self) -> int:

@@ -142,3 +142,48 @@ def test_peaking_eq_gain_at_center():
     f = np.fft.rfftfreq(n, 1 / FS)
     assert abs(H[np.argmin(np.abs(f - 2000.0))] - 6.0) < 0.1
     assert abs(H[0]) < 0.05
+
+
+def test_fast_path_gradients_match_scan():
+    """numba 수반 역전파 == 결합 스캔의 autograd (값·기울기 모두).
+
+    이 등식이 복사합성 적합의 전제다 — 빠른 경로가 틀리면 적합이 조용히 엉뚱한 곳으로 간다.
+    """
+    if not T.HAVE_FAST:
+        pytest.skip("numba 없음")
+    B, N = 2, 3000
+    torch.manual_seed(0)
+    x0 = torch.randn(B, N, dtype=torch.float64)
+    f0 = torch.linspace(300.0, 2500.0, N, dtype=torch.float64).expand(B, N).clone()
+    bw0 = torch.full((B, N), 90.0, dtype=torch.float64)
+    zi0 = torch.randn(B, 2, dtype=torch.float64)
+    w = torch.linspace(1.0, 2.0, N, dtype=torch.float64)
+
+    def run(fast):
+        old = T.USE_FAST_PATH
+        T.USE_FAST_PATH = fast
+        try:
+            xs = [t.clone().requires_grad_(True) for t in (x0, f0, bw0, zi0)]
+            y, zf = T.tv_biquad(xs[0], *T.resonator_coeffs(xs[1], xs[2], FS), zi=xs[3])
+            ((y * w).sum() + zf.sum() * 0.3).backward()
+            return [y.detach(), zf.detach()] + [t.grad for t in xs]
+        finally:
+            T.USE_FAST_PATH = old
+
+    for a, b in zip(run(False), run(True)):
+        assert torch.allclose(a, b, atol=1e-8, rtol=1e-6), float((a - b).abs().max())
+
+
+def test_fast_path_is_much_faster():
+    if not T.HAVE_FAST:
+        pytest.skip("numba 없음")
+    import time
+    n = 48000
+    x = torch.randn(1, n)
+    co = T.resonator_coeffs(torch.full((1, n), 800.0), torch.full((1, n), 90.0), FS)
+    T.tv_biquad(x, *co)                                   # warm-up (jit)
+    t = time.time(); T.tv_biquad(x, *co); fast = time.time() - t
+    T.USE_FAST_PATH = False
+    t = time.time(); T.tv_biquad(x, *co); scan = time.time() - t
+    T.USE_FAST_PATH = True
+    assert fast < scan

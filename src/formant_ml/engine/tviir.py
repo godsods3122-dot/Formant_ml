@@ -77,6 +77,9 @@ def _bcast(c, like: torch.Tensor) -> torch.Tensor:
 
 
 SCAN_DTYPE = torch.float64     # 스캔은 float64 로. 아래 docstring 참조.
+# numba 수반 경로를 쓸지. 스캔과 수치가 같고 100~1000 배 빠르다 (복사합성 적합에 필수).
+# 끄면 순수 torch 결합 스캔으로 돌아간다(참조 구현, GPU/2 차 미분에 필요).
+USE_FAST_PATH = True
 
 
 def tv_biquad(x: torch.Tensor, b0, b1, b2, a1, a2,
@@ -95,6 +98,9 @@ def tv_biquad(x: torch.Tensor, b0, b1, b2, a1, a2,
     a1, a2 = _bcast(a1, x), _bcast(a2, x)
     if zi is not None:
         zi = zi.to(SCAN_DTYPE)
+    if USE_FAST_PATH and HAVE_FAST:
+        y, zf = _TVBiquadFast.apply(x, b0, b1, b2, a1, a2, zi)
+        return y.to(dt), zf
     v1 = (b1 - a1 * b0) * x
     v2 = (b2 - a2 * b0) * x
     if zi is not None:
@@ -129,6 +135,98 @@ def tv_biquad_seq(x, b0, b1, b2, a1, a2, zi=None):
         s1 = s1_new
         ys.append(y)
     return torch.stack(ys, -1), torch.stack([s1, s2], -1)
+
+
+# ------------------------------------------------- 빠른 경로: numba 순전파 + 수반 역전파
+#
+# 결합 스캔은 정확하고 병렬이지만 초당 오디오 9~42 초가 걸려 **복사합성 적합에 못 쓴다**.
+# 시변 선형 재귀의 역전파는 닫힌 형태가 있다 — 역방향으로 도는 재귀 하나뿐이다.
+#
+#   상태  s[n] = A[n]·s[n-1] + v[n],   A[n] = [[−a1,1],[−a2,0]],  v[n] = [(b1−a1b0)x, (b2−a2b0)x]
+#   출력  y[n] = b0[n]·x[n] + e1ᵀ·s[n-1]
+#
+#   수반  λ[n-1] = g[n]·e1 + A[n]ᵀ·λ[n]          (λ[N-1] = dL/dzf, 보통 0)
+#         dL/dx  = g·b0 + λ1(b1−a1b0) + λ2(b2−a2b0)
+#         dL/db0 = x(g − λ1a1 − λ2a2),  dL/db1 = λ1x,  dL/db2 = λ2x
+#         dL/da1 = −λ1y,               dL/da2 = −λ2y
+#
+# 상태를 저장할 필요가 없다(y 와 x 만 있으면 된다). 순전파·역전파 모두 O(N) 순차 루프라
+# numba 로 돌리면 스캔보다 100~1000 배 빠르다. 수치는 스캔의 autograd 와 대조해 고정한다
+# (tests/engine/test_tviir.py::test_fast_path_gradients_match_scan).
+
+try:
+    import numba as _nbf
+
+    @_nbf.njit(cache=True, fastmath=False, parallel=False)
+    def _tvb_fwd(x, b0, b1, b2, a1, a2, zi, y, zf):
+        B, N = x.shape
+        for b in range(B):
+            s1 = zi[b, 0]; s2 = zi[b, 1]
+            for n in range(N):
+                xn = x[b, n]
+                yn = b0[b, n] * xn + s1
+                s1n = b1[b, n] * xn - a1[b, n] * yn + s2
+                s2 = b2[b, n] * xn - a2[b, n] * yn
+                s1 = s1n
+                y[b, n] = yn
+            zf[b, 0] = s1; zf[b, 1] = s2
+
+    @_nbf.njit(cache=True, fastmath=False, parallel=False)
+    def _tvb_bwd(g, gzf, x, y, b0, b1, b2, a1, a2,
+                 gx, gb0, gb1, gb2, ga1, ga2, gzi):
+        B, N = x.shape
+        for b in range(B):
+            l1 = gzf[b, 0]; l2 = gzf[b, 1]
+            for n in range(N - 1, -1, -1):
+                # λ[n] = (l1, l2) 인 상태에서 계수·입력 기울기를 먼저 뽑는다
+                gx[b, n] = (g[b, n] * b0[b, n]
+                            + l1 * (b1[b, n] - a1[b, n] * b0[b, n])
+                            + l2 * (b2[b, n] - a2[b, n] * b0[b, n]))
+                gb0[b, n] = x[b, n] * (g[b, n] - l1 * a1[b, n] - l2 * a2[b, n])
+                gb1[b, n] = l1 * x[b, n]
+                gb2[b, n] = l2 * x[b, n]
+                ga1[b, n] = -l1 * y[b, n]
+                ga2[b, n] = -l2 * y[b, n]
+                # λ[n-1] = g[n]·e1 + A[n]ᵀ λ[n]
+                nl1 = g[b, n] - a1[b, n] * l1 - a2[b, n] * l2
+                nl2 = l1
+                l1 = nl1; l2 = nl2
+            gzi[b, 0] = l1; gzi[b, 1] = l2
+
+    HAVE_FAST = True
+except Exception:                                     # pragma: no cover
+    HAVE_FAST = False
+
+
+class _TVBiquadFast(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, b0, b1, b2, a1, a2, zi):
+        dev, dt = x.device, x.dtype
+        xn = x.detach().double().cpu().numpy()
+        co = [c.detach().double().cpu().numpy() for c in (b0, b1, b2, a1, a2)]
+        z = (zi.detach().double().cpu().numpy() if zi is not None
+             else np.zeros((xn.shape[0], 2)))
+        y = np.empty_like(xn); zf = np.empty((xn.shape[0], 2))
+        _tvb_fwd(np.ascontiguousarray(xn), *[np.ascontiguousarray(c) for c in co],
+                 np.ascontiguousarray(z), y, zf)
+        ctx.save_for_backward(x, torch.from_numpy(y).to(dev, dt), b0, b1, b2, a1, a2)
+        ctx.has_zi = zi is not None
+        return torch.from_numpy(y).to(dev, dt), torch.from_numpy(zf).to(dev, dt)
+
+    @staticmethod
+    def backward(ctx, gy, gzf):
+        x, y, b0, b1, b2, a1, a2 = ctx.saved_tensors
+        dev, dt = x.device, x.dtype
+        np_ = lambda t: np.ascontiguousarray(t.detach().double().cpu().numpy())
+        g = np_(gy) if gy is not None else np.zeros_like(np_(x))
+        gz = np_(gzf) if gzf is not None else np.zeros((x.shape[0], 2))
+        outs = [np.empty_like(g) for _ in range(6)]
+        gzi = np.empty((x.shape[0], 2))
+        _tvb_bwd(g, gz, np_(x), np_(y), np_(b0), np_(b1), np_(b2), np_(a1), np_(a2),
+                 *outs, gzi)
+        t = lambda a: torch.from_numpy(a).to(dev, dt)
+        return (t(outs[0]), t(outs[1]), t(outs[2]), t(outs[3]), t(outs[4]), t(outs[5]),
+                t(gzi) if ctx.has_zi else None)
 
 
 # ------------------------------------------------------------ numpy / numba
@@ -215,6 +313,21 @@ def notch_coeffs(f_hz, bw_zero_hz, fs: float, pole_ratio: float = 4.0):
     """
     rz = pole_radius(bw_zero_hz, fs)
     rp = pole_radius(bw_zero_hz * pole_ratio, fs)
+    cs = _cos(TWO_PI * f_hz / fs)
+    b1, b2 = -2.0 * rz * cs, rz * rz
+    a1, a2 = -2.0 * rp * cs, rp * rp
+    g = (1.0 + a1 + a2) / (1.0 + b1 + b2)
+    return g + 0.0 * b1, g * b1, g * b2, a1, a2
+
+
+def peak_coeffs(f_hz, bw_pole_hz, fs: float, zero_ratio: float = 3.0):
+    """극-영점 쌍 봉우리 (비강 극). 노치의 역: 같은 각도의 더 넓은 영점쌍으로 나눠 먼 대역은 1.
+
+    DC 정규화 공명기를 250 Hz 에 그냥 끼우면 그 위가 −12 dB/oct 로 굴러떨어져 비음 머머의
+    1~2 kHz 가 −57 dB 가 됐다(측정; 실측은 −20). 봉우리 높이 ≈ zero_ratio (9.5 dB @3).
+    """
+    rp = pole_radius(bw_pole_hz, fs)
+    rz = pole_radius(bw_pole_hz * zero_ratio, fs)
     cs = _cos(TWO_PI * f_hz / fs)
     b1, b2 = -2.0 * rz * cs, rz * rz
     a1, a2 = -2.0 * rp * cs, rp * rp

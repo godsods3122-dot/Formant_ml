@@ -91,11 +91,14 @@ class GlottalSource(nn.Module):
 
     def __init__(self, fs: float, hop: int, speaker: str = "female",
                  n_rd: int = 24, n_harm: int | None = None, k_growth: float = 0.25,
-                 cycles_decay: float = 3.0, f0_min: float = 50.0):
+                 cycles_decay: float = 3.0, f0_min: float = 50.0,
+                 f0_range: tuple[float, float, float] | None = None):
         super().__init__()
         self.fs, self.hop = float(fs), int(hop)
         self.k_growth, self.cycles_decay = k_growth, cycles_decay
-        if speaker == "female":
+        if f0_range is not None:
+            self.f0_lo, self.f0_hi, self.f0_nom = map(float, f0_range)
+        elif speaker == "female":
             self.f0_lo, self.f0_hi, self.f0_nom = 110.0, 440.0, 220.0
         else:
             self.f0_lo, self.f0_hi, self.f0_nom = 65.0, 260.0, 120.0
@@ -117,13 +120,18 @@ class GlottalSource(nn.Module):
 
         amp0: 이전 청크 끝의 (씨앗 포함) 진폭. 없으면 씨앗에서 시작."""
         ps, add, ten = c["p_sub"], c["adduction"].clamp(0, 1), c["tension"]
-        f0 = torch.where(c["f0_target"] > 0, c["f0_target"], self.f0_base(ten))
+        direct = c["f0_target"] > 0
+        f0 = torch.where(direct, c["f0_target"], self.f0_base(ten))
         pth = self.threshold(f0, add)
         over = (ps - pth).clamp_min(0.0)
-        f0 = f0 * (1.0 + 0.04 * over) * c["f0_scale"]
+        # 폐압-F0 결합은 **긴장으로 F0 를 정할 때만** 건다. `f0_target` 은 "이 주파수로
+        # 울려라" 는 직접 지정이므로 그 위에 다시 곱하면 지정한 값이 안 나온다. 실제로
+        # p_sub 6.7 · Pth 2.2 에서 ×1.18 이 걸려 238 Hz 지정이 281.6 Hz 로 났고(측정),
+        # 복사합성에서 성문 펄스가 주기마다 0.18 주기씩 밀렸다.
+        f0 = torch.where(direct, f0, f0 * (1.0 + 0.04 * over)) * c["f0_scale"]
         gate = torch.clamp((add - 0.10) / 0.15, 0.0, 1.0)
         gate = gate * gate * (3 - 2 * gate)                        # 벌린 성문(add≤0.10)은 안 떤다
-        a_star = torch.sqrt(over / pth) * gate
+        a_star = torch.sqrt(over / pth + 1e-12) * gate   # +eps: sqrt(0) 의 기울기가 무한대다
         a_star = a_star / (1.0 + 0.5 * a_star)                     # 포화
         dt = self.hop / self.fs
         seed = 0.02
@@ -140,18 +148,27 @@ class GlottalSource(nn.Module):
         amp = (amp_raw - seed).clamp_min(0.0) / (1.0 - seed)
         rd = (0.3 + 2.4 * (1.0 - add) ** 1.5 + c["rd_offset"]).clamp(0.3, 2.7)
         ag_dc = 0.02 + 0.5 * (1.0 - add) ** 2.5                    # 정적 성문 면적 cm² (모달 ≈0.07 → U≈250 cm³/s)
-        asp = (1.0 - add) ** 2 * torch.sqrt(ps.clamp_min(0.0)) * c["aspiration"]
+        # 성문 난류는 **성문 양단의 압력 강하**로 난다. 구강 협착이 있으면 압력의 대부분이
+        # 협착에서 떨어지고(Po/Ps = Ag²/(Ag²+Ac²), v1 §5.3) 성문 제트는 느려진다 — /s/ 동안
+        # 성문 기식이 1~6 kHz 를 채우던 원인(측정: 앞공동 경로와 같은 크기).
+        a_c = c["a_c"].clamp_min(1e-3)
+        frac = a_c ** 2 / (a_c ** 2 + ag_dc ** 2)                  # ΔPg/Ps
+        # 세기는 ΔPg 에 선형 (√ 로 두면 /s/ 중 기식이 실측보다 10 dB 크다 — 같은 화자 A/B).
+        asp = (1.0 - add) ** 2 * frac * torch.sqrt(ps.clamp_min(0.0) + 1e-12) * c["aspiration"]
         return dict(f0=f0, amp=amp, amp_raw=amp_raw, rd=rd, ag_dc=ag_dc, asp=asp, pth=pth)
 
     # ---------------------------------------------------------- 파형
-    def _lf_coeffs(self, rd: torch.Tensor) -> torch.Tensor:
-        """(B,N) Rd -> (B,N,K) 복소 하모닉 계수 (격자 선형보간)."""
+    def _lf_index(self, rd: torch.Tensor):
+        """(B,N) Rd -> (i0, w). 하모닉 계수는 **차수별로** 표에서 뽑는다.
+
+        전에는 (B,N,K) 복소 텐서를 통째로 만들고 루프에서 `[..., j]` 로 잘랐다. 그러면
+        역전파가 차수마다 (B,N,K) 짜리 0 텐서를 만들어 채운다 — K=234, N=19200 이면 한 번에
+        37 MB, 5937 번이면 역전파의 68 % 였다(프로파일). 표를 차수별로 인덱싱하면 (B,N) 이다.
+        """
         g = self.rd_grid
         pos = (rd.clamp(g[0], g[-1]) - g[0]) / (g[-1] - g[0]) * (len(g) - 1)
         i0 = pos.floor().long().clamp(0, len(g) - 2)
-        w = (pos - i0.float()).unsqueeze(-1)
-        c0, c1 = self.lf_coef[i0], self.lf_coef[i0 + 1]
-        return c0 * (1 - w) + c1 * w
+        return i0, pos - i0.to(pos.dtype)
 
     def forward(self, c: dict, phase0: torch.Tensor | None = None,
                 rps: torch.Tensor | None = None, noise=None, frame0: int = 0,
@@ -200,8 +217,7 @@ class GlottalSource(nn.Module):
         # 하모닉 가산합성. **하모닉마다 순차 누적**한다 — (B,N,K).sum(-1) 은 텐서 크기에 따라
         # 축약 순서가 달라 float32 반올림이 청크 의존이 되고(3e-6), 그것이 고 Q 성도를 지나며
         # 스트리밍/오프라인 차이 1e-3 로 커졌다(측정). 순차 누적은 청크와 무관하고 메모리도 작다.
-        coef = self._lf_coeffs(rd)                                 # (B,N,K)
-        mag, ang = coef.abs(), torch.angle(coef)
+        i0, wrd = self._lf_index(rd)                               # (B,N), (B,N)
         k = self.k_idx
         f_nyq, width = 0.95 * fs / 2, 0.02 * fs / 2
         f_cut = f_nyq + 6.0 * width                    # 이 위는 마스크를 정확히 0 으로 (청크 무관 상한)
@@ -211,12 +227,16 @@ class GlottalSource(nn.Module):
         for j in range(k_max):
             kk = k[j]
             fk = f0 * kk
-            mask = torch.sigmoid((f_nyq - fk) / width) * (fk <= f_cut)
+            live = fk <= f_cut
+            if not bool(live.any()):
+                continue
+            cj = self.lf_coef[i0, j] * (1 - wrd) + self.lf_coef[i0 + 1, j] * wrd   # (B,N)
+            mask = torch.sigmoid((f_nyq - fk) / width) * live
             gain = 10.0 ** (tilt * (log2f0 + math.log2(float(kk))) / 20.0)
-            ph = phase * kk + ang[..., j]
+            ph = phase * kk + torch.angle(cj)
             if rps is not None:
                 ph = ph + rps[..., j]
-            du = du + 2.0 * mag[..., j] * mask * gain * torch.cos(ph)
+            du = du + 2.0 * cj.abs() * mask * gain * torch.cos(ph)
         du = du * amp
         # 성문 개방기 (LF: 0 ~ te 가 열림) -> 기식 AM 마스크
         frac = phase / (2 * math.pi)
@@ -226,6 +246,6 @@ class GlottalSource(nn.Module):
         voiced = (amp > 1e-3).float()
         asp_env = asp * (1.0 + 0.7 * voiced * (open_phase - 0.5))
         return dict(du=du, phase=phase, asp_env=asp_env.clamp_min(0.0),
-                    amp=amp, f0=f0, ag_dc=up(st["ag_dc"]), voiced=voiced,
+                    amp=amp, f0=f0, ag_dc=up(st["ag_dc"]), ag_dc_frames=st["ag_dc"], voiced=voiced,
                     physiology=st, amp_last=st["amp_raw"][:, t - 1], state=state,
                     phase_last=phase64[:, -1:])

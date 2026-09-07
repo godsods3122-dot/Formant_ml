@@ -29,16 +29,19 @@ bash scripts/setup_env.sh && source .venv/bin/activate
 export OMP_NUM_THREADS=2            # 일부 컨테이너에서 torch 4 스레드는 원소별 연산이 1000 배 느리다
 
 python -m pytest tests/engine -q                    # v2 성질 테스트
-python scripts/v2_listen.py --out out/v2 --praat    # 아라/라/사/나 청취 세트 + 측정표
+python scripts/v2_listen.py --out out/v2 --profile profiles/yang_female.json --praat   # 청취 세트 9 종 + 측정표
 ```
 
 ```python
 from formant_ml.engine import VoiceEngine, phones
 from formant_ml.engine.control import track_from_keyframes
 from formant_ml.engine.tokens import TokenRegistry
+from formant_ml.engine.profile import SpeakerProfile
 
-eng = VoiceEngine()                              # 여성 화자, 48 kHz, 1 ms 제어 프레임
-y = eng.render(phones.ara())                     # 아라 (모음 사이 탄음)
+prof = SpeakerProfile.load("profiles/yang_female.json")   # 녹음 계측값 (docs/MEASUREMENTS.md)
+eng = VoiceEngine(profile=prof)                  # 48 kHz, 1 ms 제어 프레임
+y = eng.render(phones.ara(prof))                 # 아라 (모음 사이 탄음)
+y = eng.render(phones.irinilssirirae(prof))      # '일인일실이래'
 
 track = track_from_keyframes([                  # ms 단위 물리 factor 스크립트
     {"t": 0.00, "p_sub": 7.5, "adduction": 0.6, "tension": 0.5, "f1": 945, "f2": 1590, "f3": 2850},

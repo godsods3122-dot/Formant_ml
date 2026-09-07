@@ -69,8 +69,9 @@ def test_phase_continuity_across_chunks():
     full = g(c, noise=nb)
     c1 = {k: v[:, :100] for k, v in c.items()}; c2 = {k: v[:, 100:] for k, v in c.items()}
     a = g(c1, noise=nb)
-    b = g(c2, phase0=a["phase"][:, -1:], noise=nb, frame0=100, amp0=a["amp_last"], state=a["state"])
-    assert torch.allclose(torch.cat([a["du"], b["du"]], -1), full["du"], atol=2e-3)
+    b = g(c2, phase0=a["phase_last"], noise=nb, frame0=100, amp0=a["amp_last"], state=a["state"])
+    d = (torch.cat([a["du"], b["du"]], -1) - full["du"]).abs().max()
+    assert float(d) < 1e-2 * float(full["du"].abs().max()), float(d)
     d = torch.remainder(b["phase"][0, 0] - a["phase"][0, -1], 2 * math.pi)
     step = 2 * math.pi * float(a["f0"][0, -1]) / FS
     assert abs(float(d) - step) < 0.05 * step + 1e-4     # 청크 경계에서 위상이 한 스텝만 진행
