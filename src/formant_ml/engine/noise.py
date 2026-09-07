@@ -55,6 +55,18 @@ def reynolds(u, a_c):
     return v * d / NU, v, d
 
 
+def butterworth_q(n_sections: int) -> list[float]:
+    """2n 차 버터워스를 2 차 절편 n 개로 나눌 때의 Q 들.
+
+    **같은 Q 를 반복하면 안 된다.** 같은 2 차 저역통과를 n 번 걸면 −3 dB 점이 아래로
+    끌려 내려오고 무릎이 뭉개져 "완만한 내리막" 이 된다. 실측 /ㅅ/ 는 10 kHz 까지
+    평평하다가 12 kHz 부터 절벽이다 — 그 모양은 통과대역이 평평하고 무릎이 선
+    버터워스라야 나온다. Q_k = 1 / (2 cos((2k+1)π / 4n)).
+    """
+    return [1.0 / (2.0 * math.cos((2 * k + 1) * math.pi / (4 * n_sections)))
+            for k in range(n_sections)]
+
+
 def slow_modulation(white_frames: torch.Tensor, fs_frame: float, knee_hz, zi=None):
     """느린 1/f² 변조 포락선 (프레임률, 단위분산 근사). v1 §5 의 난류 비정상성(제트 사행).
 
@@ -73,17 +85,19 @@ class FricationNoise(nn.Module):
     """협착 공기역학 -> 마찰 소스 (샘플률). 색은 여기서 **소스 스펙트럼**까지만."""
 
     def __init__(self, fs: float, hop: int, mod_depth: float = 0.25,
-                 amp_ref: float = 0.062, lp_ratio: float = 1.4,
-                 source_hf_shelf_db: float = -9.0):
+                 amp_ref: float = 0.062, lp_ratio: float = 1.8,
+                 lp_stages: int = 2, source_hf_shelf_db: float = -6.0):
         super().__init__()
         self.fs, self.hop = float(fs), int(hop)
         self.mod_depth = mod_depth
-        # 제트 난류 스펙트럼의 고역 절벽: Strouhal 정점의 lp_ratio 배 위에서 2차 저역통과.
-        # 다이폴(+6)·방사(+6) 를 합쳐도 그 위에서 −6 dB/oct 로 떨어지게 한다
-        # (실측 /s/ 는 13~14 kHz 위에서 절벽처럼 떨어진다 — v1 HANDOFF §6.10).
+        # 제트 난류 스펙트럼의 고역 절벽: Strouhal 정점의 lp_ratio 배에서 4 차 버터워스.
         self.log_lp_ratio = nn.Parameter(torch.tensor(math.log(lp_ratio)))
-        # 실측 적합 (남성 ㅅ ×3, 0.6~20 kHz 7 대역, rms 3.2 dB): 셸프 −9 dB, lp_ratio 1.4,
-        # back_leak 0.10, 앞공동 대역폭 500+0.12f, 장애물 다이폴 0 (ADR 0011).
+        self.lp_stages = lp_stages
+        # 실측 재적합 (남성 ㅅ ×3, **4~16 kHz** 2 kHz 대역, rms 2.75 dB, 0.3.2):
+        # 셸프 −6 dB, lp_ratio 1.8, 2 절편. 이전 값(−9 dB, 1.4, 절벽 미구현)은 고차 극이
+        # 10 kHz 에서 +97 dB 를 얹던 시절에 맞춘 것이라 그 보정이 사라지자 고역이 남았다.
+        # 채점 대역이 4~16 kHz 인 이유: 4 kHz 아래 실측은 방 잡음이고, 16 kHz 위는
+        # 44.1 kHz 녹음의 안티에일리어싱 필터라 48 kHz 합성과 비교 대상이 아니다.
         self.source_hf_shelf_db = source_hf_shelf_db
         # 학습 파라미터: 변조 스펙트럼 기울기/꺾임, 소스 세기 보정
         self.log_beta = nn.Parameter(torch.tensor(math.log(2.0)))
@@ -177,6 +191,15 @@ class FricationNoise(nn.Module):
         obst = up(c["obstacle"])
         dip, state["dip"] = tv_biquad(src, *first_difference_coeffs(1.0, src), zi=state.get("dip"))
         src = (1.0 - obst) * src + obst * dip * 4.0
+        # **고역 절벽.** 에디가 아무리 작아도 크기에 하한이 있어 소스는 어느 주파수 위에서
+        # 떨어진다. 이 절벽이 `log_lp_ratio` 로 선언만 되어 있고 **걸리지 않고 있었다**:
+        # 그래서 소스가 나이퀴스트까지 평평했고, 실측 남성 /ㅅ/ 이 정점 대비 12~16 kHz 에서
+        # −30 dB 인데 합성은 −13 dB 에서 멈췄다(측정). 정점의 lp_ratio 배에서 2 차씩
+        # `lp_stages` 단 — 한 단(−12 dB/oct)으로는 실측 기울기에 못 미친다.
+        lpf = (f_peak * torch.exp(self.log_lp_ratio)).clamp(600.0, 0.45 * fs)
+        for i, q in enumerate(butterworth_q(self.lp_stages)):
+            src, state[f"lp{i}"] = tv_biquad(src, *lowpass_coeffs(lpf, q, fs),
+                                             zi=state.get(f"lp{i}"))
         return dict(source=src * env * mod * am, env=env, f_peak=f_peak,
                     reynolds=re, flow=u, state=state)
 
