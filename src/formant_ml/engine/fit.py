@@ -400,6 +400,7 @@ class CopySynthFitter:
         sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, max(iters, 1), eta_min=lr * 0.05)
         best = (-1e18, None, None, None)
         hist: list[tuple[float, float]] = []
+        bad_grads = 0
         for it in range(iters):
             opt.zero_grad(set_to_none=True)
             l, sc, env_sc, per = self.loss()
@@ -419,13 +420,24 @@ class CopySynthFitter:
                         self.log_gain.detach().clone(),
                         (env, fine, self._last_db, float(l.detach()), per))
             l.backward()
-            torch.nn.utils.clip_grad_norm_(
-                [self.w, self.d, self.log_gain, self.pulse_phi0], 5.0)
+            ps = [self.w, self.d, self.log_gain, self.pulse_phi0]
+            # **비유한 기울기로 걸음을 딛으면 안 된다.** Adam 의 모멘트가 NaN 으로
+            # 오염되면 그 뒤 모든 파라미터가 NaN 이 되고, 손실을 보기 전에 엔진 안에서
+            # 터진다(실측: 탄음 구간에서 int(NaN)). 그런 회차는 건너뛴다.
+            if any(p.grad is not None and not torch.isfinite(p.grad).all() for p in ps):
+                bad_grads += 1
+                for p in ps:
+                    p.grad = None
+                sch.step()
+                continue
+            torch.nn.utils.clip_grad_norm_(ps, 5.0)
             opt.step(); sch.step()
             if verbose and (it % log_every == 0 or it == iters - 1):
                 print(f"    [{it:4d}] 포락 {env:6.2f}%  정밀 {fine:6.2f}%  "
                       f"오차 {self._last_db:5.2f} dB  펄스 {self._last_pulse:.3f}  "
                       f"손실 {float(l.detach()):.4f}")
+        if verbose and bad_grads:
+            print(f"    (기울기 비유한 {bad_grads} 회 건너뜀)")
         if best[1] is not None:
             with torch.no_grad():
                 self.w.copy_(best[1][0]); self.d.copy_(best[1][1])
