@@ -397,11 +397,22 @@ class CopySynthFitter:
         return sc_sum / len(self.sizes), env_db, env_sc, per
 
     def phase_loss(self, y: torch.Tensor) -> torch.Tensor:
-        """복소 STFT 잔차. 크기가 이미 맞을 때만 의미가 있다."""
-        k = 1024
-        Sp, St = _stft(y, k, self.wins[k]), _stft(self.target, k, self.wins[k])
-        m = min(Sp.shape[-1], St.shape[-1])
-        return (St[..., :m] - Sp[..., :m]).abs().mean() / (St[..., :m].abs().mean() + 1e-9)
+        """복소 STFT 잔차. **크기가 이미 맞을 때만** 의미가 있다.
+
+        크기가 틀린 상태에서 켜면 복소 차이가 크기 오차에 지배되어 위상에 대한 기울기가
+        묻힌다. 그래서 마지막 단계에서만 켠다.
+
+        여러 창을 쓰는 이유: 창이 길수록 하모닉이 분해되어 위상이 정밀해지지만 손실면이
+        톱니가 된다. 짧은 창이 큰 틀을 잡고 긴 창이 다듬도록 겹친다.
+        """
+        out = 0.0
+        for k in (256, 512, 1024):
+            Sp, St = _stft(y, k, self.wins[k]), _stft(self.target, k, self.wins[k])
+            m = min(Sp.shape[-1], St.shape[-1])
+            b = self.bin_max[k]
+            out = out + ((St[:, :b, :m] - Sp[:, :b, :m]).abs().mean()
+                         / (St[:, :b, :m].abs().mean() + 1e-9))
+        return out / 3.0
 
     def penalty(self) -> torch.Tensor:
         """물리적으로 성립하지 않는 해를 막는다.
@@ -535,6 +546,7 @@ class CopySynthFitter:
 
     def fit_staged(self, global_iters: int = 200, stage_iters: int = 150,
                    lr_global=(0.015, 0.03, 0.05, 0.09), lr_frame: float = 0.04,
+                   phase_iters: int = 0, phase_w: float = 3.0,
                    verbose: bool = True, log_every: int = 50) -> FitReport:
         """전역 스칼라 -> 제어 격자를 성기게에서 촘촘하게, 창도 함께 늘려 가며."""
         if verbose:
@@ -556,6 +568,12 @@ class CopySynthFitter:
                 print(f"  2.{si + 1} 단계  격자 {grid:g} ms ({tc} 점)  창 {sizes}")
             rep = self.fit(stage_iters, lr_frame * (0.75 ** si), log_every, verbose,
                            sizes=sizes)
+        if phase_iters > 0:
+            self.phase_weight = phase_w
+            if verbose:
+                print(f"  3 단계  위상 (가중 {phase_w})")
+            rep = self.fit(phase_iters, lr_frame * 0.4, log_every, verbose, sizes=FFT_SIZES)
+            self.phase_weight = 0.0
         self.sizes = list(FFT_SIZES)
         return rep
 
