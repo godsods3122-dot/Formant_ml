@@ -55,8 +55,12 @@ STAGES = ((256, 512), (256, 512, 1024), (256, 512, 1024, 2048), FFT_SIZES)
 # 포먼트에 전역 오프셋을 주면 최적화가 F4 를 F1 아래로 끌어내리는 식으로 스펙트럼을
 # 맞춘다(실측: F1 887->248, F2 1550->3250, F4 5153->915). 대역 에너지는 맞지만
 # 조음으로는 말이 안 되는 해다. 그런 자유도는 애초에 주지 않는다.
+# `tract_gain` 은 여기 없다. 전역 수준은 `log_gain` 이 이미 닫힌 형태로 잡는데
+# 둘 다 열어 두면 서로를 상쇄하며 떠돌고, 그 사이에서 `p_sub` 까지 끌려간다
+# (실측: 보통 세기 모음인데 p_sub 가 17.6 cmH2O — 큰 소리로 외치는 값 — 로 갔다).
+# `tract_gain` 은 폐쇄 감쇠 같은 **시간 변화**로만 쓴다.
 GLOBAL_PARAMS = frozenset((
-    "p_sub", "adduction", "rd_offset", "tilt", "aspiration", "tract_gain",
+    "p_sub", "adduction", "rd_offset", "tilt", "aspiration",
     "fric_gain", "back_leak", "nasal_damp", "nasal_gain",
     "jitter", "shimmer", "bw1", "bw2", "bw3", "bw4",
 ))
@@ -69,7 +73,8 @@ PRIOR_W: dict[str, float] = {
     "nasal_f3": 20.0, "nasal_z": 20.0, "nasal_gain": 10.0, "nasal_damp": 10.0,
     "a_c": 10.0, "obstacle": 10.0, "front_len": 10.0, "back_leak": 5.0,
     "bw1": 2.0, "bw2": 2.0, "bw3": 2.0, "bw4": 2.0,
-    "p_sub": 0.3, "adduction": 0.3, "tilt": 0.1, "aspiration": 0.1,
+    # p_sub 는 세기의 물리량이다. 이득과 겹치는 방향으로 끌려가지 않게 세게 묶는다.
+    "p_sub": 3.0, "adduction": 0.3, "tilt": 0.1, "aspiration": 0.1,
     "rd_offset": 0.3, "tract_gain": 0.3, "fric_gain": 0.3,
     # 지터는 하모닉 차수에 비례해 위상변조 지수가 커진다(β ∝ k). 그래서 고차 하모닉을
     # 통째로 뭉개 **고역 잡음 바닥을 혼자 결정한다** (실측: 지터 0.004 + 시머 0.03 이
