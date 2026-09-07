@@ -29,49 +29,17 @@ from .noise import C_SOUND
 from .tviir import (allpass_coeffs, antiresonator_coeffs, first_difference_coeffs,
                     lowpass_coeffs, notch_coeffs, peak_coeffs, resonator_coeffs, tv_biquad)
 
-
-def higher_pole_correction_fir(fs: float, length_cm: float, n_explicit: int, bw_floor: float,
-                               bw_slope: float, extra_bw_floor: float, n_taps: int = 1024,
-                               n_tail: int = 400, tail_bw_slope: float = 0.15,
-                               cap_db: float = 40.0) -> torch.Tensor:
-    """Fant 의 고차 극 보정을 **최소위상 FIR** 로 (n_explicit 번째 위의 극 전부).
-
-    무손실관 |H| = 1/|cos(πf/2F₁)| 는 어디서나 ≥ 1 인데, DC 정규화 공명기 N 개의 곱은 그 위에서
-    급히 떨어진다 — L=17 cm, N=11 이면 6 kHz 에서 −27 dB, 8 kHz 에서 −50 dB (계산). 모음의 4~8 kHz 가
-    실측보다 35~60 dB 어두웠던 원인이다. 꼬리 극 F_n=(2n−1)c/4L (n>N) 을 감쇠 공명기로 두고 그 곱의
-    크기를 켑스트럼으로 최소위상화한다. 매끈한 곡선이라 1024 탭이면 충분하다.
-    """
-    f1 = C_SOUND / (4.0 * length_cm)
-    n_fft = 8 * n_taps
-    f = np.linspace(0.0, fs / 2, n_fft // 2 + 1)
-    w = 2 * np.pi * f / fs
-    z1 = np.exp(-1j * w)
-    logmag = np.zeros_like(f)
-    for n in range(n_explicit + 1, n_explicit + 1 + n_tail):
-        fn = (2 * n - 1) * f1
-        # 꼬리 극의 손실: 벽·점성·방사가 주파수에 따라 커진다 → 대역폭이 가파르게 는다
-        bw = max(bw_floor + tail_bw_slope * fn, extra_bw_floor)
-        if fn > fs / 2:                                  # 나이퀴스트 위 극: 연속계 근사 (봉우리 없음)
-            logmag += -np.log(np.abs(1.0 - (f / fn) ** 2 + 1j * (f / fn) * (bw / fn)))
-            continue
-        r = np.exp(-np.pi * bw / fs); th = 2 * np.pi * fn / fs
-        a1, a2 = -2 * r * np.cos(th), r * r
-        D = 1.0 + a1 * z1 + a2 * z1 * z1
-        logmag += np.log(abs(1 + a1 + a2)) - np.log(np.abs(D))
-    logmag = np.minimum(logmag, np.log(10.0 ** (cap_db / 20)))  # 상한 (실측 8~13 kHz 는 정점 −40~−50 dB)
-    # 최소위상: 실켑스트럼 접기
-    mag = np.concatenate([logmag, logmag[-2:0:-1]])
-    cep = np.fft.ifft(mag).real
-    n = len(cep); fold = np.zeros(n); fold[0] = cep[0]; fold[1:n // 2] = 2 * cep[1:n // 2]; fold[n // 2] = cep[n // 2]
-    h = np.fft.ifft(np.exp(np.fft.fft(fold))).real[:n_taps]
-    h *= np.hanning(2 * n_taps)[n_taps:]                      # 꼬리만 창
-    return torch.tensor(h, dtype=torch.float32)
+# 고차 극 보정을 최소위상 FIR 로 되돌리는 경로가 여기 있었다. 12 kHz 에서 +160 dB 가
+# 필요해 수치적으로 성립하지 않아 기각했고(ADR 0009·0012), 대역폭 법칙을 하나로
+# 합치면서 그 함수가 참조하던 `extra_bw_floor`·`extra_bw_slope` 도 사라졌다.
+# 기록은 ADR 에 있다 — 죽은 코드로 남겨 두면 낡은 파라미터로 되살아난다.
 
 
 class VocalTract(nn.Module):
     def __init__(self, fs: float, hop: int, length_cm: float = 14.6,
                  bw_floor: float = 40.0, bw_slope: float = 0.05,
-                 n_formants: int = N_FORMANTS, n_extra: int | None = None):
+                 n_formants: int = N_FORMANTS, n_extra: int | None = None,
+                 front_bw_slope: float = 0.20):
         super().__init__()
         self.fs, self.hop = float(fs), int(hop)
         self.length_cm = length_cm
@@ -96,8 +64,12 @@ class VocalTract(nn.Module):
         # 학습 파라미터: 고차 극 보정의 대역폭 배율(화자 고역 손실), 앞공동 대역폭 배율
         self.log_extra_bw = nn.Parameter(torch.tensor(0.0))
         self.log_front_bw = nn.Parameter(torch.tensor(0.0))
-        self.extra_bw_floor = 800.0
-        self.front_bw_slope = 0.12      # 앞공동 극의 대역폭 = 500 + 이 값 × f (실측 적합)
+        # 고역 손실이 커지는 자리. Q 는 10 kHz 에서 ≈1.5, 14 kHz 에서 ≈1 이 된다.
+        self.bw_hf_knee = 10250.0
+        self.bw_hf_width = 1150.0
+        # 앞공동 극의 대역폭 = 500 + 이 값 × f_p. **화자 프로파일이 준다** — 한 상수로
+        # 두면 두 화자가 반대로 잡아당긴다. 실측 적합: 남 /ㅅ/ 0.08, 여 /ㅆ/ 0.36.
+        self.front_bw_slope = float(front_bw_slope)
         self.nasal_zfrac = 0.80         # 측지 영점의 대역폭 = fz × 이 값 (깊이·폭)
         self.nasal_gain = 1.60          # 머머가 모음보다 −7 dB (실측 M −6.7) 이 되는 값
         # 비강도 관이다 — 극 3 개로 자르면 2 kHz 위가 −60 dB 로 무너진다(측정). 인두+비강
@@ -106,13 +78,28 @@ class VocalTract(nn.Module):
         self.register_buffer("nasal_extra", torch.tensor(
             [2400.0 + k * nsp for k in range(1, 64) if 2400.0 + k * nsp < 0.70 * fs / 2],
             dtype=torch.float32))
-        self.extra_bw_slope = 1.00        # 고차 극 손실 (벽·점성·방사·횡모드). Q≈1
-        self.use_hpc = False
-        self.register_buffer("hpc", torch.zeros(1))
+
 
     # ------------------------------------------------------------ 계수
     def default_bw(self, f):
-        return self.bw_floor + self.bw_slope * f
+        """극의 물리 기본 대역폭. **모든 극이 같은 법칙을 쓴다.**
+
+        예전에는 캐스케이드가 `40 + 0.05f`, 고차 극이 `800 + 1.0f` 로 **다른 법칙**을
+        썼다. 그래서 두 무리가 만나는 자리에서 Q 가 18.1 -> 0.92 로 20 배 급변하고,
+        거기에 깊은 골이 생겼다 (실측: 남성 8.5 kHz 에서 −11.5 dB. 그 주파수는
+        `(2K−1)·c/4L` 이라 화자마다 다르다 — 즉 물리가 아니라 코드 상수 K 가 만든
+        인공물이었다).
+
+        손실은 주파수를 따라 **연속으로** 커진다: 벽·점성·방사에 더해 고역에서는
+        평면파 가정이 무너지고 횡모드가 열린다. 그것을 하나의 매끈한 식으로 쓴다.
+
+            B(f) = bw_floor + bw_slope·f + f·σ((f − f_c)/w)
+
+        낮은 쪽은 Klatt 의 포먼트 대역폭(B1 50~80, B4 175~280)을 그대로 두고,
+        10 kHz 부근에서 Q≈1.5, 14 kHz 에서 Q≈1 이 되도록 f_c·w 를 잡았다.
+        """
+        return (self.bw_floor + self.bw_slope * f
+                + f * torch.sigmoid((f - self.bw_hf_knee) / self.bw_hf_width))
 
     def _up(self, v):
         return frames_to_samples(v.unsqueeze(-1), self.hop)[..., 0][:, :self._n_emit]
@@ -146,21 +133,9 @@ class VocalTract(nn.Module):
         for i, f in enumerate(self.extra_formants):
             key = f"x{i}"
             fk = f.to(x.dtype).expand_as(x)
-            bw = torch.clamp(self.bw_floor + self.extra_bw_slope * fk, min=self.extra_bw_floor) * bw_scale
+            bw = self.default_bw(fk) * bw_scale        # 캐스케이드와 **같은 법칙**
             x, state[key] = tv_biquad(x, *resonator_coeffs(fk, bw, self.fs), zi=state.get(key))
         return x
-
-    def _hpc(self, x, state):
-        """고차 극 보정 FIR (LTI, 최소위상). 스트리밍은 마지막 n_taps−1 샘플을 이어 붙인다."""
-        k = self.hpc.numel()
-        hist = state.get("hpc")
-        if hist is None:
-            hist = torch.zeros(x.shape[0], k - 1, dtype=x.dtype, device=x.device)
-        xin = torch.cat([hist, x], dim=1)
-        y = torch.nn.functional.conv1d(xin.unsqueeze(1),
-                                       self.hpc.to(x.dtype).flip(0).view(1, 1, -1)).squeeze(1)
-        state["hpc"] = xin[:, -(k - 1):]
-        return y
 
     def _front_cavity(self, x, c, state):
         """협착 하류 앞공동 극 + 뒤공동 영점. 치찰음 지문이 여기 있다."""
@@ -274,8 +249,6 @@ class VocalTract(nn.Module):
         oral, nas = opn / tot, vel / tot
         tracks = self._formant_tracks(c)
         y_g = self._extra_cascade(self._cascade(x_g * oral, tracks, state, "f"), state)
-        if self.use_hpc:
-            y_g = self._hpc(y_g, state)
         y_f = self._front_cavity((1.0 - leak) * fr_r * oral, c, state)
         # 비강도 같은 이유로 **입력에** 건다. 출력에 걸면 연구개가 닫힌 동안에도 분기가
         # 소스를 받아 울리고, 열리는 순간 그 에너지가 통째로 튀어나온다(측정: 12 배 클릭).

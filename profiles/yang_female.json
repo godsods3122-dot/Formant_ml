@@ -95,7 +95,8 @@
   "abduct_lead_ms": 35,
   "abduct_lag_ms": 55,
   "affricate_level_db": -3.0,
-  "aspirated_level_db": -2.0
+  "aspirated_level_db": -2.0,
+  "front_bw_slope": 0.36
  },
  "nasal": {
   "poles": [

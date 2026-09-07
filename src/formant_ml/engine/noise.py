@@ -85,19 +85,27 @@ class FricationNoise(nn.Module):
     """협착 공기역학 -> 마찰 소스 (샘플률). 색은 여기서 **소스 스펙트럼**까지만."""
 
     def __init__(self, fs: float, hop: int, mod_depth: float = 0.25,
-                 amp_ref: float = 0.062, lp_ratio: float = 1.8,
-                 lp_stages: int = 2, source_hf_shelf_db: float = -6.0):
+                 amp_ref: float = 0.062, lp_ratio: float = 3.2,
+                 lp_stages: int = 2, source_hf_shelf_db: float = 0.0):
         super().__init__()
         self.fs, self.hop = float(fs), int(hop)
         self.mod_depth = mod_depth
         # 제트 난류 스펙트럼의 고역 절벽: Strouhal 정점의 lp_ratio 배에서 4 차 버터워스.
         self.log_lp_ratio = nn.Parameter(torch.tensor(math.log(lp_ratio)))
         self.lp_stages = lp_stages
-        # 실측 재적합 (남성 ㅅ ×3, **4~16 kHz** 2 kHz 대역, rms 2.75 dB, 0.3.2):
-        # 셸프 −6 dB, lp_ratio 1.8, 2 절편. 이전 값(−9 dB, 1.4, 절벽 미구현)은 고차 극이
-        # 10 kHz 에서 +97 dB 를 얹던 시절에 맞춘 것이라 그 보정이 사라지자 고역이 남았다.
-        # 채점 대역이 4~16 kHz 인 이유: 4 kHz 아래 실측은 방 잡음이고, 16 kHz 위는
-        # 44.1 kHz 녹음의 안티에일리어싱 필터라 48 kHz 합성과 비교 대상이 아니다.
+        # **채점은 소스가 아니라 방사된 출력에서 한다** (0.3.3). 소스만 보고 맞추면
+        # 앞공동 극이 그 위에 −12 dB/oct 를 또 얹는 것을 놓친다. 실제로 소스 기준으로
+        # 맞춘 lp_ratio 1.8 은 출력에서 남 /ㅅ/ 12~16 kHz 를 실측보다 17~27 dB 어둡게
+        # 만들었다(정점 기준). 실측은 방사음이므로 채점도 방사음이어야 한다.
+        #
+        # 출력 기준 재적합 (남 ㅅ ×3 · 여 ㅆ, 정점 대역 기준 dB):
+        #   lp_ratio 1.8 -> 3.2 :  rms 남 13.67 / 여 10.42  ->  남 2.44 / 여 2.04
+        # 채점 대역: 남은 4~16 kHz (44.1 kHz 녹음이라 그 위는 안티에일리어싱),
+        # 여는 4~22 kHz (48 kHz 녹음이라 16~22 kHz 도 실측이다). 4 kHz 아래는 방 잡음.
+        # 통과대역(4~12 kHz)의 기울기는 이 절벽이 아니라 **앞공동 극의 대역폭**(프로파일)이
+        # 정한다. 절벽은 그 위 12~22 kHz 의 상한이다.
+        # 셸프는 −6~+6 dB 에서 rms 가 0.03 밖에 안 움직여 **사실상 작동하지 않는다.**
+        # 값이 남아 있으면 뭔가 하는 것처럼 읽히므로 0 으로 둔다.
         self.source_hf_shelf_db = source_hf_shelf_db
         # 학습 파라미터: 변조 스펙트럼 기울기/꺾임, 소스 세기 보정
         self.log_beta = nn.Parameter(torch.tensor(math.log(2.0)))

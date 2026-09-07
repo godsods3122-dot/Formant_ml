@@ -60,8 +60,10 @@ class VoiceEngine(nn.Module):
         self.frication = FricationNoise(fs, hop)
         self.aspiration = AspirationNoise(fs, hop)
         self.transients = TransientTemplateBank(fs)
+        fbw = float(profile.sibilant.get("front_bw_slope", 0.20)) if profile else 0.20
         self.tract = VocalTract(fs, hop, length_cm=self.cfg.tract_length_cm,
-                                n_extra=self.cfg.n_extra_formants)
+                                n_extra=self.cfg.n_extra_formants,
+                                front_bw_slope=fbw)
         self.residual = ResidualCorrector(fs, hop) if self.cfg.residual else None
         self.reset()
 
