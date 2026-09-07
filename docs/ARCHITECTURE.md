@@ -162,6 +162,9 @@ src/formant_ml/
     voice.py         VoiceEngine
     phones.py        한국어 음소 제스처 (구조만; 숫자는 프로파일)
     profile.py       SpeakerProfile — 화자 한 명 = JSON 한 장 (profiles/*.json)
+    denoise.py       위너 스펙트럼 차감 (복사합성 전처리)
+    analyze.py       녹음 → 1 ms 제어열 초기값 (Praat F0·펄스 + 참 포락선 LPC 포먼트)
+    fit.py           복사합성 적합기 — 미분가능 엔진으로 제어열 역추정
   dsp/, models/, …   v1 (0.1.x) — 동결. 참고용. 새 기능을 넣지 않는다.
 tests/engine/        v2 성질 테스트
 docs/adr/            결정 기록
@@ -177,3 +180,27 @@ docs/adr/            결정 기록
 6. 모음 자세(a_c=3 cm²)에서 Re < 1800 → 마찰 소스 정확히 0.
 7. 잔차망·토큰 표는 0 초기화 → 학습 전 항등.
 8. 토큰 apply → strip 이 제어열을 정확히 복원한다.
+9. `f0_target > 0` 이면 렌더된 F0 가 **그 값 그대로**다. 폐압-F0 결합은 긴장으로 F0 를
+   정할 때만 걸린다 (0.3.1 이전에는 위에 또 곱해져 ×1.18 이었다).
+10. 제스처 세기(설측·탄음·비음)가 프로파일의 실측 목표 dB 안에 든다. 창은 프레임 번호가
+    아니라 **제어열**에서 읽는다 — 지속시간이 화자마다 다르다.
+11. 적합기의 최선 파라미터 사본은 `opt.step()` **앞에서** 뜬다. 되돌린 해의 손실이
+    기록된 최선과 같아야 한다.
+12. 전역 오프셋은 포먼트·F0 를 건드리지 않는다. 포먼트 순서와 대역폭 상한은 벌점이 강제한다.
+
+## 8. 복사합성 경로 (0.3.x)
+
+```mermaid
+flowchart LR
+    REC[녹음 wav] --> DN[denoise<br/>위너 차감]
+    DN --> AN[analyze<br/>Praat F0·펄스<br/>참 포락선 LPC]
+    AN --> TR[ControlTrack<br/>1 ms + 성문 펄스 시각]
+    TR --> FIT[CopySynthFitter]
+    ENG[VoiceEngine<br/>미분가능] --> FIT
+    FIT -->|다해상도 STFT + 멜 dB + 펄스 위상| FIT
+    FIT --> OUT[적합된 제어열 + 되합성 wav]
+```
+
+단계: 전역 스칼라(30) → 제어 격자 20 → 10 → 5 → 1 ms, 창 256 → 4096.
+성기게 시작하는 이유는 긴 창부터 켜면 F0 에 대한 손실면이 하모닉 간격마다 골이 파인
+톱니가 되어 가장 가까운 가짜 골에 갇히기 때문이다.
