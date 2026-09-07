@@ -120,10 +120,15 @@ class GlottalSource(nn.Module):
 
         amp0: 이전 청크 끝의 (씨앗 포함) 진폭. 없으면 씨앗에서 시작."""
         ps, add, ten = c["p_sub"], c["adduction"].clamp(0, 1), c["tension"]
-        f0 = torch.where(c["f0_target"] > 0, c["f0_target"], self.f0_base(ten))
+        direct = c["f0_target"] > 0
+        f0 = torch.where(direct, c["f0_target"], self.f0_base(ten))
         pth = self.threshold(f0, add)
         over = (ps - pth).clamp_min(0.0)
-        f0 = f0 * (1.0 + 0.04 * over) * c["f0_scale"]
+        # 폐압-F0 결합은 **긴장으로 F0 를 정할 때만** 건다. `f0_target` 은 "이 주파수로
+        # 울려라" 는 직접 지정이므로 그 위에 다시 곱하면 지정한 값이 안 나온다. 실제로
+        # p_sub 6.7 · Pth 2.2 에서 ×1.18 이 걸려 238 Hz 지정이 281.6 Hz 로 났고(측정),
+        # 복사합성에서 성문 펄스가 주기마다 0.18 주기씩 밀렸다.
+        f0 = torch.where(direct, f0, f0 * (1.0 + 0.04 * over)) * c["f0_scale"]
         gate = torch.clamp((add - 0.10) / 0.15, 0.0, 1.0)
         gate = gate * gate * (3 - 2 * gate)                        # 벌린 성문(add≤0.10)은 안 떤다
         a_star = torch.sqrt(over / pth + 1e-12) * gate   # +eps: sqrt(0) 의 기울기가 무한대다

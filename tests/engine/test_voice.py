@@ -40,10 +40,32 @@ def test_tap_makes_a_short_dip_with_continuous_voicing(eng):
 
 
 def test_lateral_onset_is_quieter_than_vowel_but_voiced(eng):
-    y = eng.render(phones.ra())
-    e = _env_db(y)
-    hold = e[8:16].mean(); vowel = e[30:45].mean()
-    assert 1.0 < vowel - hold < 15.0
+    """설측 유지부가 뒤 모음보다 프로파일의 `lateral.level_db` 만큼 조용하다.
+
+    창을 프레임 번호로 박아 두면 안 된다. 지속시간이 화자마다 다르고, 그 창이
+    엇나가면 테스트가 **엉뚱한 이유로** 통과한다(실제로 겪었다: `f0_target` 위에
+    폐압 결합이 곱해져 F0 가 18 % 높던 시절, 하모닉이 F1 을 비껴가 유지부가 우연히
+    조용했고 그걸로 통과하고 있었다). 창은 제어열에서 읽는다.
+    """
+    tr = phones.ra()
+    y = eng.render(tr)
+    hop = eng.cfg.hop
+    mix, ps = tr["lat_mix"], tr["p_sub"]
+    after = np.flatnonzero(mix > 0.1)
+    hold = (mix > 0.9) & (ps > 0)
+    vowel = np.zeros(tr.n_frames, dtype=bool)
+    vowel[after[-1] + 40:] = True
+    vowel &= ps > 0
+
+    def rms_db(m):
+        i = np.flatnonzero(m)
+        seg = y[i[0] * hop:min((i[-1] + 1) * hop, len(y))]
+        return 20 * np.log10(np.sqrt((seg ** 2).mean()) + 1e-12)
+
+    got = rms_db(hold) - rms_db(vowel)
+    want = eng.profile.lateral["level_db"] if eng.profile else -2.0
+    assert abs(got - want) < 2.5, (got, want)
+    assert rms_db(hold) > rms_db(vowel) - 25.0          # 발성이 끊기지 않는다
 
 
 def test_keyframe_track_defaults_before_first_key_and_zero_hold():

@@ -110,7 +110,8 @@ class VoiceEngine(nn.Module):
         st["frame"] += t
         return dict(audio=y, du=g["du"], fric=fr["source"], asp=asp["source"], transient=tr,
                     glottal_path=out["glottal_path"], front_path=out["front_path"],
-                    f0=g["f0"], amp=g["amp"], reynolds=fr["reynolds"], state=st)
+                    f0=g["f0"], amp=g["amp"], phase=g["phase"], reynolds=fr["reynolds"],
+                    state=st)
 
     # ------------------------------------------------------------ 편의 API
     @torch.no_grad()

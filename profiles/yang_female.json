@@ -59,7 +59,7 @@
    4400
   ],
   "zero_bw": 350,
-  "gain": 1.5,
+  "gain": 1.3173953574520811,
   "hold_ms": 60,
   "release_ms": 70,
   "level_db": -2.0
@@ -73,7 +73,7 @@
   "approach_ms": 12,
   "closure_ms": 12,
   "release_ms": 14,
-  "gain": 0.8,
+  "gain": 0.7380115829476589,
   "dip_db": -10.0,
   "transient_amp": 0.0
  },
@@ -104,7 +104,7 @@
    2150.0
   ],
   "damp": 1.2,
-  "gain": 1.0,
+  "gain": 0.7544664767848195,
   "zero_hz": {
    "m": 1200.0,
    "n": 1650.0,

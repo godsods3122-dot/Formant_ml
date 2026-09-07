@@ -84,6 +84,37 @@ def lpc_formants(a: np.ndarray, sr: int, fmin: float = 120.0, fmax: float = 1200
     return list(zip(f[o], bw[o]))
 
 
+def glottal_pulses(y: np.ndarray, sr: int, prof: SpeakerProfile) -> np.ndarray:
+    """성문 폐쇄 시각(초). Praat 의 상호상관 PointProcess.
+
+    F0 를 주기별로 정확히 주는 것은 피치 궤적이 아니라 **펄스 열**이다. 궤적은 프레임마다
+    독립 추정이라 0.5 % 씩 흔들리고, 위상은 F0 의 누적합이라 그 흔들림이 쌓인다. 200 ms
+    (48 주기) 면 0.5 % 오차가 0.24 주기의 어긋남이 된다 — 크기는 맞는데 펄스가 어긋난
+    소리가 나온다. 펄스 열에서 F0 를 만들면 그 누적 오차가 원리적으로 없다.
+    """
+    import parselmouth
+    from parselmouth.praat import call
+    snd = parselmouth.Sound(y.astype(np.float64), sr)
+    pt = snd.to_pitch(time_step=0.001, pitch_floor=max(60.0, prof.f0_lo * 0.6),
+                      pitch_ceiling=prof.f0_hi * 1.3)
+    pp = call([snd, pt], "To PointProcess (cc)")
+    n = int(call(pp, "Get number of points"))
+    return np.array([call(pp, "Get time from index", i + 1) for i in range(n)])
+
+
+def f0_from_pulses(pulses: np.ndarray, t_grid: np.ndarray, f0_lo: float,
+                   f0_hi: float) -> np.ndarray | None:
+    """펄스 열 -> 프레임별 F0. 주기의 중점에 1/T 를 놓고 선형 보간한다."""
+    if len(pulses) < 3:
+        return None
+    d = np.diff(pulses)
+    ok = (d > 1.0 / (f0_hi * 1.3)) & (d < 1.0 / (f0_lo * 0.6))
+    if ok.sum() < 2:
+        return None
+    tm, f0 = 0.5 * (pulses[:-1] + pulses[1:])[ok], (1.0 / d)[ok]
+    return np.interp(t_grid, tm, f0)
+
+
 def smooth_track(x: np.ndarray, med: int, avg: int) -> np.ndarray:
     """중앙값 -> 이동평균. 프레임별 독립 추정의 흔들림을 지운다.
 
@@ -111,7 +142,8 @@ def smooth_track(x: np.ndarray, med: int, avg: int) -> np.ndarray:
 
 def analyze(y: np.ndarray, sr: int, prof: SpeakerProfile, hop: int,
             n_formants: int = 4, order: int | None = None,
-            t0: float = 0.0, full: np.ndarray | None = None) -> ControlTrack:
+            t0: float = 0.0, full: np.ndarray | None = None,
+            pulses: np.ndarray | None = None) -> ControlTrack:
     """녹음 -> 제어열 초기값 (프레임 = hop 샘플).
 
     F0·유성도는 Praat, 포먼트는 참 포락선 + LPC, 세기는 프레임 RMS,
@@ -123,6 +155,8 @@ def analyze(y: np.ndarray, sr: int, prof: SpeakerProfile, hop: int,
     # F0·HNR 은 **파일 전체**에서 잰다. 300 ms 짜리 조각에 Praat 을 걸면 NaN 이 돌아오고
     # 그러면 초기값이 통째로 기본값으로 무너진다(실제로 겪었다).
     src = full if full is not None else y
+    if pulses is None:
+        pulses = glottal_pulses(src, sr, prof)
     snd = parselmouth.Sound(src.astype(np.float64), sr)
     pt = snd.to_pitch(time_step=step, pitch_floor=max(60.0, prof.f0_lo * 0.6),
                       pitch_ceiling=prof.f0_hi * 1.3)
@@ -205,4 +239,21 @@ def analyze(y: np.ndarray, sr: int, prof: SpeakerProfile, hop: int,
         tr[f"bw{k}"] = smooth_track(tr[f"bw{k}"], m, a_s)
     for k in ("f0_target", "p_sub", "adduction", "tension", "a_c"):
         tr[k] = smooth_track(tr[k], m, a_f)
+    # **F0 는 펄스 열이 우선한다.** 피치 궤적은 프레임마다 독립이라 0.5 % 씩 흔들리고,
+    # 위상은 그 누적합이라 200 ms 면 0.24 주기가 어긋난다. 펄스에서 만든 F0 는 그 누적
+    # 오차가 원리적으로 없다. 무성 구간에서는 펄스가 없으므로 궤적 값을 그대로 둔다.
+    t_grid = (np.arange(n) + 0.5) * step + t0
+    pf = f0_from_pulses(pulses, t_grid, prof.f0_lo, prof.f0_hi) if pulses is not None else None
+    if pf is not None:
+        near = np.zeros(n, dtype=bool)
+        if len(pulses):
+            k = np.searchsorted(pulses, t_grid).clip(1, len(pulses) - 1)
+            near = np.minimum(np.abs(t_grid - pulses[k]),
+                              np.abs(t_grid - pulses[k - 1])) < 0.02
+        tr["f0_target"] = np.where(near, pf, tr["f0_target"])
+    if pulses is not None and len(pulses):
+        rel = pulses - t0
+        tr.pulses = rel[(rel >= 0.0) & (rel < n * step)]
+    else:
+        tr.pulses = np.zeros(0)
     return tr.clamp()

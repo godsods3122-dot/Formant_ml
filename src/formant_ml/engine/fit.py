@@ -151,13 +151,16 @@ class CopySynthFitter:
     def __init__(self, engine, target: np.ndarray, sr: int, init: ControlTrack,
                  params: tuple[str, ...] = DEFAULT_PARAMS,
                  lam_smooth: float = 3e-3, lam_prior: float = 1e-4,
-                 phase_weight: float = 0.0, n_mels: int = 48, device: str = "cpu"):
+                 phase_weight: float = 0.0, pulse_weight: float = 1.0,
+                 n_mels: int = 48, device: str = "cpu"):
         self.eng = engine
         self.hop = engine.cfg.hop
         self.fs = engine.cfg.sample_rate
         self.device = device
         self.lam_smooth, self.lam_prior = lam_smooth, lam_prior
         self.phase_weight = phase_weight
+        self.pulse_weight = pulse_weight
+        self._last_pulse = float("nan")
         self.sizes = list(FFT_SIZES)
 
         if sr != self.fs:
@@ -196,6 +199,12 @@ class CopySynthFitter:
         self.log_gain = torch.zeros(1, dtype=torch.float64, device=device,
                                     requires_grad=True)
 
+        # 목표의 성문 폐쇄 시각 -> 샘플 색인 (있으면 위상 고정에 쓴다)
+        pl = np.asarray(getattr(init, "pulses", np.zeros(0)), dtype=np.float64)
+        pl = pl[(pl >= 0.0) & (pl * self.fs < n - 1)]
+        self.pulse_idx = torch.as_tensor((pl * self.fs).astype(np.int64), device=device)
+        self.pulse_phi0 = torch.zeros(1, dtype=torch.float64, device=device,
+                                      requires_grad=True)
         self.wins = {k: torch.hann_window(k, device=device) for k in FFT_SIZES}
         # 포락은 **짧은 창**에서 잰다. 1024 (21 ms) 는 F0 240 Hz 의 하모닉을 분해하므로
         # 그 위의 멜은 포락이 아니라 하모닉 정렬을 재게 된다.
@@ -270,10 +279,27 @@ class CopySynthFitter:
         return self.gain_db()
 
     # ------------------------------------------------------------ 손실
-    def synth(self) -> torch.Tensor:
+    def synth(self, want_phase: bool = False):
         self.eng.reset()
         out = self.eng(self.control(), self.track.events, 0.0)
-        return out["audio"] * torch.exp(self.log_gain).to(torch.float32)
+        y = out["audio"] * torch.exp(self.log_gain).to(torch.float32)
+        return (y, out["phase"]) if want_phase else y
+
+    def pulse_loss(self, phase: torch.Tensor) -> torch.Tensor:
+        """성문 펄스 위치를 목표의 폐쇄 시각에 건다.
+
+        크기 스펙트럼만 맞추면 위상은 자유롭게 흐른다. 이 엔진은 위상이 모형에서 나오므로
+        (시변 IIR 이 샘플마다 이어진다) 소스 펄스만 제자리에 놓으면 나머지 위상은 물리가
+        정한다. 그래서 **파형 위상이 아니라 펄스 시각**을 건다 — 손실면이 매끈하다.
+
+        `1 − cos(φ(t_k) − φ0)` 를 쓴다. φ0 는 학습되는 상수 하나다 (LF 파형의 폐쇄
+        시점과 Praat 의 폐쇄 시각 정의가 몇 도 다르므로, 그 차이는 상수로 흡수시킨다).
+        """
+        idx = self.pulse_idx
+        if idx.numel() == 0:
+            return torch.zeros((), device=phase.device)
+        ph = phase[0].index_select(0, idx).double()
+        return (1.0 - torch.cos(ph - self.pulse_phi0)).mean()
 
     @staticmethod
     def _db(x: torch.Tensor) -> torch.Tensor:
@@ -343,10 +369,16 @@ class CopySynthFitter:
         return pen
 
     def loss(self):
-        y = self.synth()
+        want = self.pulse_weight > 0 and self.pulse_idx.numel() > 0
+        out = self.synth(want_phase=want)
+        y, phase = out if want else (out, None)
         sc, env_db, env_sc, per = self.spectral_loss(y)
         l = 4.0 * env_db + env_sc + 0.5 * sc      # 포락(dB)이 주 목적, SC 는 보조
         self._last_db = float(env_db.detach()) * 20.0
+        if want:
+            pl = self.pulse_loss(phase)
+            self._last_pulse = float(pl.detach())
+            l = l + self.pulse_weight * pl
         if self.phase_weight > 0:
             l = l + self.phase_weight * self.phase_loss(y)
         if self.lam_smooth > 0 and self.w.shape[0] > 1:
@@ -363,7 +395,8 @@ class CopySynthFitter:
             sizes: tuple[int, ...] | None = None) -> FitReport:
         if sizes is not None:
             self.sizes = list(sizes)
-        opt = torch.optim.Adam(params or [self.w, self.d, self.log_gain], lr=lr)
+        opt = torch.optim.Adam(params or [self.w, self.d, self.log_gain,
+                                          self.pulse_phi0], lr=lr)
         sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, max(iters, 1), eta_min=lr * 0.05)
         best = (-1e18, None, None, None)
         hist: list[tuple[float, float]] = []
@@ -374,20 +407,25 @@ class CopySynthFitter:
                 if verbose:
                     print(f"    [{it}] 손실 비유한 — 중단")
                 break
-            l.backward()
-            torch.nn.utils.clip_grad_norm_([self.w, self.d, self.log_gain], 5.0)
-            opt.step(); sch.step()
             env = float(100.0 * (1.0 - env_sc.detach()))
             fine = float(100.0 * (1.0 - sc.detach()))
             hist.append((env, fine))
+            # **파라미터 사본은 걸음을 딛기 전에 뜬다.** step() 뒤에 뜨면 n 회차의 손실과
+            # n+1 회차의 파라미터가 짝지어져, 복원해도 그 손실이 안 나온다(실측: 최선
+            # 1.3185 로 기록해 놓고 복원하니 1.4828).
             score = -float(l.detach())
             if score > best[0]:
                 best = (score, (self.w.detach().clone(), self.d.detach().clone()),
                         self.log_gain.detach().clone(),
                         (env, fine, self._last_db, float(l.detach()), per))
+            l.backward()
+            torch.nn.utils.clip_grad_norm_(
+                [self.w, self.d, self.log_gain, self.pulse_phi0], 5.0)
+            opt.step(); sch.step()
             if verbose and (it % log_every == 0 or it == iters - 1):
                 print(f"    [{it:4d}] 포락 {env:6.2f}%  정밀 {fine:6.2f}%  "
-                      f"오차 {self._last_db:5.2f} dB  손실 {float(l.detach()):.4f}")
+                      f"오차 {self._last_db:5.2f} dB  펄스 {self._last_pulse:.3f}  "
+                      f"손실 {float(l.detach()):.4f}")
         if best[1] is not None:
             with torch.no_grad():
                 self.w.copy_(best[1][0]); self.d.copy_(best[1][1])
@@ -397,14 +435,14 @@ class CopySynthFitter:
             env = fine = db = lv = float("nan"); per = {}
         return FitReport(env, fine, db, per, lv, len(hist), hist)
 
-    def fit_staged(self, global_iters: int = 150, stage_iters: int = 150,
-                   lr_global: float = 0.15, lr_frame: float = 0.05,
+    def fit_staged(self, global_iters: int = 200, stage_iters: int = 150,
+                   lr_global: float = 0.05, lr_frame: float = 0.04,
                    verbose: bool = True, log_every: int = 50) -> FitReport:
         """전역 스칼라 -> 제어 격자를 성기게에서 촘촘하게, 창도 함께 늘려 가며."""
         if verbose:
             print(f"  1 단계 전역 {len(self.names)} 스칼라 (이득 {self.gain_db():+.1f} dB)")
         rep = self.fit(global_iters, lr_global, log_every, verbose,
-                       params=[self.d, self.log_gain], sizes=STAGES[0])
+                       params=[self.d, self.log_gain, self.pulse_phi0], sizes=STAGES[0])
         for si, (grid, sizes) in enumerate(zip(GRID_MS, STAGES)):
             tc = self.set_grid(grid)
             if verbose:

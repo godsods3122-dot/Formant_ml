@@ -100,6 +100,8 @@ class ControlTrack:
     values: np.ndarray
     frame_ms: float = 1.0
     events: list[dict] = field(default_factory=list)   # 샘플 정확도 과도음 이벤트
+    # 성문 폐쇄 시각(초, 트랙 시작 기준). 분석이 채우고 복사합성 적합이 위상 고정에 쓴다.
+    pulses: np.ndarray = field(default_factory=lambda: np.zeros(0))
 
     @property
     def n_frames(self) -> int:

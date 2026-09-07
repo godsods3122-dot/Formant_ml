@@ -146,21 +146,38 @@ def test_fitter_gradients_are_finite(_engine):
         assert t.grad is not None and torch.isfinite(t.grad).all(), name
 
 
-def test_fitter_improves_a_detuned_start(_engine):
-    """기울기·기식이 틀린 출발점에서 전역 단계가 손실을 내린다."""
+def test_fitter_recovers_a_detuned_tilt(_engine):
+    """소스 기울기가 7 dB/oct 틀린 출발점에서 전역 단계가 원래 값을 되찾는다.
+
+    lr 은 0.05 여야 한다. 0.2 로 하면 30 개 오프셋이 한꺼번에 넘어가 출발점보다
+    나빠진 채로 끝난다(실측: 손실 1.3185 에서 한 번도 못 내려왔다).
+    """
     tr = _track()
     target = _engine.render(tr)
     bad = ControlTrack(tr.values.copy(), tr.frame_ms)
     bad["tilt"] = 9.0
-    bad["aspiration"] = 1.0
     f = CopySynthFitter(_engine, target, 48000, bad)
+    f.sizes = [256, 512]                 # 손실 비교는 같은 창 집합에서만 뜻이 있다
     with torch.no_grad():
         l0 = float(f.loss()[0])
-    rep = f.fit(40, 0.2, 999, verbose=False, params=[f.d, f.log_gain], sizes=(256, 512))
+    rep = f.fit(60, 0.05, 999, verbose=False, params=[f.d, f.log_gain], sizes=(256, 512))
     with torch.no_grad():
         l1 = float(f.loss()[0])
-    assert l1 < l0 - 0.05, (l0, l1)
-    assert rep.env > 0.0
+    assert l1 < 0.25 * l0, (l0, l1)
+    assert rep.db < 0.6                                   # 평균 스펙트럼 오차 dB
+    got = dict((n, b) for n, _, b in f.moved())["tilt"]
+    assert abs(got - 2.0) < 1.5, got
+
+
+def test_best_snapshot_is_taken_before_the_step(_engine):
+    """되돌린 해의 손실이 기록된 최선과 같아야 한다 (step 뒤에 사본을 뜨면 어긋난다)."""
+    tr = _track()
+    bad = ControlTrack(tr.values.copy(), tr.frame_ms)
+    bad["tilt"] = 9.0
+    f = CopySynthFitter(_engine, _engine.render(tr), 48000, bad)
+    rep = f.fit(6, 0.3, 999, verbose=False, params=[f.d, f.log_gain], sizes=(256, 512))
+    with torch.no_grad():
+        assert abs(float(f.loss()[0]) - rep.loss) < 1e-5
 
 
 def test_global_offset_never_touches_formants(_engine):

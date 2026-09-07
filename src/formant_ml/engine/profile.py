@@ -27,11 +27,11 @@ class SpeakerProfile:
         "e": [494, 2453, 3138], "ae": [630, 2280, 3070]})
     # 유음
     lateral: dict = field(default_factory=lambda: dict(
-        f=[459, 1914, 2907], zeros=[3300, 4400], zero_bw=350, gain=1.05,
+        f=[459, 1914, 2907], zeros=[3300, 4400], zero_bw=350, gain=0.65,
         hold_ms=120, release_ms=90, level_db=-4.0))
     tap: dict = field(default_factory=lambda: dict(
         f=[486, 1782, 2736], approach_ms=30, closure_ms=25, release_ms=35,
-        gain=0.7, dip_db=-5.0, transient_amp=0.0))
+        gain=0.66, dip_db=-5.0, transient_amp=0.0))
     # 치찰음 지문 (앞공동 정점 등)
     sibilant: dict = field(default_factory=lambda: dict(
         peak_hz=8000.0, level_db=-11.0, dur_ms=130, tense_dur_ms=70, a_min=0.10,
@@ -42,7 +42,7 @@ class SpeakerProfile:
     # 비음
     # 비음: 병렬 비강 분기의 극 3 개 + 폐쇄 위치가 정하는 측지 영점. 시간 상수는 실측.
     nasal: dict = field(default_factory=lambda: dict(
-        poles=[350.0, 1200.0, 2000.0], damp=1.2, gain=1.0,
+        poles=[350.0, 1200.0, 2000.0], damp=1.2, gain=0.75,
         zero_hz={"m": 1100.0, "n": 1500.0, "ng": 2400.0},
         murmur_db=-10.0, dur_ms=70,
         velum_lead_ms=60, velum_lag_ms=90, closure_ms=35, release_ms=18,
