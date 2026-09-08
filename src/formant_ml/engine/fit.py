@@ -622,9 +622,28 @@ class CopySynthFitter:
         self._restore(start)
         return best[1]
 
+    def pick_lr_phase(self, candidates, iters: int, verbose: bool = True) -> float:
+        """위상 단계의 lr 도 짧은 탐침으로 고른다.
+
+        전역 단계와 같은 이유이고, 실측으로도 구간마다 최적이 다르다 (위상 800 반복):
+        정상 모음 0.05~0.12, 설측 0.12 이상, 탄음 0.05. 하나로 못 정한다.
+        """
+        start = self._snapshot()
+        best = (float("inf"), float(candidates[0]))
+        for lr in candidates:
+            self._restore(start)
+            rep = self.fit(iters, float(lr), 10 ** 9, False, sizes=FFT_SIZES)
+            if np.isfinite(rep.loss) and rep.loss < best[0]:
+                best = (rep.loss, float(lr))
+            if verbose:
+                print(f"      lr {float(lr):5.3f} -> 손실 {rep.loss:.4f}")
+        self._restore(start)
+        return best[1]
+
     def fit_staged(self, global_iters: int = 200, stage_iters: int = 150,
                    lr_global=(0.015, 0.03, 0.05, 0.09), lr_frame: float = 0.04,
-                   phase_iters: int = 200, phase_w: float = 3.0,
+                   phase_iters: int = 800, phase_w: float = 3.0,
+                   lr_phase=(0.05, 0.12, 0.25),
                    verbose: bool = True, log_every: int = 50) -> FitReport:
         """전역 스칼라 -> 제어 격자를 성기게에서 촘촘하게, 창도 함께 늘려 가며."""
         if verbose:
@@ -649,11 +668,28 @@ class CopySynthFitter:
         # **위상 단계는 기본이다.** 크기만 맞추면 위상은 물리가 강제하는 곳에서만 맞는다.
         # 실측(코퍼스 150 ms 창 4 개): 조화 SNR +3.3/+1.0/+3.5/−2.6 -> +24.7/+16.5/+12.9/+16.2,
         # 위상 모양 오차 7.6/29.9/65.5/25.4° -> 3.4/17.8/32.6/16.4°. 포락은 안 나빠졌다.
+        # **위상 단계는 예산이 모자랐다.** 예전 값(lr = lr_frame·0.4 = 0.016, 200 반복)은
+        # 어느 구간에서도 바닥에 못 닿았다. 학습률과 반복만 올린 실측(무제약):
+        #
+        #   | 구간      | 예전 (lr 0.016 / 200) | lr 0.12 / 800 |
+        #   |-----------|-----------------------|---------------|
+        #   | 정상 모음 |                  3.4° |      **0.1°** |
+        #   | 설측 닐   |                 96.5° |     **36.4°** |
+        #   | 탄음 이리 |                 50.9° |     **18.3°** |
+        #
+        # 기구를 하나도 안 더하고 설측 2.6 배, 탄음 2.8 배다. 크기 적합 단계는 설측의
+        # 위상을 아예 못 건드렸고(94.8 -> 96.5°) 오직 이 단계만 움직였다.
         if phase_iters > 0:
             self.phase_weight = phase_w
             if verbose:
-                print(f"  3 단계  위상 (가중 {phase_w})")
-            rep = self.fit(phase_iters, lr_frame * 0.4, log_every, verbose, sizes=FFT_SIZES)
+                print(f"  3 단계  위상 (가중 {phase_w}, {phase_iters} 반복)")
+            if isinstance(lr_phase, (int, float)):
+                lr_p = float(lr_phase)
+            else:
+                lr_p = self.pick_lr_phase(lr_phase, max(30, phase_iters // 8), verbose)
+                if verbose:
+                    print(f"      -> lr {lr_p:.3f} 선택")
+            rep = self.fit(phase_iters, lr_p, log_every, verbose, sizes=FFT_SIZES)
             self.phase_weight = 0.0
         self.sizes = list(FFT_SIZES)
         return rep
