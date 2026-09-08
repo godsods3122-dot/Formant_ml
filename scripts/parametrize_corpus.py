@@ -134,8 +134,13 @@ def fit_one(path: str, t0: float, t1: float, kind: str, prof: SpeakerProfile,
     return row
 
 
-def _worker(args):
-    """한 **파일**의 구간 전부를 처리한다 — 잡음 제거와 성문 펄스를 나눠 쓰기 위해."""
+def _worker(args, on_row=None):
+    """한 **파일**의 구간 전부를 처리한다 — 잡음 제거와 성문 펄스를 나눠 쓰기 위해.
+
+    `on_row` 는 단일 프로세스로 돌 때만 쓴다. 파일 하나가 몇십 분씩 걸리는데 그 동안
+    아무것도 안 찍히면 멈춘 것과 구별이 안 된다 (다중 프로세스에서는 피클이 안 되므로
+    None 이고, 진행은 파일 단위로 보인다).
+    """
     (path, segs, prof_path, out_dir, budget, patience, threads) = args
     torch.set_num_threads(threads)
     rows = []
@@ -160,6 +165,8 @@ def _worker(args):
                        error=f"{type(e).__name__}: {e}",
                        traceback=traceback.format_exc()[-1500:])
         rows.append(row)
+        if on_row is not None:
+            on_row(row)
     return rows
 
 
@@ -237,10 +244,15 @@ def main() -> None:
                         done += 1
                         _log(fh, row, done, n_seg, t_all)
         else:
+            state = {"n": done}
+
+            def emit(row):
+                state["n"] += 1
+                _log(fh, row, state["n"], n_seg, t_all)
+
             for j in jobs:
-                for row in _worker(j):
-                    done += 1
-                    _log(fh, row, done, n_seg, t_all)
+                _worker(j, on_row=emit)
+            done = state["n"]
     print(f"\n끝. 색인: {idx}")
 
 
