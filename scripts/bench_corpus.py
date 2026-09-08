@@ -102,8 +102,10 @@ def bench(path, t0, t1, prof, verbose=False, iters=(200, 150, 800)):
     ft = f.result_track()
     fid = f.fidelity()
     cmp = tb.compare(tgt, out, FS)
+    # `fine` 은 **fid 쪽 것을 쓴다.** `rep.fine` 은 손실이 쓰는 값이라 마찰 구간에서
+    # 기대 스펙트럼 평활이 걸려 있다. 채점은 손실과 독립이어야 한다.
     return dict(
-        env=rep.env, fine=rep.fine, **fid,
+        env=rep.env, **fid,
         phase=float(np.median(ph)) if ph else float("nan"),
         snr=seg_snr(ht, hs, FS),
         v1=float(np.median(np.abs(np.diff(np.asarray(ft["f1"]))))),
