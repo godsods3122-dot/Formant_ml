@@ -48,6 +48,16 @@ from .control import INDEX, PARAMS, ControlTrack
 FFT_SIZES = (256, 512, 1024, 2048, 4096)
 MEL_FFT = 256              # 포락용 창 (5.3 ms @48 kHz) — 하모닉이 분해되지 않는다
 DB_RANGE = 70.0            # 정점 아래 이만큼까지만 본다
+# **난류 우세 빈에서 기대 스펙트럼을 볼 시간 폭 (ms). 0 이면 끈다.**
+#
+# 마찰 잡음의 STFT 크기는 확률변수다 (레일리). 프레임별 실현을 맞추라고 하면 기울기의
+# 대부분이 그 잡음이고, 최적해도 실현마다 다르다. 재현할 수 있는 것은 **기대값**뿐이니
+# 그것을 비교한다. 목표와 합성에 똑같이 걸리므로 편향은 없고 분산만 줄어든다.
+#
+# 25 ms 는 마찰음 길이(이 화자 실측 70~110 ms, `profiles/yang_female.json`)의 1/4 이라
+# 정상부를 뭉개지 않으면서 창 256 에서 19 프레임을 평균한다(분산 1/19). 조화 우세
+# 빈에는 `1−w` 가중이 0 이라 아무 일도 일어나지 않는다.
+NOISE_EXPECT_MS = 25.0
 # 성김 -> 촘촘함. 각 단계에서 켜는 창 크기.
 STAGES = ((256, 512), (256, 512, 1024), (256, 512, 1024, 2048), FFT_SIZES)
 
@@ -320,9 +330,18 @@ class CopySynthFitter:
         self.mel = mel_bank(MEL_FFT, self.fs, n_mels, fmax=self.f_max).to(device)
         # 선형 SC 도 같은 상한을 쓴다.
         self.bin_max = {k: int(math.ceil(self.f_max / (self.fs / k))) + 1 for k in FFT_SIZES}
+        # 목표의 조화/잔차 분해. 위상 항(조화부만 본다)과 크기 항(난류부는 기대
+        # 스펙트럼으로 본다)이 같은 것을 쓰므로 한 번만 만든다.
+        self._har_res = self._decompose_target()
         with torch.no_grad():
-            self.tgt_S = {k: _stft(self.target, k, self.wins[k]).abs()[:, :self.bin_max[k]]
-                          for k in FFT_SIZES}
+            self._harm_w = {k: self._harmonic_weight(k) for k in FFT_SIZES}
+            self._noise_w = {k: (1.0 - self._harm_w[k]) for k in FFT_SIZES}
+            self._sm_frames = {k: max(1, int(round(NOISE_EXPECT_MS
+                                                   / (1000.0 * (k // 4) / self.fs))))
+                               for k in FFT_SIZES}
+            raw = {k: _stft(self.target, k, self.wins[k]).abs()[:, :self.bin_max[k]]
+                   for k in FFT_SIZES}
+            self.tgt_S = {k: self._expect(v, k) for k, v in raw.items()}
             self.tgt_M = self.mel[:, :self.tgt_S[MEL_FFT].shape[1]] @ self.tgt_S[MEL_FFT]
             self.tgt_Mdb = self._db(self.tgt_M)
             self.db_floor = float(self.tgt_Mdb.max()) - DB_RANGE
@@ -468,14 +487,15 @@ class CopySynthFitter:
         sc_sum, per = 0.0, {}
         Smel = None
         for k in self.sizes:
-            Sp = _stft(y, k, self.wins[k]).abs()[:, :self.bin_max[k]]
+            Sp = self._expect(_stft(y, k, self.wins[k]).abs()[:, :self.bin_max[k]], k)
             if k == MEL_FFT:
                 Smel = Sp
             sc = self._sc(self.tgt_S[k], Sp)
             sc_sum = sc_sum + sc
             per[k] = float(100.0 * (1.0 - sc.detach()))
         if Smel is None:
-            Smel = _stft(y, MEL_FFT, self.wins[MEL_FFT]).abs()[:, :self.bin_max[MEL_FFT]]
+            Smel = self._expect(
+                _stft(y, MEL_FFT, self.wins[MEL_FFT]).abs()[:, :self.bin_max[MEL_FFT]], MEL_FFT)
         Mp = self.mel[:, :Smel.shape[1]] @ Smel
         m = min(Mp.shape[-1], self.tgt_M.shape[-1])
         Mp, Mt = Mp[..., :m], self.tgt_M[..., :m]
@@ -489,10 +509,36 @@ class CopySynthFitter:
         return sc_sum / len(self.sizes), env_db, env_sc, per
 
     def phase_loss(self, y: torch.Tensor) -> torch.Tensor:
-        """복소 STFT 잔차. **크기가 이미 맞을 때만** 의미가 있다.
+        """**단위 크기** 복소 잔차 — 크기와 직교한 순수 위상 거리, 조화 우세부에만.
 
-        크기가 틀린 상태에서 켜면 복소 차이가 크기 오차에 지배되어 위상에 대한 기울기가
-        묻힌다. 그래서 마지막 단계에서만 켠다.
+        왜 복소 잔차를 그냥 쓰면 안 되는가
+        ----------------------------------
+        예전 형태는 `|S_t − S_p|` 였다. 위상이 상관된 곳(하모닉)에서는 옳게 작동하지만,
+        **위상이 무상관인 곳(모든 난류)에서는 |S_p| = 0 이 최소다.** 두 위상이 독립이면
+        E|S_t − S_p|² = |S_t|² + |S_p|² 이므로 합성을 **끄는 것**이 가장 좋은 해가 된다.
+
+        실측 (같은 스펙트럼의 두 독립 실현, 합성 진폭 g 를 훑는다):
+
+            | g   | 예전 위상항 | 크기항 SC |
+            |-----|-------------|-----------|
+            | 0.0 |  0.999 ←최소 |     1.000 |
+            | 0.8 |  1.277      |     0.627 |
+            | 1.0 |  1.411      |     0.665 |
+
+        `fit_staged` 는 이 항을 기본으로 800 회 돌린다. 즉 마찰 구간은 800 회 내내
+        "소리를 꺼라" 는 기울기를 받고 있었다.
+
+        고친 형태
+        ---------
+        두 복소수를 단위 크기로 정규화한 뒤 거리를 재고, 목표 크기로 가중한다:
+
+            d(t,f) = w(t,f) · |S_t/|S_t| − S_p/|S_p||
+
+        `S_p` 의 크기에 대한 편미분이 항등적으로 0 이므로 **어떤 구간에서도 소리를
+        끄지 않는다.** 크기는 크기 항이, 위상은 위상 항이 맡는 깨끗한 분해다.
+
+        가중 w 는 **목표의 조화 우세도**다 (`_harmonic_weight`). 난류 빈에서는 0 이라
+        아예 안 본다 — 재도 뜻이 없는 양이기 때문이다.
 
         여러 창을 쓰는 이유: 창이 길수록 하모닉이 분해되어 위상이 정밀해지지만 손실면이
         톱니가 된다. 짧은 창이 큰 틀을 잡고 긴 창이 다듬도록 겹친다.
@@ -502,15 +548,90 @@ class CopySynthFitter:
             Sp, St = _stft(y, k, self.wins[k]), _stft(self.target, k, self.wins[k])
             m = min(Sp.shape[-1], St.shape[-1])
             b = self.bin_max[k]
-            ref = St[:, :b, :m].abs().mean()
-            # **복소 크기는 꺾이지는 않지만 0 근처에서 곡률이 발산한다.** 적합이
-            # 좋아질수록 이 차이가 0 으로 가므로 오히려 더 나쁘다. √(|z|²+δ²)−δ 로
-            # 바닥을 깔아 준다. δ 는 목표 크기의 1e-3 이라 손실값은 사실상 그대로다.
-            d = St[:, :b, :m] - Sp[:, :b, :m]
-            dlt = 1e-3 * ref.detach() + 1e-12
-            sm = (torch.sqrt(d.real ** 2 + d.imag ** 2 + dlt ** 2) - dlt).mean()
-            out = out + sm / (ref + 1e-9)
+            St, Sp = St[:, :b, :m], Sp[:, :b, :m]
+            at = St.abs()
+            w = self._harm_w[k][:, :, :m] * at
+            # 단위 크기로 정규화. δ 는 크기가 0 에 가까운 빈에서 방향이 폭주하는 것을
+            # 막는다 (그런 빈은 w 도 작아 어차피 기여가 없다).
+            dt = 1e-4 * at.mean().detach() + 1e-12
+            ut = St / torch.sqrt(at ** 2 + dt ** 2)
+            up = Sp / torch.sqrt(Sp.abs() ** 2 + dt ** 2)
+            d = ut - up
+            # √(|z|²+δ²)−δ — |z| 는 0 에서 곡률이 발산한다. 적합이 좋아질수록 그리로
+            # 가므로 바닥을 깔아 둔다 (relu 제거와 같은 부류, C² 유지).
+            e = torch.sqrt(d.real ** 2 + d.imag ** 2 + 1e-6) - 1e-3
+            out = out + (w * e).sum() / (w.sum() + 1e-9)
         return out / 3.0
+
+    def _decompose_target(self) -> tuple[np.ndarray, np.ndarray] | None:
+        """목표를 조화 성분과 잔차로 가른다 (`waveform.decompose`).
+
+        성문 펄스에서 나온 국소 F0 로 3 주기 창에서 최소제곱을 푼다. 무성 구간에서는
+        F0 가 없어 조화 성분이 0 이 되고 전부 잔차로 간다 — 따로 마스크가 필요 없다.
+        """
+        from .waveform import decompose
+        tgt = self.target[0].detach().cpu().numpy().astype(np.float64)
+        f0 = np.asarray(self.track["f0_target"], dtype=np.float64)
+        voi = np.asarray(getattr(self.track, "voiced", np.zeros(0, dtype=bool)))
+        if voi.shape[0] == f0.shape[0]:
+            f0 = np.where(voi, f0, 0.0)
+        try:
+            _, har, res = decompose(tgt, self.fs, f0, self.hop)
+        except Exception:
+            return None
+        return har, res
+
+    def _harmonic_weight(self, k: int) -> torch.Tensor:
+        """(1, F, T) 조화 우세도 — 이 시간·주파수 빈이 얼마나 '주기적'인가.
+
+            w = |STFT(조화)| / (|STFT(조화)| + |STFT(잔차)|)
+
+        모음의 낮은 하모닉에서 1 에 가깝고, 마찰 잡음과 모음 고역의 기식에서 0 에
+        가깝다. 목표에서 한 번만 계산하는 상수다.
+
+        두 곳이 이 값을 쓴다. 위상 항은 **w 로 가중**해 조화부만 보고(난류의 위상은
+        재도 뜻이 없다), 크기 항은 **1−w 로 가중**해 난류부에서 기대 스펙트럼을
+        비교한다(실현을 맞추라고 하면 기울기가 잡음이다).
+        """
+        b = self.bin_max[k]
+        if self._har_res is None:
+            return torch.ones(1, b, 1, device=self.device)
+        har, res = self._har_res
+        H = _stft(torch.as_tensor(har, dtype=torch.float32,
+                                  device=self.device).unsqueeze(0), k, self.wins[k]).abs()[:, :b]
+        R = _stft(torch.as_tensor(res, dtype=torch.float32,
+                                  device=self.device).unsqueeze(0), k, self.wins[k]).abs()[:, :b]
+        return (H / (H + R + 1e-9)).detach()
+
+    def _time_smooth(self, S: torch.Tensor, k: int) -> torch.Tensor:
+        """파워 영역에서 시간축 이동평균 -> 크기. 난류의 **기대** 스펙트럼을 만든다.
+
+        파워가 가법적이므로 평균은 파워에서 낸다. 폭은 `NOISE_EXPECT_MS` 이고 창
+        크기별로 프레임 수가 다르다 (긴 창은 이미 시간 폭이 커서 평활이 거의 없다).
+        """
+        n = self._sm_frames.get(k, 1)
+        if n <= 1 or S.shape[-1] < 2:
+            return S
+        n = min(n, S.shape[-1] // 2 * 2 + 1)
+        pad = n // 2
+        p = torch.nn.functional.pad(S ** 2, (pad, n - 1 - pad), mode="replicate")
+        return torch.sqrt(torch.nn.functional.avg_pool1d(p, n, stride=1) + 1e-20)
+
+    def _expect(self, S: torch.Tensor, k: int) -> torch.Tensor:
+        """난류 우세 빈만 기대 스펙트럼으로 갈아 끼운다.
+
+        `(1−w)` 로 섞으므로 조화부는 프레임별 실현 그대로 남는다. 목표와 합성에
+        **똑같이** 걸리므로 편향은 생기지 않고 기울기의 분산만 줄어든다.
+        """
+        if NOISE_EXPECT_MS <= 0 or self._har_res is None:
+            return S
+        wn = self._noise_w.get(k)
+        if wn is None:
+            return S
+        m = min(S.shape[-1], wn.shape[-1])
+        w = wn[..., :m]
+        s = S[..., :m]
+        return s + w * (self._time_smooth(s, k) - s)
 
     @staticmethod
     def _soft_over(x: torch.Tensor, width: float) -> torch.Tensor:
@@ -620,7 +741,18 @@ class CopySynthFitter:
     # ------------------------------------------------------------- 적합
     def fit(self, iters: int = 200, lr: float = 0.05, log_every: int = 25,
             verbose: bool = True, params: list | None = None,
-            sizes: tuple[int, ...] | None = None) -> FitReport:
+            sizes: tuple[int, ...] | None = None,
+            patience: int = 0, tol: float = 3e-4) -> FitReport:
+        """`patience` 회 동안 손실이 `tol`(상대) 만큼도 안 줄면 멈춘다.
+
+        **코퍼스 규모로 가려면 수렴 판정이 필요하다.** 지금까지는 고정 반복 뒤 최저손실
+        스냅샷을 취할 뿐이라 이미 수렴한 구간에서도 예산을 다 썼다 (docs/HANDOFF.md §5:
+        "구간당 5 -> 25 분이 됐다"). 45 분 코퍼스를 200 ms 구간으로 쪼개면 수천 개다.
+
+        `patience=0` 이면 끈다 — 예전 거동 그대로다. 코사인 스케줄러가 lr 을 줄이는
+        중이므로 문턱을 너무 크게 잡으면 아직 내려갈 수 있는데 멈춘다. 3e-4 는 실측에서
+        마지막 20 % 구간의 회차당 개선폭보다 작다.
+        """
         if sizes is not None:
             self.sizes = list(sizes)
         opt = torch.optim.Adam(params or [self.w, self.d, self.log_gain,
@@ -629,6 +761,7 @@ class CopySynthFitter:
         best = (-1e18, None, None, None)
         hist: list[tuple[float, float]] = []
         bad_grads = 0
+        stall = 0
         for it in range(iters):
             opt.zero_grad(set_to_none=True)
             l, sc, env_sc, per = self.loss()
@@ -643,10 +776,18 @@ class CopySynthFitter:
             # n+1 회차의 파라미터가 짝지어져, 복원해도 그 손실이 안 나온다(실측: 최선
             # 1.3185 로 기록해 놓고 복원하니 1.4828).
             score = -float(l.detach())
+            # 스냅샷은 조금이라도 나아지면 뜬다. 멈춤 판정만 **의미 있는** 개선을 센다.
+            gain = score - best[0]
             if score > best[0]:
                 best = (score, (self.w.detach().clone(), self.d.detach().clone()),
                         self.log_gain.detach().clone(),
                         (env, fine, self._last_db, float(l.detach()), per))
+            if patience > 0:
+                stall = 0 if gain > tol * abs(score) else stall + 1
+                if stall >= patience:
+                    if verbose:
+                        print(f"    [{it}] 수렴 ({patience} 회 정체) — 조기 종료")
+                    break
             l.backward()
             ps = [self.w, self.d, self.log_gain, self.pulse_phi0]
             # **비유한 기울기로 걸음을 딛으면 안 된다.** Adam 의 모멘트가 NaN 으로
@@ -727,8 +868,13 @@ class CopySynthFitter:
                    lr_global=(0.015, 0.03, 0.05, 0.09), lr_frame: float = 0.04,
                    phase_iters: int = 800, phase_w: float = 3.0,
                    lr_phase=(0.05, 0.12, 0.25),
-                   verbose: bool = True, log_every: int = 50) -> FitReport:
-        """전역 스칼라 -> 제어 격자를 성기게에서 촘촘하게, 창도 함께 늘려 가며."""
+                   verbose: bool = True, log_every: int = 50,
+                   patience: int = 0) -> FitReport:
+        """전역 스칼라 -> 제어 격자를 성기게에서 촘촘하게, 창도 함께 늘려 가며.
+
+        `patience` 는 각 단계의 수렴 판정에 그대로 넘어간다. 코퍼스를 통째로 돌릴 때
+        쓴다 (`scripts/parametrize_corpus.py`). 기본 0 = 예전 거동.
+        """
         if verbose:
             print(f"  1 단계 전역 {len(self.names)} 스칼라 (이득 {self.gain_db():+.1f} dB)")
         if isinstance(lr_global, (int, float)):
@@ -741,13 +887,14 @@ class CopySynthFitter:
         else:
             lr_g = float(lr_global[0])
         rep = self.fit(global_iters, lr_g, log_every, verbose,
-                       params=[self.d, self.log_gain, self.pulse_phi0], sizes=STAGES[0])
+                       params=[self.d, self.log_gain, self.pulse_phi0], sizes=STAGES[0],
+                       patience=patience)
         for si, (grid, sizes) in enumerate(zip(GRID_MS, STAGES)):
             tc = self.set_grid(grid)
             if verbose:
                 print(f"  2.{si + 1} 단계  격자 {grid:g} ms ({tc} 점)  창 {sizes}")
             rep = self.fit(stage_iters, lr_frame * (0.75 ** si), log_every, verbose,
-                           sizes=sizes)
+                           sizes=sizes, patience=patience)
         # **위상 단계는 기본이다.** 크기만 맞추면 위상은 물리가 강제하는 곳에서만 맞는다.
         # 실측(코퍼스 150 ms 창 4 개): 조화 SNR +3.3/+1.0/+3.5/−2.6 -> +24.7/+16.5/+12.9/+16.2,
         # 위상 모양 오차 7.6/29.9/65.5/25.4° -> 3.4/17.8/32.6/16.4°. 포락은 안 나빠졌다.
@@ -772,7 +919,8 @@ class CopySynthFitter:
                 lr_p = self.pick_lr_phase(lr_phase, max(30, phase_iters // 8), verbose)
                 if verbose:
                     print(f"      -> lr {lr_p:.3f} 선택")
-            rep = self.fit(phase_iters, lr_p, log_every, verbose, sizes=FFT_SIZES)
+            rep = self.fit(phase_iters, lr_p, log_every, verbose, sizes=FFT_SIZES,
+                           patience=patience)
             self.phase_weight = 0.0
         self.sizes = list(FFT_SIZES)
         return rep
@@ -783,9 +931,41 @@ class CopySynthFitter:
             v = self.control()[0].double().cpu().numpy()
         return ControlTrack(v, self.track.frame_ms, list(self.track.events))
 
-    def render(self) -> np.ndarray:
+    def render(self, seed: int | None = None) -> np.ndarray:
+        """적합된 파라미터로 합성. `seed` 를 주면 **난류의 실현만** 바꾼다.
+
+        같은 파라미터를 시드만 바꿔 두 번 합성하면, 그 둘의 거리가 곧 "완벽한 모형이라도
+        남는" 실현 잡음이다. 일치율에서 그 바닥을 빼면 편향만 남는다
+        (`turbulence.corrected_sc`). 치찰음을 정직하게 채점하는 유일한 길이다.
+
+        시드는 **`cfg.seed` 로** 바꾼다. `eng.noise` 에 직접 대입하면 조용히 무시된다 —
+        `synth()` 가 부르는 `VoiceEngine.reset()` 이 `NoiseBank(self.cfg.seed)` 로
+        덮어쓰기 때문이다.
+        """
         with torch.no_grad():
-            return self.synth()[0].cpu().numpy()
+            if seed is None:
+                return self.synth()[0].cpu().numpy()
+            old = self.eng.cfg.seed
+            try:
+                self.eng.cfg.seed = int(seed)
+                return self.synth()[0].cpu().numpy()
+            finally:
+                self.eng.cfg.seed = old
+
+    def fidelity(self, seed_b: int = 991) -> dict:
+        """실현 잡음을 뺀 성적표. 치찰음을 포함한 구간에서 유일하게 정직한 값이다.
+
+        `fine` 은 지금까지 쓰던 값(비교용), `fine_corr` 이 편향만 남긴 값이다.
+        `floor` 는 원래 자가 원리적으로 넘을 수 없는 상한 — `fine` 이 이 근처면
+        **모형이 나쁜 게 아니라 자가 바닥에 닿은 것**이다.
+        """
+        from . import turbulence as tb
+        tgt = self.target[0].detach().cpu().numpy().astype(np.float64)
+        a = self.render()
+        b = self.render(seed_b)
+        out = tb.spectral_fidelity(tgt, a, b, self.fs, tuple(FFT_SIZES), self.f_max)
+        out["spectrum_match"] = tb.spectrum_match(tgt, a, self.fs)
+        return out
 
     def gain_db(self) -> float:
         return float(20.0 * self.log_gain.detach().item() / math.log(10))
