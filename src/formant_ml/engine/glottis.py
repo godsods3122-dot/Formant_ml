@@ -92,8 +92,12 @@ class GlottalSource(nn.Module):
     def __init__(self, fs: float, hop: int, speaker: str = "female",
                  n_rd: int = 24, n_harm: int | None = None, k_growth: float = 0.25,
                  cycles_decay: float = 3.0, f0_min: float = 50.0,
-                 f0_range: tuple[float, float, float] | None = None):
+                 f0_range: tuple[float, float, float] | None = None,
+                 noise_modulation: str = "legacy"):
         super().__init__()
+        if noise_modulation not in ("legacy", "lf"):
+            raise ValueError("noise_modulation must be 'legacy' or 'lf'")
+        self.noise_modulation = noise_modulation
         self.fs, self.hop = float(fs), int(hop)
         self.k_growth, self.cycles_decay = k_growth, cycles_decay
         if f0_range is not None:
@@ -107,6 +111,18 @@ class GlottalSource(nn.Module):
         self.register_buffer("rd_grid", rds)
         self.register_buffer("lf_coef", coef)                      # (n_rd, K)
         self.register_buffer("k_idx", torch.arange(1, n_harm + 1, dtype=torch.float32))
+        if noise_modulation == "lf":
+            # Integrate the SAME LF derivative used for the harmonic source, from
+            # opening (phase zero) to closure. No independent open-quotient fit.
+            flows = []
+            for r in rds:
+                e = lf_pulse(float(r))
+                flow = np.concatenate(([0.0], np.cumsum(e)[:-1]))
+                flow /= flow.max()
+                flows.append(flow - flow.mean())
+            # Derived table, not checkpoint state: legacy checkpoints still load.
+            self.register_buffer("lf_flow", torch.tensor(np.stack(flows), dtype=torch.float32),
+                                 persistent=False)
 
     # ---------------------------------------------------------- 생리 상태
     def threshold(self, f0, adduction):
@@ -169,6 +185,30 @@ class GlottalSource(nn.Module):
         pos = (rd.clamp(g[0], g[-1]) - g[0]) / (g[-1] - g[0]) * (len(g) - 1)
         i0 = pos.floor().long().clamp(0, len(g) - 2)
         return i0, pos - i0.to(pos.dtype)
+
+    def lf_noise_envelope(self, phase: torch.Tensor, rd: torch.Tensor,
+                          voiced: torch.Tensor) -> torch.Tensor:
+        """Unit-cycle-mean AM from normalized LF flow, with no unvoiced AM.
+
+        Periodic Catmull–Rom interpolation is C1 across phase/table boundaries.
+        Each Rd row is centered over a full cycle, not the current chunk; hence
+        normalization needs neither future samples nor extra streaming state.
+        The fixed 0.7 depth reuses aspiration's existing modulation strength.
+        """
+        i, wrd = self._lf_index(rd)
+        size = self.lf_flow.shape[1]
+        pos = torch.remainder(phase / (2 * math.pi), 1.0) * size
+        j = pos.floor().long()
+        w = pos - j.to(pos.dtype)
+        points = []
+        for offset in (-1, 0, 1, 2):
+            col = (j + offset) % size
+            points.append(self.lf_flow[i, col] * (1 - wrd)
+                          + self.lf_flow[i + 1, col] * wrd)
+        p0, p1, p2, p3 = points
+        flow = p1 + 0.5 * w * (p2 - p0 + w * (
+            2 * p0 - 5 * p1 + 4 * p2 - p3 + w * (3 * (p1 - p2) + p3 - p0)))
+        return 1.0 + 0.7 * voiced * flow
 
     def forward(self, c: dict, phase0: torch.Tensor | None = None,
                 rps: torch.Tensor | None = None, noise=None, frame0: int = 0,
@@ -249,8 +289,16 @@ class GlottalSource(nn.Module):
         open_phase = torch.where(frac < 0.65, open_phase, torch.zeros_like(open_phase))
         asp = up(st["asp"])
         voiced = (amp > 1e-3).float()
-        asp_env = asp * (1.0 + 0.7 * voiced * (open_phase - 0.5))
+        noise_am = None
+        if self.noise_modulation == "lf":
+            noise_am = self.lf_noise_envelope(phase, rd, voiced)
+            # Legacy open mask mean = 0.65/2, so keep its mean source level
+            # while replacing only the periodic shape (not an RMS guarantee).
+            asp_env = asp * (1.0 + 0.7 * voiced * (0.325 - 0.5)) * noise_am
+        else:
+            asp_env = asp * (1.0 + 0.7 * voiced * (open_phase - 0.5))
         return dict(du=du, phase=phase, asp_env=asp_env.clamp_min(0.0),
+                    noise_am=noise_am,
                     amp=amp, f0=f0, ag_dc=up(st["ag_dc"]), ag_dc_frames=st["ag_dc"], voiced=voiced,
                     physiology=st, amp_last=st["amp_raw"][:, t - 1], state=state,
                     phase_last=phase64[:, -1:])

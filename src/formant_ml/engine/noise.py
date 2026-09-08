@@ -68,16 +68,19 @@ def butterworth_q(n_sections: int) -> list[float]:
 
 
 def slow_modulation(white_frames: torch.Tensor, fs_frame: float, knee_hz, zi=None):
-    """느린 1/f² 변조 포락선 (프레임률, 단위분산 근사). v1 §5 의 난류 비정상성(제트 사행).
+    """Fixed two-pole lowpass modulation (approximately unit variance).
 
     2 극 저역통과(RBJ, 꺾임 knee_hz)를 **상태를 이어가며** 적용한다 — FFT 로 만들면
     청크 경계에 따라 달라져 스트리밍 = 오프라인이 깨진다. 이득은 백색 입력의 출력
     분산이 1 이 되도록 근사 정규화한다.
     """
-    k = float(knee_hz.detach()) if torch.is_tensor(knee_hz) else float(knee_hz)
+    # Preserve the old float64 coefficient calculation without detaching knee.
+    k = torch.as_tensor(knee_hz, dtype=torch.float64, device=white_frames.device)
+    if not bool(torch.isfinite(k).all() & (k > 0).all() & (k < fs_frame / 2).all()):
+        raise ValueError("knee_hz must be finite and between zero and frame Nyquist")
     co = lowpass_coeffs(k, 0.707, fs_frame)
     y, zf = tv_biquad(white_frames, *co, zi=zi)
-    gain = math.sqrt(fs_frame / (2.0 * math.pi * k))          # 등가 잡음 대역폭 보정
+    gain = torch.sqrt(fs_frame / (2.0 * math.pi * k)).to(y.dtype)
     return y * gain, zf
 
 
@@ -107,17 +110,22 @@ class FricationNoise(nn.Module):
         # 셸프는 −6~+6 dB 에서 rms 가 0.03 밖에 안 움직여 **사실상 작동하지 않는다.**
         # 값이 남아 있으면 뭔가 하는 것처럼 읽히므로 0 으로 둔다.
         self.source_hf_shelf_db = source_hf_shelf_db
-        # 학습 파라미터: 변조 스펙트럼 기울기/꺾임, 소스 세기 보정
-        self.log_beta = nn.Parameter(torch.tensor(math.log(2.0)))
+        # Historical checkpoint key only: the fixed-shape lowpass never used
+        # beta. No slope fitting is implemented; do not advertise a dead knob.
+        self.register_buffer("log_beta", torch.tensor(math.log(2.0)))
+        # Differentiable internals, NOT optimized by the default control fitter.
         self.log_knee = nn.Parameter(torch.tensor(math.log(8.0)))
         self.log_amp = nn.Parameter(torch.tensor(math.log(amp_ref)))
 
     def forward(self, c: dict, ag_dc: torch.Tensor, glottal_phase: torch.Tensor,
                 voiced: torch.Tensor, noise=None, frame0: int = 0,
-                state: dict | None = None, emit: int | None = None) -> dict:
+                state: dict | None = None, emit: int | None = None,
+                noise_am: torch.Tensor | None = None) -> dict:
         """c: 프레임률 (B,T) dict (p_sub, a_c, obstacle, fric_gain). ag_dc: **프레임률** (B,T) 성문 면적.
 
         noise: NoiseBank (위치 기반), frame0: 청크의 첫 프레임, state: 필터 상태(스트리밍).
+        noise_am: optional shared unit-mean LF envelope from GlottalSource;
+                  omitted retains legacy phase modulation and calling convention.
         반환: source (B,N) 마찰 소스 파형, env (B,N), f_peak (B,N), reynolds, flow, state
         """
         fs, hop = self.fs, self.hop
@@ -163,7 +171,7 @@ class FricationNoise(nn.Module):
         # 장애물(앞니) 소스의 혹은 자유 제트의 Strouhal 정점보다 높고 넓다(Shadle). 같은 화자 A/B 에서
         # St=0.2 그대로 두면 1~3 kHz 가 10~12 dB 과했다. 정점 ×2.5, Q 0.5.
         f_peak = (0.5 * v / d.clamp_min(1e-3)).clamp(800.0, 0.45 * fs)
-        # 느린 1/f^β 변조 (제트 사행) + 유성 구간에서는 성문 개방기 AM
+        # Fixed two-pole slow modulation + voiced glottal-cycle AM.
         mod, zmod = slow_modulation(
             noise.white("mod", frame0, t_all, b, ps.dtype, ps.device), fs / hop,
             torch.exp(self.log_knee), state.get("mod"))
@@ -189,6 +197,10 @@ class FricationNoise(nn.Module):
         frac = glottal_phase[:, :n] / (2 * math.pi)
         gate = 0.5 * (1.0 + torch.cos(2 * math.pi * frac))
         am = 1.0 - 0.35 * voiced[:, :n] * gate
+        if noise_am is not None:
+            # Keep the legacy cycle mean (0.825 when voiced), but use exactly
+            # the same LF flow shape as aspiration, with no extra fit parameter.
+            am = (1.0 - 0.175 * voiced[:, :n]) * noise_am[:, :n]
         white = noise.white("fric", frame0 * hop, n, b, ps.dtype, ps.device)
         # 난류 소스의 스펙트럼.
         #

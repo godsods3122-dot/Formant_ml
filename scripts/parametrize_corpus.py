@@ -23,9 +23,9 @@
 
 치찰음을 어떻게 채점하는가
 --------------------------
-`fine`(선형 다해상도 STFT)은 난류에서 **34 % 가 상한**이다 — 같은 스펙트럼의 두 독립
-실현조차 그렇다. 그 자로는 마찰이 든 구간을 채점할 수 없다. 그래서 `fine_corr`
-(실현 잡음을 뺀 값)을 같이 낸다. 자세한 것은 `engine/turbulence.py` 머리말.
+`fine`(선형 다해상도 STFT)은 독립 잡음 실현에서 약 34 % 가 기대값이다 (엄밀한 상한
+아님). `fine_corr` 는 실현 분산을 차감한 휴리스틱 추정이며 미분해 값은 하한도
+신뢰구간도 아니다. `ok` 는 학습용 자동 필터일 뿐 지각적 동등성 판정이 아니다.
 """
 from __future__ import annotations
 
@@ -113,11 +113,15 @@ def fit_one(path: str, t0: float, t1: float, kind: str, prof: SpeakerProfile,
         pulses=np.asarray(track.pulses))
     row = dict(stem=stem, file=os.path.basename(path), t0=t0, t1=t1, kind=kind,
                frames=int(res.values.shape[0]), npz=os.path.relpath(npz, out_dir),
-               env=rep.env, fine=rep.fine, db=rep.db,
+               env=rep.env, fine=fid["fine"], db=rep.db,
                fine_corr=fid["fine_corr"], floor=fid["floor"],
                trust=fid["trust"], resolved=fid["resolved"],
                noise_ratio=fid["noise_ratio"],
-               spectrum_match=fid["spectrum_match"], gain_db=fit.gain_db())
+               spectrum_match=fid["spectrum_match"], gain_db=fit.gain_db(),
+               correction_status=fid.get("correction_status",
+                                         "resolved" if fid["resolved"] else "unresolved"),
+               score_note="clipped heuristic estimate, not a bound; trust is not confidence; "
+                          "ok is an automatic filter, not perceptual equivalence")
     if kind == "fricative":
         c = tb.compare(tgt, out, 48000.0)
         row.update(centroid_err=c["centroid_err"], band_mae=c["band_mae_db"],
@@ -125,7 +129,7 @@ def fit_one(path: str, t0: float, t1: float, kind: str, prof: SpeakerProfile,
                    centroid_target=c["target"]["centroid"],
                    centroid_synth=c["synth"]["centroid"])
     # **`fine_corr` 만으로 판정하면 안 된다.** 분해가 안 된 구간(치찰음이 대개 그렇다)
-    # 에서는 그 값이 상한일 뿐이라 잡음 투성이 합성도 높게 나온다. 잡음량이 맞는지를
+    # 에서는 그 값이 미분해 추정치라 잡음 투성이 합성도 높게 나온다. 잡음량이 맞는지를
     # `noise_ratio` 로 같이 본다.
     nr = fid["noise_ratio"]
     row["ok"] = bool(rep.env >= OK_ENV
@@ -265,8 +269,9 @@ def _log(fh, row, done, total, t_all):
         print(f"[{done}/{total}] {row['stem']:>34s}  실패 {row['error'][:60]}", flush=True)
     else:
         print(f"[{done}/{total}] {row['stem']:>34s} {row['kind'][:4]:>4s} "
-              f"포락 {row['env']:5.1f} 보정정밀 {'>' if not row['resolved'] else ' '}"
-              f"{row['fine_corr']:5.1f} 잡음비 {row['noise_ratio']:4.2f} "
+              f"포락 {row['env']:5.1f} 보정정밀 "
+              f"{row['fine_corr']:5.1f} ({'resolved' if row['resolved'] else 'unresolved estimate'}) "
+              f"잡음비 {row['noise_ratio']:4.2f} "
               f"{'ok' if row['ok'] else '--'} "
               f"{row.get('seconds', 0):5.1f}s  남은 {eta/60:.0f}분", flush=True)
 

@@ -48,6 +48,9 @@ class EngineConfig:
     n_extra_formants: int | None = None      # None = 나이퀴스트까지 전부 (고차 극 보정)
     residual: bool = True
     seed: int = 0
+    # Experimental A/B only; keep legacy until held-out pronunciation evidence.
+    # Internal noise parameters are not fitted by the default control fitter.
+    noise_modulation: str = "legacy"    # "lf": shared Rd-linked flow AM
 
     @property
     def hop(self) -> int:
@@ -63,7 +66,8 @@ class VoiceEngine(nn.Module):
         f0r = (profile.f0_lo, profile.f0_hi, profile.f0_nominal) if profile else None
         if profile:
             self.cfg.tract_length_cm = profile.tract_length_cm
-        self.glottis = GlottalSource(fs, hop, speaker=self.cfg.speaker, f0_range=f0r)
+        self.glottis = GlottalSource(fs, hop, speaker=self.cfg.speaker, f0_range=f0r,
+                                     noise_modulation=self.cfg.noise_modulation)
         self.frication = FricationNoise(fs, hop)
         self.aspiration = AspirationNoise(fs, hop)
         self.transients = TransientTemplateBank(fs)
@@ -99,7 +103,7 @@ class VoiceEngine(nn.Module):
         g = self.glottis(c, phase0=st["phase"], noise=self.noise, frame0=f0i,
                          amp0=st["amp"], state=st["glottis"], emit=t)
         fr = self.frication(c, g["ag_dc_frames"], g["phase"], g["voiced"], noise=self.noise,
-                            frame0=f0i, state=st["fric"], emit=t)
+                            frame0=f0i, state=st["fric"], emit=t, noise_am=g["noise_am"])
         asp = self.aspiration(g["asp_env"], noise=self.noise, sample0=s0, state=st["asp"])
         ev = [dict(e, t=e["t"] - t_offset_s) for e in (events or [])
               if -0.1 <= e["t"] - t_offset_s < n / self.cfg.sample_rate]

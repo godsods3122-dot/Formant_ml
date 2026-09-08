@@ -959,11 +959,12 @@ class CopySynthFitter:
                 self.eng.cfg.seed = old
 
     def fidelity(self, seed_b: int = 991) -> dict:
-        """실현 잡음을 뺀 성적표. 치찰음을 포함한 구간에서 유일하게 정직한 값이다.
+        """실현 분산을 추정해 차감한 진단용 성적표.
 
-        `fine` 은 지금까지 쓰던 값(비교용), `fine_corr` 이 편향만 남긴 값이다.
-        `floor` 는 원래 자가 원리적으로 넘을 수 없는 상한 — `fine` 이 이 근처면
-        **모형이 나쁜 게 아니라 자가 바닥에 닿은 것**이다.
+        `fine_corr` 은 분산 추정에 의존한다. `resolved=False` 이면 편향을
+        판별하지 못했으며, 보정값은 신뢰구간의 하한이 아니다. `trust` 는
+        잔여거리 비율이고 `floor` 는 실현 기준 추정값이지 보편적 상한이 아니다.
+        여러 시드·대역·시간 구조와 청취를 함께 평가해야 한다.
         """
         from . import turbulence as tb
         tgt = self.target[0].detach().cpu().numpy().astype(np.float64)
