@@ -91,6 +91,30 @@ GLOBAL_PARAMS = frozenset((
 VEL_LIMIT_HZ_PER_MS: dict[str, float] = {
     "f1": 27.0, "f2": 93.0, "f3": 151.0, "f4": 145.0,
 }
+
+# **힌지는 틀린 형태였다.** 95 분위를 문턱으로 두면 그 아래의 균일한 난동을 그냥
+# 통과시킨다. 실측: 지속 모음의 실제 F2 속도는 1.1 Hz/ms 인데 문턱은 93 이라, 모음에서
+# 적합값이 57 Hz/ms 로 널뛰어도 벌점이 0 이다 (A/B 실측: 속도 77.9→57.3 으로 26 % 만
+# 줄고 조화 SNR 은 4.6 dB 잃었다 — 나쁜 거래).
+#
+# 조음 속도의 실측 분포는 꼬리가 중앙의 200~300 배인 희소 신호다:
+#
+#   |    | 중앙 | 95분위 |   최대 | 꼬리/중앙 |
+#   |----|------|--------|--------|-----------|
+#   | F1 |  2.9 |   27.2 |  877.8 |      303× |
+#   | F2 |  7.0 |   92.7 | 2043.0 |      292× |
+#   | F3 | 11.5 |  151.0 | 2540.5 |      221× |
+#
+# "대부분 정지, 가끔 크게 이동" — 이런 분포의 사전은 이차(가우시안)가 아니라 L1
+# (라플라스) 계열이다. 그래서 후버(smooth L1)를 쓴다: 무릎 아래는 이차라 미분이
+# 살아 있고, 위는 선형이라 드문 급전에 이차 벌점처럼 가혹하지 않다.
+#
+# 무릎은 **실측 중앙값**이다 — "여기가 보통 속도" 라는 뜻이지 상한이 아니다.
+VEL_KNEE_HZ_PER_MS: dict[str, float] = {
+    "f1": 2.9, "f2": 7.0, "f3": 11.5, "f4": 10.7,
+}
+# "off" | "hinge"(95 분위 상한) | "huber"(중앙값 무릎 smooth L1)
+VEL_MODE = "huber"
 # 기본값 0 — **아직 켜지 않는다.** 기구와 계측 상수는 여기 있지만, 세기(VEL_W)가
 # 포락 일치를 얼마나 깎는지 A/B 로 확인하기 전에는 모든 적합의 거동을 바꿀 수 없다.
 # 힌지 자체는 검증했다: F2 이동 10/50/93 Hz/ms 는 벌점 0, 150 은 0.97, 309 는 14.0.
@@ -470,16 +494,23 @@ class CopySynthFitter:
                     bw = self._to_val(u[:, k], self.specs[k])
                     over = torch.relu(bw - 0.8 * f[:, j]) / 1000.0
                     pen = pen + 2.0 * (over * over).mean()
-        if VEL_W > 0 and u.shape[0] > 1:
+        if VEL_W > 0 and VEL_MODE != "off" and u.shape[0] > 1:
             dt = max(self.track.frame_ms, 1e-6)
-            for nm, lim in VEL_LIMIT_HZ_PER_MS.items():
+            tab = (VEL_LIMIT_HZ_PER_MS if VEL_MODE == "hinge" else VEL_KNEE_HZ_PER_MS)
+            for nm, lim in tab.items():
                 if nm not in self.names:
                     continue
                 k = self.names.index(nm)
                 v = self._to_val(u[:, k], self.specs[k])
                 rate = (v[1:] - v[:-1]).abs() / dt
-                over = torch.relu(rate - lim) / 100.0
-                pen = pen + VEL_W * (over * over).mean()
+                if VEL_MODE == "hinge":
+                    over = torch.relu(rate - lim) / 100.0
+                    pen = pen + VEL_W * (over * over).mean()
+                else:
+                    # 후버. lim 으로 나눠 무차원으로 만든다 (파라미터끼리 같은 저울).
+                    r = rate / lim
+                    h = torch.where(r < 1.0, 0.5 * r * r, r - 0.5)
+                    pen = pen + VEL_W * h.mean()
         return pen
 
     def loss(self):
