@@ -28,6 +28,21 @@
    제곱 영역에서 빼면 남는 것이 **편향** — 모형이 실제로 틀린 만큼이다. 완벽한
    모형에서 100 % 로 수렴한다.
 
+   **다만 이 자에는 신뢰도가 붙는다** (`trust` / `resolved`). 편향이 실현 잡음보다
+   작으면 분해가 안 되고, 그때의 값은 "이 값이다" 가 아니라 **"적어도 이 값"** 이다.
+   완벽한 모형이 거기 오고(편향이 실제로 0 이니까) 잡음이 과한 합성도 거기 온다 —
+   **둘을 가르는 것은 `noise_ratio`** (합성/목표 실현 분산 비) 다. 실측 대조군:
+
+    | 대조군            | 정밀  | 보정  | 신뢰도 | 분해 | 잡음비 |
+    |-------------------|-------|-------|--------|------|--------|
+    | 완벽 (시드만 다름)| 33.9  | 97.2  |  0.007 | ✗    |  0.97  |
+    | 1 kHz 어긋남      | 29.4  | 74.3  |  0.105 | ✓    |  0.97  |
+    | 크게 어긋남       | −5.8  |  6.9  |  0.600 | ✓    |  0.98  |
+    | 6 dB 조용         | 31.7  | 51.0  |  0.399 | ✓    |  0.24  |
+    | 같은 하모닉       | 100.0 | 100.0 |  1.000 | ✓    |  1.00  |
+
+   잡음비가 6 dB 조용한 합성에서 0.24 로 나온다 — 진폭 0.5 배의 분산비 0.25 다.
+
 2. **치찰음 척도** (`sibilant_features`). 문헌이 조음 위치를 가른다고 확인한 양들:
    스펙트럼 봉우리 위치와 네 모멘트(무게중심·표준편차·왜도·첨도)
    [Jongman, Wayland & Wong (2000), JASA 108(3):1252 — "spectral peak location,
@@ -61,6 +76,11 @@ LTAS_EDGES = (0.0, 500.0, 1000.0, 2000.0, 3000.0, 4000.0, 5000.0, 6000.0,
               8000.0, 10000.0, 12000.0, 16000.0, 24000.0)
 # 포락 변조 스펙트럼의 대역. 5~60 Hz 는 제트 사행(의도한 것), 그 위는 질감이다.
 MOD_EDGES = (5.0, 60.0, 400.0, 800.0, 1200.0, 2000.0)
+# 보정 일치율이 **분해**됐다고 볼 최소 신뢰도. 목표-합성 거리 중 실현 잡음으로 설명되지
+# 않는 몫이 이만큼은 되어야, 남은 편향을 "쟀다" 고 말할 수 있다. 그 아래면 값은
+# 상한일 뿐이다 (편향 ≤ 그 값). 완벽한 모형도 여기 오므로 실패 표시가 아니다 —
+# 잡음량이 맞는지는 `noise_ratio` 로 따로 본다.
+TRUST_MIN = 0.10
 
 
 # ----------------------------------------------------------------- 스펙트럼 추정
@@ -234,39 +254,84 @@ def _sq(a: np.ndarray, b: np.ndarray) -> float:
     return float((d * d).sum())
 
 
+def _realization_var(mag: np.ndarray, k: int = 9) -> float:
+    """시간 평활 잔차로 실현 분산을 추정한다.
+
+    신호의 실제 변화(마찰 시작, 포먼트 전이)도 섞이므로 **절대값은 못 믿는다.** 목표와
+    합성에 똑같이 걸었을 때의 **비**만 쓴다 — 그 용도로는 편향이 대부분 상쇄된다.
+    """
+    a = np.asarray(mag, dtype=np.float64)
+    t = a.shape[-1]
+    if t < 3:
+        return 0.0
+    k = max(3, min(k, t // 2 * 2 + 1))
+    ker = np.ones(k) / k
+    sm = np.apply_along_axis(lambda v: np.convolve(
+        np.pad(v, k // 2, mode="edge"), ker, mode="valid")[:t], -1, a)
+    return float(((a - sm) ** 2).sum())
+
+
 def corrected_sc(mag_t: np.ndarray, mag_p: np.ndarray,
-                 mag_p2: np.ndarray | None) -> tuple[float, float]:
-    """실현 잡음을 뺀 스펙트럼 수렴도 -> (보정 SC, 바닥 SC).
+                 mag_p2: np.ndarray | None) -> dict:
+    """실현 잡음을 뺀 스펙트럼 수렴도.
+
+    -> `{"sc", "floor", "trust", "noise_ratio"}`
 
     크기 스펙트럼을 `|S| = m + n` (기대값 + 실현 잡음) 으로 쓰면
 
-        E‖|S_t|−|S_p|‖² = ‖m_t−m_p‖² + V_t + V_p
-        E‖|S_p|−|S_p'|‖² = 2·V_p                    (같은 파라미터, 시드만 다름)
+        D_tp  = E‖|S_t|−|S_p|‖²  = ‖m_t−m_p‖² + V_t + V_p
+        D_pp' = E‖|S_p|−|S_p'|‖² = 2·V_p            (같은 파라미터, 시드만 다름)
 
-    이다. 모형이 옳다면 V_t ≈ V_p 이므로 둘째 식이 첫 식의 잡음 항 전체를 준다.
-    빼고 남는 것이 **편향** ‖m_t−m_p‖² — 모형이 실제로 틀린 만큼이다. 분모의
-    ‖m_t‖² 도 같은 방식으로 V_t = D_pp'/2 를 빼서 보정한다.
+    이므로 **빼야 할 것은 V_t + V_p** 이고 그중 V_p 만 정확히 안다 (= D_pp'/2).
 
-    `mag_p2` 가 없으면 보정 없이 원래 SC 를 돌려준다 (바닥 0).
+    **V_t ≈ V_p 를 가정하고 D_pp' 를 통째로 빼면 안 된다.** 합성의 실현 분산이 목표보다
+    크면 (실제로 그렇다 — 녹음은 위너 차감을 거쳐 스펙트럼이 평활해져 있다) 과하게
+    빼서 **잡음 투성이 합성이 100 % 를 받는다.** 실측: 치찰음 구간 넷 전부 100.00.
+
+    그래서 V_t 를 따로 추정한다. 시간 평활 잔차는 절대 눈금이 안 맞지만, 합성 쪽에서는
+    참값(D_pp'/2)을 아니까 그것으로 눈금을 교정해 목표에 옮긴다:
+
+        V_t ≈ V_t^est · (D_pp'/2) / V_p^est
+
+    V_p = 2·V_t 인 경우로 확인하면 정확히 ‖m_t−m_p‖² 가 남는다.
+
+    돌려주는 값
+    -----------
+    * `sc`    — 보정 SC. 완벽한 모형에서 0 (= 일치 100 %).
+    * `floor` — 실현 잡음이 만드는 바닥. 원래 SC 가 이보다 좋아질 수 없다.
+    * `trust` — `(D_tp − 뺀 양) / D_tp`. **0 에 가까우면 보정값을 믿으면 안 된다** —
+      실현 잡음이 거리를 통째로 설명해 버려 편향을 못 잰다. 그럴 때는
+      `spectrum_match`(시간 평균 스펙트럼)를 대신 본다.
+    * `noise_ratio` — V_p/V_t 추정. 1 보다 크면 합성이 목표보다 잡음이 심하다.
+      **이건 보정으로 지워지는 양이 아니라 별개의 결함이다** (잡음량도 물리
+      파라미터다). 모양이 맞는지와 잡음량이 맞는지를 갈라서 봐야 한다.
 
     성질:
-    * 완벽한 모형 -> 보정 SC 0 (일치 100 %). 원래 SC 는 0.655 (일치 34.5 %).
+    * 완벽한 모형 -> sc 0. 원래 SC 는 0.655 (일치 34.5 %).
     * 결정적 신호(하모닉) -> D_pp' ≈ 0 이므로 보정이 아무 일도 안 한다.
-    * 잡음이 목표보다 많거나 적으면 -> V_p ≠ V_t 라 완전히는 안 지워진다. 그건
-      결함이 아니라 **실제 차이**다 (잡음량도 물리 파라미터다).
     """
     n_t = float((np.asarray(mag_t, dtype=np.float64) ** 2).sum())
     d_tp = _sq(mag_t, mag_p)
     if mag_p2 is None:
-        return float(np.sqrt(d_tp / max(n_t, 1e-30))), 0.0
+        return dict(sc=float(np.sqrt(d_tp / max(n_t, 1e-30))), floor=0.0,
+                    trust=1.0, noise_ratio=float("nan"))
     d_pp = _sq(mag_p, mag_p2)
-    bias = max(d_tp - d_pp, 0.0)
-    denom = max(n_t - 0.5 * d_pp, 1e-30)
-    # 바닥은 **원래 SC 를 넘지 않게** 자른다. 합성이 목표보다 잡음이 많으면 D_pp' 가
-    # D_tp 보다 커질 수 있는데, 그때 "상한이 실측보다 나쁘다" 고 적으면 읽는 사람이
-    # 헷갈린다. 그런 경우는 보정 SC 가 0 (= 편향 없음) 으로 이미 말해 준다.
-    return (float(np.sqrt(bias / denom)),
-            float(np.sqrt(min(d_pp, d_tp) / max(n_t, 1e-30))))
+    vt_est, vp_est = _realization_var(mag_t), _realization_var(mag_p)
+    ratio = float(vp_est / max(vt_est, 1e-30))
+    # 두 신호가 사실상 같으면 잴 것이 없다 — 실현 잡음도 0 이라 아래의 비가 0/0 이 된다.
+    if d_tp <= 1e-12 * max(n_t, 1e-30):
+        return dict(sc=0.0, floor=0.0, trust=1.0, noise_ratio=ratio)
+    v_p = 0.5 * d_pp
+    v_t = vt_est * (v_p / max(vp_est, 1e-30))    # 합성 쪽 참값으로 눈금을 교정해 옮긴다
+    sub = min(v_t + v_p, d_tp)                   # 실제 거리보다 더 뺄 수는 없다
+    bias = max(d_tp - sub, 0.0)
+    denom = max(n_t - v_t, 1e-30)
+    return dict(
+        sc=float(np.sqrt(bias / denom)),
+        floor=float(np.sqrt(min(sub, d_tp) / max(n_t, 1e-30))),
+        trust=float((d_tp - sub) / d_tp),
+        noise_ratio=ratio,
+    )
 
 
 def spectrum_match(target: np.ndarray, synth: np.ndarray, fs: float) -> float:
@@ -338,15 +403,25 @@ def spectral_fidelity(target: np.ndarray, synth: np.ndarray,
 
     돌려주는 값:
     * `fine`      — 지금까지 쓰던 값 (비교용으로 남긴다)
-    * `fine_corr` — 편향만 남긴 값. **완벽한 모형에서 100 % 로 수렴한다.**
+    * `fine_corr` — 편향만 남긴 값. 완벽한 모형에서 100 % 로 수렴한다.
     * `floor`     — 실현 잡음이 만드는 바닥. 원래 값이 이보다 좋아질 수 없다.
+    * `trust` / `resolved` — **`resolved` 가 False 면 `fine_corr` 을 "이 값이다" 로
+      읽으면 안 되고 "적어도 이 값" 으로 읽어야 한다.** 편향이 실현 잡음보다 작아
+      분해가 안 된 것이다. 완벽한 모형도 여기 오고 (편향이 실제로 0 이니까), 잡음이
+      과한 합성도 여기 온다 — **둘을 가르는 것은 `noise_ratio` 다.**
+    * `noise_ratio` — 합성/목표의 실현 분산 비. 1 이면 잡음량이 맞다. 실측으로
+      진폭을 6 dB 낮춘 합성에서 0.24 가 나온다 (이론 0.25).
+
+    그래서 치찰음 구간의 성적은 **세 값을 함께** 읽는다:
+    `fine_corr` 이 높고 `noise_ratio` ≈ 1 이면 좋은 것이고, `fine_corr` 이 높은데
+    `noise_ratio` 가 1 에서 멀면 "모양은 못 재겠고 잡음량은 틀렸다" 는 뜻이다.
     """
     n = min(len(target), len(synth))
     if synth2 is not None:
         n = min(n, len(synth2))
     t, p = target[:n], synth[:n]
     p2 = synth2[:n] if synth2 is not None else None
-    raw, cor, flo = [], [], []
+    raw, cor, flo, tru, nr = [], [], [], [], []
     for k in sizes:
         if n < k:
             continue
@@ -357,11 +432,16 @@ def spectral_fidelity(target: np.ndarray, synth: np.ndarray,
         m = min(A.shape[1], B.shape[1]) if C is None else min(A.shape[1], B.shape[1], C.shape[1])
         A, B = A[:, :m], B[:, :m]
         C = C[:, :m] if C is not None else None
-        r, _ = corrected_sc(A, B, None)
-        c, f0 = corrected_sc(A, B, C)
-        raw.append(r); cor.append(c); flo.append(f0)
+        raw.append(corrected_sc(A, B, None)["sc"])
+        d = corrected_sc(A, B, C)
+        cor.append(d["sc"]); flo.append(d["floor"])
+        tru.append(d["trust"]); nr.append(d["noise_ratio"])
     if not raw:
-        return dict(fine=float("nan"), fine_corr=float("nan"), floor=float("nan"))
+        return dict(fine=float("nan"), fine_corr=float("nan"), floor=float("nan"),
+                    trust=float("nan"), noise_ratio=float("nan"))
+    trust = float(np.mean(tru))
     return dict(fine=100.0 * (1.0 - float(np.mean(raw))),
                 fine_corr=100.0 * (1.0 - float(np.mean(cor))),
-                floor=100.0 * (1.0 - float(np.mean(flo))))
+                floor=100.0 * (1.0 - float(np.mean(flo))),
+                trust=trust, noise_ratio=float(np.mean(nr)) if nr else float("nan"),
+                resolved=bool(trust >= TRUST_MIN))

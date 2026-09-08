@@ -54,6 +54,25 @@ def test_corrected_sc_saturates_for_a_perfect_model():
     r = tb.spectral_fidelity(t, p, p2, FS)
     assert r["fine"] < 45.0                 # 원래 자는 여전히 낮다
     assert r["fine_corr"] > 95.0            # 보정하면 거의 만점
+    # 편향이 실제로 0 이므로 **분해되지 않는다** — 이건 실패가 아니라 이 자의 한계다.
+    # 잡음량이 맞는다는 것은 noise_ratio 가 따로 말해 준다.
+    assert not r["resolved"]
+    assert 0.8 < r["noise_ratio"] < 1.25
+
+
+def test_noise_ratio_catches_a_level_error_the_correction_cannot():
+    """분해가 안 될 때 **좋은 합성과 잡음 과다를 가르는 것은 `noise_ratio` 다.**
+
+    보정 일치율만 보면 둘 다 높게 나올 수 있다. 잡음량은 물리 파라미터이므로 별개로
+    보고해야 한다.
+    """
+    t = _band(1, 4000, 11000)
+    good = tb.spectral_fidelity(t, _band(2, 4000, 11000), _band(3, 4000, 11000), FS)
+    quiet = tb.spectral_fidelity(t, 0.5 * _band(2, 4000, 11000),
+                                 0.5 * _band(3, 4000, 11000), FS)
+    assert 0.8 < good["noise_ratio"] < 1.25
+    # 진폭 0.5 배 -> 분산비 0.25. 추정이 그 근처를 짚어야 한다.
+    assert 0.15 < quiet["noise_ratio"] < 0.40
 
 
 def test_corrected_sc_still_sees_a_real_error():
@@ -75,8 +94,10 @@ def test_correction_is_harmless_on_deterministic_signals():
     t = _tone(200.0)
     same = tb.spectral_fidelity(t, _tone(200.0), _tone(200.0), FS)
     assert same["fine"] > 99.0 and same["fine_corr"] > 99.0
+    assert same["resolved"]                  # 실현 잡음이 없으니 완전히 분해된다
     off = tb.spectral_fidelity(t, _tone(206.0), _tone(206.0), FS)
     assert abs(off["fine"] - off["fine_corr"]) < 1.0     # 보정이 개입하지 않는다
+    assert off["resolved"] and off["trust"] > 0.9
 
 
 def test_level_error_is_not_forgiven():
@@ -85,6 +106,7 @@ def test_level_error_is_not_forgiven():
     r = tb.spectral_fidelity(t, 0.5 * _band(2, 4000, 11000),
                              0.5 * _band(3, 4000, 11000), FS)
     assert r["fine_corr"] < 70.0
+    assert r["resolved"]                     # 레벨 오차는 잡음보다 커서 분해된다
     # 반대로 모양만 보는 자는 레벨을 무시한다 (둘이 다른 것을 잰다)
     assert tb.spectrum_match(t, 0.5 * _band(2, 4000, 11000), FS) > 85.0
 

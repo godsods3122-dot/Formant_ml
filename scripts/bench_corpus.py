@@ -125,9 +125,11 @@ def main() -> None:
     prof = SpeakerProfile.load(a.profile)
     torch.set_num_threads(2)
     it = (60, 40, 250) if a.quick else (200, 150, 800)
-    print(f"{'구간':>16s} {'포락':>6s} {'정밀':>6s} {'보정정밀':>8s} {'상한':>6s} "
+    print(f"{'구간':>16s} {'포락':>6s} {'정밀':>6s} {'보정정밀':>9s} {'잡음비':>6s} "
           f"{'위상':>7s} {'조화SNR':>8s} {'무게중심':>9s} {'대역MAE':>8s} "
           f"{'변조MAE':>8s} {'비조화 합/목':>13s}")
+    print("  * 보정정밀 앞의 '>=' 는 편향이 실현 잡음보다 작아 분해가 안 됐다는 뜻이다.")
+    print("    그때는 잡음비(합성/목표 실현 분산, 1 이 맞음)와 무게중심을 함께 읽는다.\n")
     for name, path, t0, t1, kind in SEGMENTS:
         if a.only and a.only not in name:
             continue
@@ -136,8 +138,10 @@ def main() -> None:
             continue
         t = time.time()
         r = bench(path, t0, t1, prof, a.verbose, it)
-        print(f"{name:>16s} {r['env']:6.2f} {r['fine']:6.2f} {r['fine_corr']:8.2f} "
-              f"{r['floor']:6.2f} {r['phase']:6.1f}° {r['snr']:8.2f} "
+        mark = " " if r["resolved"] else ">"
+        print(f"{name:>16s} {r['env']:6.2f} {r['fine']:6.2f} "
+              f"{mark}={r['fine_corr']:6.2f} {r['noise_ratio']:6.2f} "
+              f"{r['phase']:6.1f}° {r['snr']:8.2f} "
               f"{r['centroid_err']:8.0f}  {r['band_mae']:8.2f} {r['mod_mae']:8.2f} "
               f"{r['nh_synth']:6.1f}% /{r['nh_target']:5.1f}%  ({time.time()-t:.0f}s)",
               flush=True)

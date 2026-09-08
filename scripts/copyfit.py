@@ -105,9 +105,14 @@ def main() -> None:
     # 난류에서 34.5 % 가 원리적 상한이다 (engine/turbulence.py 머리말). 실현 잡음을
     # 뺀 값을 같이 낸다 — 완벽한 모형이면 여기서 97 % 가 나온다.
     fid = fit.fidelity()
-    print(f"실현 잡음을 빼면: 보정 정밀 {fid['fine_corr']:5.2f} %   "
-          f"(기존 자의 이 구간 상한 {fid['floor']:.1f} %,  "
+    mark = "" if fid["resolved"] else "\u2265 "   # 분해 안 됨 -> "적어도 이 값"
+    print(f"실현 잡음을 빼면: 보정 정밀 {mark}{fid['fine_corr']:.2f} %   "
+          f"(신뢰도 {fid['trust']:.2f}, 잡음비 {fid['noise_ratio']:.2f}, "
+          f"기존 자의 이 구간 상한 {fid['floor']:.1f} %,  "
           f"시간평균 스펙트럼 {fid['spectrum_match']:.1f} %)")
+    if not fid["resolved"]:
+        print("  * 편향이 실현 잡음보다 작아 분해되지 않았다. 위 값은 상한이다 — "
+              "잡음비(1 이 맞음)와 아래 치찰음 지문을 함께 읽을 것.")
 
     out = fit.render()
     os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)

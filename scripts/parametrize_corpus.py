@@ -55,6 +55,9 @@ from formant_ml.engine.voice import EngineConfig, VoiceEngine
 # 이 아래면 "적합이 실패했다" 고 본다. 포락은 조음이, 보정 정밀은 파형까지가 맞는가.
 OK_ENV = 85.0
 OK_FINE_CORR = 70.0
+# 잡음량이 이 범위를 벗어나면 실패로 본다 (합성/목표 실현 분산 비, 1 이 맞음).
+# ±6 dB 진폭 오차가 분산비 0.25 / 4.0 에 해당하므로 그 절반쯤에서 자른다.
+OK_NOISE_LO, OK_NOISE_HI = 0.5, 2.0
 
 
 def _name(path: str, t0: float, t1: float) -> str:
@@ -112,6 +115,8 @@ def fit_one(path: str, t0: float, t1: float, kind: str, prof: SpeakerProfile,
                frames=int(res.values.shape[0]), npz=os.path.relpath(npz, out_dir),
                env=rep.env, fine=rep.fine, db=rep.db,
                fine_corr=fid["fine_corr"], floor=fid["floor"],
+               trust=fid["trust"], resolved=fid["resolved"],
+               noise_ratio=fid["noise_ratio"],
                spectrum_match=fid["spectrum_match"], gain_db=fit.gain_db())
     if kind == "fricative":
         c = tb.compare(tgt, out, 48000.0)
@@ -119,7 +124,13 @@ def fit_one(path: str, t0: float, t1: float, kind: str, prof: SpeakerProfile,
                    sibilance_err=c["sibilance_err"], mod_mae=c["mod_mae_pct"],
                    centroid_target=c["target"]["centroid"],
                    centroid_synth=c["synth"]["centroid"])
-    row["ok"] = bool(rep.env >= OK_ENV and fid["fine_corr"] >= OK_FINE_CORR)
+    # **`fine_corr` 만으로 판정하면 안 된다.** 분해가 안 된 구간(치찰음이 대개 그렇다)
+    # 에서는 그 값이 상한일 뿐이라 잡음 투성이 합성도 높게 나온다. 잡음량이 맞는지를
+    # `noise_ratio` 로 같이 본다.
+    nr = fid["noise_ratio"]
+    row["ok"] = bool(rep.env >= OK_ENV
+                     and fid["fine_corr"] >= OK_FINE_CORR
+                     and (not np.isfinite(nr) or OK_NOISE_LO <= nr <= OK_NOISE_HI))
     return row
 
 
@@ -242,8 +253,9 @@ def _log(fh, row, done, total, t_all):
         print(f"[{done}/{total}] {row['stem']:>34s}  실패 {row['error'][:60]}", flush=True)
     else:
         print(f"[{done}/{total}] {row['stem']:>34s} {row['kind'][:4]:>4s} "
-              f"포락 {row['env']:5.1f} 보정정밀 {row['fine_corr']:5.1f} "
-              f"(상한 {row['floor']:4.1f}) {'ok' if row['ok'] else '--'} "
+              f"포락 {row['env']:5.1f} 보정정밀 {'>' if not row['resolved'] else ' '}"
+              f"{row['fine_corr']:5.1f} 잡음비 {row['noise_ratio']:4.2f} "
+              f"{'ok' if row['ok'] else '--'} "
               f"{row.get('seconds', 0):5.1f}s  남은 {eta/60:.0f}분", flush=True)
 
 
