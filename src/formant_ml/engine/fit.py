@@ -479,9 +479,12 @@ class CopySynthFitter:
         Mp = self.mel[:, :Smel.shape[1]] @ Smel
         m = min(Mp.shape[-1], self.tgt_M.shape[-1])
         Mp, Mt = Mp[..., :m], self.tgt_M[..., :m]
-        a = self._db(Mt).clamp_min(self.db_floor)
-        b = self._db(Mp).clamp_min(self.db_floor)
-        env_db = (a - b).abs().mean() / 20.0
+        # **clamp 도 abs 도 꺾임이다.** 멜 빈 수천 개마다 꺾이면 손실이 C² 가 아니게
+        # 되고 헤시안 기반 진단이 통째로 막힌다 (docs/MEASUREMENTS.md §8.7). 폭은
+        # dB 단위 0.5 — 계측 잡음보다 작아 거동은 사실상 그대로다.
+        a = self._soft_floor(self._db(Mt), self.db_floor, 0.5)
+        b = self._soft_floor(self._db(Mp), self.db_floor, 0.5)
+        env_db = self._soft_abs(a - b, 0.5).mean() / 20.0
         env_sc = self._sc(Mt, Mp)
         return sc_sum / len(self.sizes), env_db, env_sc, per
 
@@ -499,9 +502,54 @@ class CopySynthFitter:
             Sp, St = _stft(y, k, self.wins[k]), _stft(self.target, k, self.wins[k])
             m = min(Sp.shape[-1], St.shape[-1])
             b = self.bin_max[k]
-            out = out + ((St[:, :b, :m] - Sp[:, :b, :m]).abs().mean()
-                         / (St[:, :b, :m].abs().mean() + 1e-9))
+            ref = St[:, :b, :m].abs().mean()
+            # **복소 크기는 꺾이지는 않지만 0 근처에서 곡률이 발산한다.** 적합이
+            # 좋아질수록 이 차이가 0 으로 가므로 오히려 더 나쁘다. √(|z|²+δ²)−δ 로
+            # 바닥을 깔아 준다. δ 는 목표 크기의 1e-3 이라 손실값은 사실상 그대로다.
+            d = St[:, :b, :m] - Sp[:, :b, :m]
+            dlt = 1e-3 * ref.detach() + 1e-12
+            sm = (torch.sqrt(d.real ** 2 + d.imag ** 2 + dlt ** 2) - dlt).mean()
+            out = out + sm / (ref + 1e-9)
         return out / 3.0
+
+    @staticmethod
+    def _soft_over(x: torch.Tensor, width: float) -> torch.Tensor:
+        """relu 의 부드러운 대체. width 만큼의 폭으로 무릎을 뭉갠다.
+
+        **relu 를 쓰면 안 된다.** 꺾임점에서 2 차 도함수가 정의되지 않아 손실이 C² 가
+        아니게 되고, 그러면 헤시안 기반 진단(유효 파라미터 수 γ 등)이 통째로 막힌다.
+        실측으로 확인했다: 유한차분 헤시안의 대칭성(uᵀHv = vᵀHu)이 ε 을 4 자릿수
+        쓸어도 41.9 / 47.5 / 178.2 / 153.5 % 로 깨졌다 (docs/MEASUREMENTS.md §8.7).
+        손실은 결정적이었으므로 원인은 무작위성이 아니라 꺾임이다.
+
+        width → 0 이면 relu 로 수렴한다. 벌점으로서의 성질(문턱 아래는 거의 0, 위는
+        선형)은 그대로 두고 미분만 매끄럽게 만든다.
+        """
+        return width * torch.nn.functional.softplus(x / width)
+
+    @staticmethod
+    def _soft_abs(x: torch.Tensor, width: float) -> torch.Tensor:
+        """|x| 의 부드러운 대체 (의사 후버). 작은 x 에서 x²/2width, 큰 x 에서 |x|.
+
+        포락 오차의 L1 이 손실의 최대 꺾임원이었다 — 멜 빈 수천 개마다 a=b 에서
+        꺾인다. width 는 "이 정도 차이는 오차로 안 친다" 는 뜻이고, dB 단위에서
+        0.5 dB 면 계측 잡음보다 작아 거동이 사실상 안 바뀐다.
+        """
+        return width * (torch.sqrt(1.0 + (x / width) ** 2) - 1.0)
+
+    @staticmethod
+    def _soft_floor(x: torch.Tensor, floor: float, width: float) -> torch.Tensor:
+        """clamp_min 의 부드러운 대체. floor + softplus(x − floor)."""
+        return floor + width * torch.nn.functional.softplus((x - floor) / width)
+
+    @staticmethod
+    def _pseudo_huber(r: torch.Tensor) -> torch.Tensor:
+        """후버의 매끄러운 형태. torch.where 는 1 차 도함수만 이어져 C² 가 아니다.
+
+        √(1+r²) − 1 은 작은 r 에서 r²/2, 큰 r 에서 r−1 로 후버와 같은 모양이면서
+        무한히 미분 가능하다.
+        """
+        return torch.sqrt(1.0 + r * r) - 1.0
 
     def penalty(self) -> torch.Tensor:
         """물리적으로 성립하지 않는 해를 막는다.
@@ -514,14 +562,14 @@ class CopySynthFitter:
         pen = torch.zeros((), dtype=torch.float64, device=self.device)
         if len(self.f_idx) >= 2:
             f = torch.stack([self._to_val(u[:, i], self.specs[i]) for i in self.f_idx], 1)
-            gap = torch.relu(f[:, :-1] + F_MARGIN_HZ - f[:, 1:]) / 1000.0
+            gap = self._soft_over(f[:, :-1] + F_MARGIN_HZ - f[:, 1:], 30.0) / 1000.0
             pen = pen + 10.0 * (gap * gap).mean()
             for j, i in enumerate(self.f_idx):
                 nb = self.names[i].replace("f", "bw")
                 if nb in self.names:
                     k = self.names.index(nb)
                     bw = self._to_val(u[:, k], self.specs[k])
-                    over = torch.relu(bw - 0.8 * f[:, j]) / 1000.0
+                    over = self._soft_over(bw - 0.8 * f[:, j], 30.0) / 1000.0
                     pen = pen + 2.0 * (over * over).mean()
         if VEL_W > 0 and VEL_MODE != "off" and u.shape[0] > 1:
             dt = max(self.track.frame_ms, 1e-6)
@@ -539,12 +587,12 @@ class CopySynthFitter:
                 else:
                     rate = (v[1:] - v[:-1]).abs() / dt
                 if VEL_MODE == "hinge":
-                    over = torch.relu(rate - lim) / 100.0
+                    over = self._soft_over(rate - lim, 0.05 * lim) / 100.0
                     pen = pen + VEL_W * (over * over).mean()
                 else:
                     # 후버. lim 으로 나눠 무차원으로 만든다 (파라미터끼리 같은 저울).
                     r = rate / lim
-                    h = torch.where(r < 1.0, 0.5 * r * r, r - 0.5)
+                    h = self._pseudo_huber(r)
                     pen = pen + VEL_W * h.mean()
         return pen
 
