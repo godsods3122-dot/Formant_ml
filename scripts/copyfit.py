@@ -93,7 +93,8 @@ def main() -> None:
     prof = SpeakerProfile.load(a.profile) if a.profile else DEFAULT_PROFILE
     hop = max(1, int(round(a.frame_ms * sr / 1000.0)))
     track = analyze(seg, sr, prof, hop, t0=a.t0, full=y)
-    print(f"구간 {a.t0:.3f}~{t1:.3f} s, {track.n_frames} 프레임 × {track.frame_ms} ms")
+    print(f"구간 {a.t0:.3f}~{t1:.3f} s, {track.n_frames} 프레임 × {track.frame_ms} ms",
+          flush=True)
 
     eng = VoiceEngine(EngineConfig(sample_rate=48000, frame_ms=a.frame_ms,
                                    speaker="female" if prof.f0_nominal > 165 else "male",

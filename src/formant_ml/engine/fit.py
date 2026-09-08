@@ -804,7 +804,7 @@ class CopySynthFitter:
             if verbose and (it % log_every == 0 or it == iters - 1):
                 print(f"    [{it:4d}] 포락 {env:6.2f}%  정밀 {fine:6.2f}%  "
                       f"오차 {self._last_db:5.2f} dB  펄스 {self._last_pulse:.3f}  "
-                      f"손실 {float(l.detach()):.4f}")
+                      f"손실 {float(l.detach()):.4f}", flush=True)
         if verbose and bad_grads:
             print(f"    (기울기 비유한 {bad_grads} 회 건너뜀)")
         if best[1] is not None:
@@ -892,7 +892,7 @@ class CopySynthFitter:
         for si, (grid, sizes) in enumerate(zip(GRID_MS, STAGES)):
             tc = self.set_grid(grid)
             if verbose:
-                print(f"  2.{si + 1} 단계  격자 {grid:g} ms ({tc} 점)  창 {sizes}")
+                print(f"  2.{si + 1} 단계  격자 {grid:g} ms ({tc} 점)  창 {sizes}", flush=True)
             rep = self.fit(stage_iters, lr_frame * (0.75 ** si), log_every, verbose,
                            sizes=sizes, patience=patience)
         # **위상 단계는 기본이다.** 크기만 맞추면 위상은 물리가 강제하는 곳에서만 맞는다.
@@ -912,7 +912,7 @@ class CopySynthFitter:
         if phase_iters > 0:
             self.phase_weight = phase_w
             if verbose:
-                print(f"  3 단계  위상 (가중 {phase_w}, {phase_iters} 반복)")
+                print(f"  3 단계  위상 (가중 {phase_w}, {phase_iters} 반복)", flush=True)
             if isinstance(lr_phase, (int, float)):
                 lr_p = float(lr_phase)
             else:
