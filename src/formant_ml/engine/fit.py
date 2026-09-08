@@ -272,7 +272,13 @@ class CopySynthFitter:
         # 그 아래 16~22 kHz 도 녹음 장비의 안티에일리어싱이 만든 값이다. 그걸 목표로
         # 두면 적합기가 "저 위를 비워라" 를 물리 파라미터로 달성하려 들고, 그 왜곡이
         # 8~12 kHz 를 10 dB 어둡게 만들었다(실측: 남성 /사/).
-        self.f_max = min(0.5 * float(sr), 0.5 * self.fs) * 0.90
+        # **표본화율만으로는 부족하다.** 손실 압축을 거친 음원은 sr 이 48 kHz 여도 대역이
+        # 잘려 있다 (orphan 코퍼스 실측: 전부 20 kHz 에서 급락, 나이퀴스트는 24 kHz).
+        # 그 빈 4 kHz 를 손실이 보면 적합기가 "저 위를 비워라" 를 물리 파라미터로
+        # 달성하려 든다. 녹음에서 직접 재서 낮은 쪽을 쓴다.
+        from .turbulence import effective_bandwidth
+        bw = effective_bandwidth(np.asarray(target, dtype=np.float64), float(sr))
+        self.f_max = min(0.5 * float(sr), 0.5 * self.fs, bw) * 0.90
         if sr != self.fs:
             from scipy.signal import resample_poly
             g = math.gcd(int(sr), int(self.fs))

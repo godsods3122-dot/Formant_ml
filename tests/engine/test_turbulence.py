@@ -207,3 +207,32 @@ def test_phase_distance_of_identical_signal_is_zero_at_any_level(g):
     """같은 파형이면 진폭이 달라도 위상 거리는 0 이다 (크기와 완전히 직교)."""
     t = _tone(200.0)
     assert _phase_terms(t, g * t)[1] < 0.05
+
+
+# ------------------------------------------------- 손실 압축의 대역 상한
+def test_effective_bandwidth_leaves_full_band_alone():
+    """대역 제한이 없으면 자르지 않는다 — 확실하지 않으면 건드리지 않는 편이 안전하다."""
+    x = np.random.default_rng(0).standard_normal(int(FS * 0.4))
+    assert tb.effective_bandwidth(x, FS) >= 0.49 * FS
+
+
+def test_effective_bandwidth_finds_a_lowpass():
+    """저역통과가 걸린 신호에서 상한을 찾는다 (보수적으로 — 실제보다 높게 잡는다)."""
+    from scipy.signal import butter, sosfilt
+    x = np.random.default_rng(0).standard_normal(int(FS * 0.4))
+    sos = butter(8, 12000 / (FS / 2), btype="low", output="sos")
+    bw = tb.effective_bandwidth(sosfilt(sos, x), FS)
+    assert 12000.0 <= bw < 0.45 * FS         # 진짜 신호를 버리지 않는다
+    # 더 낮게 자르면 더 낮게 검출해야 한다
+    sos2 = butter(8, 8000 / (FS / 2), btype="low", output="sos")
+    assert tb.effective_bandwidth(sosfilt(sos2, x), FS) < bw
+
+
+def test_effective_bandwidth_on_a_brickwall():
+    """손실 압축의 컷오프는 급격하다 — 그런 모양에서 정확해야 한다."""
+    n = int(FS * 0.4)
+    X = np.fft.rfft(np.random.default_rng(1).standard_normal(n))
+    f = np.fft.rfftfreq(n, 1 / FS)
+    X[f > 16000.0] = 0.0
+    bw = tb.effective_bandwidth(np.fft.irfft(X, n), FS)
+    assert 15000.0 < bw < 17500.0
