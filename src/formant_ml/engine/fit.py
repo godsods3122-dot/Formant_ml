@@ -272,7 +272,13 @@ class CopySynthFitter:
         # 그 아래 16~22 kHz 도 녹음 장비의 안티에일리어싱이 만든 값이다. 그걸 목표로
         # 두면 적합기가 "저 위를 비워라" 를 물리 파라미터로 달성하려 들고, 그 왜곡이
         # 8~12 kHz 를 10 dB 어둡게 만들었다(실측: 남성 /사/).
-        self.f_max = min(0.5 * float(sr), 0.5 * self.fs) * 0.90
+        # **표본화율만으로는 부족하다.** 손실 압축을 거친 음원은 sr 이 48 kHz 여도 대역이
+        # 잘려 있다 (orphan 코퍼스 실측: 전부 20 kHz 에서 급락, 나이퀴스트는 24 kHz).
+        # 그 빈 4 kHz 를 손실이 보면 적합기가 "저 위를 비워라" 를 물리 파라미터로
+        # 달성하려 든다. 녹음에서 직접 재서 낮은 쪽을 쓴다.
+        from .turbulence import effective_bandwidth
+        bw = effective_bandwidth(np.asarray(target, dtype=np.float64), float(sr))
+        self.f_max = min(0.5 * float(sr), 0.5 * self.fs, bw) * 0.90
         if sr != self.fs:
             from scipy.signal import resample_poly
             g = math.gcd(int(sr), int(self.fs))
@@ -804,7 +810,7 @@ class CopySynthFitter:
             if verbose and (it % log_every == 0 or it == iters - 1):
                 print(f"    [{it:4d}] 포락 {env:6.2f}%  정밀 {fine:6.2f}%  "
                       f"오차 {self._last_db:5.2f} dB  펄스 {self._last_pulse:.3f}  "
-                      f"손실 {float(l.detach()):.4f}")
+                      f"손실 {float(l.detach()):.4f}", flush=True)
         if verbose and bad_grads:
             print(f"    (기울기 비유한 {bad_grads} 회 건너뜀)")
         if best[1] is not None:
@@ -892,7 +898,7 @@ class CopySynthFitter:
         for si, (grid, sizes) in enumerate(zip(GRID_MS, STAGES)):
             tc = self.set_grid(grid)
             if verbose:
-                print(f"  2.{si + 1} 단계  격자 {grid:g} ms ({tc} 점)  창 {sizes}")
+                print(f"  2.{si + 1} 단계  격자 {grid:g} ms ({tc} 점)  창 {sizes}", flush=True)
             rep = self.fit(stage_iters, lr_frame * (0.75 ** si), log_every, verbose,
                            sizes=sizes, patience=patience)
         # **위상 단계는 기본이다.** 크기만 맞추면 위상은 물리가 강제하는 곳에서만 맞는다.
@@ -912,7 +918,7 @@ class CopySynthFitter:
         if phase_iters > 0:
             self.phase_weight = phase_w
             if verbose:
-                print(f"  3 단계  위상 (가중 {phase_w}, {phase_iters} 반복)")
+                print(f"  3 단계  위상 (가중 {phase_w}, {phase_iters} 반복)", flush=True)
             if isinstance(lr_phase, (int, float)):
                 lr_p = float(lr_phase)
             else:

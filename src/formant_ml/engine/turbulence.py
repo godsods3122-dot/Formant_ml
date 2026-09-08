@@ -444,3 +444,36 @@ def spectral_fidelity(target: np.ndarray, synth: np.ndarray,
                 floor=100.0 * (1.0 - float(np.mean(flo))),
                 trust=trust, noise_ratio=float(np.mean(nr)) if nr else float("nan"),
                 resolved=bool(trust >= TRUST_MIN))
+
+
+def effective_bandwidth(x: np.ndarray, fs: float, drop_db: float = 35.0,
+                        floor_db: float = 25.0) -> float:
+    """녹음의 **실제** 대역 상한 (Hz). 손실 압축의 로우패스를 찾아낸다.
+
+    왜 필요한가
+    -----------
+    적합 손실이 녹음의 대역 위를 보면, 적합기가 "저 위를 비워라" 를 물리 파라미터로
+    달성하려 들고 그 왜곡이 가청 대역을 망친다 (실측: 남성 /사/ 에서 8~12 kHz 가
+    10 dB 어두워졌다 — `CopySynthFitter.f_max` 주석).
+
+    `fit.py` 는 표본화율로 그것을 막아 왔다. 그런데 **손실 압축을 거친 음원은 표본화율이
+    맞아도 대역이 잘려 있다.** orphan 코퍼스 실측: 48 kHz 파일인데 전부 20 kHz 에서
+    급락한다 (나이퀴스트 24 kHz). 그 차이 4 kHz 를 손실이 보고 있었다.
+
+    방법: 시간 평균 스펙트럼에서 중역(2~8 kHz) 레벨 대비 `drop_db` 아래로 떨어지고
+    **그 위로 다시 안 올라오는** 첫 주파수를 찾는다. 못 찾으면 나이퀴스트를 돌려준다
+    (자르지 않는다 — 확실하지 않으면 건드리지 않는 편이 안전하다).
+    """
+    f, p = average_psd(np.asarray(x, dtype=np.float64), fs)
+    if len(f) < 16:
+        return 0.5 * fs
+    db = 10.0 * np.log10(p + 1e-30)
+    mid = (f >= 2000.0) & (f <= 8000.0)
+    if not mid.any():
+        return 0.5 * fs
+    ref = float(np.median(db[mid]))
+    hi = np.flatnonzero(f > max(4000.0, 0.25 * fs))
+    for i in hi:
+        if db[i] < ref - drop_db and bool(np.all(db[i:] < ref - floor_db)):
+            return float(f[i])
+    return 0.5 * fs

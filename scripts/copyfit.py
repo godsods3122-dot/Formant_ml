@@ -69,6 +69,9 @@ def main() -> None:
     ap.add_argument("--no-denoise", action="store_true")
     ap.add_argument("--phase", type=float, default=0.0, help="복소 STFT 항 가중(2 단계용)")
     ap.add_argument("--threads", type=int, default=2)
+    ap.add_argument("--patience", type=int, default=0,
+                    help="이 회차 동안 손실이 안 줄면 그 단계를 끝낸다 (0 = 끔). "
+                         "긴 음원에서는 켜는 편이 낫다 — 수렴한 단계에 예산을 다 쓴다")
     a = ap.parse_args()
     torch.set_num_threads(a.threads)
 
@@ -90,7 +93,8 @@ def main() -> None:
     prof = SpeakerProfile.load(a.profile) if a.profile else DEFAULT_PROFILE
     hop = max(1, int(round(a.frame_ms * sr / 1000.0)))
     track = analyze(seg, sr, prof, hop, t0=a.t0, full=y)
-    print(f"구간 {a.t0:.3f}~{t1:.3f} s, {track.n_frames} 프레임 × {track.frame_ms} ms")
+    print(f"구간 {a.t0:.3f}~{t1:.3f} s, {track.n_frames} 프레임 × {track.frame_ms} ms",
+          flush=True)
 
     eng = VoiceEngine(EngineConfig(sample_rate=48000, frame_ms=a.frame_ms,
                                    speaker="female" if prof.f0_nominal > 165 else "male",
@@ -98,7 +102,8 @@ def main() -> None:
     fit = CopySynthFitter(eng, seg, sr, track, phase_weight=a.phase)
     kw = {} if a.lr_global is None else {"lr_global": a.lr_global}
     rep = fit.fit_staged(global_iters=a.global_iters, stage_iters=a.stage_iters,
-                         lr_frame=a.lr_frame, phase_iters=a.phase_iters, **kw)
+                         lr_frame=a.lr_frame, phase_iters=a.phase_iters,
+                         patience=a.patience, **kw)
     print(rep)
 
     # **치찰음이 든 구간에서는 위의 `정밀` 을 모형 품질로 읽으면 안 된다.** 그 자는
