@@ -255,15 +255,18 @@ def corrected_sc(mag_t: np.ndarray, mag_p: np.ndarray,
     * 잡음이 목표보다 많거나 적으면 -> V_p ≠ V_t 라 완전히는 안 지워진다. 그건
       결함이 아니라 **실제 차이**다 (잡음량도 물리 파라미터다).
     """
-    n_t = _sq(mag_t, np.zeros_like(mag_t))
+    n_t = float((np.asarray(mag_t, dtype=np.float64) ** 2).sum())
     d_tp = _sq(mag_t, mag_p)
     if mag_p2 is None:
-        sc = np.sqrt(d_tp / max(n_t, 1e-30))
-        return float(sc), 0.0
+        return float(np.sqrt(d_tp / max(n_t, 1e-30))), 0.0
     d_pp = _sq(mag_p, mag_p2)
     bias = max(d_tp - d_pp, 0.0)
     denom = max(n_t - 0.5 * d_pp, 1e-30)
-    return float(np.sqrt(bias / denom)), float(np.sqrt(min(d_pp, d_tp) / max(n_t, 1e-30)))
+    # 바닥은 **원래 SC 를 넘지 않게** 자른다. 합성이 목표보다 잡음이 많으면 D_pp' 가
+    # D_tp 보다 커질 수 있는데, 그때 "상한이 실측보다 나쁘다" 고 적으면 읽는 사람이
+    # 헷갈린다. 그런 경우는 보정 SC 가 0 (= 편향 없음) 으로 이미 말해 준다.
+    return (float(np.sqrt(bias / denom)),
+            float(np.sqrt(min(d_pp, d_tp) / max(n_t, 1e-30))))
 
 
 def spectrum_match(target: np.ndarray, synth: np.ndarray, fs: float) -> float:

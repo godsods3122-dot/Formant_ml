@@ -2,6 +2,59 @@
 
 형식: [Keep a Changelog](https://keepachangelog.com/ko/1.1.0/). 버전 규칙: `docs/VERSIONING.md`.
 
+## [0.3.7] — 2026-09-08
+
+**치찰음을 재는 자가 틀렸다.** 0.3.1 의 목표였던 "스펙트럼 95 % 이상 일치" 는 난류에서
+**원리적으로 도달 불가능**하다 — 자 때문이다. 같은 스펙트럼의 두 독립 실현을 서로
+채점하면 33.3 % 가 나오고, 레일리 크기의 이론값 √((4−π)/2) = 34.5 % 와 일치한다.
+즉 완벽한 물리 모형도 치찰음에서 34 % 다. 자를 바꾼다 (MEASUREMENTS §9).
+
+### Fixed
+- **위상 항이 마찰음을 끄고 있었다.** `|S_t − S_p|` 는 위상이 무상관인 곳에서
+  `|S_p| = 0` 이 최소다 (E|S_t−S_p|² = |S_t|²+|S_p|²). 실측 g 스윕: 0.0 에서 0.999,
+  1.0 에서 1.411. `fit_staged` 가 이 항을 기본 800 회 돌리므로 마찰 구간은 800 회 내내
+  "소리를 꺼라" 는 기울기를 받았다. 단위 크기 복소 잔차(순수 위상 거리)를 목표의 조화
+  우세도로 가중하는 형태로 바꿨다 — 크기에 대한 편미분이 항등적으로 0 이다.
+- **`pyproject.toml` 이 0 바이트였다** (0.3.1 커밋에서 1154 → 0 으로 잘림).
+  `pip install -e ".[dev]"` 가 실패해 README 의 빠른 시작이 성립하지 않았다.
+- **`eng.noise` 대입이 조용히 무시된다.** `VoiceEngine.reset()` 이
+  `NoiseBank(self.cfg.seed)` 로 덮어쓴다. 시드는 `cfg.seed` 를 통해야 바뀐다.
+- **`noise.py` 의 사각파 게이트** `1 − 0.5·voiced·(frac < 0.35)` 를 올림 코사인으로.
+  주기 평균 0.8250 은 보존하고 계단이 만들던 배음 29.2 % 를 없앤다 (HANDOFF §7 의 숙제).
+- `docs/MEASUREMENTS.md` 에 `## 8.` 이 두 개 있었다. 앞의 것(파형 일치도)을 §7.7 로 —
+  코드·문서의 `§8.x` 참조는 전부 뒤의 것(동적 구간)을 가리킨다.
+
+### Added
+- **`engine/turbulence.py`** — 난류를 통계로 재는 자.
+  - `corrected_sc` / `spectral_fidelity` — 같은 파라미터를 **시드만 바꿔** 한 번 더
+    합성해 실현 잡음의 바닥을 재고 제곱 영역에서 뺀다. 완벽한 모형에서 97.2 % 로
+    수렴하고 하모닉에서는 값을 안 바꾼다(100 → 100). 판별 여유가 4.5 → 24.6 %p.
+  - `spectral_moments` / `spectral_peak` / `sibilance_db` — 조음 위치를 가르는 양들
+    (Jongman, Wayland & Wong 2000, JASA 108:1252).
+  - `multitaper_psd` — DPSS 저분산 추정 (Reidy 2015, JASA 137:EL248).
+  - `modulation_bands` / `amplitude_kurtosis` — 지글거림의 자. 대조군 필수.
+- **`engine/segment.py`** — 녹음을 모음/마찰 구간으로. 판정은 `analyze.py` 와 같은 규칙.
+- **`scripts/bench_corpus.py`** — orphan 코퍼스의 고정 구간으로 회귀 벤치.
+  `bench_copyfit.py` 가 쓰던 `data/ref/*.wav` 는 레포에 없다.
+- **`scripts/parametrize_corpus.py`** — 코퍼스 → 물리 factor 시계열(학습 목표) + 품질
+  지표. 나쁜 적합을 학습에 먹이면 신경망이 적합기의 실패를 배우므로 `ok` 를 표시한다.
+- `CopySynthFitter.render(seed=...)` / `.fidelity()`.
+- `fit()` / `fit_staged()` 에 수렴 판정 `patience` (HANDOFF §5 의 "적합 시간").
+- `tests/engine/test_turbulence.py` 16 종. 절반이 결함의 회귀 테스트다 —
+  `test_old_phase_term_was_minimised_by_silence` 는 있던 버그를 남기고,
+  `test_phase_distance_is_blind_to_level` 은 다시 못 들어오게 막는다.
+
+### Changed
+- **마찰 구간의 크기 손실을 기대 스펙트럼으로 본다.** 난류 우세 빈만 25 ms 시간
+  평활한다 (`NOISE_EXPECT_MS`). 목표·합성 양쪽에 똑같이 걸리므로 편향은 없고 분산만
+  1/19 로 준다 (실측 시간축 표준편차 0.290 → 0.060, 이론 √19 = 4.36 배).
+
+### 알려진 문제
+- `analyze.py` 의 마찰 판정(무성 + 고역/저역비 > 0 dB)이 **치찰음과 호흡·기식을 못
+  가른다.** 코퍼스 실측: 그대로 쓰면 무게중심 중앙값 5175 Hz (프로파일 8100 Hz),
+  치찰도 > 8 dB 이고 무게중심 > 6 kHz 로 거르면 7997 Hz. 아직 안 고쳤다 — 문턱을
+  실측으로 정하기 전에는 건드리지 않는다.
+
 ## [0.3.1] — 2026-09-07
 
 사용자 지시("원래 목소리를 직접 합성하고 각 포인트별로 물리 파라미터를 매칭해라. 노이즈를

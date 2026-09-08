@@ -31,14 +31,29 @@ export OMP_NUM_THREADS=2            # 일부 컨테이너에서 torch 4 스레�
 python -m pytest tests/engine -q                    # v2 성질 테스트
 python scripts/v2_listen.py --out out/v2 --profile profiles/yang_female.json --praat   # 청취 세트 9 종 + 측정표
 
-# 복사합성 — 녹음을 정답으로 두고 물리 파라미터를 역추정한다 (0.3.x 의 주 작업 방식)
-python scripts/copyfit.py data/ref/female_yang_ilin-ilsil.wav \
-    --profile profiles/yang_female.json --from 2.86 --to 3.06 --out out/fit
-# -> out/fit_target.wav / out/fit_fit.wav / out/fit_track.npz / out/fit_report.json
-#    포락 일치 %, 정밀 일치 %, 멜 대역 평균 오차 dB, 대역 에너지 표
+# 코퍼스를 받는다 (orphan 브랜치, 같은 화자 205 개 / 45 분)
+mkdir -p data/voices
+for f in $(git ls-tree -r --name-only origin/orphan | grep '^voices/'); do
+    git show "origin/orphan:$f" > "data/$f"
+done
 
+# 복사합성 — 녹음을 정답으로 두고 물리 파라미터를 역추정한다 (0.3.x 의 주 작업 방식)
+python scripts/copyfit.py data/voices/yang_00000034.wav \
+    --profile profiles/yang_female.json --from 0.510 --to 0.665 --out out/fit
+# -> out/fit_target.wav / out/fit_fit.wav / out/fit_track.npz / out/fit_report.json
+
+python scripts/bench_corpus.py --quick            # 고정 구간 4 개 회귀 벤치
+python scripts/parametrize_corpus.py --out out/corpus --jobs 3 --resume
+                                                  # 코퍼스 전체 -> 물리 factor 학습 데이터
 python scripts/calibrate_levels.py --write        # 제스처 세기를 프로파일 실측 목표에 맞춘다
 ```
+
+> **치찰음이 든 구간에서 `정밀 일치` 를 모형 품질로 읽지 말 것.** 그 자는 난류에서
+> **34.5 % 가 원리적 상한**이다 — 같은 스펙트럼의 두 독립 실현조차 33.3 % 다
+> (레일리 크기, √((4−π)/2)). 완벽한 물리 모형도 그 이상 못 받는다. 대신
+> `fit.fidelity()` 의 `fine_corr`(실현 잡음을 뺀 값, 완벽한 모형에서 97 %)을 쓰고,
+> 같이 나오는 `floor` 로 "지금 자가 바닥에 닿았는가" 를 확인한다.
+> 자세한 것은 [`docs/MEASUREMENTS.md`](docs/MEASUREMENTS.md) §9.
 
 > **지표가 맞는데 소리가 틀리면 지표를 더 만들지 말고 복사합성을 돌려라.** 손으로
 > 작곡하는 방식에는 비교할 정답이 없어서 틀린 곳을 좁힐 수 없다. 이 적합기는 도구이자
