@@ -673,8 +673,14 @@ def spectral_fidelity(target: np.ndarray, synth: np.ndarray,
 
 
 def effective_bandwidth(x: np.ndarray, fs: float, drop_db: float = 35.0,
-                        floor_db: float = 25.0) -> float:
+                        floor_db: float = 25.0, cliff_khz: float = 1.5,
+                        flat_db_per_khz: float = 0.2) -> float:
     """녹음의 **실제** 대역 상한 (Hz). 손실 압축의 로우패스를 찾아낸다.
+
+    **진단용이다. 적합 손실의 상한으로 쓰지 않는다.** 녹음에서는 정확하지만(코퍼스
+    20.1 kHz) 합성 신호의 자연스러운 고역 롤오프를 컷으로 오인한 전력이 있다
+    (9.96 kHz → 조건을 두 번 조인 뒤에도 11.1 kHz). 잘못 자르면 진짜 신호를 버리므로
+    `CopySynthFitter` 는 표본화율만 쓴다.
 
     왜 필요한가
     -----------
@@ -686,9 +692,21 @@ def effective_bandwidth(x: np.ndarray, fs: float, drop_db: float = 35.0,
     맞아도 대역이 잘려 있다.** orphan 코퍼스 실측: 48 kHz 파일인데 전부 20 kHz 에서
     급락한다 (나이퀴스트 24 kHz). 그 차이 4 kHz 를 손실이 보고 있었다.
 
-    방법: 시간 평균 스펙트럼에서 중역(2~8 kHz) 레벨 대비 `drop_db` 아래로 떨어지고
-    **그 위로 다시 안 올라오는** 첫 주파수를 찾는다. 못 찾으면 나이퀴스트를 돌려준다
-    (자르지 않는다 — 확실하지 않으면 건드리지 않는 편이 안전하다).
+    **자연스러운 고역 롤오프와 구별해야 한다.** 음성은 소스 기울기(−12 dB/oct) 때문에
+    고역이 원래 완만히 떨어진다. 레벨만 보면 그것도 "컷" 으로 읽히고, 그러면 진짜
+    신호를 버린다 (실측: 합성 음성에서 9.96 kHz 를 상한이라고 답했다).
+
+    가르는 것은 **기울기**다. 손실 압축의 컷오프는 절벽이라 `cliff_khz` 폭 안에서
+    `drop_db` 가 통째로 떨어진다. 자연 롤오프는 그 폭에서 몇 dB 뿐이다.
+
+    그리고 컷 **위가 평탄한 바닥**이어야 한다. 손실 압축은 그 위에 양자화·디더 잡음만
+    남아 거의 수평이지만, 자연 롤오프는 계속 떨어진다 (실측: 코퍼스 −0.07 dB/kHz,
+    합성 음성 −0.5 dB/kHz).
+
+    방법: 중역(2~8 kHz) 레벨 대비 `drop_db` 아래로 떨어지고, **그 위로 다시 안
+    올라오며**, 하락이 `cliff_khz` 안에서 일어나고, 그 위 기울기가 `flat_db_per_khz`
+    보다 완만한 첫 주파수. 못 찾으면 나이퀴스트를 돌려준다 — **확실하지 않으면
+    건드리지 않는다.** 잘못 자르면 진짜 신호를 버린다.
     """
     f, p = average_psd(np.asarray(x, dtype=np.float64), fs)
     if len(f) < 16:
@@ -698,8 +716,25 @@ def effective_bandwidth(x: np.ndarray, fs: float, drop_db: float = 35.0,
     if not mid.any():
         return 0.5 * fs
     ref = float(np.median(db[mid]))
+    df = float(f[1] - f[0]) if len(f) > 1 else 1.0
+    back = max(1, int(round(cliff_khz * 1000.0 / max(df, 1e-9))))
     hi = np.flatnonzero(f > max(4000.0, 0.25 * fs))
     for i in hi:
-        if db[i] < ref - drop_db and bool(np.all(db[i:] < ref - floor_db)):
-            return float(f[i])
+        if db[i] >= ref - drop_db:
+            continue
+        if not bool(np.all(db[i:] < ref - floor_db)):
+            continue
+        # 절벽인가 — 바로 앞 cliff_khz 안에 이 하락의 대부분이 들어 있어야 한다.
+        j = max(0, i - back)
+        if float(db[j] - db[i]) < 0.6 * drop_db:
+            continue
+        # 컷 위가 **평탄한 바닥**인가. 손실 압축은 그 위에 양자화·디더 잡음만 남아
+        # 거의 수평이고, 자연 롤오프는 계속 떨어진다. 실측: 코퍼스 −0.07 dB/kHz,
+        # 합성 음성 −0.5 dB/kHz. 이 조건이 없으면 합성의 고역 롤오프를 컷으로 오인한다.
+        tail = db[i:]
+        if len(tail) >= 8:
+            slope = float(np.polyfit(f[i:] / 1000.0, tail, 1)[0])
+            if slope < -flat_db_per_khz:
+                continue
+        return float(f[i])
     return 0.5 * fs
