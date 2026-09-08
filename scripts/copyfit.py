@@ -80,8 +80,15 @@ def main() -> None:
     ap.add_argument("--patience", type=int, default=0,
                     help="이 회차 동안 손실이 안 줄면 그 단계를 끝낸다 (0 = 끔). "
                          "긴 음원에서는 켜는 편이 낫다 — 수렴한 단계에 예산을 다 쓴다")
+    ap.add_argument("--gain-acc", type=float, default=None,
+                    help="이득류(tract_gain/fric_gain/aspiration)의 가속도 벌점 세기. "
+                         "마찰 구간에서 적합기가 못 맞출 난류 요동을 이득으로 좇는 것을 "
+                         "막는다 (fit.GAIN_ACC_W). 생략하면 모듈 기본값")
     a = ap.parse_args()
     torch.set_num_threads(a.threads)
+    if a.gain_acc is not None:
+        from formant_ml.engine import fit as _fit
+        _fit.GAIN_ACC_W = float(a.gain_acc)
 
     y, sr = sf.read(a.wav)
     if y.ndim > 1:

@@ -143,6 +143,12 @@ def smooth_track(x: np.ndarray, med: int, avg: int) -> np.ndarray:
     return x
 
 
+#: 앞니 다이폴의 **바닥값**. 0 이 아니어야 하는 이유는 위 주석 참조 (로짓이
+#: 죽는다). 0.02 는 마찰 소스에 2 % 만 섞이는 값이라 음향적으로 무의미하고,
+#: 오직 적합기의 기울기가 흐르게 하는 몫이다.
+OBSTACLE_FLOOR = 0.02
+
+
 def analyze(y: np.ndarray, sr: int, prof: SpeakerProfile, hop: int,
             n_formants: int = 4, order: int | None = None,
             t0: float = 0.0, full: np.ndarray | None = None,
@@ -256,6 +262,25 @@ def analyze(y: np.ndarray, sr: int, prof: SpeakerProfile, hop: int,
         rband[i] = r
         vals[i, INDEX["a_c"]] = float(np.clip(3.0 * 10 ** (-(r + 10) / 25.0), 0.06, 3.0))
         vals[i, INDEX["front_len"]] = prof.sib_front_len_cm
+        # **앞니 다이폴을 켜 둔다.** 이게 0 이면 적합기가 **원리적으로 못 켠다** —
+        # `fit._to_raw` 가 로짓이라 0 은 x 를 1e-4 로 자르고, 거기서 시그모이드
+        # 기울기가 1e-4 로 죽는다. 게다가 `PRIOR_W["obstacle"] = 10` 이 초기값에
+        # 세게 묶는다. 이중 잠금이라 실제로 **적합된 트랙 전 구간이 0.0001**(= 그
+        # 클램프 값) 이었다 — 즉 실제 녹음 복사합성에서는 치찰음의 다이폴 소스가
+        # 통째로 꺼져 있었고, 적합기는 그 빈자리를 `fric_gain` 을 중앙 10.2 / 최대
+        # 67 까지 올려 레벨로 때웠다(측정, out/long/s101_track.npz).
+        # `lat_mix` 를 0.05 로 켜 둔 것과 **같은 부류의 버그**다(바로 아래 주석).
+        #
+        # 초기값은 같은 `r` 에서 낸다. a_c 가 다이폴 기준 면적(noise.OBSTACLE_A_REF
+        # = 0.1 cm²)을 지나는 구간이 r ≈ 27, 협착이 0.5 cm² 로 넓어지는 구간이
+        # r ≈ 9.5 다. 그 사이를 부드럽게 잇고, 밖에서는 **바닥이 아니라 작은 값**을
+        # 준다 — 모음에서도 기울기가 흘러야 적합기가 되돌릴 수 있다. 그 작은 값이
+        # 모음을 더럽히지는 않는다: 다이폴은 마찰 소스에만 걸리고, 그 위에 기하
+        # 효율 (0.1/a_c)^2.5 가 또 곱해져 a_c = 3 에서 6e-5 배가 된다.
+        g = float(np.clip((r - 9.5) / (27.0 - 9.5), 0.0, 1.0))
+        g = g * g * (3.0 - 2.0 * g)                      # smoothstep — 꺾임을 만들지 않는다
+        vals[i, INDEX["obstacle"]] = OBSTACLE_FLOOR + (
+            float(prof.sibilant.get("obstacle", 0.15)) - OBSTACLE_FLOOR) * g
         # **측지 분기를 켜 둔다(깊이 0 에 가깝게).** 설측음의 정의적 특징은 혀 옆으로
         # 공기가 흐르며 생기는 반공진인데, 지금까지 `lat_*` 가 전부 0 이라 적합기에
         # 그걸 만들 수단이 아예 없었다(실측: 설측 위상 오차 89.5°, 사전을 40 -> 0.5 로
@@ -308,7 +333,10 @@ def analyze(y: np.ndarray, sr: int, prof: SpeakerProfile, hop: int,
     for k in range(1, n_formants + 1):
         tr[f"f{k}"] = smooth_track(tr[f"f{k}"], m, a_f)
         tr[f"bw{k}"] = smooth_track(tr[f"bw{k}"], m, a_s)
-    for k in ("f0_target", "adduction", "tension", "a_c"):
+    # obstacle 도 함께 뭉갠다 — a_c 와 **같은 r 에서 낸 값**이라 프레임마다 같이
+    # 튄다. 안 뭉개면 소스 스펙트럼이 프레임률(1 kHz)로 흔들려 그 자체가
+    # 거친 변조가 된다.
+    for k in ("f0_target", "adduction", "tension", "a_c", "obstacle"):
         tr[k] = smooth_track(tr[k], m, a_f)
     tr["tract_gain"] = smooth_track(tr["tract_gain"], m, max(2, int(round(6.0 / fm))))
     # **F0 는 펄스 열이 우선한다.** 피치 궤적은 프레임마다 독립이라 0.5 % 씩 흔들리고,

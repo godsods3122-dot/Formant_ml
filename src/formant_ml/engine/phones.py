@@ -139,7 +139,22 @@ class Builder:
         gain = 10 ** ((lvl - SIB_REF_DB) / 20.0)
         l1, l2, l3 = S.get("locus", [470.0, 1800.0, 2700.0])
         l2 = 0.5 * l2 + 0.5 * v2                       # 로커스는 뒤따르는 모음 쪽으로 당겨진다
-        rise, fall = 0.040, 0.018
+        # 협착 전이 시간. **길이에 비례해야 한다.**
+        #
+        # v1 은 혀 제스처를 `tongue_constriction` 으로 그렸다: 고원이 62 %
+        # (`TONGUE_SUSTAIN_HOLD`), 정점이 57 % (`TONGUE_CLOSE_FRAC`) 이므로 폐쇄가
+        # 21.7 %, 해제가 16.3 % 다. 그 비대칭이 곧 실측 상승/하강비 1.28~1.35 이고,
+        # "가청 포락선의 절반 이상이 페이드 인" 이 거기서 나온다.
+        #
+        # v2 는 40 / 18 ms 를 **절대값**으로 박아 두었다. 130 ms CV 에서는 31 / 14 %
+        # 라 대충 맞지만, 600 ms 로 끄는 /s/ 에서는 6.7 / 3 % 가 되어 혀가 순식간에
+        # 자세를 잡고 나머지를 고원으로 버틴다 — 페이드 인이 사라진다.
+        # 측정 (고역 11~16 kHz 가 중역 2~4 kHz 보다 늦게 서는 폭, 긴 /s/):
+        #   rise 40 ms +11 ms / 200 ms +53 ms / 500 ms +235 ms  (사람 127~296 ms)
+        #
+        # 그래서 비례로 두되 예전 값을 **바닥**으로 남긴다 — 짧은 CV 는 그대로다.
+        rise = max(0.040, 0.217 * dur)
+        fall = max(0.018, 0.163 * dur)
         # 경음은 성문을 덜 벌리고 빨리 닫는다 (Cho·Jun·Ladefoged 2002: /s'/ 의 성문 개대가 작다)
         adduct = 0.10 if tense else 0.06
         lead = self.ms(S.get("abduct_lead_ms", 35))
@@ -150,8 +165,18 @@ class Builder:
                  back_leak=S["back_leak"], front_len=self.p.sib_front_len_cm,
                  obstacle=S["obstacle"], fric_gain=gain, oral_open=1.0,
                  f1=l1, f2=l2, f3=l3, tract_gain=0.9)
-        self.add(t0 + rise, a_c=S["a_min"])
-        self.add(t0 + dur - fall, a_c=S["a_min"], adduction=adduct)
+        # **짧은 음절은 목표까지 못 간다** (undershoot). 뒤따르는 모음을 예기해
+        # 혀가 협착을 덜 만들고, 그만큼 제트가 굵어 앞니 다이폴이 약해지며 앞공동
+        # 극이 드러난다. v1 실측: 긴 /s/ 의 목표가 0.050 cm² 인데 CV 는 0.11 —
+        # 2.2 배 넓다 (`TONGUE_CV_A_MIN`). 그 값에서 봉우리 5276 Hz / 4~6 kHz
+        # 50.2 % 로 실측(4673~5556 Hz, 43~48 %) 안에 들어왔고, 0.050 을 쓰면
+        # 10218 Hz / 17 % 로 지속음과 구분이 안 됐다.
+        #
+        # 130 ms 급 음절에서 2.2 배, 400 ms 이상이면 목표 그대로. 그 사이는 선형.
+        under = 1.0 + 1.2 * min(max((0.40 - dur) / (0.40 - 0.13), 0.0), 1.0)
+        a_min = S["a_min"] * under
+        self.add(t0 + rise, a_c=a_min)
+        self.add(t0 + dur - fall, a_c=a_min, adduction=adduct)
         self.add(t0 + dur, a_c=3.0, obstacle=0.0, front_len=0.0, back_leak=0.3, fric_gain=gain)
         self.add(t0 + dur + lag, adduction=0.6, fric_gain=1.0)    # 성문은 늦게 닫힌다 → 기식 꼬리
         self.add(t0 + dur + 0.055, f1=v1, f2=v2, f3=v3, tract_gain=1.0)

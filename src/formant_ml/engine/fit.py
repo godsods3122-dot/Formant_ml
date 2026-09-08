@@ -159,6 +159,36 @@ VEL_MODE = "accel"
 # 힌지 자체는 검증했다: F2 이동 10/50/93 Hz/ms 는 벌점 0, 150 은 0.97, 309 는 14.0.
 VEL_W = 0.0
 
+# **이득류의 가속도 무릎 (dB/ms²).** 포먼트와 같은 논리를 세기 쪽에 건 것이다.
+#
+# 왜 필요한가. 마찰 구간에서 목표의 순시 진폭은 **원리적으로 재현 불가능**하다 —
+# 난류의 실현은 시드가 다르면 다르다(engine/turbulence.py). 그런데 `tract_gain` 은
+# 1 ms 격자에서 자유롭고 사전이 약해서(PRIOR_W 0.3), 적합기가 그 못 맞출 요동을
+# **이득으로 좇는다**. 그 결과가 합성음에 얹히는 진폭 잔물결이다.
+#
+# 실측 (yang_00000101 마찰 프레임, 4~12 kHz 포락선의 변조 지수, 목표 대비):
+#
+#   |                                   조건 | F0 대역 | 60-150 Hz | 150-400 Hz |
+#   |----------------------------------------|---------|-----------|------------|
+#   | 적합된 트랙 그대로                     | 10.79x  |   5.94x   |   11.58x   |
+#   | fric_gain 만 25 ms 평활                |  9.74x  |   5.48x   |   11.50x   |
+#   | + a_c + p_sub 도 평활                  |  9.74x  |   6.43x   |   11.09x   |
+#   | + **tract_gain** 도 평활               |  5.46x  |   3.42x   |    5.47x   |
+#
+# 즉 잔물결의 **절반이 tract_gain 하나**에서 나온다. 사용자가 "지글거린다" 고 한
+# 성분이 이것이다.
+#
+# 무릎은 어디서 오는가. 성도의 출력 이득은 조음기 위치와 방사가 정하는 양이라
+# 그 변조는 조음 속도로 묶인다. 사람 말의 진폭 변조는 음절률 4 Hz, 음소률
+# 10~16 Hz 에 몰려 있고(Greenberg), **50 Hz 위의 조음성 변조는 없다** — 그 위는
+# 전부 소스(F0)와 난류다. 진폭 A dB, 주파수 f 의 정현 변조는 2 차 차분 크기가
+# A·(2πf·dt)² 이므로, dt = 1 ms · f = 50 Hz · A = 1 dB 에서 0.099 dB/ms² 다.
+GAIN_ACC_KNEE_DB_MS2: dict[str, float] = {
+    "tract_gain": 0.10, "fric_gain": 0.10, "aspiration": 0.10,
+}
+# 세기. 0 이면 항이 빠진다. 값은 A/B 로 정한다 (docs/MEASUREMENTS.md §13).
+GAIN_ACC_W = 0.0
+
 PRIOR_W: dict[str, float] = {
     "f0_target": 40.0, "f1": 40.0, "f2": 40.0, "f3": 20.0, "f4": 10.0,
     # 곁가지는 분석이 못 재는 양이다. 세게 묶으면 적합기가 열지를 못한다 —
@@ -723,6 +753,18 @@ class CopySynthFitter:
                     r = rate / lim
                     h = self._pseudo_huber(r)
                     pen = pen + VEL_W * h.mean()
+        if GAIN_ACC_W > 0 and u.shape[0] >= 3:
+            # 이득은 **로그(dB)로 본다.** 비율 그대로 2 차 차분을 재면 fric_gain 이
+            # 1 일 때와 67 일 때(실측 범위) 같은 상대 요동에 67 배 다른 벌점이 붙는다.
+            dt = max(self.track.frame_ms, 1e-6)
+            for nm, knee in GAIN_ACC_KNEE_DB_MS2.items():
+                if nm not in self.names:
+                    continue
+                k = self.names.index(nm)
+                v = self._to_val(u[:, k], self.specs[k])
+                g = 20.0 * torch.log10(v.clamp_min(1e-4))
+                acc = (g[2:] - 2.0 * g[1:-1] + g[:-2]).abs() / (dt * dt)
+                pen = pen + GAIN_ACC_W * self._pseudo_huber(acc / knee).mean()
         return pen
 
     def loss(self):
