@@ -260,14 +260,13 @@ def _realization_var(mag: np.ndarray, k: int = 9) -> float:
     신호의 실제 변화(마찰 시작, 포먼트 전이)도 섞이므로 **절대값은 못 믿는다.** 목표와
     합성에 똑같이 걸었을 때의 **비**만 쓴다 — 그 용도로는 편향이 대부분 상쇄된다.
     """
+    from scipy.ndimage import uniform_filter1d
     a = np.asarray(mag, dtype=np.float64)
     t = a.shape[-1]
     if t < 3:
         return 0.0
     k = max(3, min(k, t // 2 * 2 + 1))
-    ker = np.ones(k) / k
-    sm = np.apply_along_axis(lambda v: np.convolve(
-        np.pad(v, k // 2, mode="edge"), ker, mode="valid")[:t], -1, a)
+    sm = uniform_filter1d(a, k, axis=-1, mode="nearest")
     return float(((a - sm) ** 2).sum())
 
 
