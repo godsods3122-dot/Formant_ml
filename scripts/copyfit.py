@@ -1,7 +1,7 @@
 """복사합성 — 녹음의 노이즈를 지우고, 스펙트럼이 맞을 때까지 물리 파라미터를 추적한다.
 
-    OMP_NUM_THREADS=2 python scripts/copyfit.py data/ref/female_yang_ilin-ilsil.wav \
-        --profile profiles/yang_female.json --from 2.86 --to 3.06 --out out/fit
+    OMP_NUM_THREADS=2 python scripts/copyfit.py data/voices/yang_00000034.wav \
+        --profile profiles/yang_female.json --from 0.510 --to 0.665 --out out/fit
 
 무엇을 하는가
     1. 잡음 프로파일 추정 -> 위너 스펙트럼 차감 (engine/denoise.py)
@@ -9,8 +9,16 @@
     3. 미분가능 엔진으로 제어열을 역추정 (engine/fit.py) — 전역 스칼라 -> 성김/촘촘함 프레임별
     4. 원본·복원·차이를 wav 로, 제어열을 npz 로, 일치율 표를 표준출력으로
 
-일치율은 두 가지다. **포락**(멜 dB, 조음이 맞는가)과 **정밀**(선형 다해상도 STFT,
-F0 궤적과 성문 펄스 위치까지 맞는가). 자세한 정의는 engine/fit.py 머리말에 있다.
+일치율을 어떻게 읽는가
+    **포락** (멜 dB) — 조음이 맞는가. 사람이 듣는 음색에 대응한다.
+    **정밀** (선형 다해상도 STFT) — F0 궤적과 성문 펄스 위치까지 맞는가.
+    **보정 정밀** — 실현 잡음을 뺀 값. **치찰음이 든 구간에서는 이것만 읽는다.**
+
+`정밀` 은 난류에서 34.5 % 가 원리적 상한이다 — 같은 스펙트럼의 두 독립 실현조차
+33.3 % 다 (레일리 크기, √((4−π)/2)). 완벽한 물리 모형도 그 이상 못 받으므로, 마찰이
+든 구간에서 그 값을 모형 품질로 읽으면 안 된다. 같이 찍히는 `상한` 이 그 구간에서
+`정밀` 이 받을 수 있는 최대값이고, `보정 정밀` 은 완벽한 모형에서 97 % 로 수렴한다.
+자세한 것은 engine/turbulence.py 머리말과 docs/MEASUREMENTS.md §9.
 """
 from __future__ import annotations
 
@@ -93,6 +101,14 @@ def main() -> None:
                          lr_frame=a.lr_frame, phase_iters=a.phase_iters, **kw)
     print(rep)
 
+    # **치찰음이 든 구간에서는 위의 `정밀` 을 모형 품질로 읽으면 안 된다.** 그 자는
+    # 난류에서 34.5 % 가 원리적 상한이다 (engine/turbulence.py 머리말). 실현 잡음을
+    # 뺀 값을 같이 낸다 — 완벽한 모형이면 여기서 97 % 가 나온다.
+    fid = fit.fidelity()
+    print(f"실현 잡음을 빼면: 보정 정밀 {fid['fine_corr']:5.2f} %   "
+          f"(기존 자의 이 구간 상한 {fid['floor']:.1f} %,  "
+          f"시간평균 스펙트럼 {fid['spectrum_match']:.1f} %)")
+
     out = fit.render()
     os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
     sf.write(a.out + "_target.wav", seg, sr)
@@ -102,6 +118,8 @@ def main() -> None:
              names=np.array(PARAM_NAMES))
     with open(a.out + "_report.json", "w", encoding="utf-8") as f:
         json.dump({"env": rep.env, "fine": rep.fine, "per_size": rep.per_size,
+                   "fine_corr": fid["fine_corr"], "floor": fid["floor"],
+                   "spectrum_match": fid["spectrum_match"],
                    "loss": rep.loss, "gain_db": fit.gain_db(),
                    "moved": {n: [x, z] for n, x, z in fit.moved()}},
                   f, ensure_ascii=False, indent=1)
@@ -110,6 +128,18 @@ def main() -> None:
     print("           " + " ".join(f"{lo // 1000}-{hi // 1000}k".rjust(6) for lo, hi in BANDS))
     print("목표      " + " ".join(f"{v:6.1f}" for v in band_db(seg, sr)))
     print("합성      " + " ".join(f"{v:6.1f}" for v in band_db(out, 48000)))
+    # 치찰음 지문 — 조음 위치가 맞는가 (Jongman et al. 2000). 대역 에너지표가 맞아도
+    # 무게중심이 1 kHz 어긋나면 /s/ 가 /ʃ/ 로 들린다.
+    from formant_ml.engine import turbulence as tb
+    c = tb.compare(fit.target[0].numpy(), out, 48000.0)
+    print("\n치찰음 지문 (목표 -> 합성)")
+    print(f"  무게중심 {c['target']['centroid']:7.0f} -> {c['synth']['centroid']:7.0f} Hz "
+          f"({c['centroid_err']:+.0f})   봉우리 {c['target']['peak']:6.0f} -> "
+          f"{c['synth']['peak']:6.0f} Hz ({c['peak_err']:+.0f})")
+    print(f"  치찰도   {c['target']['sibilance']:7.1f} -> {c['synth']['sibilance']:7.1f} dB "
+          f"({c['sibilance_err']:+.1f})   대역 MAE {c['band_mae_db']:.2f} dB   "
+          f"변조 MAE {c['mod_mae_pct']:.1f} %p")
+
     print("\n움직인 파라미터 (초기 중앙값 -> 적합 중앙값)")
     for n, x, z in fit.moved():
         if abs(z - x) > 0.05 * max(abs(x), 1e-6):
