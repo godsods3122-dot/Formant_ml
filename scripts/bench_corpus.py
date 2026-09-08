@@ -72,7 +72,8 @@ def nonharmonic(sig, har, voi, nf):
     return 100 * float(np.median(v)) if v else float("nan")
 
 
-def bench(path, t0, t1, prof, verbose=False, iters=(200, 150, 800)):
+def bench(path, t0, t1, prof, verbose=False, iters=(200, 150, 800),
+          probe=True, patience=0):
     y, sr = sf.read(path)
     if y.ndim > 1:
         y = y.mean(1)
@@ -82,8 +83,12 @@ def bench(path, t0, t1, prof, verbose=False, iters=(200, 150, 800)):
     eng = VoiceEngine(EngineConfig(sample_rate=48000, frame_ms=1.0,
                                    speaker="female", residual=False), prof)
     f = CopySynthFitter(eng, seg, sr, tr)
+    # lr 탐침은 비용의 절반쯤이다 (전역 4 후보 + 위상 3 후보). 구간마다 맞는 값이
+    # 다르므로 회귀 벤치에서는 켜 두지만, 반복 실행할 때는 끄고 고정값을 쓴다.
+    kw = {} if probe else {"lr_global": 0.05, "lr_phase": 0.12}
     rep = f.fit_staged(global_iters=iters[0], stage_iters=iters[1],
-                       phase_iters=iters[2], verbose=verbose, log_every=10 ** 9)
+                       phase_iters=iters[2], verbose=verbose, log_every=10 ** 9,
+                       patience=patience, **kw)
     out = f.render()
     tgt = f.target[0].numpy()
     n = min(len(tgt), len(out))
@@ -123,6 +128,10 @@ def main() -> None:
     ap.add_argument("--verbose", action="store_true")
     ap.add_argument("--quick", action="store_true", help="예산을 1/4 로 (개발용)")
     ap.add_argument("--only", default=None, help="이름에 이 문자열이 든 구간만")
+    ap.add_argument("--no-probe", action="store_true",
+                    help="lr 탐침을 끄고 고정값을 쓴다 (비용 절반, 반복 실행용)")
+    ap.add_argument("--patience", type=int, default=0,
+                    help="이 회차 동안 손실이 안 줄면 그 단계를 끝낸다 (0 = 끔)")
     a = ap.parse_args()
     prof = SpeakerProfile.load(a.profile)
     torch.set_num_threads(2)
@@ -139,7 +148,8 @@ def main() -> None:
             print(f"{name:>16s}  (파일 없음: {path})")
             continue
         t = time.time()
-        r = bench(path, t0, t1, prof, a.verbose, it)
+        r = bench(path, t0, t1, prof, a.verbose, it,
+                  probe=not a.no_probe, patience=a.patience)
         mark = " " if r["resolved"] else ">"
         print(f"{name:>16s} {r['env']:6.2f} {r['fine']:6.2f} "
               f"{mark}={r['fine_corr']:6.2f} {r['noise_ratio']:6.2f} "
