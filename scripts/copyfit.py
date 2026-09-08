@@ -12,12 +12,12 @@
 일치율을 어떻게 읽는가
     **포락** (멜 dB) — 조음이 맞는가. 사람이 듣는 음색에 대응한다.
     **정밀** (선형 다해상도 STFT) — F0 궤적과 성문 펄스 위치까지 맞는가.
-    **보정 정밀** — 실현 잡음을 뺀 값. **치찰음이 든 구간에서는 이것만 읽는다.**
+    **보정 정밀** — 실현 분산을 추정해 뺀 진단값. 대역·변조·잡음비와 함께 읽는다.
 
-`정밀` 은 난류에서 34.5 % 가 원리적 상한이다 — 같은 스펙트럼의 두 독립 실현조차
-33.3 % 다 (레일리 크기, √((4−π)/2)). 완벽한 물리 모형도 그 이상 못 받으므로, 마찰이
-든 구간에서 그 값을 모형 품질로 읽으면 안 된다. 같이 찍히는 `상한` 이 그 구간에서
-`정밀` 이 받을 수 있는 최대값이고, `보정 정밀` 은 완벽한 모형에서 97 % 로 수렴한다.
+34.5 % 는 동일 PSD 의 독립 가우시안 잡음을 비평활 STFT 크기로 비교할 때의
+이론적 기준이지 모든 치찰음의 상한이 아니다. `trust` 는 분산 차감 뒤 남은 거리
+비율이며 신뢰확률이 아니다. 분해 불가인 보정값은 신뢰구간의 하한도 아니다.
+어떤 일치율도 인간과 구별 불가능함을 보장하지 않는다.
 자세한 것은 engine/turbulence.py 머리말과 docs/MEASUREMENTS.md §9.
 """
 from __future__ import annotations
@@ -49,6 +49,14 @@ def band_db(x: np.ndarray, sr: int) -> list[float]:
     p = np.abs(np.fft.rfft(x * np.hanning(len(x)))) ** 2
     tot = p.sum() + 1e-20
     return [10 * np.log10(p[(f >= lo) & (f < hi)].sum() / tot + 1e-20) for lo, hi in BANDS]
+
+
+def fidelity_summary(fid: dict) -> str:
+    score = f"{fid['fine_corr']:.2f} %" if fid["resolved"] else "분해 불가"
+    return (f"보정 정밀: {score} (진단값 {fid['fine_corr']:.2f}, "
+            f"잔여거리 비율 {fid['trust']:.2f}, 잡음비 {fid['noise_ratio']:.2f}, "
+            f"실현 기준 추정 {fid['floor']:.1f} %, "
+            f"시간평균 스펙트럼 {fid['spectrum_match']:.1f} %)")
 
 
 def main() -> None:
@@ -106,18 +114,12 @@ def main() -> None:
                          patience=a.patience, **kw)
     print(rep)
 
-    # **치찰음이 든 구간에서는 위의 `정밀` 을 모형 품질로 읽으면 안 된다.** 그 자는
-    # 난류에서 34.5 % 가 원리적 상한이다 (engine/turbulence.py 머리말). 실현 잡음을
-    # 뺀 값을 같이 낸다 — 완벽한 모형이면 여기서 97 % 가 나온다.
+    # 보정값은 진단용이며 청취상 동등성이나 신뢰구간을 뜻하지 않는다.
     fid = fit.fidelity()
-    mark = "" if fid["resolved"] else "\u2265 "   # 분해 안 됨 -> "적어도 이 값"
-    print(f"실현 잡음을 빼면: 보정 정밀 {mark}{fid['fine_corr']:.2f} %   "
-          f"(신뢰도 {fid['trust']:.2f}, 잡음비 {fid['noise_ratio']:.2f}, "
-          f"기존 자의 이 구간 상한 {fid['floor']:.1f} %,  "
-          f"시간평균 스펙트럼 {fid['spectrum_match']:.1f} %)")
+    print(fidelity_summary(fid))
     if not fid["resolved"]:
-        print("  * 편향이 실현 잡음보다 작아 분해되지 않았다. 위 값은 상한이다 — "
-              "잡음비(1 이 맞음)와 아래 치찰음 지문을 함께 읽을 것.")
+        print("  * 분산 보정으로 편향을 판별하지 못했다. 하한·합격 판정으로 쓰지 말고 "
+              "잡음비와 아래 치찰음 지문을 함께 읽을 것.")
 
     out = fit.render()
     os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
@@ -129,6 +131,9 @@ def main() -> None:
     with open(a.out + "_report.json", "w", encoding="utf-8") as f:
         json.dump({"env": rep.env, "fine": rep.fine, "per_size": rep.per_size,
                    "fine_corr": fid["fine_corr"], "floor": fid["floor"],
+                   "resolved": fid["resolved"], "trust": fid["trust"],
+                   "noise_ratio": fid["noise_ratio"],
+                   "score_kind": "diagnostic_not_perceptual_equivalence",
                    "spectrum_match": fid["spectrum_match"],
                    "loss": rep.loss, "gain_db": fit.gain_db(),
                    "moved": {n: [x, z] for n, x, z in fit.moved()}},
