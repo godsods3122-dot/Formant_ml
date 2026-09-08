@@ -67,6 +67,35 @@ GLOBAL_PARAMS = frozenset((
 
 # 사전(prior) 가중. 분석이 믿을 만한 양은 세게 묶고, 관측되지 않는 양은 기본값에
 # 묶어 둔다. 약하게 푸는 것은 수준·음질 계열뿐이다.
+# **조음 속도 상한 (Hz/ms).** 성도는 근육이 움직이는 물건이라 포먼트가 임의로 빨리
+# 뛸 수 없다. 이 값을 넘으면 그건 조음이 아니라 적합기의 프레임별 난동이다.
+#
+# 계측(`data/ref` 여성 3 개, 유성 프레임 쌍 10,333 개, Praat 1 ms):
+#
+#   |    | 중앙 | 80분위 | 95분위 | 99분위 |
+#   |----|------|--------|--------|--------|
+#   | F1 |  2.9 |    8.5 |   27.2 |  147.3 |
+#   | F2 |  7.0 |   22.7 |   92.7 |  604.9 |
+#   | F3 | 11.5 |   37.5 |  151.0 |  770.7 |
+#   | F4 | 10.7 |   31.2 |  145.2 |  771.8 |
+#
+# 99 분위의 폭주(F2 605, 최대 2043)는 Praat 추적기가 포먼트를 맞바꾼 것이지 조음이
+# 아니다. 그래서 **95 분위를 상한**으로 잡는다. 그 아래는 공짜, 넘으면 이차로 문다
+# (평활 벌점처럼 전 구간을 뭉개면 설측 F2 의 실제 급전이 같이 죽는다).
+#
+# 이 제약이 왜 필요했나 — 없을 때 적합된 궤적을 실측과 대조하면:
+#   지속 모음 F1 실제 중앙 1.1 Hz/ms  vs  적합 126.4 Hz/ms (×115)
+#   설측    F2 실제 중앙 25.5        vs  적합 309.0      (×12)
+# 즉 `lam_smooth` 만으로는 네 자릿수 모자랐다. 해가 심하게 비-식별이 되어, 크기만
+# 맞고 위상은 틀린 해로 굴러가도 밀어낼 힘이 없었다.
+VEL_LIMIT_HZ_PER_MS: dict[str, float] = {
+    "f1": 27.0, "f2": 93.0, "f3": 151.0, "f4": 145.0,
+}
+# 기본값 0 — **아직 켜지 않는다.** 기구와 계측 상수는 여기 있지만, 세기(VEL_W)가
+# 포락 일치를 얼마나 깎는지 A/B 로 확인하기 전에는 모든 적합의 거동을 바꿀 수 없다.
+# 힌지 자체는 검증했다: F2 이동 10/50/93 Hz/ms 는 벌점 0, 150 은 0.97, 309 는 14.0.
+VEL_W = 0.0
+
 PRIOR_W: dict[str, float] = {
     "f0_target": 40.0, "f1": 40.0, "f2": 40.0, "f3": 20.0, "f4": 10.0,
     # 곁가지는 분석이 못 재는 양이다. 세게 묶으면 적합기가 열지를 못한다 —
@@ -426,6 +455,7 @@ class CopySynthFitter:
 
         (1) 포먼트 순서. F4 가 F1 아래로 내려가는 해가 실제로 나왔다.
         (2) 대역폭이 중심 주파수를 넘지 않을 것 — 넘으면 그건 극이 아니라 기울기다.
+        (3) 조음 속도. 계측된 생리적 상한(`VEL_LIMIT_HZ_PER_MS`)을 넘는 이동은 문다.
         """
         u = self._u()
         pen = torch.zeros((), dtype=torch.float64, device=self.device)
@@ -440,6 +470,16 @@ class CopySynthFitter:
                     bw = self._to_val(u[:, k], self.specs[k])
                     over = torch.relu(bw - 0.8 * f[:, j]) / 1000.0
                     pen = pen + 2.0 * (over * over).mean()
+        if VEL_W > 0 and u.shape[0] > 1:
+            dt = max(self.track.frame_ms, 1e-6)
+            for nm, lim in VEL_LIMIT_HZ_PER_MS.items():
+                if nm not in self.names:
+                    continue
+                k = self.names.index(nm)
+                v = self._to_val(u[:, k], self.specs[k])
+                rate = (v[1:] - v[:-1]).abs() / dt
+                over = torch.relu(rate - lim) / 100.0
+                pen = pen + VEL_W * (over * over).mean()
         return pen
 
     def loss(self):
