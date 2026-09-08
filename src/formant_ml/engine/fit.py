@@ -113,8 +113,37 @@ VEL_LIMIT_HZ_PER_MS: dict[str, float] = {
 VEL_KNEE_HZ_PER_MS: dict[str, float] = {
     "f1": 2.9, "f2": 7.0, "f3": 11.5, "f4": 10.7,
 }
-# "off" | "hinge"(95 분위 상한) | "huber"(중앙값 무릎 smooth L1)
-VEL_MODE = "huber"
+# **가속도 무릎 (Hz/ms²).** 1 차 차분(속도)으로는 난동과 실제 조음을 못 가른다 —
+# 동적 구간에서 둘은 크기가 비슷하고 **시간 구조**만 다르다. 난동은 부호가 매 프레임
+# 뒤집히고, 실제 급전은 한 방향으로 지속된다. 그래서 2 차 차분을 본다: 빠르게
+# *움직이는* 것은 허용하고 빠르게 *방향을 바꾸는* 것만 문다.
+#
+# 실측 (data/ref 여성 3 개, 유성 프레임 삼중항 10,305 개, Praat 1 ms):
+#
+#   |    | 속도 중앙 | 가속 중앙 | 가속 80% | 가속 95% |
+#   |----|-----------|-----------|----------|----------|
+#   | F1 |       2.9 |       0.7 |      2.4 |     12.6 |
+#   | F2 |       7.0 |       1.9 |      8.0 |     69.4 |
+#   | F3 |      11.5 |       3.4 |     15.4 |    117.4 |
+#   | F4 |      10.7 |       3.5 |     12.6 |    132.5 |
+#
+# 가속도가 더 나은 판별자인 이유가 이 표에 있다. 우리 적합의 난동은 F2 기준
+# 300~500 Hz/ms 로 부호가 매 프레임 뒤집히므로 가속도는 약 600~1000 Hz/ms² 다.
+#
+#   속도로 보면   실제 7.0  vs 난동 ~300   ->  43 배
+#   가속도로 보면 실제 1.9  vs 난동 ~600   -> 300 배
+#
+# 판별 여유가 7 배 넓다. 속도로는 실제 급전(최대 628 Hz/ms)이 난동 영역과 겹쳐서
+# 못 갈랐는데, 가속도로는 실제 급전이 한 방향으로 지속되므로 겹치지 않는다.
+ACC_KNEE_HZ_PER_MS2: dict[str, float] = {
+    "f1": 0.7, "f2": 1.9, "f3": 3.4, "f4": 3.5,
+}
+# "off" | "hinge"(95 분위 상한) | "huber"(속도 중앙값 무릎) | "accel"(가속도 무릎)
+#
+# 앞의 둘은 기각됐다 (docs/MEASUREMENTS.md §8.6). 성긴 격자도 기각됐다 (§8.9) —
+# 균일한 격자든 균일한 벌점이든 모든 시점에 똑같이 자유도를 주거나 뺏는데, 조음은
+# "대부분 정지, 짧은 순간에 급전" 이라 그 틀로는 두 요구를 동시에 못 맞춘다.
+VEL_MODE = "accel"
 # 기본값 0 — **아직 켜지 않는다.** 기구와 계측 상수는 여기 있지만, 세기(VEL_W)가
 # 포락 일치를 얼마나 깎는지 A/B 로 확인하기 전에는 모든 적합의 거동을 바꿀 수 없다.
 # 힌지 자체는 검증했다: F2 이동 10/50/93 Hz/ms 는 벌점 0, 150 은 0.97, 309 는 14.0.
@@ -496,13 +525,19 @@ class CopySynthFitter:
                     pen = pen + 2.0 * (over * over).mean()
         if VEL_W > 0 and VEL_MODE != "off" and u.shape[0] > 1:
             dt = max(self.track.frame_ms, 1e-6)
-            tab = (VEL_LIMIT_HZ_PER_MS if VEL_MODE == "hinge" else VEL_KNEE_HZ_PER_MS)
+            tab = {"hinge": VEL_LIMIT_HZ_PER_MS, "huber": VEL_KNEE_HZ_PER_MS,
+                   "accel": ACC_KNEE_HZ_PER_MS2}[VEL_MODE]
             for nm, lim in tab.items():
-                if nm not in self.names:
+                if nm not in self.names or u.shape[0] < 3:
                     continue
                 k = self.names.index(nm)
                 v = self._to_val(u[:, k], self.specs[k])
-                rate = (v[1:] - v[:-1]).abs() / dt
+                if VEL_MODE == "accel":
+                    # 2 차 차분. 한 방향으로 꾸준히 가는 급전은 여기서 0 에 가깝고,
+                    # 부호가 뒤집히는 난동만 크게 나온다.
+                    rate = (v[2:] - 2.0 * v[1:-1] + v[:-2]).abs() / (dt * dt)
+                else:
+                    rate = (v[1:] - v[:-1]).abs() / dt
                 if VEL_MODE == "hinge":
                     over = torch.relu(rate - lim) / 100.0
                     pen = pen + VEL_W * (over * over).mean()
