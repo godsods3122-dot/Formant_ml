@@ -940,9 +940,9 @@ class CopySynthFitter:
     def render(self, seed: int | None = None) -> np.ndarray:
         """적합된 파라미터로 합성. `seed` 를 주면 **난류의 실현만** 바꾼다.
 
-        같은 파라미터를 시드만 바꿔 두 번 합성하면, 그 둘의 거리가 곧 "완벽한 모형이라도
-        남는" 실현 잡음이다. 일치율에서 그 바닥을 빼면 편향만 남는다
-        (`turbulence.corrected_sc`). 치찰음을 정직하게 채점하는 유일한 길이다.
+        같은 파라미터를 시드만 바꾼 합성 간 거리는 실현 분산을 추정하는 대조군이다.
+        `turbulence.corrected_sc` 의 보정은 목표 분산 추정에도 의존하므로,
+        여러 시드의 대역·시간 구조와 함께 읽는다. 시드별로 다시 적합하지 않는다.
 
         시드는 **`cfg.seed` 로** 바꾼다. `eng.noise` 에 직접 대입하면 조용히 무시된다 —
         `synth()` 가 부르는 `VoiceEngine.reset()` 이 `NoiseBank(self.cfg.seed)` 로

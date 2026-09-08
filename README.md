@@ -48,6 +48,22 @@ python scripts/parametrize_corpus.py --out out/corpus --jobs 3 --resume
 python scripts/calibrate_levels.py --write        # 제스처 세기를 프로파일 실측 목표에 맞춘다
 ```
 
+발음 진단은 `scripts/bench_corpus.py --denoise all --seeds 0,991,2027
+--budget 2,1,0 --no-probe --json out/diagnostics.json` 으로 시작할 수 있다.
+기존 네 구간만 사용하며 작은 예산은 **동작 확인용이지 품질 판정용이 아니다**.
+원음에서 고정한 마스크로 마찰 정상부·유성 중첩·모음 개시를 따로 평가한다.
+각 피팅 결과를 시드만 바꿔 재합성한 분포와 지표별 유효 길이를 보고하며, 짧아서
+측정할 수 없는 변조 대역은 `null` 로 남긴다. 특히 5 Hz 변조는 100 ms 치찰음 하나로
+신뢰성 있게 추정할 수 없다.
+
+`--coupling all` 은 `"legacy"` 와 실험용 `"lf"` 를 **각각 적합**하는 비교다.
+`EngineConfig(noise_modulation="lf")` 는 LF 유량 형태를 기식·마찰의 공통 변조에
+사용하며 기존 방식이 기본값이다. `--audio-dir out/listening` 은 익명 WAV 와
+별도 정답표를 만든다. 정답표와 보고서를 청자에게 노출하지 말 것.
+이는 청취 자료 준비 기능이며, 객관 점수나 이 파일들만으로 지각적 동등성을
+주장하지 않는다. 실측과 남겨 둔 물리 가설은
+[`docs/MEASUREMENTS.md`](docs/MEASUREMENTS.md) §10 에 있다.
+
 > **치찰음의 정밀 일치율은 지각적 동일성 점수가 아니다.** 34.5 % 는 동일 PSD 의
 > 독립 가우시안 잡음을 비평활 STFT 크기로 비교할 때의 이론적 기준이지, 유성 성분이
 > 섞인 모든 치찰음의 상한이 아니다. `fit.fidelity()` 의 `fine_corr` 도 분산 추정에

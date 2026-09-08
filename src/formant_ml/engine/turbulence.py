@@ -33,7 +33,7 @@
    완벽한 모형이 거기 오고(편향이 실제로 0 이니까) 잡음이 과한 합성도 거기 온다 —
    **둘을 가르는 것은 `noise_ratio`** (합성/목표 실현 분산 비) 다. 실측 대조군:
 
-    | 대조군            | 정밀  | 보정  | 신뢰도 | 분해 | 잡음비 |
+    | 대조군            | 정밀  | 보정  | 잔여비 | 분해 | 잡음비 |
     |-------------------|-------|-------|--------|------|--------|
     | 완벽 (시드만 다름)| 33.9  | 97.2  |  0.007 | ✗    |  0.97  |
     | 1 kHz 어긋남      | 29.4  | 74.3  |  0.105 | ✓    |  0.97  |
@@ -280,14 +280,14 @@ def corrected_sc(mag_t: np.ndarray, mag_p: np.ndarray,
         D_tp  = E‖|S_t|−|S_p|‖²  = ‖m_t−m_p‖² + V_t + V_p
         D_pp' = E‖|S_p|−|S_p'|‖² = 2·V_p            (같은 파라미터, 시드만 다름)
 
-    이므로 **빼야 할 것은 V_t + V_p** 이고 그중 V_p 만 정확히 안다 (= D_pp'/2).
+    이므로 **빼야 할 것은 V_t + V_p** 이고 V_p 는 합성 쌍으로 추정한다 (= D_pp'/2).
 
     **V_t ≈ V_p 를 가정하고 D_pp' 를 통째로 빼면 안 된다.** 합성의 실현 분산이 목표보다
     크면 (실제로 그렇다 — 녹음은 위너 차감을 거쳐 스펙트럼이 평활해져 있다) 과하게
     빼서 **잡음 투성이 합성이 100 % 를 받는다.** 실측: 치찰음 구간 넷 전부 100.00.
 
     그래서 V_t 를 따로 추정한다. 시간 평활 잔차는 절대 눈금이 안 맞지만, 합성 쪽에서는
-    참값(D_pp'/2)을 아니까 그것으로 눈금을 교정해 목표에 옮긴다:
+    실현 쌍의 추정값(D_pp'/2)으로 눈금을 교정해 목표에 옮긴다:
 
         V_t ≈ V_t^est · (D_pp'/2) / V_p^est
 
@@ -305,10 +305,13 @@ def corrected_sc(mag_t: np.ndarray, mag_p: np.ndarray,
       파라미터다). 모양이 맞는지와 잡음량이 맞는지를 갈라서 봐야 한다.
 
     성질:
-    * 완벽한 모형 -> sc 0. 원래 SC 는 0.655 (일치 34.5 %).
+    * 독립 레일리 실현의 원래 SC 기대값은 약 0.655 (일치 34.5 %).
     * 결정적 신호(하모닉) -> D_pp' ≈ 0 이므로 보정이 아무 일도 안 한다.
     """
     n_t = float((np.asarray(mag_t, dtype=np.float64) ** 2).sum())
+    if n_t <= 1e-24 or not np.isfinite(n_t):
+        return dict(sc=float("nan"), floor=float("nan"), trust=float("nan"),
+                    noise_ratio=float("nan"))
     d_tp = _sq(mag_t, mag_p)
     if mag_p2 is None:
         return dict(sc=float(np.sqrt(d_tp / max(n_t, 1e-30))), floor=0.0,
@@ -320,7 +323,7 @@ def corrected_sc(mag_t: np.ndarray, mag_p: np.ndarray,
     if d_tp <= 1e-12 * max(n_t, 1e-30):
         return dict(sc=0.0, floor=0.0, trust=1.0, noise_ratio=ratio)
     v_p = 0.5 * d_pp
-    v_t = vt_est * (v_p / max(vp_est, 1e-30))    # 합성 쪽 참값으로 눈금을 교정해 옮긴다
+    v_t = vt_est * (v_p / max(vp_est, 1e-30))
     sub = min(v_t + v_p, d_tp)                   # 실제 거리보다 더 뺄 수는 없다
     bias = max(d_tp - sub, 0.0)
     denom = max(n_t - v_t, 1e-30)
@@ -341,6 +344,11 @@ def spectrum_match(target: np.ndarray, synth: np.ndarray, fs: float) -> float:
 
     dB 로 비교하는 이유: 선형 파워로 재면 가장 큰 대역 하나가 값을 독차지한다.
     """
+    if min(len(target), len(synth)) < 32:
+        return float("nan")
+    if not all(np.isfinite(x).all() and np.max(np.abs(x)) > 1e-12
+               for x in (np.asarray(target), np.asarray(synth))):
+        return float("nan")
     ft, pt = average_psd(target, fs)
     fp, pp = average_psd(synth, fs)
     n = min(len(pt), len(pp))
@@ -351,6 +359,8 @@ def spectrum_match(target: np.ndarray, synth: np.ndarray, fs: float) -> float:
         return float("nan")
     a, b = a[keep], b[keep]
     a = a - a.mean(); b = b - b.mean()   # 전역 레벨은 이득의 몫, 여기선 모양만 본다
+    if np.linalg.norm(a) < 1e-9:
+        return float("nan")
     return float(100.0 * (1.0 - np.linalg.norm(a - b) / (np.linalg.norm(a) + 1e-12)))
 
 

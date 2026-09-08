@@ -125,3 +125,10 @@ def test_spectral_fidelity_status_for_missing_short_silent_and_unresolved():
     r = tb.spectral_fidelity(noise(), noise(1), noise(2), FS)
     assert r["correction_status"] == "unresolved"
     assert not r["resolved"]
+
+
+def test_silence_has_no_spectral_shape_or_corrected_score():
+    x = np.zeros(5000)
+    assert np.isnan(tb.spectrum_match(x, x, FS))
+    assert np.isnan(tb.spectrum_match(np.ones(10), np.ones(10), FS))
+    assert np.isnan(tb.corrected_sc(np.zeros((10, 10)), np.zeros((10, 10)), None)["sc"])
