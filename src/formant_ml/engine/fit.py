@@ -940,9 +940,9 @@ class CopySynthFitter:
     def render(self, seed: int | None = None) -> np.ndarray:
         """적합된 파라미터로 합성. `seed` 를 주면 **난류의 실현만** 바꾼다.
 
-        같은 파라미터를 시드만 바꿔 두 번 합성하면, 그 둘의 거리가 곧 "완벽한 모형이라도
-        남는" 실현 잡음이다. 일치율에서 그 바닥을 빼면 편향만 남는다
-        (`turbulence.corrected_sc`). 치찰음을 정직하게 채점하는 유일한 길이다.
+        같은 파라미터를 시드만 바꾼 합성 간 거리는 실현 분산을 추정하는 대조군이다.
+        `turbulence.corrected_sc` 의 보정은 목표 분산 추정에도 의존하므로,
+        여러 시드의 대역·시간 구조와 함께 읽는다. 시드별로 다시 적합하지 않는다.
 
         시드는 **`cfg.seed` 로** 바꾼다. `eng.noise` 에 직접 대입하면 조용히 무시된다 —
         `synth()` 가 부르는 `VoiceEngine.reset()` 이 `NoiseBank(self.cfg.seed)` 로
@@ -959,11 +959,12 @@ class CopySynthFitter:
                 self.eng.cfg.seed = old
 
     def fidelity(self, seed_b: int = 991) -> dict:
-        """실현 잡음을 뺀 성적표. 치찰음을 포함한 구간에서 유일하게 정직한 값이다.
+        """실현 분산을 추정해 차감한 진단용 성적표.
 
-        `fine` 은 지금까지 쓰던 값(비교용), `fine_corr` 이 편향만 남긴 값이다.
-        `floor` 는 원래 자가 원리적으로 넘을 수 없는 상한 — `fine` 이 이 근처면
-        **모형이 나쁜 게 아니라 자가 바닥에 닿은 것**이다.
+        `fine_corr` 은 분산 추정에 의존한다. `resolved=False` 이면 편향을
+        판별하지 못했으며, 보정값은 신뢰구간의 하한이 아니다. `trust` 는
+        잔여거리 비율이고 `floor` 는 실현 기준 추정값이지 보편적 상한이 아니다.
+        여러 시드·대역·시간 구조와 청취를 함께 평가해야 한다.
         """
         from . import turbulence as tb
         tgt = self.target[0].detach().cpu().numpy().astype(np.float64)

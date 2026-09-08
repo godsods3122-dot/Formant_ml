@@ -18,22 +18,22 @@
 
     E‖|S₁|−|S₂|‖² / E‖|S₁|‖² = (4−π)/2·σ²/(2σ²)  ->  SC = √((4−π)/2) = 0.655
 
-즉 **완벽한 모형이라도 치찰음에서 정밀 34.5 % 가 상한**이다. 95 % 를 목표로 걸면
-그건 달성 불가능한 목표가 아니라 **틀린 자**다.
+즉 독립 레일리 실현의 기대 정밀 점수는 약 34.5 % 다. 이는 유한 표본의 엄밀한
+상한도, 모든 치찰음에 적용되는 상한도 아니다.
 
 무엇으로 바꾸는가
 -----------------
 1. **편향 보정 스펙트럼 수렴도** (`corrected_sc`). 같은 파라미터를 시드만 바꿔 한 번 더
    합성하면 그 둘의 거리가 곧 "완벽한 모형이라도 남는" 실현 잡음이다. 그 바닥을
-   제곱 영역에서 빼면 남는 것이 **편향** — 모형이 실제로 틀린 만큼이다. 완벽한
-   모형에서 100 % 로 수렴한다.
+   제곱 영역에서 빼면 모형 편향의 휴리스틱 추정이 남는다. 분산 추정과 정상성
+   가정에 민감하며, 음질이나 지각적 동등성의 증거가 아니다.
 
-   **다만 이 자에는 신뢰도가 붙는다** (`trust` / `resolved`). 편향이 실현 잡음보다
-   작으면 분해가 안 되고, 그때의 값은 "이 값이다" 가 아니라 **"적어도 이 값"** 이다.
+   `trust` / `resolved` 는 잔여 거리 비율과 그 임계 판정이지 통계적 신뢰도가 아니다.
+   분해가 안 된 점수는 **미분해 추정치**이며 하한이나 신뢰구간이 아니다.
    완벽한 모형이 거기 오고(편향이 실제로 0 이니까) 잡음이 과한 합성도 거기 온다 —
    **둘을 가르는 것은 `noise_ratio`** (합성/목표 실현 분산 비) 다. 실측 대조군:
 
-    | 대조군            | 정밀  | 보정  | 신뢰도 | 분해 | 잡음비 |
+    | 대조군            | 정밀  | 보정  | 잔여비 | 분해 | 잡음비 |
     |-------------------|-------|-------|--------|------|--------|
     | 완벽 (시드만 다름)| 33.9  | 97.2  |  0.007 | ✗    |  0.97  |
     | 1 kHz 어긋남      | 29.4  | 74.3  |  0.105 | ✓    |  0.97  |
@@ -76,10 +76,7 @@ LTAS_EDGES = (0.0, 500.0, 1000.0, 2000.0, 3000.0, 4000.0, 5000.0, 6000.0,
               8000.0, 10000.0, 12000.0, 16000.0, 24000.0)
 # 포락 변조 스펙트럼의 대역. 5~60 Hz 는 제트 사행(의도한 것), 그 위는 질감이다.
 MOD_EDGES = (5.0, 60.0, 400.0, 800.0, 1200.0, 2000.0)
-# 보정 일치율이 **분해**됐다고 볼 최소 신뢰도. 목표-합성 거리 중 실현 잡음으로 설명되지
-# 않는 몫이 이만큼은 되어야, 남은 편향을 "쟀다" 고 말할 수 있다. 그 아래면 값은
-# 상한일 뿐이다 (편향 ≤ 그 값). 완벽한 모형도 여기 오므로 실패 표시가 아니다 —
-# 잡음량이 맞는지는 `noise_ratio` 로 따로 본다.
+# Heuristic residual-distance threshold, not statistical confidence or a bound.
 TRUST_MIN = 0.10
 
 
@@ -233,7 +230,9 @@ def modulation_bands(x: np.ndarray, fs: float, lo: float = 4000.0,
     e = e - e.mean()
     E = np.abs(np.fft.rfft(e * np.hanning(len(e)))) ** 2
     fm = np.fft.rfftfreq(len(e), 1.0 / fs)
-    tot = E[(fm >= edges[0]) & (fm < edges[-1])].sum() + 1e-30
+    tot = E[(fm >= edges[0]) & (fm < edges[-1])].sum()
+    if tot <= 1e-20:
+        return np.full(len(edges) - 1, np.nan)
     return np.array([100.0 * E[(fm >= a) & (fm < b_)].sum() / tot
                      for a, b_ in zip(edges[:-1], edges[1:])])
 
@@ -281,14 +280,14 @@ def corrected_sc(mag_t: np.ndarray, mag_p: np.ndarray,
         D_tp  = E‖|S_t|−|S_p|‖²  = ‖m_t−m_p‖² + V_t + V_p
         D_pp' = E‖|S_p|−|S_p'|‖² = 2·V_p            (같은 파라미터, 시드만 다름)
 
-    이므로 **빼야 할 것은 V_t + V_p** 이고 그중 V_p 만 정확히 안다 (= D_pp'/2).
+    이므로 **빼야 할 것은 V_t + V_p** 이고 V_p 는 합성 쌍으로 추정한다 (= D_pp'/2).
 
     **V_t ≈ V_p 를 가정하고 D_pp' 를 통째로 빼면 안 된다.** 합성의 실현 분산이 목표보다
     크면 (실제로 그렇다 — 녹음은 위너 차감을 거쳐 스펙트럼이 평활해져 있다) 과하게
     빼서 **잡음 투성이 합성이 100 % 를 받는다.** 실측: 치찰음 구간 넷 전부 100.00.
 
     그래서 V_t 를 따로 추정한다. 시간 평활 잔차는 절대 눈금이 안 맞지만, 합성 쪽에서는
-    참값(D_pp'/2)을 아니까 그것으로 눈금을 교정해 목표에 옮긴다:
+    실현 쌍의 추정값(D_pp'/2)으로 눈금을 교정해 목표에 옮긴다:
 
         V_t ≈ V_t^est · (D_pp'/2) / V_p^est
 
@@ -296,8 +295,8 @@ def corrected_sc(mag_t: np.ndarray, mag_p: np.ndarray,
 
     돌려주는 값
     -----------
-    * `sc`    — 보정 SC. 완벽한 모형에서 0 (= 일치 100 %).
-    * `floor` — 실현 잡음이 만드는 바닥. 원래 SC 가 이보다 좋아질 수 없다.
+    * `sc`    — 보정 SC 추정. 0 으로 클리핑될 수 있다; 완벽함을 뜻하지 않는다.
+    * `floor` — 추정 실현 잡음 기여량. 원래 SC 의 엄밀한 하한이 아니다.
     * `trust` — `(D_tp − 뺀 양) / D_tp`. **0 에 가까우면 보정값을 믿으면 안 된다** —
       실현 잡음이 거리를 통째로 설명해 버려 편향을 못 잰다. 그럴 때는
       `spectrum_match`(시간 평균 스펙트럼)를 대신 본다.
@@ -306,10 +305,13 @@ def corrected_sc(mag_t: np.ndarray, mag_p: np.ndarray,
       파라미터다). 모양이 맞는지와 잡음량이 맞는지를 갈라서 봐야 한다.
 
     성질:
-    * 완벽한 모형 -> sc 0. 원래 SC 는 0.655 (일치 34.5 %).
+    * 독립 레일리 실현의 원래 SC 기대값은 약 0.655 (일치 34.5 %).
     * 결정적 신호(하모닉) -> D_pp' ≈ 0 이므로 보정이 아무 일도 안 한다.
     """
     n_t = float((np.asarray(mag_t, dtype=np.float64) ** 2).sum())
+    if n_t <= 1e-24 or not np.isfinite(n_t):
+        return dict(sc=float("nan"), floor=float("nan"), trust=float("nan"),
+                    noise_ratio=float("nan"))
     d_tp = _sq(mag_t, mag_p)
     if mag_p2 is None:
         return dict(sc=float(np.sqrt(d_tp / max(n_t, 1e-30))), floor=0.0,
@@ -321,7 +323,7 @@ def corrected_sc(mag_t: np.ndarray, mag_p: np.ndarray,
     if d_tp <= 1e-12 * max(n_t, 1e-30):
         return dict(sc=0.0, floor=0.0, trust=1.0, noise_ratio=ratio)
     v_p = 0.5 * d_pp
-    v_t = vt_est * (v_p / max(vp_est, 1e-30))    # 합성 쪽 참값으로 눈금을 교정해 옮긴다
+    v_t = vt_est * (v_p / max(vp_est, 1e-30))
     sub = min(v_t + v_p, d_tp)                   # 실제 거리보다 더 뺄 수는 없다
     bias = max(d_tp - sub, 0.0)
     denom = max(n_t - v_t, 1e-30)
@@ -342,6 +344,11 @@ def spectrum_match(target: np.ndarray, synth: np.ndarray, fs: float) -> float:
 
     dB 로 비교하는 이유: 선형 파워로 재면 가장 큰 대역 하나가 값을 독차지한다.
     """
+    if min(len(target), len(synth)) < 32:
+        return float("nan")
+    if not all(np.isfinite(x).all() and np.max(np.abs(x)) > 1e-12
+               for x in (np.asarray(target), np.asarray(synth))):
+        return float("nan")
     ft, pt = average_psd(target, fs)
     fp, pp = average_psd(synth, fs)
     n = min(len(pt), len(pp))
@@ -352,6 +359,8 @@ def spectrum_match(target: np.ndarray, synth: np.ndarray, fs: float) -> float:
         return float("nan")
     a, b = a[keep], b[keep]
     a = a - a.mean(); b = b - b.mean()   # 전역 레벨은 이득의 몫, 여기선 모양만 본다
+    if np.linalg.norm(a) < 1e-9:
+        return float("nan")
     return float(100.0 * (1.0 - np.linalg.norm(a - b) / (np.linalg.norm(a) + 1e-12)))
 
 
@@ -372,10 +381,226 @@ def compare(target: np.ndarray, synth: np.ndarray, fs: float) -> dict:
         peak_err=b["peak"] - a["peak"],
         sibilance_err=b["sibilance"] - a["sibilance"],
         band_mae_db=float(np.nanmean(np.abs(b["bands"][:nb] - a["bands"][:nb]))),
-        mod_mae_pct=float(np.nanmean(np.abs(b["mod"] - a["mod"]))),
+        mod_mae_pct=(_finite_mean(np.abs(b["mod"] - a["mod"]))
+                     if np.isfinite(a["mod"]).any() and np.isfinite(b["mod"]).any()
+                     else float("nan")),
         kurtosis_err=b["kurtosis_t"] - a["kurtosis_t"],
         match_spectrum=spectrum_match(target, synth, fs),
     )
+
+
+def _runs(mask: np.ndarray) -> list[tuple[int, int]]:
+    edges = np.diff(np.r_[False, np.asarray(mask, dtype=bool), False].astype(int))
+    return list(zip(np.flatnonzero(edges == 1).tolist(),
+                    np.flatnonzero(edges == -1).tolist()))
+
+
+def target_regions(target: np.ndarray, fs: float, voiced: np.ndarray,
+                   frame_ms: float = 1.0) -> dict:
+    """Target-only, heuristic masks, reusable unchanged for every render/condition.
+
+    Voicing comes from target analysis. Frication is measured independently of
+    voicing: analyzer ``fricative`` is explicitly unvoiced-only and cannot identify
+    overlap. No phonetic annotation or calibrated classification confidence is
+    claimed. A clip beginning in a vowel has no observed vowel onset.
+    """
+    x = np.asarray(target, dtype=float)
+    if fs <= 0 or frame_ms <= 0 or x.ndim != 1:
+        raise ValueError("positive sample rate/frame duration and mono target required")
+    step = fs * frame_ms / 1000.0
+    nf = min(len(voiced), int(np.ceil(len(x) / step)))
+    v = np.asarray(voiced[:nf], dtype=bool)
+    rms, ratio = np.zeros(nf), np.full(nf, -np.inf)
+    width = max(32, int(round(0.020 * fs)))
+    freq = np.fft.rfftfreq(width, 1 / fs)
+    low = (freq >= 300) & (freq < 1000)
+    high = (freq >= 3000) & (freq < min(12000, fs / 2))
+    for i in range(nf):
+        center = int(round((i + 0.5) * step))
+        a, b = max(0, center - width // 2), min(len(x), center + width // 2)
+        z = x[a:b]
+        if not len(z):
+            continue
+        rms[i] = np.sqrt(np.mean(z ** 2))
+        if high.sum() >= 4 and low.sum() >= 4:
+            p = np.abs(np.fft.rfft(z * np.hanning(len(z)), n=width)) ** 2
+            ratio[i] = 10 * np.log10((p[high].sum() + 1e-30) /
+                                    (p[low].sum() + 1e-30))
+    active = (rms > max(float(rms.max()) if nf else 0, 1e-12) * 10 ** (-25 / 20))
+    active &= rms > 1e-10
+    fric = active & (ratio > 0)
+    core = fric & ~v
+    trim = max(1, int(round(5 / frame_ms)))
+    interior = np.zeros(nf, dtype=bool)
+    for a, b in _runs(core):
+        if b - a > 2 * trim:
+            interior[a + trim:b - trim] = True
+    near_core = np.zeros(nf, dtype=bool)
+    vicinity = max(1, int(round(30 / frame_ms)))
+    for a, b in _runs(core):
+        near_core[max(0, a - vicinity):min(nf, b + vicinity)] = True
+    overlap = fric & v & near_core
+    onset = np.zeros(nf, dtype=bool)
+    onset_frames = max(1, int(round(50 / frame_ms)))
+    for a, b in _runs(v & active & ~fric):
+        # Require observed preceding frication, not merely a segment boundary.
+        if a > 0 and np.any(fric[max(0, a - vicinity):a]):
+            onset[a:min(b, a + onset_frames)] = True
+    masks = {"frication_core": interior, "voiced_overlap": overlap, "vowel_onset": onset}
+    definitions = {
+        "frication_core": "active AND high/low > 0 dB AND NOT target-voiced; trim 5 ms at each run edge",
+        "voiced_overlap": "active AND high/low > 0 dB AND target-voiced; within 30 ms of unvoiced frication",
+        "vowel_onset": "first <=50 ms of active target-voiced/nonfricative run after frication within 30 ms",
+    }
+    return {
+        "source": "raw target only; fixed across denoise conditions and synthesis seeds",
+        "frame_ms": frame_ms,
+        "analysis_window_ms": 20,
+        "frication_bands_hz": [[300, 1000], [3000, min(12000, fs / 2)]],
+        "activity_gate_db": -25,
+        "confidence": "heuristic, uncalibrated; voicing errors and high harmonics can misclassify",
+        "regions": {
+            name: {
+                "definition": definitions[name],
+                "confidence": "low" if high.sum() < 4 or not mask.any() else "heuristic",
+                "spans": [[int(round(a * step)), min(len(x), int(round(b * step)))]
+                          for a, b in _runs(mask)],
+                "status": "available" if mask.any() else "unavailable",
+            } for name, mask in masks.items()
+        },
+    }
+
+
+def _finite_mean(values) -> float | None:
+    a = np.asarray(values, dtype=float)
+    a = a[np.isfinite(a)]
+    return float(a.mean()) if len(a) else None
+
+
+def diagnostic_metrics(target: np.ndarray, synth: np.ndarray, fs: float,
+                       bandwidth: float | None = None) -> dict:
+    """Metrics for ONE contiguous interval, never a concatenation of mask islands.
+
+    Null metrics are unavailable (silence, insufficient duration or bandwidth).
+    Modulation requires >=2 cycles at each band's lower edge, >=2 FFT bins,
+    and an upper edge no greater than the carrier bandwidth.
+    Envelope correlations use a 2 ms moving average and discard 5 ms edges.
+    These objective diagnostics do not establish perceptual equivalence.
+    """
+    from scipy.ndimage import uniform_filter1d
+    t, s = np.asarray(target, dtype=float), np.asarray(synth, dtype=float)
+    n = min(len(t), len(s))
+    t, s = t[:n], s[:n]
+    result = {"status": "unavailable", "reason": None, "metrics": {}}
+    if n < max(64, int(0.020 * fs)):
+        result["reason"] = "less than 20 ms contiguous data"
+        return result
+    if not np.isfinite(t).all() or not np.isfinite(s).all():
+        result["reason"] = "nonfinite waveform"
+        return result
+    rt, rs = float(np.sqrt(np.mean(t ** 2))), float(np.sqrt(np.mean(s ** 2)))
+    if rt <= 1e-10:
+        result["reason"] = "silent target"
+        return result
+    bw = min(fs / 2, bandwidth if bandwidth is not None else fs / 2)
+    metrics = {"rms_error_db": float(20 * np.log10(max(rs, 1e-12) / rt))}
+    result.update(status="available", metrics=metrics, bandwidth_hz=float(bw))
+    f, pt = average_psd(t, fs)
+    _, ps = average_psd(s, fs)
+    keep = f <= bw
+    f, pt, ps = f[keep], pt[keep], ps[keep]
+    for name in ("centroid_err_hz", "band_mae_db", "spectrum_match"):
+        metrics[name] = None
+    if rs > 1e-10 and len(f) >= 8:
+        ct, cs = spectral_moments(f, pt), spectral_moments(f, ps)
+        err = cs["centroid"] - ct["centroid"]
+        metrics["centroid_err_hz"] = float(err) if np.isfinite(err) else None
+        edges = [e for e in LTAS_EDGES if e <= bw]
+        if len(edges) >= 2:
+            metrics["band_mae_db"] = _finite_mean(
+                np.abs(band_levels_db(f, pt, edges) - band_levels_db(f, ps, edges)))
+        a, b = 10 * np.log10(pt + 1e-30), 10 * np.log10(ps + 1e-30)
+        keep = a > a.max() - 60
+        a, b = a[keep], b[keep]
+        if len(a) >= 8 and np.std(a) > 1e-6:
+            a, b = a - a.mean(), b - b.mean()
+            metrics["spectrum_match"] = float(100 * (1 - np.linalg.norm(a - b) /
+                                                     np.linalg.norm(a)))
+    for lo, hi in ((300, 1000), (1000, 3000), (4000, 12000)):
+        label = f"{lo}_{hi}"
+        corr_key = f"envelope_corr_{label}"
+        metrics[corr_key] = None
+        for a, b in zip(MOD_EDGES[:-1], MOD_EDGES[1:]):
+            for prefix in ("mod_target_pct", "mod_synth_pct", "mod_error_pp"):
+                metrics[f"{prefix}_{label}_{int(a)}_{int(b)}"] = None
+        # Do not silently relabel a truncated carrier band as the full band.
+        if hi > min(bw, 0.45 * fs) or rs <= 1e-10:
+            continue
+        bt, et = _band_envelope(t, fs, lo, hi)
+        bs, es = _band_envelope(s, fs, lo, hi)
+        if bt is None or min(np.std(bt) / rt, np.std(bs) / rs) < 1e-3:
+            continue
+        edge = max(1, int(0.005 * fs))
+        window = max(1, int(0.002 * fs))
+        et = uniform_filter1d(et, window)[edge:-edge]
+        es = uniform_filter1d(es, window)[edge:-edge]
+        if n >= int(0.030 * fs) and min(et.std(), es.std()) > 1e-10:
+            metrics[corr_key] = float(np.corrcoef(et, es)[0, 1])
+        mt, ms = modulation_bands(t, fs, lo, hi), modulation_bands(s, fs, lo, hi)
+        fm = np.fft.rfftfreq(n, 1 / fs)
+        for i, (a, b) in enumerate(zip(MOD_EDGES[:-1], MOD_EDGES[1:])):
+            if b > hi - lo or n / fs < 2 / a or ((fm >= a) & (fm < b)).sum() < 2:
+                continue
+            for prefix, value in (("mod_target_pct", mt[i]), ("mod_synth_pct", ms[i]),
+                                  ("mod_error_pp", abs(mt[i] - ms[i]))):
+                if np.isfinite(value):
+                    metrics[f"{prefix}_{label}_{int(a)}_{int(b)}"] = float(value)
+    return result
+
+
+def region_diagnostics(target: np.ndarray, synth: np.ndarray, fs: float,
+                       regions: dict, bandwidth: float | None = None) -> dict:
+    """Evaluate each fixed target run separately, then duration-weight scalar metrics."""
+    out = {}
+    for name, region in regions["regions"].items():
+        runs = []
+        for a, b in region["spans"]:
+            end = min(b, len(target), len(synth))
+            r = diagnostic_metrics(target[a:end], synth[a:end], fs, bandwidth)
+            runs.append(dict(start_sample=a, end_sample=end, **r))
+        keys = {key for r in runs for key in r["metrics"]}
+        means, coverage = {}, {}
+        for key in sorted(keys):
+            valid = [(r["metrics"].get(key), r["end_sample"] - r["start_sample"])
+                     for r in runs if r["metrics"].get(key) is not None]
+            coverage[key] = sum(n for _, n in valid) / fs
+            means[key] = (float(np.average([v for v, _ in valid],
+                                          weights=[n for _, n in valid]))
+                          if valid else None)
+        available = any(r["status"] == "available" for r in runs)
+        out[name] = dict(
+            definition=region["definition"], confidence=region["confidence"],
+            status="available" if available else "unavailable",
+            reason=(None if available else "no eligible contiguous target runs" if runs
+                    else "no target frames match this mask"),
+            duration_s=sum(b - a for a, b in region["spans"]) / fs,
+            runs=runs, metrics=means, metric_duration_s=coverage,
+        )
+    return out
+
+
+def seed_summary(rows: list[dict]) -> dict:
+    """Descriptive distributions over same-fit renders, NOT confidence intervals."""
+    result = {}
+    for key in sorted({key for row in rows for key in row}):
+        values = [row.get(key) for row in rows]
+        a = np.array([v for v in values if isinstance(v, (float, int, np.number))
+                      and not isinstance(v, (bool, np.bool_)) and np.isfinite(v)])
+        result[key] = dict(count=len(a), median=float(np.median(a)) if len(a) else None,
+                           min=float(a.min()) if len(a) else None,
+                           max=float(a.max()) if len(a) else None,
+                           std=float(a.std()) if len(a) > 1 else None)
+    return result
 
 
 # ------------------------------------------------- 적합 성적표 (편향 보정)
@@ -402,12 +627,10 @@ def spectral_fidelity(target: np.ndarray, synth: np.ndarray,
 
     돌려주는 값:
     * `fine`      — 지금까지 쓰던 값 (비교용으로 남긴다)
-    * `fine_corr` — 편향만 남긴 값. 완벽한 모형에서 100 % 로 수렴한다.
-    * `floor`     — 실현 잡음이 만드는 바닥. 원래 값이 이보다 좋아질 수 없다.
-    * `trust` / `resolved` — **`resolved` 가 False 면 `fine_corr` 을 "이 값이다" 로
-      읽으면 안 되고 "적어도 이 값" 으로 읽어야 한다.** 편향이 실현 잡음보다 작아
-      분해가 안 된 것이다. 완벽한 모형도 여기 오고 (편향이 실제로 0 이니까), 잡음이
-      과한 합성도 여기 온다 — **둘을 가르는 것은 `noise_ratio` 다.**
+    * `fine_corr` — 분산 차감 후 클리핑된 편향 추정. 100 은 완벽함의 증거가 아니다.
+    * `floor`     — 실현 잡음 기여량에서 환산한 기대 점수; 엄밀한 상한이 아니다.
+    * `trust` / `resolved` — 잔여 거리 비율 / 휴리스틱 임계 판정. 통계적 신뢰도가
+      아니다. 미분해 점수는 하한(`>=`)도 신뢰구간도 아니다.
     * `noise_ratio` — 합성/목표의 실현 분산 비. 1 이면 잡음량이 맞다. 실측으로
       진폭을 6 dB 낮춘 합성에서 0.24 가 나온다 (이론 0.25).
 
@@ -435,15 +658,18 @@ def spectral_fidelity(target: np.ndarray, synth: np.ndarray,
         d = corrected_sc(A, B, C)
         cor.append(d["sc"]); flo.append(d["floor"])
         tru.append(d["trust"]); nr.append(d["noise_ratio"])
-    if not raw:
+    if not raw or not np.any(np.abs(t) > 1e-12):
         return dict(fine=float("nan"), fine_corr=float("nan"), floor=float("nan"),
-                    trust=float("nan"), noise_ratio=float("nan"))
+                    trust=float("nan"), noise_ratio=float("nan"), resolved=False,
+                    correction_status="unavailable")
     trust = float(np.mean(tru))
     return dict(fine=100.0 * (1.0 - float(np.mean(raw))),
                 fine_corr=100.0 * (1.0 - float(np.mean(cor))),
                 floor=100.0 * (1.0 - float(np.mean(flo))),
                 trust=trust, noise_ratio=float(np.mean(nr)) if nr else float("nan"),
-                resolved=bool(trust >= TRUST_MIN))
+                resolved=bool(trust >= TRUST_MIN),
+                correction_status=("uncorrected" if synth2 is None else
+                                   "resolved" if trust >= TRUST_MIN else "unresolved"))
 
 
 def effective_bandwidth(x: np.ndarray, fs: float, drop_db: float = 35.0,
