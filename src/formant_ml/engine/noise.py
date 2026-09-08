@@ -33,6 +33,11 @@ NU = 0.15                # 공기 동점성 cm²/s
 RE_CRIT = 1800.0         # 난류 개시 레이놀즈 수 (Stevens 1998, 1700~1800)
 RE_REF = 8000.0          # /s/ 급 협착의 전형값 — 세기 정규화 기준
 C_SOUND = 35000.0        # cm/s
+# **성문 주기에 동기한 마찰 AM 의 깊이.** 폐쇄기에 유량이 줄어 마찰도 준다.
+# 깊이 0.35 는 예전 사각파 게이트(`1 − 0.5·(frac < 0.35)`)의 주기 평균을 보존하도록
+# 고른 값이다. 기식 쪽 `glottis.ASP_AM_DEPTH` 와 함께 F0 동기 변조를 만든다 —
+# 실측으로 정해야 하므로 상수로 빼 둔다.
+FRIC_AM_DEPTH = 0.35
 
 
 def series_flow(p_sub_cmh2o, a_g, a_c):
@@ -196,7 +201,7 @@ class FricationNoise(nn.Module):
         # F0 하나에만 실린다 — 계단이 만들던 F0 배음 계열이 사라진다.
         frac = glottal_phase[:, :n] / (2 * math.pi)
         gate = 0.5 * (1.0 + torch.cos(2 * math.pi * frac))
-        am = 1.0 - 0.35 * voiced[:, :n] * gate
+        am = 1.0 - FRIC_AM_DEPTH * voiced[:, :n] * gate
         if noise_am is not None:
             # Keep the legacy cycle mean (0.825 when voiced), but use exactly
             # the same LF flow shape as aspiration, with no extra fit parameter.

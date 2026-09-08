@@ -76,6 +76,19 @@ def lf_pulse(rd: float, n: int = 4096) -> np.ndarray:
     return e / (np.abs(e).max() + 1e-12)
 
 
+# **성문 개방기에 동기한 기식 AM 의 깊이** (Klatt & Klatt 1990).
+#
+# `asp_env = asp·(1 + d·voiced·(open_phase − 0.5))` 이므로 d=0.7 이면 기식 잡음이 매
+# 성문 주기마다 ±35 % 변조된다. 그 변조는 F0 와 그 배음에 그대로 실린다.
+#
+# 실측 (yang_00000101, 고역 4~12 kHz 포락의 변조 스펙트럼 **절대** 에너지, 목표 대비):
+# F0~2.5F0 대역이 2.37 배, 60~150 Hz 가 4.01 배 과다하다. 사람은 그 대역의 진폭 변조를
+# 거칠기(roughness)로 듣는다 — 사용자가 "지지직거린다" 고 한 성분이다.
+#
+# 값은 실측으로 정해야 하므로 상수로 빼 둔다. 하드코딩된 채로는 A/B 를 못 돌린다.
+ASP_AM_DEPTH = 0.7
+
+
 def lf_table(n_rd: int = 24, rd_min: float = 0.3, rd_max: float = 2.7,
              n_harm: int = 400, n: int = 4096) -> tuple[torch.Tensor, torch.Tensor]:
     """Rd 격자 -> 하모닉 복소계수 (n_rd, n_harm). 격자 사이는 선형보간(미분가능)."""
@@ -211,7 +224,8 @@ class GlottalSource(nn.Module):
         return 1.0 + 0.7 * voiced * flow
 
     def forward(self, c: dict, phase0: torch.Tensor | None = None,
-                rps: torch.Tensor | None = None, noise=None, frame0: int = 0,
+                rps: torch.Tensor | None = None, dispersion: float = 0.0,
+                noise=None, frame0: int = 0,
                 amp0: torch.Tensor | None = None, state: dict | None = None,
                 emit: int | None = None) -> dict:
         """c: 프레임률 (B,T) dict. 반환 샘플률 텐서들 (B,N).
@@ -281,6 +295,14 @@ class GlottalSource(nn.Module):
             ph = phase * kk + torch.angle(cj)
             if rps is not None:
                 ph = ph + rps[..., j]
+            if dispersion != 0.0:
+                # **하모닉 위상 분산.** 고역일수록 지연되는 이차 위상 −D·(f/f_nyq)²
+                # (= 주파수에 선형인 그룹 지연 = 시간축으로 퍼지는 chirp). 실제 성대는
+                # 딱딱하지 않아 점막파로 상하연이 시간차를 두고 닫히므로 이런 분산이
+                # 생긴다. `rps` 와 달리 **샘플률 fk 를 그대로 써서** (B,N,K) 텐서를
+                # 만들지 않는다 — K=240 이면 그것만 65 MB 다.
+                xn = (fk / (0.5 * fs)).clamp(0.0, 1.0)
+                ph = ph - dispersion * xn * xn
             du = du + 2.0 * cj.abs() * mask * gain * torch.cos(ph)
         du = du * amp
         # 성문 개방기 (LF: 0 ~ te 가 열림) -> 기식 AM 마스크
@@ -294,9 +316,9 @@ class GlottalSource(nn.Module):
             noise_am = self.lf_noise_envelope(phase, rd, voiced)
             # Legacy open mask mean = 0.65/2, so keep its mean source level
             # while replacing only the periodic shape (not an RMS guarantee).
-            asp_env = asp * (1.0 + 0.7 * voiced * (0.325 - 0.5)) * noise_am
+            asp_env = asp * (1.0 + ASP_AM_DEPTH * voiced * (0.325 - 0.5)) * noise_am
         else:
-            asp_env = asp * (1.0 + 0.7 * voiced * (open_phase - 0.5))
+            asp_env = asp * (1.0 + ASP_AM_DEPTH * voiced * (open_phase - 0.5))
         return dict(du=du, phase=phase, asp_env=asp_env.clamp_min(0.0),
                     noise_am=noise_am,
                     amp=amp, f0=f0, ag_dc=up(st["ag_dc"]), ag_dc_frames=st["ag_dc"], voiced=voiced,
