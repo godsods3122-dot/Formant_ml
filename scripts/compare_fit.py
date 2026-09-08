@@ -30,6 +30,32 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+
+def _use_korean_font() -> None:
+    """한글 라벨이 두부(□)로 나오지 않게 한다. 없으면 조용히 기본 폰트를 쓴다.
+
+    **파일 경로로 직접 등록한다.** 시스템에 폰트를 방금 깔았어도 matplotlib 의 폰트
+    캐시는 그대로라 이름으로는 못 찾는다.
+    """
+    import glob as _glob
+    from matplotlib import font_manager
+    for pat in ("/usr/share/fonts/**/NanumGothic.ttf",
+                "/usr/share/fonts/**/NanumBarunGothic.ttf",
+                "/usr/share/fonts/**/NotoSansCJK*.ttc",
+                "/usr/share/fonts/**/NotoSansKR*.otf"):
+        for path in _glob.glob(pat, recursive=True):
+            try:
+                font_manager.fontManager.addfont(path)
+                name = font_manager.FontProperties(fname=path).get_name()
+            except Exception:
+                continue
+            plt.rcParams["font.family"] = name
+            plt.rcParams["axes.unicode_minus"] = False   # 마이너스가 두부로 나온다
+            return
+
+
+_use_korean_font()
+
 from formant_ml.engine import turbulence as tb
 
 
@@ -64,17 +90,24 @@ def main() -> None:
     n = min(len(tgt), len(syn))
     tgt, syn = np.asarray(tgt[:n], float), np.asarray(syn[:n], float)
 
-    # 확대 위치: 지정이 없으면 **에너지가 가장 큰 유성부**를 고른다 (마찰은 겹칠 수 없다)
+    # 확대 위치: 지정이 없으면 **저역이 가장 강한 곳**을 고른다.
+    #
+    # 전체 에너지로 고르면 안 된다 — 치찰음이 가장 큰 구간이면 거기가 뽑히는데, 난류는
+    # 원리적으로 파형이 안 겹치므로 "위상이 틀렸다" 고 오독하게 된다 (실제로 한 번
+    # 그렇게 뽑혔다). 모음은 저역(0.3~1 kHz)이 강하고 치찰음은 약하니 그걸로 가른다.
     if a.zoom_at is None:
+        from scipy.signal import butter, sosfiltfilt
+        sos = butter(4, [300 / (fs / 2), 1000 / (fs / 2)], btype="band", output="sos")
+        lo = sosfiltfilt(sos, tgt)
         w = int(0.02 * fs)
-        m = n // w
-        r = np.sqrt((tgt[:m * w].reshape(-1, w) ** 2).mean(1))
+        m = max(1, n // w)
+        r = np.sqrt((lo[:m * w].reshape(-1, w) ** 2).mean(1))
         a.zoom_at = float((int(np.argmax(r)) + 0.5) * w / fs)
     z0 = max(0, int((a.zoom_at - a.zoom_ms / 2000.0) * fs))
     z1 = min(n, z0 + int(a.zoom_ms / 1000.0 * fs))
 
-    fig, ax = plt.subplots(4, 1, figsize=(13, 13),
-                           gridspec_kw={"height_ratios": [1, 1, 2, 1.4]})
+    fig, ax = plt.subplots(5, 1, figsize=(13, 15),
+                           gridspec_kw={"height_ratios": [1, 1, 1.6, 1.6, 1.5]})
     t = np.arange(n) / fs
 
     ax[0].plot(t, tgt, lw=0.4, color="#1f77b4", label="목표(녹음)")
@@ -97,30 +130,30 @@ def main() -> None:
     kw = dict(aspect="auto", origin="lower", cmap="magma",
               extent=[0, tt[m - 1], 0, f[-1] / 1000], vmin=vmax - 80, vmax=vmax)
     ax[2].imshow(St[:, :m], **kw)
-    ax[2].set_ylabel("목표  kHz")
-    ax[2].set_title("스펙트로그램 (위 목표 / 아래 합성은 같은 눈금)")
-    div = ax[2].inset_axes([0, -1.05, 1, 1.0])
-    div.imshow(Sp[:, :m], **kw)
-    div.set_ylabel("합성  kHz")
-    div.set_xlabel("s")
+    ax[2].set_ylabel("kHz")
+    ax[2].set_title("스펙트로그램 — 목표(녹음)")
     ax[2].set_xticks([])
+    ax[3].imshow(Sp[:, :m], **kw)
+    ax[3].set_ylabel("kHz")
+    ax[3].set_xlabel("s")
+    ax[3].set_title("스펙트로그램 — 합성 (위와 같은 dB 눈금)")
 
     ft, pt = tb.average_psd(tgt, fs)
     fp, pp = tb.average_psd(syn, fs)
     k = min(len(pt), len(pp))
     dt = 10 * np.log10(pt[:k] + 1e-20)
     dp = 10 * np.log10(pp[:k] + 1e-20)
-    ax[3].plot(ft[:k] / 1000, dt, lw=1.0, color="#1f77b4", label="목표")
-    ax[3].plot(ft[:k] / 1000, dp, lw=1.0, color="#d62728", alpha=0.8, label="합성")
-    ax[3].plot(ft[:k] / 1000, dp - dt, lw=0.8, color="#2ca02c", alpha=0.7, label="차이")
-    ax[3].axhline(0, color="0.6", lw=0.5)
-    ax[3].set_xlim(0, min(24, ft[k - 1] / 1000))
-    ax[3].set_ylim(dt.max() - 90, dt.max() + 6)
-    ax[3].set_xlabel("kHz"); ax[3].set_ylabel("dB")
-    ax[3].legend(loc="upper right", fontsize=8)
-    ax[3].set_title("시간 평균 스펙트럼 — 난류는 이걸로 비교한다")
+    ax[4].plot(ft[:k] / 1000, dt, lw=1.0, color="#1f77b4", label="목표")
+    ax[4].plot(ft[:k] / 1000, dp, lw=1.0, color="#d62728", alpha=0.8, label="합성")
+    ax[4].plot(ft[:k] / 1000, dp - dt, lw=0.8, color="#2ca02c", alpha=0.6, label="차이")
+    ax[4].axhline(0, color="0.6", lw=0.5)
+    ax[4].set_xlim(0, min(24, ft[k - 1] / 1000))
+    ax[4].set_ylim(dt.max() - 90, dt.max() + 6)
+    ax[4].set_xlabel("kHz"); ax[4].set_ylabel("dB")
+    ax[4].legend(loc="upper right", fontsize=8)
+    ax[4].set_title("시간 평균 스펙트럼 — 난류는 이걸로 비교한다")
 
-    for x in ax:
+    for x in (ax[0], ax[1], ax[4]):
         x.grid(alpha=0.25)
     plt.tight_layout()
     out = a.out or (a.stem + "_compare.png")
