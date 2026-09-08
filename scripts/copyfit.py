@@ -53,7 +53,10 @@ def main() -> None:
     ap.add_argument("--frame-ms", type=float, default=1.0)
     ap.add_argument("--global-iters", type=int, default=200)
     ap.add_argument("--stage-iters", type=int, default=100)
-    ap.add_argument("--lr-global", type=float, default=0.05)
+    ap.add_argument("--phase-iters", type=int, default=200,
+                    help="마지막 위상 단계. 0 이면 끔 (크기만 맞춘다)")
+    ap.add_argument("--lr-global", type=float, default=None,
+                    help="생략하면 짧은 탐침으로 자동 선택 (구간마다 맞는 값이 다르다)")
     ap.add_argument("--lr-frame", type=float, default=0.04)
     ap.add_argument("--no-denoise", action="store_true")
     ap.add_argument("--phase", type=float, default=0.0, help="복소 STFT 항 가중(2 단계용)")
@@ -85,8 +88,9 @@ def main() -> None:
                                    speaker="female" if prof.f0_nominal > 165 else "male",
                                    residual=False), prof)
     fit = CopySynthFitter(eng, seg, sr, track, phase_weight=a.phase)
+    kw = {} if a.lr_global is None else {"lr_global": a.lr_global}
     rep = fit.fit_staged(global_iters=a.global_iters, stage_iters=a.stage_iters,
-                         lr_global=a.lr_global, lr_frame=a.lr_frame)
+                         lr_frame=a.lr_frame, phase_iters=a.phase_iters, **kw)
     print(rep)
 
     out = fit.render()

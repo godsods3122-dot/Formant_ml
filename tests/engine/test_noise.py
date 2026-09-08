@@ -76,29 +76,63 @@ def test_butterworth_q_is_staggered_not_repeated():
     assert butterworth_q(4)[-1] == pytest.approx(2.5629, abs=1e-3)
 
 
-def test_frication_source_falls_above_the_peak():
-    """마찰 소스에 고역 절벽이 **실제로 걸려 있어야** 한다.
-
-    `log_lp_ratio` 가 선언만 되고 걸리지 않아 소스가 나이퀴스트까지 평평했다. 그래서
-    실측 남성 /ㅅ/ 이 정점 대비 12~16 kHz 에서 −30 dB 인데 합성은 −13 dB 에서 멈췄다.
-    """
+def _sib_bands(front_bw_slope=None, front_len=1.46, n=300):
+    """치찰음 자세를 렌더하고 2 kHz 대역 레벨(dB)을 돌려준다."""
     import numpy as np
     from formant_ml.engine.control import ControlTrack, default_vector
+    from formant_ml.engine.profile import SpeakerProfile
     from formant_ml.engine.voice import EngineConfig, VoiceEngine
-    eng = VoiceEngine(EngineConfig(sample_rate=48000, frame_ms=1.0, residual=False))
-    v = np.tile(default_vector(), (300, 1))
+    prof = SpeakerProfile()
+    if front_bw_slope is not None:
+        prof.sibilant = dict(prof.sibilant, front_bw_slope=front_bw_slope)
+    eng = VoiceEngine(EngineConfig(sample_rate=48000, frame_ms=1.0, residual=False), prof)
+    v = np.tile(default_vector(), (n, 1))
     tr = ControlTrack(v, 1.0)
     tr["p_sub"] = 8.0; tr["adduction"] = 0.05; tr["a_c"] = 0.06; tr["c_place"] = 0.95
-    tr["front_len"] = 1.46; tr["obstacle"] = 0.15; tr["fric_gain"] = 8.0
+    tr["front_len"] = front_len; tr["obstacle"] = 0.15; tr["fric_gain"] = 8.0
     tr["f1"] = 600; tr["f2"] = 1400; tr["f3"] = 2500; tr["f4"] = 3500
     tr["residual_mix"] = 0.0
     y = eng.render(tr.clamp())[9600:]
     f = np.fft.rfftfreq(len(y), 1 / 48000)
     p = np.abs(np.fft.rfft(y * np.hanning(len(y)))) ** 2
-    def band(lo, hi):
-        return 10 * np.log10(p[(f >= lo) & (f < hi)].mean() + 1e-20)
+    return lambda lo, hi: 10 * np.log10(p[(f >= lo) & (f < hi)].mean() + 1e-20)
+
+
+def test_frication_has_a_shoulder_then_a_slope_then_a_cliff():
+    """마찰 스펙트럼의 모양: 정점 아래 어깨 → 완만한 내리막 → 극단 고역의 절벽.
+
+    **내리막을 절벽으로 만들면 안 된다.** 소스만 보고 lp_ratio 를 맞췄더니(0.3.2)
+    앞공동 극이 그 위에 −12 dB/oct 를 또 얹어 출력의 12~16 kHz 가 실측보다 17~27 dB
+    어두워졌다. 통과대역의 기울기는 소스 절벽이 아니라 **앞공동 극의 대역폭**이 정한다.
+    """
+    band = _sib_bands()
     peak = band(5000, 8000)
-    assert band(12000, 16000) < peak - 12.0        # 절벽이 있다
-    assert band(18000, 22000) < peak - 25.0
-    # 정점 아래는 절벽이 아니라 **완만한 어깨**다 (실측 4~6 kHz 가 정점 −2.8 dB).
-    assert band(4000, 6000) > peak - 6.0
+    assert band(4000, 6000) > peak - 6.0            # 어깨 (실측 정점 −2.8 dB)
+    assert peak - 20.0 < band(12000, 16000) < peak - 4.0     # 벽이 아니라 내리막
+    # 계속 내려가야 한다. 고쳐야 했던 실패는 고역이 **다시 올라오는** 것이었다.
+    assert band(18000, 22000) < band(12000, 16000)
+    assert band(18000, 22000) < peak - 8.0
+
+
+def test_front_cavity_bandwidth_controls_the_high_frequency_slope():
+    """앞공동 극의 대역폭(프로파일)이 고역 기울기를 단조로 정한다.
+
+    한 상수로 두면 두 화자가 반대로 잡아당긴다 — 남 /ㅅ/(평음)은 고역이 적고
+    여 /ㅆ/(경음)은 많다. 실측 적합값은 남 0.08, 여 0.36 이다.
+    """
+    slopes = [0.08, 0.20, 0.36]
+    drop = []
+    for sl in slopes:
+        band = _sib_bands(front_bw_slope=sl)
+        drop.append(band(5000, 8000) - band(12000, 16000))
+    assert drop[0] > drop[1] > drop[2], drop      # 넓을수록 고역이 덜 떨어진다
+    assert drop[0] - drop[2] > 3.0                # 쓸모 있는 범위여야 한다
+
+
+def test_profile_supplies_front_bandwidth_to_the_tract():
+    from formant_ml.engine.profile import SpeakerProfile
+    from formant_ml.engine.voice import EngineConfig, VoiceEngine
+    prof = SpeakerProfile()
+    prof.sibilant = dict(prof.sibilant, front_bw_slope=0.33)
+    eng = VoiceEngine(EngineConfig(sample_rate=48000, frame_ms=1.0, residual=False), prof)
+    assert abs(eng.tract.front_bw_slope - 0.33) < 1e-9

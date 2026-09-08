@@ -3,8 +3,8 @@ import numpy as np
 import pytest
 import torch
 
-from formant_ml.engine.analyze import (envelope_to_lpc, lpc_formants, smooth_track,
-                                       true_envelope)
+from formant_ml.engine.analyze import (analyze, envelope_to_lpc, lpc_formants,
+                                       smooth_track, true_envelope)
 from formant_ml.engine.control import ControlTrack, INDEX, default_vector
 from formant_ml.engine.denoise import denoise, noise_profile, snr_report
 from formant_ml.engine.fit import CopySynthFitter, mel_bank
@@ -259,3 +259,118 @@ def test_loss_ignores_bands_above_the_recording_nyquist(_engine):
     # 같은 신호를 48 kHz 로 주면 상한이 더 높다
     g = CopySynthFitter(_engine, y, 48000, tr)
     assert g.f_max > f.f_max
+
+
+def test_intensity_dip_goes_to_the_tract_not_the_lungs():
+    """빠른 세기 변화는 **구강 방사**(tract_gain)로, 느린 것만 폐압(p_sub)으로.
+
+    폐는 20 ms 만에 압력을 못 바꾼다. 자음의 세기 골(탄음 −9 dB / 40 ms, 비음 폐쇄,
+    파열음)은 구강이 닫혀 방사가 줄어서 생긴다. 전부 p_sub 로 보내면 −9 dB 가
+    −1.1 dB 로 뭉개진다(실측: 여성 탄음에서 p_sub 진폭이 1.05 cmH2O 뿐이었다).
+    """
+    fs = 16000
+    x = _synthetic_vowel(fs, dur=0.4)
+    # 40 ms 짜리 −9 dB 골을 낸다 (탄음 모양)
+    t = np.arange(len(x)) / fs
+    dip = 1.0 - (1.0 - 10 ** (-9.0 / 20.0)) * np.exp(-((t - 0.2) / 0.014) ** 2)
+    y = x * dip
+    prof = DEFAULT_PROFILE
+    tr = analyze(y, fs, prof, int(0.001 * fs))
+    g_db = 20 * np.log10(tr["tract_gain"])
+    p = tr["p_sub"]
+    assert g_db.max() - g_db.min() > 5.0, g_db.max() - g_db.min()   # 골이 이득에 실렸다
+    assert p.max() - p.min() < 1.0, p.max() - p.min()               # 폐압은 거의 안 움직인다
+    lo = int(0.2 * 1000)
+    assert g_db[lo - 5:lo + 5].mean() < g_db[:60].mean() - 4.0      # 골이 제자리에 있다
+
+
+def test_steady_vowel_keeps_tract_gain_flat():
+    """정상 모음에서는 이득이 평탄해야 한다 — 골 검출이 아무 데서나 튀면 안 된다."""
+    fs = 16000
+    tr = analyze(_synthetic_vowel(fs, dur=0.3), fs, DEFAULT_PROFILE, int(0.001 * fs))
+    g_db = 20 * np.log10(tr["tract_gain"])
+    assert g_db.max() - g_db.min() < 3.0, g_db.max() - g_db.min()
+
+
+def test_unvoiced_frames_do_not_get_formants_from_noise():
+    """무성 구간의 LPC 봉우리를 포먼트로 쓰면 안 된다.
+
+    포먼트는 성문이 성도를 울릴 때만 뜻이 있다. 마찰음에 LPC 를 걸면 잡음의 우연한
+    봉우리가 나오고(실측: 남성 /사/ 마찰부에서 F1 이 3539 → 486 → 2134 Hz), 순서
+    규칙이 그것들을 120 Hz 간격으로 겹쳐 쌓아 4 중 고 Q 극을 만든다. 그 극이 성도
+    종속을 +88 dB 로 만들어 (du rms 0.04 → glottal_path 1028) 적합이 통째로 무너졌다.
+    """
+    fs = 16000
+    v = _synthetic_vowel(fs, dur=0.2)
+    rng = np.random.default_rng(3)
+    noise = rng.standard_normal(int(fs * 0.15)) * np.abs(v).max() * 0.3
+    y = np.concatenate([noise, v])                      # 무성 150 ms + 유성 200 ms
+    tr = analyze(y, fs, DEFAULT_PROFILE, int(0.001 * fs))
+    f1, f2 = tr["f1"], tr["f2"]
+    assert (f2 - f1).min() > 200.0, (f2 - f1).min()     # 포먼트가 겹쳐 쌓이지 않는다
+    assert f1.max() < 1400.0, f1.max()                  # 잡음 봉우리를 F1 으로 집지 않는다
+    assert tr.voiced.shape == (tr.n_frames,)
+    assert not tr.voiced[:100].any()                    # 앞 100 ms 는 무성으로 잡힌다
+    assert tr.voiced[200:].mean() > 0.5                 # 모음은 유성으로 잡힌다
+
+
+def test_subglottal_pressure_survives_an_unvoiced_stretch():
+    """/s/ 동안에도 폐압은 모음과 거의 같다 — 난류가 비효율일 뿐 폐가 쉰 게 아니다.
+
+    무성 구간의 낮은 세기를 폐압에 넣으면 레이놀즈 게이트(비선형) 아래로 떨어져
+    마찰음이 통째로 사라진다 (실측: 남 /사/ 마찰부 −42.8 dB).
+    """
+    fs = 16000
+    v = _synthetic_vowel(fs, dur=0.2)
+    rng = np.random.default_rng(4)
+    quiet = rng.standard_normal(int(fs * 0.15)) * np.abs(v).max() * 0.05
+    tr = analyze(np.concatenate([quiet, v]), fs, DEFAULT_PROFILE, int(0.001 * fs))
+    p = tr["p_sub"]
+    assert p.min() > 5.0, p.min()                        # 무성 구간에서도 안 죽는다
+    assert p.max() - p.min() < 3.0, p.max() - p.min()    # 호흡은 천천히 움직인다
+
+
+def test_fitter_calibrates_voiced_and_unvoiced_levels_separately(_engine):
+    """하나의 이득만 맞추면 유성/무성 중 한쪽이 반드시 어긋난다."""
+    from formant_ml.engine.control import ControlTrack as CT
+    tr = _track(n=120)
+    target = _engine.render(tr)
+    init = CT(tr.values.copy(), tr.frame_ms)
+    init["fric_gain"] = 1.0
+    init.voiced = np.ones(init.n_frames, dtype=bool)
+    f = CopySynthFitter(_engine, target, 48000, init)
+    assert np.asarray(f.track.voiced).shape == (init.n_frames,)   # 마스크가 전달된다
+    assert abs(f.gain_db()) < 40.0
+
+
+def test_global_lr_is_chosen_by_probe_not_hardcoded(_engine):
+    """전역 단계의 걸음 크기는 **구간마다 다르다** — 짧게 재 보고 고른다.
+
+    실측: 40 ms 탄음은 lr 0.05 에서 포락 60.3 %, 0.02 에서 90.9 % (lr 에 단조).
+    반대로 기울기가 7 dB/oct 틀린 합성 모음은 0.02 로 못 돌아오고 0.05 가 필요하다.
+    """
+    tr = _track()
+    target = _engine.render(tr)
+    bad = ControlTrack(tr.values.copy(), tr.frame_ms)
+    bad["tilt"] = 9.0
+    f = CopySynthFitter(_engine, target, 48000, bad)
+    f.sizes = [256, 512]
+    before = f._snapshot()
+    lr = f.pick_lr_global((0.01, 0.05, 0.2), 25, verbose=False)
+    assert lr in (0.01, 0.05, 0.2)
+    # 탐침은 출발점을 되돌려 놓아야 한다 — 안 그러면 고른 lr 로 다시 못 돈다
+    after = f._snapshot()
+    for a, b in zip(before, after):
+        assert torch.equal(a, b)
+
+
+def test_probe_prefers_the_lr_that_actually_converges(_engine):
+    """탐침이 손실을 실제로 더 내리는 lr 을 고른다 (발산하는 값을 안 고른다)."""
+    tr = _track()
+    target = _engine.render(tr)
+    bad = ControlTrack(tr.values.copy(), tr.frame_ms)
+    bad["tilt"] = 9.0
+    f = CopySynthFitter(_engine, target, 48000, bad)
+    f.sizes = [256, 512]
+    lr = f.pick_lr_global((0.05, 3.0), 25, verbose=False)
+    assert lr == 0.05, lr                     # 3.0 은 발산한다

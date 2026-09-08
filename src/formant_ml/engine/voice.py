@@ -32,6 +32,13 @@ from .rng import NoiseBank
 from .tract import VocalTract
 
 
+def _dilate(x: torch.Tensor, k: int) -> torch.Tensor:
+    """1 차원 최대 팽창. 마찰 게이트의 경계를 k 샘플만큼 넓힌다."""
+    if k < 2:
+        return x
+    return torch.nn.functional.max_pool1d(x.unsqueeze(1), 2 * k + 1, 1, k).squeeze(1)
+
+
 @dataclass
 class EngineConfig:
     sample_rate: int = 48000          # 1 ms 프레임 = 정확히 48 샘플 (44.1 kHz 는 44.1 이라 시간축이 어긋난다)
@@ -60,8 +67,10 @@ class VoiceEngine(nn.Module):
         self.frication = FricationNoise(fs, hop)
         self.aspiration = AspirationNoise(fs, hop)
         self.transients = TransientTemplateBank(fs)
+        fbw = float(profile.sibilant.get("front_bw_slope", 0.20)) if profile else 0.20
         self.tract = VocalTract(fs, hop, length_cm=self.cfg.tract_length_cm,
-                                n_extra=self.cfg.n_extra_formants)
+                                n_extra=self.cfg.n_extra_formants,
+                                front_bw_slope=fbw)
         self.residual = ResidualCorrector(fs, hop) if self.cfg.residual else None
         self.reset()
 
@@ -100,7 +109,16 @@ class VoiceEngine(nn.Module):
         y = out["audio"]
         if self.residual is not None:
             heads = self.residual(ctrl, state=st["residual"], emit=t)
+            # **마찰 구간에서는 잔차를 끈다.** 사용자 규칙: 치찰음은 학습에 맡기지 말고
+            # 직접 구현할 것. 잔차 EQ 는 전 대역·전 구간에 걸리므로, 막지 않으면 치찰음
+            # 물리가 틀렸을 때 신경망이 ±6 dB EQ 로 덮어 버린다. 그러면 (1) 물리는 계속
+            # 틀린 채로 남고 (2) 학습 데이터에 없는 새 발화에서 치찰음이 무너진다.
+            # 기준은 레이놀즈 게이트를 지난 **실제 마찰 유량**이다 — 제어값이 아니라
+            # 물리량이라 "마찰이 실제로 일어나는 곳" 과 정확히 일치한다.
+            fr_on = (fr["source"].detach().abs() > 0).to(y.dtype)
+            fr_on = _dilate(fr_on, hop)                     # 경계에서 새지 않게 넓힌다
             mix = frames_to_samples(c["residual_mix"].unsqueeze(-1), hop)[..., 0][:, :n]
+            mix = mix * (1.0 - fr_on[:, :n])
             r = self.residual.apply(y, heads, mix, state=st["residual"])
             y, st["residual"] = r["audio"], r["state"]
         st["phase"] = g["phase_last"]

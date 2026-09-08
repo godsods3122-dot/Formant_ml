@@ -115,6 +115,9 @@ def f0_from_pulses(pulses: np.ndarray, t_grid: np.ndarray, f0_lo: float,
     return np.interp(t_grid, tm, f0)
 
 
+FRICATIVE_HL_DB = 0.0      # 고역(3~16k)/저역(0.1~1k) 비가 이보다 크면 마찰로 본다
+
+
 def smooth_track(x: np.ndarray, med: int, avg: int) -> np.ndarray:
     """중앙값 -> 이동평균. 프레임별 독립 추정의 흔들림을 지운다.
 
@@ -176,15 +179,28 @@ def analyze(y: np.ndarray, sr: int, prof: SpeakerProfile, hop: int,
     w = np.hanning(win)
     order = order or 14
     vals = np.tile(default_vector(), (n, 1))
+    rms_db = np.zeros(n)
+    voi = np.zeros(n, dtype=bool)
+    rband = np.zeros(n)
     f0_last = prof.f0_nominal
+    # 무성 구간에서 유지할 자세. **첫 프레임이 무성일 수 있으므로** 프로파일의 중립
+    # 모음으로 씨앗을 준다 — 그러지 않으면 무성 첫 프레임의 잡음 봉우리를 끝까지 끌고 간다.
+    nv = list(prof.vowels.get("a", [700.0, 1200.0, 2600.0]))
+    _sp = 35000.0 / (2.0 * prof.tract_length_cm)
+    while len(nv) < n_formants:
+        nv.append(nv[-1] + _sp)
+    f_hold: list[tuple[float, float]] = [(f, 60.0 + 0.06 * f) for f in nv[:n_formants]]
     for i in range(n):
         t = (i + 0.5) * step
         ca = int(t * sra) - win // 2
         sa = ya[max(ca, 0):max(ca, 0) + win]
         if len(sa) < win:
             sa = np.pad(sa, (0, win - len(sa)))
-        f0 = pt.get_value_at_time(t + t0)
-        f0 = f0_last if (f0 is None or f0 != f0) else f0
+        f0_raw = pt.get_value_at_time(t + t0)
+        # **유성 판정은 피치가 잡혔는가로 한다.** HNR 로 가르면 마찰음의 우연한 값이
+        # 0~11 dB 로 나와 모음(10~22 dB)과 겹친다(실측: 남성 /사/). 피치는 안 겹친다.
+        voiced = f0_raw is not None and f0_raw == f0_raw
+        f0 = f0_raw if voiced else f0_last
         f0_last = f0
         # 리프터 컷은 F0 주기(퀘프런시 sra/f0)의 절반보다 아래여야 빗살이 지워진다.
         n_cep = int(np.clip(0.45 * sra / max(f0, 80.0), 14, 45))
@@ -205,29 +221,84 @@ def analyze(y: np.ndarray, sr: int, prof: SpeakerProfile, hop: int,
         hi = p[(fr >= 3000) & (fr < 16000)].sum() + 1e-20
         vals[i, INDEX["f0_target"]] = f0
         # 세기 -> 폐압. 발성 역치가 3~5 cmH2O 이므로 그 위에서 로그로 편다.
-        vals[i, INDEX["p_sub"]] = np.clip(3.0 + 5.0 * (20 * np.log10(rms) + 60) / 40.0, 0.0, 16.0)
+        rms_db[i] = 20 * np.log10(rms)
+        voi[i] = voiced
         vals[i, INDEX["adduction"]] = np.clip(0.10 + 0.5 * (h + 5) / 25.0, 0.02, 0.85)
         vals[i, INDEX["tension"]] = np.clip(
             np.log(f0 / prof.f0_lo) / np.log(prof.f0_hi / prof.f0_lo), 0.0, 1.0)
-        # 못 찾은 상위 포먼트는 **균등 간격 c/2L** 로 채운다. 프로파일 기본값을
-        # 그냥 넣으면 F4 < F3 처럼 순서가 뒤집혀 캐스케이드가 엉킨다.
-        spacing = 35000.0 / (2.0 * prof.tract_length_cm)
-        prev = 0.0
-        for k in range(1, n_formants + 1):
-            if len(fmts) >= k:
-                f, bw = fmts[k - 1]
-                bwv = float(np.clip(bw, 40.0, 900.0))
-            else:
-                f, bwv = prev + spacing, 200.0 + 60.0 * k
-            f = max(f, prev + 120.0)
-            prev = f
+        # **무성 구간의 포먼트는 믿으면 안 된다.** 포먼트는 성문이 성도를 울릴 때만
+        # 뜻이 있다. 마찰음 구간에 LPC 를 걸면 잡음의 우연한 봉우리가 나오고(실측:
+        # 남성 /사/ 마찰부에서 F1 이 3539 → 486 → 2134 Hz 로 널뛰었다), 아래의 순서
+        # 규칙이 그것들을 120 Hz 간격으로 **겹쳐 쌓아** 4 중 고 Q 극을 만든다.
+        # 그 극이 성도 종속을 +88 dB 로 만들어(du rms 0.04 → glottal_path 1028)
+        # 복사합성이 통째로 무너졌다. 무성 구간에서는 **직전 유성 프레임의 자세를
+        # 유지한다** — 조음기관은 무성 구간에도 그 자리에 있다.
+        if voiced:
+            # 못 찾은 상위 포먼트는 균등 간격 c/2L 로 채운다. 프로파일 기본값을
+            # 그냥 넣으면 F4 < F3 처럼 순서가 뒤집혀 캐스케이드가 엉킨다.
+            spacing = 35000.0 / (2.0 * prof.tract_length_cm)
+            prev, cur = 0.0, []
+            for k in range(1, n_formants + 1):
+                if len(fmts) >= k:
+                    f, bw = fmts[k - 1]
+                    bwv = float(np.clip(bw, 40.0, 900.0))
+                else:
+                    f, bwv = prev + spacing, 200.0 + 60.0 * k
+                f = max(f, prev + 120.0)
+                prev = f
+                cur.append((f, bwv))
+            f_hold = cur
+        for k, (f, bwv) in enumerate(f_hold, start=1):
             vals[i, INDEX[f"f{k}"]] = f
             vals[i, INDEX[f"bw{k}"]] = bwv
         # 마찰: 고역/저역 비가 크면 협착이 좁다 (초기값일 뿐, 적합이 다듬는다)
         r = 10 * np.log10(hi / lo)
+        rband[i] = r
         vals[i, INDEX["a_c"]] = float(np.clip(3.0 * 10 ** (-(r + 10) / 25.0), 0.06, 3.0))
         vals[i, INDEX["front_len"]] = prof.sib_front_len_cm
-        vals[i, INDEX["tract_gain"]] = 1.0
+        # **측지 분기를 켜 둔다(깊이 0 에 가깝게).** 설측음의 정의적 특징은 혀 옆으로
+        # 공기가 흐르며 생기는 반공진인데, 지금까지 `lat_*` 가 전부 0 이라 적합기에
+        # 그걸 만들 수단이 아예 없었다(실측: 설측 위상 오차 89.5°, 사전을 40 -> 0.5 로
+        # 풀어도 변화 없음 — 자유도가 묶인 게 아니라 **없었다**).
+        # 주파수는 로그 파라미터라 0 이면 적합 대상에서 빠지므로 미리 켜고, 깊이만
+        # `lat_mix` 로 0 부근에서 시작한다. 정확히 0 이면 `_lateral` 이 조기 반환해
+        # 기울기가 안 흐르므로 0.05 로 둔다 (대역폭이 20 배로 벌어져 음향 효과는 없다).
+        vals[i, INDEX["lat_z1"]] = float(prof.lateral["zeros"][0])
+        vals[i, INDEX["lat_z2"]] = float(prof.lateral["zeros"][1])
+        vals[i, INDEX["lat_bw"]] = float(prof.lateral["zero_bw"])
+        vals[i, INDEX["lat_mix"]] = 0.05
+
+    # **세기를 폐압에만 실으면 안 된다.** 폐는 20 ms 만에 압력을 못 바꾼다. 자음의
+    # 세기 골(탄음 −9 dB / 40 ms, 비음 폐쇄, 파열음)은 **구강이 닫혀 방사가 줄어서**
+    # 생긴다. 전부 p_sub 로 보내면 −9 dB 가 −1.1 dB 로 뭉개진다(실측: 여성 탄음에서
+    # p_sub 진폭이 1.05 cmH2O 뿐이었다). 느린 성분(호흡, 150 ms)만 폐압에 싣고
+    # 빠른 성분(조음, 10~40 ms)은 성도 출력 이득으로 보낸다.
+    # 느린 성분은 **유성 프레임에서만** 잰다. /s/ 동안에도 폐압은 모음과 거의 같다 —
+    # 난류가 소리로 바뀌는 효율이 낮아서 조용한 것이지 폐가 쉰 것이 아니다. 무성 구간의
+    # 낮은 세기를 그대로 넣으면 폐압이 3.5 cmH2O 까지 떨어지고, 마찰 세기는 레이놀즈
+    # 게이트를 통과한 **비선형**이라 그 순간 마찰음이 통째로 사라진다(실측: 남 /사/
+    # 마찰부가 −42.8 dB). 유성 프레임 사이를 이어 붙여 호흡의 연속성을 지킨다.
+    fm_ms = 1000.0 * hop / sr
+    idx = np.arange(n)
+    if voi.any():
+        slow_v = smooth_track(rms_db[voi], max(3, int(round(75.0 / fm_ms)) | 1),
+                              max(2, int(round(150.0 / fm_ms))))
+        slow = np.interp(idx, idx[voi], slow_v)
+    else:
+        slow = smooth_track(rms_db, max(3, int(round(75.0 / fm_ms)) | 1),
+                            max(2, int(round(150.0 / fm_ms))))
+    vals[:, INDEX["p_sub"]] = np.clip(3.0 + 5.0 * (slow + 60) / 40.0, 0.0, 16.0)
+    # 빠른 성분은 **구강 폐쇄**의 표현이다. 다만 마찰 구간에서는 세기를 소스가 정하므로
+    # 거기서 이득을 깎으면 안 된다 — 그건 `fric_gain` 의 몫이다.
+    #
+    # **무성이라는 것만으로 마찰이라고 보면 안 된다.** 비음 머머는 유성인데 약해서
+    # 피치 검출이 자주 놓치고(실측: 남 /나/ 300 프레임 중 176 이 무성으로 잡혔다),
+    # 그걸 마찰로 오인하면 폐쇄의 세기 골이 통째로 사라진다. 마찰은 **고역/저역비**로
+    # 가른다: 실측 무성부 r 중앙값이 /ㅆ/ +16.2, /ㅅ/ +15.9 인데 비음 머머는 −26.2 이라
+    # 0 dB 로 깨끗이 갈린다.
+    fric = (~voi) & (rband > FRICATIVE_HL_DB)
+    fast = np.where(fric, 1.0, np.clip(10.0 ** ((rms_db - slow) / 20.0), 0.05, 4.0))
+    vals[:, INDEX["tract_gain"]] = fast
     tr = ControlTrack(vals, frame_ms=1000.0 * hop / sr)
     # 프레임률에 맞춰 평활. 5 ms 프레임이면 창 수를 줄인다.
     fm = tr.frame_ms
@@ -237,8 +308,9 @@ def analyze(y: np.ndarray, sr: int, prof: SpeakerProfile, hop: int,
     for k in range(1, n_formants + 1):
         tr[f"f{k}"] = smooth_track(tr[f"f{k}"], m, a_f)
         tr[f"bw{k}"] = smooth_track(tr[f"bw{k}"], m, a_s)
-    for k in ("f0_target", "p_sub", "adduction", "tension", "a_c"):
+    for k in ("f0_target", "adduction", "tension", "a_c"):
         tr[k] = smooth_track(tr[k], m, a_f)
+    tr["tract_gain"] = smooth_track(tr["tract_gain"], m, max(2, int(round(6.0 / fm))))
     # **F0 는 펄스 열이 우선한다.** 피치 궤적은 프레임마다 독립이라 0.5 % 씩 흔들리고,
     # 위상은 그 누적합이라 200 ms 면 0.24 주기가 어긋난다. 펄스에서 만든 F0 는 그 누적
     # 오차가 원리적으로 없다. 무성 구간에서는 펄스가 없으므로 궤적 값을 그대로 둔다.
@@ -251,6 +323,8 @@ def analyze(y: np.ndarray, sr: int, prof: SpeakerProfile, hop: int,
             near = np.minimum(np.abs(t_grid - pulses[k]),
                               np.abs(t_grid - pulses[k - 1])) < 0.02
         tr["f0_target"] = np.where(near, pf, tr["f0_target"])
+    tr.voiced = voi
+    tr.fricative = fric
     if pulses is not None and len(pulses):
         rel = pulses - t0
         tr.pulses = rel[(rel >= 0.0) & (rel < n * step)]

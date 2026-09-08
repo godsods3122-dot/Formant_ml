@@ -38,6 +38,10 @@ class SpeakerProfile:
         obstacle=0.15, back_leak=0.10, locus=[470.0, 1900.0, 2900.0],
         lax_level_db=-11.0, tense_level_db=-6.0, affricate_level_db=-7.0,
         aspirated_level_db=-4.5,
+        # 앞공동 극의 대역폭 = 500 + 이 값 × f_p. **화자마다 다르다** — 한 상수로 두면
+        # 두 화자가 반대로 잡아당긴다(남 /ㅅ/ 평음은 고역이 적고 여 /ㅆ/ 경음은 많다).
+        # 방사 임피던스와 앞니 주변 손실이 정하는 기하 성질이라 프로파일에 둔다.
+        front_bw_slope=0.20,
         abduct_lead_ms=35, abduct_lag_ms=55))
     # 비음
     # 비음: 병렬 비강 분기의 극 3 개 + 폐쇄 위치가 정하는 측지 영점. 시간 상수는 실측.

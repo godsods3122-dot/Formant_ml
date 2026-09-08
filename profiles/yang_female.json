@@ -3,8 +3,8 @@
  "sex": "female",
  "tract_length_cm": 14.6,
  "f0_nominal": 240.0,
- "f0_lo": 150.0,
- "f0_hi": 520.0,
+ "f0_lo": 120.0,
+ "f0_hi": 580.0,
  "p_sub": 7.5,
  "vowels": {
   "a": [
@@ -95,7 +95,8 @@
   "abduct_lead_ms": 35,
   "abduct_lag_ms": 55,
   "affricate_level_db": -3.0,
-  "aspirated_level_db": -2.0
+  "aspirated_level_db": -2.0,
+  "front_bw_slope": 0.36
  },
  "nasal": {
   "poles": [

@@ -67,9 +67,94 @@ GLOBAL_PARAMS = frozenset((
 
 # 사전(prior) 가중. 분석이 믿을 만한 양은 세게 묶고, 관측되지 않는 양은 기본값에
 # 묶어 둔다. 약하게 푸는 것은 수준·음질 계열뿐이다.
+# **조음 속도 상한 (Hz/ms).** 성도는 근육이 움직이는 물건이라 포먼트가 임의로 빨리
+# 뛸 수 없다. 이 값을 넘으면 그건 조음이 아니라 적합기의 프레임별 난동이다.
+#
+# 계측(`data/ref` 여성 3 개, 유성 프레임 쌍 10,333 개, Praat 1 ms):
+#
+#   |    | 중앙 | 80분위 | 95분위 | 99분위 |
+#   |----|------|--------|--------|--------|
+#   | F1 |  2.9 |    8.5 |   27.2 |  147.3 |
+#   | F2 |  7.0 |   22.7 |   92.7 |  604.9 |
+#   | F3 | 11.5 |   37.5 |  151.0 |  770.7 |
+#   | F4 | 10.7 |   31.2 |  145.2 |  771.8 |
+#
+# 99 분위의 폭주(F2 605, 최대 2043)는 Praat 추적기가 포먼트를 맞바꾼 것이지 조음이
+# 아니다. 그래서 **95 분위를 상한**으로 잡는다. 그 아래는 공짜, 넘으면 이차로 문다
+# (평활 벌점처럼 전 구간을 뭉개면 설측 F2 의 실제 급전이 같이 죽는다).
+#
+# 이 제약이 왜 필요했나 — 없을 때 적합된 궤적을 실측과 대조하면:
+#   지속 모음 F1 실제 중앙 1.1 Hz/ms  vs  적합 126.4 Hz/ms (×115)
+#   설측    F2 실제 중앙 25.5        vs  적합 309.0      (×12)
+# 즉 `lam_smooth` 만으로는 네 자릿수 모자랐다. 해가 심하게 비-식별이 되어, 크기만
+# 맞고 위상은 틀린 해로 굴러가도 밀어낼 힘이 없었다.
+VEL_LIMIT_HZ_PER_MS: dict[str, float] = {
+    "f1": 27.0, "f2": 93.0, "f3": 151.0, "f4": 145.0,
+}
+
+# **힌지는 틀린 형태였다.** 95 분위를 문턱으로 두면 그 아래의 균일한 난동을 그냥
+# 통과시킨다. 실측: 지속 모음의 실제 F2 속도는 1.1 Hz/ms 인데 문턱은 93 이라, 모음에서
+# 적합값이 57 Hz/ms 로 널뛰어도 벌점이 0 이다 (A/B 실측: 속도 77.9→57.3 으로 26 % 만
+# 줄고 조화 SNR 은 4.6 dB 잃었다 — 나쁜 거래).
+#
+# 조음 속도의 실측 분포는 꼬리가 중앙의 200~300 배인 희소 신호다:
+#
+#   |    | 중앙 | 95분위 |   최대 | 꼬리/중앙 |
+#   |----|------|--------|--------|-----------|
+#   | F1 |  2.9 |   27.2 |  877.8 |      303× |
+#   | F2 |  7.0 |   92.7 | 2043.0 |      292× |
+#   | F3 | 11.5 |  151.0 | 2540.5 |      221× |
+#
+# "대부분 정지, 가끔 크게 이동" — 이런 분포의 사전은 이차(가우시안)가 아니라 L1
+# (라플라스) 계열이다. 그래서 후버(smooth L1)를 쓴다: 무릎 아래는 이차라 미분이
+# 살아 있고, 위는 선형이라 드문 급전에 이차 벌점처럼 가혹하지 않다.
+#
+# 무릎은 **실측 중앙값**이다 — "여기가 보통 속도" 라는 뜻이지 상한이 아니다.
+VEL_KNEE_HZ_PER_MS: dict[str, float] = {
+    "f1": 2.9, "f2": 7.0, "f3": 11.5, "f4": 10.7,
+}
+# **가속도 무릎 (Hz/ms²).** 1 차 차분(속도)으로는 난동과 실제 조음을 못 가른다 —
+# 동적 구간에서 둘은 크기가 비슷하고 **시간 구조**만 다르다. 난동은 부호가 매 프레임
+# 뒤집히고, 실제 급전은 한 방향으로 지속된다. 그래서 2 차 차분을 본다: 빠르게
+# *움직이는* 것은 허용하고 빠르게 *방향을 바꾸는* 것만 문다.
+#
+# 실측 (data/ref 여성 3 개, 유성 프레임 삼중항 10,305 개, Praat 1 ms):
+#
+#   |    | 속도 중앙 | 가속 중앙 | 가속 80% | 가속 95% |
+#   |----|-----------|-----------|----------|----------|
+#   | F1 |       2.9 |       0.7 |      2.4 |     12.6 |
+#   | F2 |       7.0 |       1.9 |      8.0 |     69.4 |
+#   | F3 |      11.5 |       3.4 |     15.4 |    117.4 |
+#   | F4 |      10.7 |       3.5 |     12.6 |    132.5 |
+#
+# 가속도가 더 나은 판별자인 이유가 이 표에 있다. 우리 적합의 난동은 F2 기준
+# 300~500 Hz/ms 로 부호가 매 프레임 뒤집히므로 가속도는 약 600~1000 Hz/ms² 다.
+#
+#   속도로 보면   실제 7.0  vs 난동 ~300   ->  43 배
+#   가속도로 보면 실제 1.9  vs 난동 ~600   -> 300 배
+#
+# 판별 여유가 7 배 넓다. 속도로는 실제 급전(최대 628 Hz/ms)이 난동 영역과 겹쳐서
+# 못 갈랐는데, 가속도로는 실제 급전이 한 방향으로 지속되므로 겹치지 않는다.
+ACC_KNEE_HZ_PER_MS2: dict[str, float] = {
+    "f1": 0.7, "f2": 1.9, "f3": 3.4, "f4": 3.5,
+}
+# "off" | "hinge"(95 분위 상한) | "huber"(속도 중앙값 무릎) | "accel"(가속도 무릎)
+#
+# 앞의 둘은 기각됐다 (docs/MEASUREMENTS.md §8.6). 성긴 격자도 기각됐다 (§8.9) —
+# 균일한 격자든 균일한 벌점이든 모든 시점에 똑같이 자유도를 주거나 뺏는데, 조음은
+# "대부분 정지, 짧은 순간에 급전" 이라 그 틀로는 두 요구를 동시에 못 맞춘다.
+VEL_MODE = "accel"
+# 기본값 0 — **아직 켜지 않는다.** 기구와 계측 상수는 여기 있지만, 세기(VEL_W)가
+# 포락 일치를 얼마나 깎는지 A/B 로 확인하기 전에는 모든 적합의 거동을 바꿀 수 없다.
+# 힌지 자체는 검증했다: F2 이동 10/50/93 Hz/ms 는 벌점 0, 150 은 0.97, 309 는 14.0.
+VEL_W = 0.0
+
 PRIOR_W: dict[str, float] = {
     "f0_target": 40.0, "f1": 40.0, "f2": 40.0, "f3": 20.0, "f4": 10.0,
-    "velum": 20.0, "oral_open": 20.0, "nasal_f": 20.0, "nasal_f2": 20.0,
+    # 곁가지는 분석이 못 재는 양이다. 세게 묶으면 적합기가 열지를 못한다 —
+    # 남 /나/ 머머가 "이득 −24 dB 내린 모음" 으로 굳던 원인.
+    "velum": 3.0, "oral_open": 3.0, "lat_mix": 1.0, "lat_bw": 2.0,
+    "nasal_f": 20.0, "nasal_f2": 20.0,
     "nasal_f3": 20.0, "nasal_z": 20.0, "nasal_gain": 10.0, "nasal_damp": 10.0,
     "a_c": 10.0, "obstacle": 10.0, "front_len": 10.0, "back_leak": 5.0,
     "bw1": 2.0, "bw2": 2.0, "bw3": 2.0, "bw4": 2.0,
@@ -92,6 +177,7 @@ STEP: dict[str, float] = {
     "f0_target": 0.15, "f1": 0.25, "f2": 0.25, "f3": 0.3, "f4": 0.3,
     "bw1": 0.5, "bw2": 0.5, "bw3": 0.5, "bw4": 0.5,
     "velum": 0.5, "oral_open": 0.5, "a_c": 0.5, "front_len": 0.3,
+    "lat_mix": 0.5, "lat_bw": 0.3,
     "jitter": 0.5, "shimmer": 0.5,
     "nasal_f": 0.3, "nasal_f2": 0.3, "nasal_f3": 0.3, "nasal_z": 0.3,
 }
@@ -107,6 +193,9 @@ DEFAULT_PARAMS = (
     "tract_gain", "a_c", "fric_gain", "obstacle", "back_leak", "front_len",
     "velum", "oral_open", "nasal_f", "nasal_f2", "nasal_f3", "nasal_z",
     "nasal_damp", "nasal_gain",
+    # 곁가지(side branch)를 적합 대상에 넣는다. 이게 빠져 있으면 설측·비음처럼
+    # 곁가지가 정의적 특징인 조음을 **원리적으로 못 맞춘다** (실측 §8.4).
+    "lat_mix", "lat_bw",
 )
 
 
@@ -178,7 +267,15 @@ class CopySynthFitter:
             from scipy.signal import resample_poly
             g = math.gcd(int(sr), int(self.fs))
             target = resample_poly(target, self.fs // g, int(sr) // g)
-        self.track = ControlTrack(init.values.copy(), init.frame_ms, list(init.events))
+        # **분석이 붙여 준 부가 정보(성문 펄스·유성 마스크)를 같이 옮긴다.** 새로
+        # ControlTrack 을 만들면서 빠뜨리면 조용히 기본값(빈 배열)이 되고, 마찰 이득
+        # 보정이 아무 일도 안 하게 된다 (실측: 남 /사/ 무성부가 −40.8 dB 인 채로 시작).
+        self.track = ControlTrack(init.values.copy(), init.frame_ms, list(init.events),
+                                  pulses=np.asarray(getattr(init, "pulses", np.zeros(0))).copy(),
+                                  voiced=np.asarray(getattr(init, "voiced",
+                                                            np.zeros(0, dtype=bool))).copy(),
+                                  fricative=np.asarray(getattr(init, "fricative",
+                                                               np.zeros(0, dtype=bool))).copy())
         self.track["residual_mix"] = 0.0
         n = self.track.n_frames * self.hop
         t = np.zeros(n)
@@ -278,18 +375,52 @@ class CopySynthFitter:
         cols = torch.stack([self._to_val(u[:, i], s) for i, s in enumerate(self.specs)], 1)
         return self.base.clone().index_copy(1, self.cols, cols).unsqueeze(0).to(torch.float32)
 
-    def calibrate_gain(self) -> float:
-        """초기 이득을 RMS 로 닫힌 형태로 준다.
+    def _rms(self, x: torch.Tensor, mask: np.ndarray | None) -> float:
+        if mask is None or not mask.any():
+            return float(x.pow(2).mean().sqrt()) + 1e-12
+        i = np.flatnonzero(np.repeat(mask, self.hop)[:x.shape[-1]])
+        return float(x[..., i].pow(2).mean().sqrt()) + 1e-12
 
-        안 하면 1 회차 수렴도가 −18000 % 에서 시작하고(실측) Adam 이 그것만 수십 회 민다.
+    def calibrate_gain(self) -> float:
+        """초기 이득을 닫힌 형태로 준다. **유성/무성을 따로 맞춘다.**
+
+        하나의 이득만 맞추면 유성과 무성 중 한쪽이 반드시 크게 어긋난다. 마찰 세기는
+        `fric_gain` 이 정하는데 그 초기값이 1.0 이고, 실측과의 차이가 40 dB 를 넘으면
+        경사 하강으로는 못 간다 (한 걸음이 상한 64 = 36 dB 안에서 움직인다). 실제로
+        남 /사/ 는 마찰부가 −42.8 dB 인 채로 시작해 끝까지 못 따라잡았다.
+        그래서 전체 이득은 **유성 프레임**에서, `fric_gain` 은 **무성 프레임**에서
+        각각 닫힌 형태로 준다.
         """
+        voi = np.asarray(getattr(self.track, "voiced", np.zeros(0, dtype=bool)))
+        if voi.shape[0] != self.n_frames:
+            voi = np.zeros(0, dtype=bool)
+        # `fric_gain` 은 **마찰 프레임**에서만 잰다. 폐쇄(비음 머머 등)를 섞으면
+        # 조용한 구간까지 마찰로 메우려 든다.
+        fri = np.asarray(getattr(self.track, "fricative", np.zeros(0, dtype=bool)))
+        if fri.shape[0] != self.n_frames:
+            fri = ~voi if voi.size else np.zeros(0, dtype=bool)
+        unv = fri
         with torch.no_grad():
             self.eng.reset()
             y = self.eng(self.control(), self.track.events, 0.0)["audio"]
-            a = float(y.pow(2).mean().sqrt()) + 1e-12
-            b = float(self.target.pow(2).mean().sqrt()) + 1e-12
-            self.log_gain.copy_(torch.tensor([math.log(b / a)], dtype=torch.float64,
+            m = voi if voi.any() else None
+            r = self._rms(self.target, m) / self._rms(y, m)
+            self.log_gain.copy_(torch.tensor([math.log(r)], dtype=torch.float64,
                                              device=self.device))
+            if unv.any() and "fric_gain" in self.names:
+                self.eng.reset()
+                y = self.eng(self.control(), self.track.events, 0.0)["audio"] * r
+                need = self._rms(self.target, unv) / self._rms(y, unv)
+                j = self.names.index("fric_gain")
+                sp = self.specs[j]
+                g0 = float(self._to_val(self.u0[:, j], sp).median())
+                tgt = float(np.clip(g0 * need, sp.lo + 1e-3, sp.hi - 1e-3))
+                # raw 좌표의 전역 오프셋으로 넣는다 (프레임별 모양은 보존)
+                d = float(self._to_raw(torch.tensor([tgt], dtype=torch.float64), sp)[0]
+                          - self._to_raw(torch.tensor([g0], dtype=torch.float64), sp)[0])
+                self.d[j] = d / max(float(self.d_mask[j]), 1.0) if self.d_mask[j] else 0.0
+                if not self.d_mask[j]:      # fric_gain 은 전역 대상이어야 한다
+                    self.d[j] = d
         return self.gain_db()
 
     # ------------------------------------------------------------ 손실
@@ -348,38 +479,121 @@ class CopySynthFitter:
         Mp = self.mel[:, :Smel.shape[1]] @ Smel
         m = min(Mp.shape[-1], self.tgt_M.shape[-1])
         Mp, Mt = Mp[..., :m], self.tgt_M[..., :m]
-        a = self._db(Mt).clamp_min(self.db_floor)
-        b = self._db(Mp).clamp_min(self.db_floor)
-        env_db = (a - b).abs().mean() / 20.0
+        # **clamp 도 abs 도 꺾임이다.** 멜 빈 수천 개마다 꺾이면 손실이 C² 가 아니게
+        # 되고 헤시안 기반 진단이 통째로 막힌다 (docs/MEASUREMENTS.md §8.7). 폭은
+        # dB 단위 0.5 — 계측 잡음보다 작아 거동은 사실상 그대로다.
+        a = self._soft_floor(self._db(Mt), self.db_floor, 0.5)
+        b = self._soft_floor(self._db(Mp), self.db_floor, 0.5)
+        env_db = self._soft_abs(a - b, 0.5).mean() / 20.0
         env_sc = self._sc(Mt, Mp)
         return sc_sum / len(self.sizes), env_db, env_sc, per
 
     def phase_loss(self, y: torch.Tensor) -> torch.Tensor:
-        """복소 STFT 잔차. 크기가 이미 맞을 때만 의미가 있다."""
-        k = 1024
-        Sp, St = _stft(y, k, self.wins[k]), _stft(self.target, k, self.wins[k])
-        m = min(Sp.shape[-1], St.shape[-1])
-        return (St[..., :m] - Sp[..., :m]).abs().mean() / (St[..., :m].abs().mean() + 1e-9)
+        """복소 STFT 잔차. **크기가 이미 맞을 때만** 의미가 있다.
+
+        크기가 틀린 상태에서 켜면 복소 차이가 크기 오차에 지배되어 위상에 대한 기울기가
+        묻힌다. 그래서 마지막 단계에서만 켠다.
+
+        여러 창을 쓰는 이유: 창이 길수록 하모닉이 분해되어 위상이 정밀해지지만 손실면이
+        톱니가 된다. 짧은 창이 큰 틀을 잡고 긴 창이 다듬도록 겹친다.
+        """
+        out = 0.0
+        for k in (256, 512, 1024):
+            Sp, St = _stft(y, k, self.wins[k]), _stft(self.target, k, self.wins[k])
+            m = min(Sp.shape[-1], St.shape[-1])
+            b = self.bin_max[k]
+            ref = St[:, :b, :m].abs().mean()
+            # **복소 크기는 꺾이지는 않지만 0 근처에서 곡률이 발산한다.** 적합이
+            # 좋아질수록 이 차이가 0 으로 가므로 오히려 더 나쁘다. √(|z|²+δ²)−δ 로
+            # 바닥을 깔아 준다. δ 는 목표 크기의 1e-3 이라 손실값은 사실상 그대로다.
+            d = St[:, :b, :m] - Sp[:, :b, :m]
+            dlt = 1e-3 * ref.detach() + 1e-12
+            sm = (torch.sqrt(d.real ** 2 + d.imag ** 2 + dlt ** 2) - dlt).mean()
+            out = out + sm / (ref + 1e-9)
+        return out / 3.0
+
+    @staticmethod
+    def _soft_over(x: torch.Tensor, width: float) -> torch.Tensor:
+        """relu 의 부드러운 대체. width 만큼의 폭으로 무릎을 뭉갠다.
+
+        **relu 를 쓰면 안 된다.** 꺾임점에서 2 차 도함수가 정의되지 않아 손실이 C² 가
+        아니게 되고, 그러면 헤시안 기반 진단(유효 파라미터 수 γ 등)이 통째로 막힌다.
+        실측으로 확인했다: 유한차분 헤시안의 대칭성(uᵀHv = vᵀHu)이 ε 을 4 자릿수
+        쓸어도 41.9 / 47.5 / 178.2 / 153.5 % 로 깨졌다 (docs/MEASUREMENTS.md §8.7).
+        손실은 결정적이었으므로 원인은 무작위성이 아니라 꺾임이다.
+
+        width → 0 이면 relu 로 수렴한다. 벌점으로서의 성질(문턱 아래는 거의 0, 위는
+        선형)은 그대로 두고 미분만 매끄럽게 만든다.
+        """
+        return width * torch.nn.functional.softplus(x / width)
+
+    @staticmethod
+    def _soft_abs(x: torch.Tensor, width: float) -> torch.Tensor:
+        """|x| 의 부드러운 대체 (의사 후버). 작은 x 에서 x²/2width, 큰 x 에서 |x|.
+
+        포락 오차의 L1 이 손실의 최대 꺾임원이었다 — 멜 빈 수천 개마다 a=b 에서
+        꺾인다. width 는 "이 정도 차이는 오차로 안 친다" 는 뜻이고, dB 단위에서
+        0.5 dB 면 계측 잡음보다 작아 거동이 사실상 안 바뀐다.
+        """
+        return width * (torch.sqrt(1.0 + (x / width) ** 2) - 1.0)
+
+    @staticmethod
+    def _soft_floor(x: torch.Tensor, floor: float, width: float) -> torch.Tensor:
+        """clamp_min 의 부드러운 대체. floor + softplus(x − floor)."""
+        return floor + width * torch.nn.functional.softplus((x - floor) / width)
+
+    @staticmethod
+    def _pseudo_huber(r: torch.Tensor) -> torch.Tensor:
+        """후버의 매끄러운 형태. torch.where 는 1 차 도함수만 이어져 C² 가 아니다.
+
+        √(1+r²) − 1 은 작은 r 에서 r²/2, 큰 r 에서 r−1 로 후버와 같은 모양이면서
+        무한히 미분 가능하다.
+        """
+        return torch.sqrt(1.0 + r * r) - 1.0
 
     def penalty(self) -> torch.Tensor:
         """물리적으로 성립하지 않는 해를 막는다.
 
         (1) 포먼트 순서. F4 가 F1 아래로 내려가는 해가 실제로 나왔다.
         (2) 대역폭이 중심 주파수를 넘지 않을 것 — 넘으면 그건 극이 아니라 기울기다.
+        (3) 조음 속도. 계측된 생리적 상한(`VEL_LIMIT_HZ_PER_MS`)을 넘는 이동은 문다.
         """
         u = self._u()
         pen = torch.zeros((), dtype=torch.float64, device=self.device)
         if len(self.f_idx) >= 2:
             f = torch.stack([self._to_val(u[:, i], self.specs[i]) for i in self.f_idx], 1)
-            gap = torch.relu(f[:, :-1] + F_MARGIN_HZ - f[:, 1:]) / 1000.0
+            gap = self._soft_over(f[:, :-1] + F_MARGIN_HZ - f[:, 1:], 30.0) / 1000.0
             pen = pen + 10.0 * (gap * gap).mean()
             for j, i in enumerate(self.f_idx):
                 nb = self.names[i].replace("f", "bw")
                 if nb in self.names:
                     k = self.names.index(nb)
                     bw = self._to_val(u[:, k], self.specs[k])
-                    over = torch.relu(bw - 0.8 * f[:, j]) / 1000.0
+                    over = self._soft_over(bw - 0.8 * f[:, j], 30.0) / 1000.0
                     pen = pen + 2.0 * (over * over).mean()
+        if VEL_W > 0 and VEL_MODE != "off" and u.shape[0] > 1:
+            dt = max(self.track.frame_ms, 1e-6)
+            tab = {"hinge": VEL_LIMIT_HZ_PER_MS, "huber": VEL_KNEE_HZ_PER_MS,
+                   "accel": ACC_KNEE_HZ_PER_MS2}[VEL_MODE]
+            for nm, lim in tab.items():
+                if nm not in self.names or u.shape[0] < 3:
+                    continue
+                k = self.names.index(nm)
+                v = self._to_val(u[:, k], self.specs[k])
+                if VEL_MODE == "accel":
+                    # 2 차 차분. 한 방향으로 꾸준히 가는 급전은 여기서 0 에 가깝고,
+                    # 부호가 뒤집히는 난동만 크게 나온다.
+                    rate = (v[2:] - 2.0 * v[1:-1] + v[:-2]).abs() / (dt * dt)
+                else:
+                    rate = (v[1:] - v[:-1]).abs() / dt
+                if VEL_MODE == "hinge":
+                    over = self._soft_over(rate - lim, 0.05 * lim) / 100.0
+                    pen = pen + VEL_W * (over * over).mean()
+                else:
+                    # 후버. lim 으로 나눠 무차원으로 만든다 (파라미터끼리 같은 저울).
+                    r = rate / lim
+                    h = self._pseudo_huber(r)
+                    pen = pen + VEL_W * h.mean()
         return pen
 
     def loss(self):
@@ -461,13 +675,72 @@ class CopySynthFitter:
             env = fine = db = lv = float("nan"); per = {}
         return FitReport(env, fine, db, per, lv, len(hist), hist)
 
+    def _snapshot(self):
+        return (self.w.detach().clone(), self.d.detach().clone(),
+                self.log_gain.detach().clone(), self.pulse_phi0.detach().clone())
+
+    def _restore(self, snap) -> None:
+        with torch.no_grad():
+            self.w.copy_(snap[0]); self.d.copy_(snap[1])
+            self.log_gain.copy_(snap[2]); self.pulse_phi0.copy_(snap[3])
+
+    def pick_lr_global(self, candidates, iters: int, verbose: bool = True) -> float:
+        """짧은 탐침으로 전역 단계의 lr 을 고른다.
+
+        **구간마다 맞는 걸음 크기가 다르다.** 40 ms 짜리 탄음은 lr 0.05 에서 포락
+        60.3 % 인데 0.02 면 90.9 % 다 (실측, lr 에 단조). 반대로 소스 기울기가 7 dB/oct
+        틀린 합성 모음은 0.02 로는 못 돌아오고 0.05 가 필요하다. 하나로 못 정하므로
+        짧게 재 보고 손실이 가장 낮은 것을 쓴다.
+        """
+        start = self._snapshot()
+        best = (float("inf"), float(candidates[0]))
+        for lr in candidates:
+            self._restore(start)
+            rep = self.fit(iters, float(lr), 10 ** 9, False,
+                           params=[self.d, self.log_gain, self.pulse_phi0], sizes=STAGES[0])
+            if np.isfinite(rep.loss) and rep.loss < best[0]:
+                best = (rep.loss, float(lr))
+            if verbose:
+                print(f"      lr {float(lr):5.3f} -> 손실 {rep.loss:.4f}")
+        self._restore(start)
+        return best[1]
+
+    def pick_lr_phase(self, candidates, iters: int, verbose: bool = True) -> float:
+        """위상 단계의 lr 도 짧은 탐침으로 고른다.
+
+        전역 단계와 같은 이유이고, 실측으로도 구간마다 최적이 다르다 (위상 800 반복):
+        정상 모음 0.05~0.12, 설측 0.12 이상, 탄음 0.05. 하나로 못 정한다.
+        """
+        start = self._snapshot()
+        best = (float("inf"), float(candidates[0]))
+        for lr in candidates:
+            self._restore(start)
+            rep = self.fit(iters, float(lr), 10 ** 9, False, sizes=FFT_SIZES)
+            if np.isfinite(rep.loss) and rep.loss < best[0]:
+                best = (rep.loss, float(lr))
+            if verbose:
+                print(f"      lr {float(lr):5.3f} -> 손실 {rep.loss:.4f}")
+        self._restore(start)
+        return best[1]
+
     def fit_staged(self, global_iters: int = 200, stage_iters: int = 150,
-                   lr_global: float = 0.05, lr_frame: float = 0.04,
+                   lr_global=(0.015, 0.03, 0.05, 0.09), lr_frame: float = 0.04,
+                   phase_iters: int = 800, phase_w: float = 3.0,
+                   lr_phase=(0.05, 0.12, 0.25),
                    verbose: bool = True, log_every: int = 50) -> FitReport:
         """전역 스칼라 -> 제어 격자를 성기게에서 촘촘하게, 창도 함께 늘려 가며."""
         if verbose:
             print(f"  1 단계 전역 {len(self.names)} 스칼라 (이득 {self.gain_db():+.1f} dB)")
-        rep = self.fit(global_iters, lr_global, log_every, verbose,
+        if isinstance(lr_global, (int, float)):
+            lr_global = (float(lr_global),)
+        if len(lr_global) > 1:
+            probe = max(20, global_iters // 4)
+            lr_g = self.pick_lr_global(lr_global, probe, verbose)
+            if verbose:
+                print(f"      -> lr {lr_g:.3f} 선택")
+        else:
+            lr_g = float(lr_global[0])
+        rep = self.fit(global_iters, lr_g, log_every, verbose,
                        params=[self.d, self.log_gain, self.pulse_phi0], sizes=STAGES[0])
         for si, (grid, sizes) in enumerate(zip(GRID_MS, STAGES)):
             tc = self.set_grid(grid)
@@ -475,6 +748,32 @@ class CopySynthFitter:
                 print(f"  2.{si + 1} 단계  격자 {grid:g} ms ({tc} 점)  창 {sizes}")
             rep = self.fit(stage_iters, lr_frame * (0.75 ** si), log_every, verbose,
                            sizes=sizes)
+        # **위상 단계는 기본이다.** 크기만 맞추면 위상은 물리가 강제하는 곳에서만 맞는다.
+        # 실측(코퍼스 150 ms 창 4 개): 조화 SNR +3.3/+1.0/+3.5/−2.6 -> +24.7/+16.5/+12.9/+16.2,
+        # 위상 모양 오차 7.6/29.9/65.5/25.4° -> 3.4/17.8/32.6/16.4°. 포락은 안 나빠졌다.
+        # **위상 단계는 예산이 모자랐다.** 예전 값(lr = lr_frame·0.4 = 0.016, 200 반복)은
+        # 어느 구간에서도 바닥에 못 닿았다. 학습률과 반복만 올린 실측(무제약):
+        #
+        #   | 구간      | 예전 (lr 0.016 / 200) | lr 0.12 / 800 |
+        #   |-----------|-----------------------|---------------|
+        #   | 정상 모음 |                  3.4° |      **0.1°** |
+        #   | 설측 닐   |                 96.5° |     **36.4°** |
+        #   | 탄음 이리 |                 50.9° |     **18.3°** |
+        #
+        # 기구를 하나도 안 더하고 설측 2.6 배, 탄음 2.8 배다. 크기 적합 단계는 설측의
+        # 위상을 아예 못 건드렸고(94.8 -> 96.5°) 오직 이 단계만 움직였다.
+        if phase_iters > 0:
+            self.phase_weight = phase_w
+            if verbose:
+                print(f"  3 단계  위상 (가중 {phase_w}, {phase_iters} 반복)")
+            if isinstance(lr_phase, (int, float)):
+                lr_p = float(lr_phase)
+            else:
+                lr_p = self.pick_lr_phase(lr_phase, max(30, phase_iters // 8), verbose)
+                if verbose:
+                    print(f"      -> lr {lr_p:.3f} 선택")
+            rep = self.fit(phase_iters, lr_p, log_every, verbose, sizes=FFT_SIZES)
+            self.phase_weight = 0.0
         self.sizes = list(FFT_SIZES)
         return rep
 
