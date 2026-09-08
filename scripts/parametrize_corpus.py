@@ -44,7 +44,7 @@ import soundfile as sf
 import torch
 
 from formant_ml.engine import turbulence as tb
-from formant_ml.engine.analyze import analyze
+from formant_ml.engine.analyze import analyze, glottal_pulses
 from formant_ml.engine.control import PARAM_NAMES
 from formant_ml.engine.denoise import denoise, noise_profile
 from formant_ml.engine.fit import CopySynthFitter
@@ -61,20 +61,33 @@ def _name(path: str, t0: float, t1: float) -> str:
     return f"{os.path.splitext(os.path.basename(path))[0]}_{int(t0*1000)}-{int(t1*1000)}"
 
 
-def fit_one(path: str, t0: float, t1: float, kind: str, prof: SpeakerProfile,
-            out_dir: str, budget: tuple[int, int, int], patience: int,
-            frame_ms: float = 1.0) -> dict:
-    """구간 하나를 적합해 npz 로 남기고 요약 한 줄을 돌려준다."""
+def load_clean(path: str) -> tuple[np.ndarray, int]:
+    """파일을 읽고 방 잡음을 지운다. **파일당 한 번만** 한다.
+
+    목표에 잡음이 남으면 엔진이 그 잡음까지 만들려고 파라미터를 비튼다
+    (engine/denoise.py 머리말). 그런데 위너 차감은 파일 전체를 훑으므로, 한 파일의
+    구간마다 다시 걸면 20 초짜리 파일에서 그 비용이 구간 수만큼 곱해진다.
+    """
     y, sr = sf.read(path)
     if y.ndim > 1:
         y = y.mean(1)
     y = np.asarray(y, dtype=np.float64)
-    # 방 잡음을 지운다. 목표에 잡음이 남으면 엔진이 **그 잡음까지** 만들려고 파라미터를
-    # 비튼다 (engine/denoise.py 머리말).
-    y = denoise(y, sr, noise_profile(y, sr))
+    return denoise(y, sr, noise_profile(y, sr)), sr
+
+
+def fit_one(path: str, t0: float, t1: float, kind: str, prof: SpeakerProfile,
+            out_dir: str, budget: tuple[int, int, int], patience: int,
+            frame_ms: float = 1.0, clean: tuple[np.ndarray, int] | None = None,
+            pulses: np.ndarray | None = None) -> dict:
+    """구간 하나를 적합해 npz 로 남기고 요약 한 줄을 돌려준다.
+
+    `clean` 과 `pulses` 는 같은 파일의 다른 구간과 **나눠 쓰라고** 있는 인자다. 둘 다
+    파일 전체를 훑는 계산이라 구간마다 다시 하면 그만큼 곱절로 든다.
+    """
+    y, sr = clean if clean is not None else load_clean(path)
     seg = y[int(t0 * sr):int(t1 * sr)]
     hop = max(1, int(round(frame_ms * sr / 1000.0)))
-    track = analyze(seg, sr, prof, hop, t0=t0, full=y)
+    track = analyze(seg, sr, prof, hop, t0=t0, full=y, pulses=pulses)
     eng = VoiceEngine(EngineConfig(sample_rate=48000, frame_ms=frame_ms,
                                    speaker="female" if prof.f0_nominal > 165 else "male",
                                    residual=False), prof)
@@ -111,19 +124,32 @@ def fit_one(path: str, t0: float, t1: float, kind: str, prof: SpeakerProfile,
 
 
 def _worker(args):
-    (path, t0, t1, kind, prof_path, out_dir, budget, patience, threads) = args
+    """한 **파일**의 구간 전부를 처리한다 — 잡음 제거와 성문 펄스를 나눠 쓰기 위해."""
+    (path, segs, prof_path, out_dir, budget, patience, threads) = args
     torch.set_num_threads(threads)
+    rows = []
     try:
         prof = SpeakerProfile.load(prof_path)
+        clean = load_clean(path)
+        pulses = glottal_pulses(clean[0], clean[1], prof)
+    except Exception as e:
+        return [dict(stem=_name(path, t0, t1), file=os.path.basename(path),
+                     t0=t0, t1=t1, kind=kind, ok=False,
+                     error=f"파일 준비 실패 {type(e).__name__}: {e}")
+                for t0, t1, kind in segs]
+    for t0, t1, kind in segs:
         t = time.time()
-        row = fit_one(path, t0, t1, kind, prof, out_dir, budget, patience)
-        row["seconds"] = round(time.time() - t, 1)
-        return row
-    except Exception as e:                      # 한 구간이 죽어도 코퍼스는 계속 돈다
-        return dict(stem=_name(path, t0, t1), file=os.path.basename(path),
-                    t0=t0, t1=t1, kind=kind, ok=False,
-                    error=f"{type(e).__name__}: {e}",
-                    traceback=traceback.format_exc()[-1500:])
+        try:
+            row = fit_one(path, t0, t1, kind, prof, out_dir, budget, patience,
+                          clean=clean, pulses=pulses)
+            row["seconds"] = round(time.time() - t, 1)
+        except Exception as e:                  # 한 구간이 죽어도 코퍼스는 계속 돈다
+            row = dict(stem=_name(path, t0, t1), file=os.path.basename(path),
+                       t0=t0, t1=t1, kind=kind, ok=False,
+                       error=f"{type(e).__name__}: {e}",
+                       traceback=traceback.format_exc()[-1500:])
+        rows.append(row)
+    return rows
 
 
 def main() -> None:
@@ -154,7 +180,9 @@ def main() -> None:
         sys.exit(f"wav 을 못 찾았다: {a.wavs}")
 
     print(f"파일 {len(paths)} 개에서 구간을 고른다...", flush=True)
-    jobs = []
+    # **작업 단위는 파일이다.** 잡음 제거와 성문 펄스 추출은 파일 전체를 훑으므로,
+    # 구간을 흩어 놓으면 그 비용이 구간 수만큼 곱해진다.
+    jobs, n_seg, n_fric = [], 0, 0
     for p in paths:
         y, sr = sf.read(p)
         if y.ndim > 1:
@@ -164,19 +192,27 @@ def main() -> None:
         except Exception as e:
             print(f"  {os.path.basename(p)}: 분할 실패 {e}", flush=True)
             continue
+        keep = []
         for s in segs:
             if s.kind not in kinds:
                 continue
             if a.resume and os.path.exists(
                     os.path.join(a.out, "tracks", _name(p, s.t0, s.t1) + ".npz")):
                 continue
-            jobs.append((p, s.t0, s.t1, s.kind, a.profile, a.out, budget,
-                         a.patience, a.threads))
-    if a.limit:
-        jobs = jobs[:a.limit]
-    n_fric = sum(1 for j in jobs if j[3] == "fricative")
-    print(f"구간 {len(jobs)} 개 (마찰 {n_fric}, 모음 {len(jobs)-n_fric}), "
+            if a.limit and n_seg >= a.limit:
+                break
+            keep.append((s.t0, s.t1, s.kind))
+            n_seg += 1
+            n_fric += s.kind == "fricative"
+        if keep:
+            jobs.append((p, keep, a.profile, a.out, budget, a.patience, a.threads))
+        if a.limit and n_seg >= a.limit:
+            break
+    print(f"구간 {n_seg} 개 (마찰 {n_fric}, 모음 {n_seg - n_fric}) / 파일 {len(jobs)} 개, "
           f"작업 {a.jobs} 개로 돈다", flush=True)
+    if not jobs:
+        print("할 일이 없다 (--resume 로 전부 건너뛴 것일 수 있다).")
+        return
 
     idx = os.path.join(a.out, "index.jsonl")
     done = 0
@@ -185,14 +221,15 @@ def main() -> None:
         if a.jobs > 1:
             import multiprocessing as mp
             with mp.get_context("spawn").Pool(a.jobs) as pool:
-                for row in pool.imap_unordered(_worker, jobs):
-                    done += 1
-                    _log(fh, row, done, len(jobs), t_all)
+                for rows in pool.imap_unordered(_worker, jobs):
+                    for row in rows:
+                        done += 1
+                        _log(fh, row, done, n_seg, t_all)
         else:
             for j in jobs:
-                row = _worker(j)
-                done += 1
-                _log(fh, row, done, len(jobs), t_all)
+                for row in _worker(j):
+                    done += 1
+                    _log(fh, row, done, n_seg, t_all)
     print(f"\n끝. 색인: {idx}")
 
 
