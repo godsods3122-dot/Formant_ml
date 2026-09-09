@@ -255,3 +255,32 @@ def test_effective_bandwidth_ignores_a_natural_rolloff():
     X = np.fft.rfft(np.random.default_rng(2).standard_normal(n))
     X = X * (1.0 / (1.0 + (f / 2000.0) ** 2))       # −12 dB/oct 에 가까운 기울기
     assert tb.effective_bandwidth(np.fft.irfft(X, n), FS) >= 0.49 * FS
+
+
+def test_env_modulation_index_isolates_the_modulation_frequency():
+    """변조 지수는 **그 대역만** 올라야 한다 — 아니면 원인을 못 가른다.
+
+    지지직 진단이 이 특이성에 통째로 걸려 있다. 대조군(가우시안 대역잡음) 대비
+    200 Hz AM 을 걸면 200~600 Hz 만 커지고 60~150 Hz 는 그대로여야 한다.
+    """
+    rng = np.random.default_rng(0)
+    fs, n = 48000.0, 24000
+    x = rng.standard_normal(n)
+    mask = np.zeros(n)
+    mask[: n // 2] = 1.0
+    bands = [(200.0, 600.0), (60.0, 150.0)]
+    base, lvl = tb.env_modulation_index(x, fs, mask, bands)
+    t = np.arange(n) / fs
+    am, _ = tb.env_modulation_index(x * (1 + 0.5 * np.cos(2 * np.pi * 200 * t)),
+                                    fs, mask, bands)
+    assert am[0] / base[0] > 3.0          # 변조 대역은 크게 오른다
+    assert am[1] / base[1] < 1.5          # 다른 대역은 거의 그대로
+    assert np.isfinite(lvl)
+
+
+def test_env_modulation_index_needs_enough_masked_samples():
+    """마스크가 거의 비면 값을 지어내지 말고 NaN 을 내야 한다."""
+    fs, n = 48000.0, 4800
+    v, lvl = tb.env_modulation_index(np.random.default_rng(1).standard_normal(n),
+                                     fs, np.zeros(n), [(60.0, 150.0)])
+    assert np.isnan(v).all() and np.isnan(lvl)

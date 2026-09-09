@@ -237,6 +237,39 @@ def modulation_bands(x: np.ndarray, fs: float, lo: float = 4000.0,
                      for a, b_ in zip(edges[:-1], edges[1:])])
 
 
+def env_modulation_index(x: np.ndarray, fs: float, mask: np.ndarray,
+                         bands, lo: float = 4000.0, hi: float = 12000.0):
+    """고역 포락의 **변조 지수** — 지정한 프레임에서만, 제 평균으로 정규화해서.
+
+    `modulation_bands` 와 두 군데가 다르고 둘 다 중요하다.
+
+    1. **프레임을 가려서 본다.** 파일을 통째로 재면 유성 구간이 지배해서(87 % 대 13 %)
+       마찰 구간의 문제가 묻힌다. 실측: 같은 음원에서 유성·비마찰은 F0 대역 변조가
+       목표의 0.73 배인데 마찰 구간은 5.50 배다 (docs/MEASUREMENTS.md §13).
+    2. **비율이 아니라 지수로 낸다.** 대역별 백분율은 전체 변조가 다 같이 커져도
+       안 움직인다. 포락선을 제 평균으로 나눈 뒤 절대 에너지를 재야 "얼마나 더
+       맥동하는가" 가 나온다. 그래야 레벨 차이와도 섞이지 않는다.
+
+    mask: 샘플률 0/1 배열 (프레임률 마스크를 hop 만큼 반복해서 준다).
+    반환: (대역별 지수 배열, 그 구간의 대역 rms dB)
+    """
+    b, e = _band_envelope(x, fs, lo, hi)
+    if b is None:
+        return np.full(len(bands), np.nan), float("nan")
+    n = min(len(e), len(mask))
+    e, m = e[:n], np.asarray(mask[:n], float)
+    w = m > 0
+    if w.sum() < 16:
+        return np.full(len(bands), np.nan), float("nan")
+    mu = float(e[w].mean()) + 1e-20
+    z = (e / mu) * m
+    z = z - z.mean()
+    E = np.abs(np.fft.rfft(z * np.hanning(n))) ** 2 / n
+    fm = np.fft.rfftfreq(n, 1.0 / fs)
+    out = np.array([E[(fm >= a) & (fm < c)].sum() for a, c in bands])
+    return out, float(20.0 * np.log10(mu))
+
+
 def amplitude_kurtosis(x: np.ndarray, fs: float, lo: float = 4000.0,
                        hi: float = 12000.0) -> float:
     """고역 대역통과 파형의 첨도. 가우시안 난류면 3, 버스트성이면 그 위."""
