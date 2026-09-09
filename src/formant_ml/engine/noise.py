@@ -278,6 +278,11 @@ class FricationNoise(nn.Module):
         # 소스의 고역 셸프 (1 kHz 모서리). 실측 적합값 −9 dB: 광대역 백색보다 조금 어둡다.
         shelf = self.source_hf_shelf_db
         src = white
+        # v1 의 `source_tilt_shift`(속도가 2 배면 소스가 1.5 dB/oct 밝아진다)를 여기
+        # 셸프로 옮겨 봤다가 **뺐다.** 1 차 셸프는 모서리 위에서 평평해져서 2~4 kHz 와
+        # 11~16 kHz 에 같은 이득을 준다 — 참 dB/oct 기울기가 아니라 대역을 못 가른다.
+        # 실측으로도 tilt 0 → 3.0 에서 대역 개시 차가 +30 ms 로 꿈쩍 안 했다(§21.6).
+        # 제대로 하려면 옥타브마다 셸프를 쌓아야 하는데, 그럴 근거가 아직 없다.
         if abs(float(shelf)) > 1e-6:
             a = math.exp(-2 * math.pi * 1000.0 / fs)
             g_hi = 10.0 ** (shelf / 20.0)
