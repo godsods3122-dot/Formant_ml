@@ -94,6 +94,10 @@ def main() -> None:
     ap.add_argument("--prior", action="append", default=None, metavar="이름=값",
                     help="사전 가중(fit.PRIOR_W) 덮어쓰기. 여러 번 줄 수 있다. "
                          "예: --prior aspiration=3.0")
+    ap.add_argument("--tilt-cap", type=float, default=None,
+                    help="소스 기울기(tilt)가 먹히는 상한 주파수 [Hz] "
+                         "(glottis.TILT_MAX_HZ, 기본 5000). 0 이면 상한 없음 — "
+                         "그러면 성문 펄스가 사각파처럼 날카로워진다 (MEASUREMENTS §25)")
     ap.add_argument("--artic-vel", type=float, default=None,
                     help="조음 속도 한계 벌점의 세기 (fit.ARTIC_VEL_W, 기본 1.0). "
                          "0 이면 끈다 — 마찰음이 유성 구간에서 1 ms 만에 켜지는 것을 "
@@ -110,6 +114,9 @@ def main() -> None:
             _fit.RIPPLE_W = float(a.ripple)
         if a.artic_vel is not None:
             _fit.ARTIC_VEL_W = float(a.artic_vel)
+    if a.tilt_cap is not None:
+        from formant_ml.engine import glottis as _g
+        _g.TILT_MAX_HZ = float(a.tilt_cap)
         for item in (a.prior or ()):
             k, _, v = item.partition("=")
             if k not in _fit.PRIOR_W and k not in _fit.DEFAULT_PARAMS:
