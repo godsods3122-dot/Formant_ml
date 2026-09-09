@@ -235,6 +235,71 @@ RIPPLE_KNEE = 0.02
 # 세기. 0 이면 항이 빠진다. `copyfit --ripple` 로 켠다.
 RIPPLE_W = 0.0
 
+# **dB/ms 벌점** — 소스 세기가 프레임마다 켜졌다 꺼지는 것을 문다.
+#
+# 왜 곡률(RIPPLE_W)로는 안 되는가 (docs/MEASUREMENTS.md §20.3). RIPPLE_W 0.03 은
+# `fric_gain` 의 최대/중앙을 71.8 → 4.5 배로 크게 잡는데도 임펄스 첨두를 323 → 232/s
+# 로만 줄인다(목표 97). 그 트랙의 50 Hz 위 전력이 23.2 → 18.6 % 로 거의 안 주기
+# 때문이다. 곡률의 L1 은 **큰 스파이크**를 깎지만 작고 빠른 흔들림은 싸게 통과시킨다.
+# 귀에 들리는 것은 후자다.
+#
+# 그래서 **1 차 차분을 dB 로** 문다. 실측(§21.3, yang_00000034 적합 트랙):
+#
+#   마찰 소스 포락 env 의 dB/ms   중앙 6.16   95 분위 33.83   최대 55.24
+#   프레임의 51 % 가 1 ms 에 6 dB 넘게 뛴다
+#
+# **무릎 1.5 dB/ms 의 출처.** 진폭 A dB · 주파수 f 의 정현 변조는 최대 기울기가
+# A·2πf·dt [dB/ms] 다. 조음이 낼 수 있는 가장 빠른 것은 음소률 상단(16 Hz,
+# Greenberg)에서의 큰 제스처 — /s/ 협착이 3.0 → 0.1 cm² 로 30 dB 움직이는 것이
+# 그것이고 진폭은 그 절반인 15 dB 다. 15 · 2π · 0.016 = **1.5 dB/ms**. 그 위는
+# 조음이 못 내는 속도다. 의사후버라 아래는 이차(싼) 영역, 위는 선형(비싼) 영역이다.
+#
+# **왜 이 다섯인가.** 마찰 소스 포락은 `env = drive x fric_gain` 인데 항별 dB/ms 가
+# drive 4.56 / fric_gain 3.45 로 **둘 다** 나쁘다(§21.3 후속). drive 는 `a_c` 와
+# `p_sub` 가 만들므로 이득만 물면 절반을 놓친다. `aspiration` 은 이 구간에서
+# 0.00 dB/ms 라 지금은 무해하지만 같은 부류라 함께 둔다.
+#
+# 0-1 종(`aspiration`)과 면적(`a_c`)도 **곱셈으로 들어가는 양**이라 dB 가 맞는
+# 저울이다. 비율 그대로 재면 fric_gain 이 1 일 때와 67 일 때 같은 상대 요동에
+# 67 배 다른 벌점이 붙는다 (GAIN_ACC_* 의 주석과 같은 이유).
+DB_RATE_KNEE_DB_MS: dict[str, float] = {
+    "fric_gain": 1.5, "tract_gain": 1.5, "aspiration": 1.5,
+    "a_c": 1.5, "p_sub": 1.5,
+}
+# 세기. 0 이면 항이 빠진다. `copyfit --db-rate` 로 켠다.
+DB_RATE_W = 0.0
+
+# **속도 벌점 (전 파라미터, 걸음 단위)** — DB_RATE 가 이득만 물어서 실패한 것의 수정.
+#
+# 실측(docs/MEASUREMENTS.md §22). `DB_RATE_W` 0.03 은 마찰 소스 포락의 dB/ms 를
+# 6.16 → 0.80 으로 내려 **소스의 첨두를 265 → 71/s 로 목표(97) 아래까지** 잡는다.
+# 그런데 최종 출력의 첨두는 323 → 271/s 로 거의 안 준다. 갈라 보면 이유가 나온다 —
+# 이번에는 **앞공동 경로가 71 → 200/s 를 만든다.**
+#
+# 적합기가 이득에서 막힌 요동을 **필터 주파수로 밀어낸 것**이다. 주파수류의 변화
+# 속도 [옥타브/ms] 중앙값:
+#
+#                     front_len   f1     f2     bw3
+#   벌점 없음            0.2368  0.1258 0.1997 0.4729
+#   DB_RATE 0.03        0.2050  0.1520 0.2077 0.6308   <- 오히려 나빠진다
+#   RIPPLE  0.03        0.0190  0.0640 0.0777 0.0426   <- 전 파라미터라 같이 잡힌다
+#
+# 생리 기준은 **0.020 oct/ms** 다 (포먼트가 1000 → 2000 Hz 를 50 ms 에 지나는 빠른
+# 전이). 벌점 없는 트랙은 중앙값이 그 10 배, 95 분위가 50 배다.
+#
+# 그래서 벌점은 **파라미터를 가리지 않아야 하고**(RIPPLE 의 성질) 동시에 곡률이
+# 아니라 **속도**를 봐야 한다(DB_RATE 의 성질). 둘을 합친 것이 이 항이다.
+#
+# 단위는 적합기의 **걸음**(`STEP`)이라 28 개 파라미터에 무릎 하나가 통한다 —
+# 주파수는 로그, 이득은 로그, 0-1 은 로짓으로 이미 정규화돼 있다.
+#
+# **무릎 0.1 /ms 의 출처.** 진폭 A 걸음 · 주파수 f 의 정현 운동은 최대 기울기가
+# A·2πf·dt 다. 조음의 상단(음소률 15 Hz, Greenberg)에서 걸음 1 짜리 제스처면
+# 1 · 2π · 15 · 0.001 = **0.094 /ms**. 그 위는 조음이 못 내는 속도다.
+W_RATE_KNEE = 0.1
+# 세기. 0 이면 항이 빠진다. `copyfit --w-rate` 로 켠다.
+W_RATE_W = 0.0
+
 PRIOR_W: dict[str, float] = {
     "f0_target": 40.0, "f1": 40.0, "f2": 40.0, "f3": 20.0, "f4": 10.0,
     # 곁가지는 분석이 못 재는 양이다. 세게 묶으면 적합기가 열지를 못한다 —
@@ -805,6 +870,23 @@ class CopySynthFitter:
             dt = max(self.track.frame_ms, 1e-6) * max(self.stride, 1)
             acc = (self.w[2:] - 2.0 * self.w[1:-1] + self.w[:-2]).abs() / (dt * dt)
             pen = pen + RIPPLE_W * self._pseudo_huber(acc / RIPPLE_KNEE).mean()
+        if W_RATE_W > 0 and self.w.shape[0] >= 2:
+            # 격자 간격은 stride 를 곱한 실제 시간이다 (RIPPLE 과 같은 규약).
+            dt = max(self.track.frame_ms, 1e-6) * max(self.stride, 1)
+            rate = (self.w[1:] - self.w[:-1]).abs() / dt
+            pen = pen + W_RATE_W * self._pseudo_huber(rate / W_RATE_KNEE).mean()
+        if DB_RATE_W > 0 and u.shape[0] >= 2:
+            # **1 차 차분을 dB 로.** 곡률이 아니라 속도를 문다 — 귀에 들리는 것은
+            # 큰 스파이크가 아니라 매 프레임의 페이드다 (MEASUREMENTS §20.3, §21.3).
+            dt = max(self.track.frame_ms, 1e-6) * max(self.stride, 1)
+            for nm, knee in DB_RATE_KNEE_DB_MS.items():
+                if nm not in self.names:
+                    continue
+                k = self.names.index(nm)
+                v = self._to_val(u[:, k], self.specs[k])
+                g = 20.0 * torch.log10(v.clamp_min(1e-4))
+                rate = (g[1:] - g[:-1]).abs() / dt
+                pen = pen + DB_RATE_W * self._pseudo_huber(rate / knee).mean()
         if GAIN_ACC_W > 0 and u.shape[0] >= 3:
             # 이득은 **로그(dB)로 본다.** 비율 그대로 2 차 차분을 재면 fric_gain 이
             # 1 일 때와 67 일 때(실측 범위) 같은 상대 요동에 67 배 다른 벌점이 붙는다.

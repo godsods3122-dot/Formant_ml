@@ -88,14 +88,26 @@ def main() -> None:
                     help="제어열 잔물결 벌점 세기 (fit.RIPPLE_W). 조음 대역(0~20 Hz) "
                          "위에서 트랙이 흔들리는 것만 문다 — 지지직과 저역 초과가 "
                          "둘 다 여기서 온다 (docs/MEASUREMENTS.md §13, §16)")
+    ap.add_argument("--db-rate", type=float, default=None,
+                    help="소스 세기의 dB/ms 벌점 세기 (fit.DB_RATE_W). 곡률 벌점"
+                         "(--ripple)이 못 잡는 '매 프레임 페이드' 를 문다 "
+                         "(docs/MEASUREMENTS.md §20.3, §21.3)")
+    ap.add_argument("--w-rate", type=float, default=None,
+                    help="전 파라미터의 속도 벌점 세기 (fit.W_RATE_W). 걸음 단위라 "
+                         "28 개에 무릎 하나가 통한다 (docs/MEASUREMENTS.md §22)")
     a = ap.parse_args()
     torch.set_num_threads(a.threads)
-    if a.gain_acc is not None or a.ripple is not None:
+    if (a.gain_acc is not None or a.ripple is not None or a.db_rate is not None
+            or a.w_rate is not None):
         from formant_ml.engine import fit as _fit
         if a.gain_acc is not None:
             _fit.GAIN_ACC_W = float(a.gain_acc)
         if a.ripple is not None:
             _fit.RIPPLE_W = float(a.ripple)
+        if a.db_rate is not None:
+            _fit.DB_RATE_W = float(a.db_rate)
+        if a.w_rate is not None:
+            _fit.W_RATE_W = float(a.w_rate)
 
     y, sr = sf.read(a.wav)
     if y.ndim > 1:
