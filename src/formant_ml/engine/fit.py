@@ -957,23 +957,27 @@ class CopySynthFitter:
             ps = [self.w, self.d, self.log_gain, self.pulse_phi0]
             # **비유한 기울기로 걸음을 딛으면 안 된다.** Adam 의 모멘트가 NaN 으로
             # 오염되면 그 뒤 모든 파라미터가 NaN 이 되고, 손실을 보기 전에 엔진 안에서
-            # 터진다(실측: 탄음 구간에서 int(NaN)). 그런 회차는 건너뛴다.
+            # 터진다(실측: 탄음 구간에서 int(NaN)).
             if any(p.grad is not None and not torch.isfinite(p.grad).all() for p in ps):
                 bad_grads += 1
                 if DEBUG_NONFINITE:
                     self._report_nonfinite(it, ps, ["w", "d", "log_gain", "pulse_phi0"])
+                # **건너뛰지 말고 성분만 지운다.** 예전에는 회차 전체를 버렸는데,
+                # 그러면 파라미터가 안 변하므로 **다음 회차도 똑같이 비유한**이다.
+                # 결정적으로 갇힌다 — 실측(out/sw/r000, yang_00000040 전체):
+                # 모든 단계가 "[30] 수렴 + 비유한 29 회 건너뜀" 으로 끝났다. 즉
+                # 단계당 실제 걸음이 **1 번**뿐이었고 포락이 82.7 % 에 머물렀다
+                # (같은 파일의 정상 적합은 93.1 %).
+                #
+                # 비유한 성분을 0 으로 두면 나머지 성분으로 걸음을 딛으므로 상태가
+                # 바뀌고, 다음 회차에는 그 자리를 벗어난다. Adam 의 모멘트도
+                # 오염되지 않는다 (0 은 유한하다).
                 for p in ps:
-                    p.grad = None
-                sch.step()
-                # **건너뛴 회차는 정체로 세지 않는다.** 걸음을 안 딛었으니 손실이
-                # 안 변하는 것이 당연한데, 그걸 "수렴" 으로 세면 비유한 기울기가
-                # 잦은 구간에서 단계가 통째로 조기 종료된다. 실측(v13/s040):
-                # 3 단계 42 회 중 27 회가 건너뛰어져 정체 30 이 먼저 찼고, 위상
-                # 단계의 **골짜기 한복판**에서 멈췄다 — 포락 90.63 -> 84.29 %.
-                # (위상 단계는 항상 한 번 꺾였다가 200 회에 걸쳐 회복한다:
-                #  room2/s040 은 92.34 -> 84.67 [50] -> 93.05 [199].)
+                    if p.grad is not None:
+                        torch.nan_to_num_(p.grad, nan=0.0, posinf=0.0, neginf=0.0)
+                # 정체 계수는 되돌린다 — 기울기 일부를 버린 회차의 정체는 수렴의
+                # 증거가 아니다 (§27: 위상 단계가 골짜기 한복판에서 멈췄다).
                 stall = stall_before
-                continue
             torch.nn.utils.clip_grad_norm_(ps, 5.0)
             opt.step(); sch.step()
             if verbose and (it % log_every == 0 or it == iters - 1):

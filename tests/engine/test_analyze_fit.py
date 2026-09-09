@@ -473,8 +473,42 @@ def test_articulator_velocity_penalty_spares_real_gestures(_engine):
     assert pg < 0.01 * ps
 
 
+def test_nonfinite_gradient_does_not_freeze_the_fit(_engine):
+    """비유한 기울기가 나도 **걸음은 딛어야 한다** — 안 그러면 결정적으로 갇힌다.
+
+    가드가 회차 전체를 버리면 파라미터가 안 변하고, 그러면 다음 회차의 기울기도
+    똑같이 비유한이다. 실측(out/sw/r000, yang_00000040 전체): 모든 단계가
+    "[30] 수렴 + 비유한 29 회 건너뜀" 으로 끝났다 — 단계당 실제 걸음이 1 번뿐이었고
+    포락이 82.7 % 에 머물렀다 (같은 파일의 정상 적합은 93.1 %).
+
+    비유한 **성분만** 0 으로 두면 나머지로 걸음을 딛으므로 그 자리를 벗어난다.
+    """
+    tr = _track(n=60)
+    target = _engine.render(tr)
+    f = CopySynthFitter(_engine, target, 48000, tr)
+    real_loss = f.loss
+
+    def poisoned():
+        l, sc, env_sc, per = real_loss()
+        return l + torch.sqrt((f.w * 0.0).sum()), sc, env_sc, per   # w 기울기가 ∞
+
+    # `fit` 은 끝에서 최선 스냅샷을 복원하므로(목표가 같은 트랙의 렌더라 0 회차가
+    # 최선이다) **도는 동안**의 파라미터를 봐야 한다.
+    seen = []
+
+    def watched():
+        seen.append(f.d.detach().clone())
+        return poisoned()
+
+    f.loss = watched
+    f.fit(iters=6, lr=0.05, verbose=False, patience=0)
+    assert len(seen) >= 3
+    moved = float((seen[-1] - seen[0]).abs().max())
+    assert moved > 1e-6, f"매 회차 비유한인데 파라미터가 안 움직였다 ({moved:.3g})"
+
+
 def test_skipped_iterations_do_not_count_as_convergence(_engine):
-    """비유한 기울기로 **건너뛴** 회차를 정체로 세면 안 된다.
+    """비유한 기울기가 든 회차를 정체로 세면 안 된다.
 
     걸음을 안 딛었으면 손실이 안 변하는 것이 당연한데 그걸 "수렴" 으로 세면, 비유한
     기울기가 잦은 구간에서 단계가 통째로 조기 종료된다. 실측(out/v13/s040): 위상
