@@ -81,13 +81,50 @@ def render(track, prof, seed=17):
         return eng.render(track)
 
 
+def _compare_target(stem: str) -> None:
+    """적합 결과의 목표·합성에 같은 자를 댄다. 마찰 구간을 트랙에서 찾아 잘라 쓴다."""
+    import soundfile as sf
+
+    from formant_ml.engine.control import INDEX
+
+    d = np.load(stem + "_track.npz")
+    vals, fm = d["values"], float(d["frame_ms"])
+    hop = int(round(fm * FS / 1000.0))
+    sel = (vals[:, INDEX["p_sub"]] > 2.0) & (vals[:, INDEX["a_c"]] < 0.5)
+    idx = np.where(sel)[0]
+    if not len(idx):
+        print("마찰 프레임이 없다"); return
+    runs = np.split(idx, np.where(np.diff(idx) > 5)[0] + 1)
+    hdr = "  ".join(f"{lo//1000}-{hi//1000}k".rjust(6) for lo, hi in BANDS)
+    print(f"{'구간':>18}  {hdr}   고역−중역")
+    for tag, path in (("목표", stem + "_target.wav"), ("합성", stem + "_fit.wav")):
+        y, sr = sf.read(path)
+        y = np.asarray(y.mean(1) if y.ndim > 1 else y, float)
+        for r in runs:
+            if len(r) < 80:
+                continue
+            i0 = max(0, (r[0] - 30) * hop)
+            i1 = min(len(y), (r[-1] + 30) * hop)
+            o = band_onsets(y[i0:i1])
+            cells = "  ".join(f"{v:6.0f}" for v in o)
+            print(f"{tag} {len(r):4d} ms 마찰  {cells}   {o[4] - o[1]:+7.0f} ms")
+    print("\n목표와 합성의 값을 나란히 볼 것 — 절대값의 합격선은 없다.")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--profile", default="profiles/yang_female.json")
     ap.add_argument("--dur", type=float, default=0.60)
     ap.add_argument("--rise", type=float, default=None, help="협착 전이 시간 [s] 강제")
+    ap.add_argument("--target", default=None, metavar="STEM",
+                    help="적합 결과(copyfit --out 값)의 목표·합성에 같은 자를 대서 "
+                         "나란히 본다. 이 자는 절대값의 합격선이 없으므로 "
+                         "**이 쪽이 본래 용도**다")
     a = ap.parse_args()
+    if a.target:
+        _compare_target(a.target)
+        return
     prof = SpeakerProfile.load(a.profile)
     from formant_ml.engine import noise as N, phones as P
 
