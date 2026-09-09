@@ -57,6 +57,20 @@ class EngineConfig:
         return int(round(self.sample_rate * self.frame_ms / 1000.0))
 
 
+# **성문 펄스의 하모닉 위상 분산 (rad @ 나이퀴스트).**
+#
+# `glottis.forward` 는 하모닉마다 위상 오프셋 `rps` 를 받도록 되어 있는데 **아무도
+# 넘기지 않고 있었다** (v1 에서 검증된 기능인데 v2 재구축에서 배선이 빠졌다).
+# 그래서 모든 하모닉이 LF 스펙트럼의 위상 그대로 정렬되고, 시간영역에서 날카로운
+# 펄스가 된다 — 실측: 고역 4~12 kHz 포락 첨도가 목표 27.2 인데 합성 42.3.
+#
+# 실제 성대는 딱딱하지 않고 점막파로 상하연이 시간차를 두고 닫히므로, 고역일수록
+# 지연이 커지는 **분산**이 생긴다. 그것을 이차 위상 `−D·(f/f_nyq)²` 로 준다
+# (= 주파수에 선형인 그룹 지연 = 시간축으로 퍼지는 chirp).
+#
+# 0 이면 항이 통째로 빠지므로 **거동이 예전과 완전히 같다.** 기본값은 실측으로 정한다.
+GLOTTAL_DISPERSION = 0.0
+
 class VoiceEngine(nn.Module):
     def __init__(self, cfg: EngineConfig | None = None, profile: SpeakerProfile | None = None):
         super().__init__()
@@ -77,6 +91,7 @@ class VoiceEngine(nn.Module):
                                 front_bw_slope=fbw)
         self.residual = ResidualCorrector(fs, hop) if self.cfg.residual else None
         self.reset()
+
 
     # ------------------------------------------------------------ 상태
     def reset(self) -> None:
@@ -101,6 +116,7 @@ class VoiceEngine(nn.Module):
         c = {name: ctrl[..., INDEX[name]] for name in PARAM_NAMES}
         f0i, s0 = st["frame"], st["frame"] * hop
         g = self.glottis(c, phase0=st["phase"], noise=self.noise, frame0=f0i,
+                         dispersion=GLOTTAL_DISPERSION,
                          amp0=st["amp"], state=st["glottis"], emit=t)
         fr = self.frication(c, g["ag_dc_frames"], g["phase"], g["voiced"], noise=self.noise,
                             frame0=f0i, state=st["fric"], emit=t, noise_am=g["noise_am"])

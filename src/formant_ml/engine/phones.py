@@ -139,7 +139,22 @@ class Builder:
         gain = 10 ** ((lvl - SIB_REF_DB) / 20.0)
         l1, l2, l3 = S.get("locus", [470.0, 1800.0, 2700.0])
         l2 = 0.5 * l2 + 0.5 * v2                       # 로커스는 뒤따르는 모음 쪽으로 당겨진다
-        rise, fall = 0.040, 0.018
+        # 협착 전이 시간. **길이에 비례해야 한다.**
+        #
+        # v1 은 혀 제스처를 `tongue_constriction` 으로 그렸다: 고원이 62 %
+        # (`TONGUE_SUSTAIN_HOLD`), 정점이 57 % (`TONGUE_CLOSE_FRAC`) 이므로 폐쇄가
+        # 21.7 %, 해제가 16.3 % 다. 그 비대칭이 곧 실측 상승/하강비 1.28~1.35 이고,
+        # "가청 포락선의 절반 이상이 페이드 인" 이 거기서 나온다.
+        #
+        # v2 는 40 / 18 ms 를 **절대값**으로 박아 두었다. 130 ms CV 에서는 31 / 14 %
+        # 라 대충 맞지만, 600 ms 로 끄는 /s/ 에서는 6.7 / 3 % 가 되어 혀가 순식간에
+        # 자세를 잡고 나머지를 고원으로 버틴다 — 페이드 인이 사라진다.
+        # 측정 (고역 11~16 kHz 가 중역 2~4 kHz 보다 늦게 서는 폭, 긴 /s/):
+        #   rise 40 ms +11 ms / 200 ms +53 ms / 500 ms +235 ms  (사람 127~296 ms)
+        #
+        # 그래서 비례로 두되 예전 값을 **바닥**으로 남긴다 — 짧은 CV 는 그대로다.
+        rise = max(0.040, 0.217 * dur)
+        fall = max(0.018, 0.163 * dur)
         # 경음은 성문을 덜 벌리고 빨리 닫는다 (Cho·Jun·Ladefoged 2002: /s'/ 의 성문 개대가 작다)
         adduct = 0.10 if tense else 0.06
         lead = self.ms(S.get("abduct_lead_ms", 35))
@@ -150,28 +165,64 @@ class Builder:
                  back_leak=S["back_leak"], front_len=self.p.sib_front_len_cm,
                  obstacle=S["obstacle"], fric_gain=gain, oral_open=1.0,
                  f1=l1, f2=l2, f3=l3, tract_gain=0.9)
-        self.add(t0 + rise, a_c=S["a_min"])
-        self.add(t0 + dur - fall, a_c=S["a_min"], adduction=adduct)
+        # **짧은 음절은 목표까지 못 간다** (undershoot). 뒤따르는 모음을 예기해
+        # 혀가 협착을 덜 만들고, 그만큼 제트가 굵어 앞니 다이폴이 약해지며 앞공동
+        # 극이 드러난다. v1 실측: 긴 /s/ 의 목표가 0.050 cm² 인데 CV 는 0.11 —
+        # 2.2 배 넓다 (`TONGUE_CV_A_MIN`). 그 값에서 봉우리 5276 Hz / 4~6 kHz
+        # 50.2 % 로 실측(4673~5556 Hz, 43~48 %) 안에 들어왔고, 0.050 을 쓰면
+        # 10218 Hz / 17 % 로 지속음과 구분이 안 됐다.
+        #
+        # 130 ms 급 음절에서 2.2 배, 400 ms 이상이면 목표 그대로. 그 사이는 선형.
+        under = 1.0 + 1.2 * min(max((0.40 - dur) / (0.40 - 0.13), 0.0), 1.0)
+        a_min = S["a_min"] * under
+        self.add(t0 + rise, a_c=a_min)
+        self.add(t0 + dur - fall, a_c=a_min, adduction=adduct)
         self.add(t0 + dur, a_c=3.0, obstacle=0.0, front_len=0.0, back_leak=0.3, fric_gain=gain)
         self.add(t0 + dur + lag, adduction=0.6, fric_gain=1.0)    # 성문은 늦게 닫힌다 → 기식 꼬리
         self.add(t0 + dur + 0.055, f1=v1, f2=v2, f3=v3, tract_gain=1.0)
         self.t = t0 + dur
         return self
 
-    def affricate(self, next_vowel="a", aspirated=False, tense=False):
+    def affricate(self, next_vowel="a", aspirated=False, tense=False, voiced=False):
         """/ㅈ, ㅊ, ㅉ/ — 폐쇄(구강압 축적) → 방전 버스트 → 마찰 → 기식 → 모음.
 
         실측: 개시가 10 ms 안에 −70 → −30 dB 로 서고, 그 뒤 100 ms 에 걸쳐 감쇠한다.
         ㅊ 의 해제 뒤 스펙트럼은 100 Hz~5 kHz 가 거의 **평탄**했다 — 마찰이 아니라 성문
         기식이 지배한다는 뜻이다. 그래서 격음은 성문을 협착보다 훨씬 늦게 닫는다.
+
+        `voiced` — 한국어 치찰음 중 **유성으로 실현되는 것은 ㅈ 하나**다(모음 사이).
+        그때 다른 것은 **성문 자세 하나**이고 나머지는 저절로 따라온다:
+
+        * 성문이 발성 자세로 남는다(내전 0.55). 그래서 성문 면적 Ag 가 작고,
+          직렬 오리피스에서 유량이 성문에 묶여 협착부 속도가 떨어진다 → 마찰이
+          약해진다. `series_flow` 가 이미 그렇게 계산한다.
+        * 폐쇄 뒤에 구강압 Po 가 오르는데 성문이 닫혀 있으니 경성문압차
+          (Ps − Po)가 빠르게 줄어 발성 역치 아래로 간다 — Ohala 의 **유성 저해음
+          공기역학 제약**이다. `noise.oral_cavity` 의 1 차 계가 그 감쇠를 낸다.
+          그래서 유성 마찰은 오래 못 간다: 마찰 구간을 짧게 잡는다.
+        * 기식 꼬리가 없다. 성문이 벌어진 적이 없으므로 `lag` 도 짧다.
+
+        즉 **따로 만든 소리가 아니라 같은 물리에 성문 자세만 바꾼 것**이다.
+        합성 결과 (여성 프로파일, 마찰 구간에서 잰 값):
+
+            무성 ㅈ  발성바(0-300 Hz) −43.1 dB  마찰대역(4-12 k)  −0.8 dB  주기성 38.2 %
+            유성 ㅈ                   −12.8              −20.9              95.4 %
+
+        내전 하나를 0.07 → 0.55 로 바꾼 것뿐인데 셋이 다 같이 움직인다.
+
+        .. note::
+           **세기는 아직 보정 전이다.** 방향(발성이 켜지고 마찰이 약해진다)은 물리가
+           내지만, 마찰이 20 dB 나 죽는 것이 실측과 맞는지는 확인하지 않았다.
+           모음 사이 ㅈ 토큰을 코퍼스에서 골라 같은 자로 재야 `adduct` 0.55 와
+           `fric` 0.050 s 를 확정할 수 있다.
         """
         S = self.p.sibilant
         v1, v2, v3 = self.V(next_vowel)
-        closure = 0.060
-        fric = 0.110 if aspirated else 0.080
+        closure = 0.050 if voiced else 0.060
+        fric = 0.110 if aspirated else (0.050 if voiced else 0.080)
         front = self.p.sib_front_len_cm * 1.25
-        adduct = 0.10 if tense else (0.03 if aspirated else 0.07)
-        lag = self.ms(20 if tense else (110 if aspirated else 55))
+        adduct = 0.55 if voiced else (0.10 if tense else (0.03 if aspirated else 0.07))
+        lag = self.ms(10 if voiced else (20 if tense else (110 if aspirated else 55)))
         lvl = S.get("aspirated_level_db" if aspirated else "affricate_level_db", -7.0)
         gain = 10 ** ((lvl - SIB_REF_DB) / 20.0)
         l1, l2, l3 = S.get("locus", [470.0, 1800.0, 2700.0])
@@ -273,6 +324,14 @@ def ma(profile=None, f0=None, p_sub=None) -> ControlTrack:
 def ja(profile=None, f0=None, p_sub=None) -> ControlTrack:
     b = _b(profile, f0, p_sub); f = b.f0
     b.affricate("a"); b.vowel("a", f0_end=f * 0.85, final=True); b.silence()
+    return b.build()
+
+
+def aja(profile=None, f0=None, p_sub=None) -> ControlTrack:
+    """/아ㅈ아/ — **유성** 치찰음. 모음 사이의 ㅈ 하나만 이렇게 실현된다."""
+    b = _b(profile, f0, p_sub); f = b.f0
+    b.vowel("a"); b.affricate("a", voiced=True)
+    b.vowel("a", f0_end=f * 0.85, final=True); b.silence()
     return b.build()
 
 

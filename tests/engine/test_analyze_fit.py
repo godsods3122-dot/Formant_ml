@@ -374,3 +374,45 @@ def test_probe_prefers_the_lr_that_actually_converges(_engine):
     f.sizes = [256, 512]
     lr = f.pick_lr_global((0.05, 3.0), 25, verbose=False)
     assert lr == 0.05, lr                     # 3.0 은 발산한다
+
+
+def test_ripple_penalty_bites_ripple_and_spares_articulation(_engine):
+    """잔물결 벌점의 **선택성** — 여기가 깨지면 조음을 뭉개고 잔물결을 놓친다.
+
+    같은 크기의 요동이라도 **빠르게 방향을 바꾸는 것**(F0 부근의 잔물결)은 크게,
+    **한 방향으로 가는 급전**(파열음 해제 같은 조음)은 거의 안 물어야 한다.
+    docs/MEASUREMENTS.md §16 이 이 성질에 통째로 기대고 있다.
+    """
+    from formant_ml.engine import fit as F
+
+    tr = _track(n=200)
+    target = _engine.render(tr)
+    f = CopySynthFitter(_engine, target, 48000, tr)
+    old = F.RIPPLE_W
+    F.RIPPLE_W = 1.0
+    try:
+        with torch.no_grad():
+            base = float(f.penalty())
+            t = np.arange(f.w.shape[0])
+            # (a) F0 부근(200 Hz, 격자 1 ms)의 잔물결. 진폭 0.1 걸음.
+            f.w.copy_(torch.zeros_like(f.w))
+            f.w[:, 0] = torch.as_tensor(0.1 * np.cos(2 * np.pi * 0.2 * t),
+                                        dtype=f.w.dtype)
+            ripple = float(f.penalty()) - base
+            # (b) 같은 진폭의 **조음** — 20 ms 에 걸친 단조 전이.
+            f.w.copy_(torch.zeros_like(f.w))
+            ramp = np.clip((t - 90) / 20.0, 0.0, 1.0) * 0.1
+            f.w[:, 0] = torch.as_tensor(ramp, dtype=f.w.dtype)
+            move = float(f.penalty()) - base
+        assert ripple > 50.0 * max(move, 1e-9)
+    finally:
+        F.RIPPLE_W = old
+        with torch.no_grad():
+            f.w.copy_(torch.zeros_like(f.w))
+
+
+def test_ripple_penalty_is_off_by_default():
+    """기본값이 0 이어야 한다 — A/B 로 세기를 정하기 전에는 거동을 안 바꾼다."""
+    from formant_ml.engine import fit as F
+    assert F.RIPPLE_W == 0.0
+    assert F.GAIN_ACC_W == 0.0

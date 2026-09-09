@@ -34,7 +34,7 @@ import soundfile as sf
 import torch
 
 from formant_ml.engine.analyze import analyze
-from formant_ml.engine.control import PARAM_NAMES
+from formant_ml.engine.control import INDEX, PARAM_NAMES
 from formant_ml.engine.denoise import denoise, noise_profile, snr_report
 from formant_ml.engine.fit import CopySynthFitter
 from formant_ml.engine.profile import DEFAULT_PROFILE, SpeakerProfile
@@ -80,8 +80,22 @@ def main() -> None:
     ap.add_argument("--patience", type=int, default=0,
                     help="이 회차 동안 손실이 안 줄면 그 단계를 끝낸다 (0 = 끔). "
                          "긴 음원에서는 켜는 편이 낫다 — 수렴한 단계에 예산을 다 쓴다")
+    ap.add_argument("--gain-acc", type=float, default=None,
+                    help="이득류(tract_gain/fric_gain/aspiration)의 가속도 벌점 세기. "
+                         "마찰 구간에서 적합기가 못 맞출 난류 요동을 이득으로 좇는 것을 "
+                         "막는다 (fit.GAIN_ACC_W). 생략하면 모듈 기본값")
+    ap.add_argument("--ripple", type=float, default=None,
+                    help="제어열 잔물결 벌점 세기 (fit.RIPPLE_W). 조음 대역(0~20 Hz) "
+                         "위에서 트랙이 흔들리는 것만 문다 — 지지직과 저역 초과가 "
+                         "둘 다 여기서 온다 (docs/MEASUREMENTS.md §13, §16)")
     a = ap.parse_args()
     torch.set_num_threads(a.threads)
+    if a.gain_acc is not None or a.ripple is not None:
+        from formant_ml.engine import fit as _fit
+        if a.gain_acc is not None:
+            _fit.GAIN_ACC_W = float(a.gain_acc)
+        if a.ripple is not None:
+            _fit.RIPPLE_W = float(a.ripple)
 
     y, sr = sf.read(a.wav)
     if y.ndim > 1:
@@ -154,6 +168,28 @@ def main() -> None:
     print(f"  치찰도   {c['target']['sibilance']:7.1f} -> {c['synth']['sibilance']:7.1f} dB "
           f"({c['sibilance_err']:+.1f})   대역 MAE {c['band_mae_db']:.2f} dB   "
           f"변조 MAE {c['mod_mae_pct']:.1f} %p")
+
+    # 지글거림 — **마찰 프레임만** 골라 고역 포락의 변조 지수를 목표와 나눈다.
+    # 위의 "변조 MAE" 는 파일 전체를 대역별 백분율로 재므로 마찰 구간의 맥동이
+    # 유성 구간에 묻힌다 (docs/MEASUREMENTS.md §13).
+    ac = res.values[:, INDEX["a_c"]]
+    ps = res.values[:, INDEX["p_sub"]]
+    f0v = res.values[:, INDEX["f0_target"]]
+    hop48 = int(round(res.frame_ms * 48000.0 / 1000.0))
+    for label, sel in (("마찰", (ps > 2.0) & (ac < 0.5)),
+                       ("유성", (ps > 2.0) & (ac > 1.0))):
+        if sel.sum() < 20:
+            continue
+        f0m = float(np.median(f0v[sel]))
+        mb = [(0.8 * f0m, 2.5 * f0m), (60.0, 150.0), (150.0, 400.0)]
+        msk = np.repeat(sel.astype(float), hop48)
+        tgt48 = fit.target[0].numpy()
+        vt, lt = tb.env_modulation_index(tgt48, 48000.0, msk, mb)
+        vs, ls = tb.env_modulation_index(out, 48000.0, msk, mb)
+        r = vs / np.maximum(vt, 1e-30)
+        print(f"  지글거림({label} {sel.mean()*100:2.0f}%, F0 {f0m:.0f} Hz)  "
+              f"F0대역 {r[0]:5.2f}x  60-150 {r[1]:5.2f}x  150-400 {r[2]:5.2f}x   "
+              f"대역레벨 {lt:.1f} -> {ls:.1f} dB")
 
     print("\n움직인 파라미터 (초기 중앙값 -> 적합 중앙값)")
     for n, x, z in fit.moved():

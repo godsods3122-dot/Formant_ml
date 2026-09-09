@@ -216,23 +216,71 @@ def test_effective_bandwidth_leaves_full_band_alone():
     assert tb.effective_bandwidth(x, FS) >= 0.49 * FS
 
 
-def test_effective_bandwidth_finds_a_lowpass():
-    """저역통과가 걸린 신호에서 상한을 찾는다 (보수적으로 — 실제보다 높게 잡는다)."""
+def test_effective_bandwidth_is_conservative_on_an_analog_lowpass():
+    """아날로그 저역통과는 **자르지 않거나 보수적으로만** 잡는다.
+
+    이 도구의 목적은 손실 압축의 브릭월이다. 완만한 전이대역을 컷으로 읽으면 진짜
+    신호를 버리므로, 애매하면 안 자르는 쪽이 옳다.
+    """
     from scipy.signal import butter, sosfilt
     x = np.random.default_rng(0).standard_normal(int(FS * 0.4))
     sos = butter(8, 12000 / (FS / 2), btype="low", output="sos")
-    bw = tb.effective_bandwidth(sosfilt(sos, x), FS)
-    assert 12000.0 <= bw < 0.45 * FS         # 진짜 신호를 버리지 않는다
-    # 더 낮게 자르면 더 낮게 검출해야 한다
-    sos2 = butter(8, 8000 / (FS / 2), btype="low", output="sos")
-    assert tb.effective_bandwidth(sosfilt(sos2, x), FS) < bw
+    assert tb.effective_bandwidth(sosfilt(sos, x), FS) >= 12000.0
 
 
-def test_effective_bandwidth_on_a_brickwall():
-    """손실 압축의 컷오프는 급격하다 — 그런 모양에서 정확해야 한다."""
+def test_effective_bandwidth_never_returns_less_than_the_real_band():
+    """**틀리더라도 높은 쪽으로 틀려야 한다.** 낮게 자르면 진짜 신호를 버린다.
+
+    이 함수는 진단용이고 적합 손실의 상한으로 쓰지 않는다 (`CopySynthFitter` 참조) —
+    합성 신호의 자연 롤오프를 컷으로 오인한 전력이 있기 때문이다. 그래서 여기서
+    지키는 것은 정확도가 아니라 **한쪽으로만 틀리는 성질**이다.
+    """
     n = int(FS * 0.4)
-    X = np.fft.rfft(np.random.default_rng(1).standard_normal(n))
     f = np.fft.rfftfreq(n, 1 / FS)
-    X[f > 16000.0] = 0.0
-    bw = tb.effective_bandwidth(np.fft.irfft(X, n), FS)
-    assert 15000.0 < bw < 17500.0
+    for cut in (12000.0, 16000.0, 20000.0):
+        X = np.fft.rfft(np.random.default_rng(1).standard_normal(n))
+        X[f > cut] = 0.0
+        assert tb.effective_bandwidth(np.fft.irfft(X, n), FS) >= cut * 0.95
+
+
+def test_effective_bandwidth_ignores_a_natural_rolloff():
+    """**자연스러운 고역 롤오프를 컷으로 오인하면 안 된다.**
+
+    음성은 소스 기울기(−12 dB/oct) 때문에 고역이 원래 완만히 떨어진다. 레벨만 보고
+    자르면 진짜 신호를 버린다 — 실측으로 합성 음성에서 9.96 kHz 를 상한이라고 답한
+    적이 있다 (`test_loss_ignores_bands_above_the_recording_nyquist` 가 깨졌다).
+    """
+    n = int(FS * 0.4)
+    f = np.fft.rfftfreq(n, 1 / FS)
+    X = np.fft.rfft(np.random.default_rng(2).standard_normal(n))
+    X = X * (1.0 / (1.0 + (f / 2000.0) ** 2))       # −12 dB/oct 에 가까운 기울기
+    assert tb.effective_bandwidth(np.fft.irfft(X, n), FS) >= 0.49 * FS
+
+
+def test_env_modulation_index_isolates_the_modulation_frequency():
+    """변조 지수는 **그 대역만** 올라야 한다 — 아니면 원인을 못 가른다.
+
+    지지직 진단이 이 특이성에 통째로 걸려 있다. 대조군(가우시안 대역잡음) 대비
+    200 Hz AM 을 걸면 200~600 Hz 만 커지고 60~150 Hz 는 그대로여야 한다.
+    """
+    rng = np.random.default_rng(0)
+    fs, n = 48000.0, 24000
+    x = rng.standard_normal(n)
+    mask = np.zeros(n)
+    mask[: n // 2] = 1.0
+    bands = [(200.0, 600.0), (60.0, 150.0)]
+    base, lvl = tb.env_modulation_index(x, fs, mask, bands)
+    t = np.arange(n) / fs
+    am, _ = tb.env_modulation_index(x * (1 + 0.5 * np.cos(2 * np.pi * 200 * t)),
+                                    fs, mask, bands)
+    assert am[0] / base[0] > 3.0          # 변조 대역은 크게 오른다
+    assert am[1] / base[1] < 1.5          # 다른 대역은 거의 그대로
+    assert np.isfinite(lvl)
+
+
+def test_env_modulation_index_needs_enough_masked_samples():
+    """마스크가 거의 비면 값을 지어내지 말고 NaN 을 내야 한다."""
+    fs, n = 48000.0, 4800
+    v, lvl = tb.env_modulation_index(np.random.default_rng(1).standard_normal(n),
+                                     fs, np.zeros(n), [(60.0, 150.0)])
+    assert np.isnan(v).all() and np.isnan(lvl)

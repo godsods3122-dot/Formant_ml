@@ -76,3 +76,38 @@ def test_phrase_has_expected_syllable_count_and_duration(prof):
     assert 0.85 < tr.seconds() < 1.1               # 실측 0.83 s + 무음
     a_c = tr["a_c"]
     assert (a_c < 0.3).any() and (tr["lat_z1"] > 0).any() and (tr["velum"] > 0.5).any()
+
+
+def test_voiced_affricate_turns_on_voicing_and_weakens_frication():
+    """유성 ㅈ 은 **성문 자세 하나**로 갈려야 한다 — 따로 만든 소리가 아니다.
+
+    내전만 0.07 -> 0.55 로 바꾸면 직렬 오리피스 모형이 나머지를 낸다:
+    성문 면적이 작아 유량이 묶이고 협착부 속도가 떨어져 마찰이 약해지며,
+    성대가 계속 울리므로 저역에 발성 바가 선다. 이 결합이 끊기면 유성 저해음의
+    공기역학(Ohala)이 모형에서 사라진 것이다.
+    """
+    from formant_ml.engine.control import INDEX
+    prof = SpeakerProfile.load("profiles/yang_female.json")
+    eng = VoiceEngine(EngineConfig(seed=17), profile=prof)
+    fs = 48000.0
+
+    def fric_bands(fn):
+        tr = fn(prof)
+        with torch.no_grad():
+            y = eng.render(tr)
+        ac = tr.values[:, INDEX["a_c"]]
+        hop = int(round(tr.frame_ms * fs / 1000))
+        sel = (ac < 0.7) & (ac > 1e-3)
+        i0 = int(np.argmax(sel))
+        i1 = len(sel) - int(np.argmax(sel[::-1]))
+        s = y[i0 * hop:i1 * hop]
+        Y = np.abs(np.fft.rfft(s * np.hanning(len(s)))) ** 2
+        f = np.fft.rfftfreq(len(s), 1 / fs)
+        tot = Y.sum() + 1e-20
+        return (10 * np.log10(Y[f < 300].sum() / tot + 1e-20),
+                10 * np.log10(Y[(f >= 4000) & (f < 12000)].sum() / tot + 1e-20))
+
+    lo_u, hi_u = fric_bands(phones.ja)
+    lo_v, hi_v = fric_bands(phones.aja)
+    assert lo_v - lo_u > 15.0        # 발성 바가 선다
+    assert hi_u - hi_v > 8.0         # 마찰이 약해진다
