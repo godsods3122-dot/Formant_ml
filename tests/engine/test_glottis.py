@@ -120,3 +120,45 @@ def test_aspiration_is_attenuated_by_the_oral_constriction():
     assert db < -20.0                    # 좁으면 크게 준다
     assert db > -35.0                    # 그러나 **이중으로** 깎지는 않는다
     assert asp_for(NEUTRAL_TRACT_AREA) == open_   # 풀리면 정확히 되돌아온다
+
+
+def test_tilt_shelf_keeps_the_pulse_from_becoming_a_square_wave():
+    """`tilt` 이 나이퀴스트까지 오르면 성문 펄스가 **사각파처럼 날카로워진다.**
+
+    tilt 은 하모닉마다 10^(tilt·log2(f/1kHz)/20) 을 곱하는 거듭제곱이라, 상한이
+    없으면 적합값 +4.8 dB/oct 에서 16 kHz 에 +23 dB 가 걸린다. 실측 |Δdu|max/rms:
+    이상적 LF 1.99 → 상한 없음 **12.47** → 5 kHz 셸프 3.82 (docs/MEASUREMENTS §25).
+
+    성대는 부드러운 물질이라 그런 소스를 못 낸다. 이 테스트는 셸프가 실제로 물고
+    있는지를 건다.
+    """
+    import numpy as np
+    import torch
+
+    from formant_ml.engine import glottis as G
+
+    fs, hop, n = 48000.0, 48, 400
+    g = G.GlottalSource(fs, hop)
+    c = {k: torch.full((1, n), v) for k, v in
+         dict(p_sub=7.0, adduction=0.6, tension=0.5, f0_target=200.0, rd_offset=0.0,
+              f0_scale=1.0, aspiration=1.0, a_c=3.0, jitter=0.0, shimmer=0.0,
+              tilt=6.0).items()}
+
+    def sharpness(cap):
+        old = G.TILT_MAX_HZ
+        G.TILT_MAX_HZ = cap
+        try:
+            with torch.no_grad():
+                du = g(c)["du"][0].numpy()
+        finally:
+            G.TILT_MAX_HZ = old
+        s = du[len(du) // 4:]
+        return float(np.abs(np.diff(s)).max() / (s.std() + 1e-12))
+
+    flat = sharpness(0.0)          # 상한 없음
+    shelf = sharpness(5000.0)
+    c["tilt"] = torch.zeros_like(c["tilt"])
+    base = sharpness(0.0)          # tilt 자체가 없는 LF 그대로
+    # 셸프는 LF 본래 모양 쪽으로 되돌려야 한다.
+    assert abs(shelf - base) < 0.7 * abs(flat - base)
+    assert G.TILT_MAX_HZ == 5000.0     # 기본으로 켜져 있어야 한다
