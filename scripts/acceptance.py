@@ -22,6 +22,11 @@
 4. **지터 낮음.** 적합이 내놓은 `jitter`·`shimmer` 궤적의 중앙값. 이 값이 곧
    학습 데이터로 나가는 물리량이다. 사람의 모달 발성은 지터 0.2~1 % 다.
 
+조건 2 에는 **F0 아래 초과**를 같이 잰다. 성문 소스는 k·F0 의 합이라 F0 아래에
+아무것도 없어야 하는데, 제어열이 프레임마다 흔들리면 그 변조가 F0 의 아래쪽 측대역이
+되어 DC 까지 접힌다 (MEASUREMENTS §26). 그 대역은 총에너지의 1 % 도 안 되므로
+**멜 포락 손실에는 안 보이지만 귀에는 거칠기로 들린다** — 그래서 따로 잰다.
+
 합격선은 `THRESHOLDS` 에 있고, 근거는 각 항목의 주석에 적었다.
 """
 from __future__ import annotations
@@ -59,6 +64,10 @@ THRESHOLDS = dict(
     env_r=0.95, env_rms_db=2.0,
     # 지터·시머 [비율]. 사람 모달 발성 0.2~1 % / 시머 2~5 %.
     jitter=0.010, shimmer=0.050,
+    # F0 **아래** 대역의 초과 [dB]. 하모닉이 원리적으로 없는 자리이므로 목표와 같아야
+    # 한다. 측정 잡음(방·코덱·잡음제거 잔여)이 있으므로 3 dB 를 준다 — 실측에서
+    # 잔물결이 살아 있으면 +15~+27 dB 가 나온다(§26.1).
+    subf0_excess_db=3.0,
 )
 
 
@@ -118,6 +127,34 @@ def envelope_db(x, win_ms):
     return 10 * np.log10((x[:m * w] ** 2).reshape(m, w).mean(1) + 1e-20)
 
 
+def subf0_excess(tgt, syn, live, f0_hz, n_fft=4096, hop=1024):
+    """F0 **아래** 대역에서 합성이 목표보다 몇 dB 더 있는가.
+
+    성문 소스는 k·F0 의 코사인 합이라 F0 아래에는 하모닉이 없다. 거기 남는 것은
+    잡음 바닥과 **제어열 변조의 아래쪽 측대역**뿐이다. 방·코덱이 만드는 차이를
+    피하려고 40 Hz 아래는 빼고, 0.75·F0 위도 뺀다 (F0 자체의 어깨가 섞인다).
+
+    전체 레벨 차이에 오염되지 않게 **하모닉 대역(F0~4·F0)으로 정규화한 뒤** 뺀다.
+    """
+    w = np.hanning(n_fft + 1)[:n_fft]
+    t = max(1, 1 + (len(tgt) - n_fft) // hop)
+    if t < 2:
+        return float("nan")
+    keep = [i for i in range(t)
+            if live[min(int(i * hop / 240), len(live) - 1)]]
+    if len(keep) < 2:
+        keep = list(range(t))
+    f = np.fft.rfftfreq(n_fft, 1.0 / FS)
+    lo = (f >= 40.0) & (f <= 0.75 * f0_hz)
+    ref = (f >= f0_hz * 0.9) & (f <= 4.0 * f0_hz)
+    out = []
+    for x in (tgt, syn):
+        fr = np.stack([x[i * hop:i * hop + n_fft] * w for i in keep])
+        P = (np.abs(np.fft.rfft(fr, axis=-1)) ** 2).mean(0)
+        out.append(10 * np.log10(P[lo].mean() / max(P[ref].mean(), 1e-30) + 1e-30))
+    return float(out[1] - out[0])
+
+
 def _r(a, b):
     n = min(len(a), len(b))
     a, b = a[:n], b[:n]
@@ -167,13 +204,19 @@ def check(stem: str) -> dict:
     out["env100_r"] = _r(e2t[:k2], e2s[:k2])
 
     voiced = ps > 2.0
+    f0v = v[voiced, INDEX["f0_target"]]
+    f0v = f0v[f0v > 0]
+    f0m = float(np.median(f0v)) if len(f0v) else 200.0
+    out["subf0_excess_db"] = subf0_excess(tgt, syn, lf, f0m)
+    out["_f0"] = f0m
     out["jitter"] = float(np.median(v[voiced, INDEX["jitter"]]))
     out["shimmer"] = float(np.median(v[voiced, INDEX["shimmer"]]))
     return out
 
 
 LOWER_IS_BETTER = {"flux_p95_ratio", "flux_over_pct", "band_mae_db", "centroid_err_hz",
-                   "tilt_err_db", "env_rms_db", "jitter", "shimmer"}
+                   "tilt_err_db", "env_rms_db", "jitter", "shimmer",
+                   "subf0_excess_db"}
 
 
 def report(stem: str, res: dict) -> bool:
@@ -182,7 +225,7 @@ def report(stem: str, res: dict) -> bool:
     ok_all = True
     groups = (("1 세로 얼룩", ("flux_p95_ratio", "flux_over_pct")),
               ("2 스펙트럼·추이", ("band_mae_db", "centroid_r", "centroid_err_hz",
-                                  "tilt_r", "tilt_err_db")),
+                                  "tilt_r", "tilt_err_db", "subf0_excess_db")),
               ("3 장기 추이곡선", ("env_r", "env_rms_db")),
               ("4 지터", ("jitter", "shimmer")))
     for title, keys in groups:
@@ -193,7 +236,7 @@ def report(stem: str, res: dict) -> bool:
             ok_all &= bool(ok)
             print(f"    {'OK ' if ok else '**' } {k:18s} {got:9.3f}   "
                   f"{'≤' if k in LOWER_IS_BETTER else '≥'} {want}")
-    print(f"    (참고) env100_r {res['env100_r']:.3f}")
+    print(f"    (참고) env100_r {res['env100_r']:.3f}   F0 중앙 {res['_f0']:.0f} Hz")
     return ok_all
 
 

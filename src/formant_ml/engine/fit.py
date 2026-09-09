@@ -37,6 +37,8 @@
 """
 from __future__ import annotations
 
+import os
+
 import math
 from dataclasses import dataclass, field
 
@@ -257,6 +259,9 @@ PRIOR_W: dict[str, float] = {
     "jitter": 0.1, "shimmer": 0.1,
 }
 F_MARGIN_HZ = 120.0        # 인접 포먼트 최소 간격
+
+#: 비유한 기울기가 났을 때 어느 파라미터·격자점인지 찍는다 (느리지 않다 — 났을 때만).
+DEBUG_NONFINITE = bool(os.environ.get("FORMANT_ML_DEBUG_NONFINITE"))
 
 # 프레임별 적합의 **한 걸음 크기**(raw 좌표). Adam 은 기울기 크기와 무관하게 lr 만큼
 # 걷기 때문에, 모든 파라미터에 같은 lr 을 주면 F0 가 한 걸음에 11 % 씩 뛴다(실측:
@@ -768,6 +773,28 @@ class CopySynthFitter:
         """clamp_min 의 부드러운 대체. floor + softplus(x − floor)."""
         return floor + width * torch.nn.functional.softplus((x - floor) / width)
 
+    def _report_nonfinite(self, it: int, ps, names) -> None:
+        """비유한 기울기가 **어느 파라미터의 어느 프레임**에서 나는지 찍는다.
+
+        `w` 는 (Tc, P_fit) 이므로 열 = 파라미터, 행 = 격자점이다. 열 이름을 붙여
+        주면 원인 파라미터가 바로 보인다. `FORMANT_ML_DEBUG_NONFINITE=1` 로 켠다.
+        """
+        for nm, p in zip(names, ps):
+            if p.grad is None or torch.isfinite(p.grad).all():
+                continue
+            bad = ~torch.isfinite(p.grad)
+            if p.grad.dim() == 2:
+                cols = bad.any(0).nonzero().flatten().tolist()
+                rows = bad.any(1).nonzero().flatten().tolist()
+                who = [self.names[c] for c in cols if c < len(self.names)]
+                print(f"    [{it}] 비유한 {nm}: 파라미터 {who}  "
+                      f"격자점 {rows[:8]}{'...' if len(rows) > 8 else ''} "
+                      f"({len(rows)}/{p.grad.shape[0]})", flush=True)
+            else:
+                idx = bad.nonzero().flatten().tolist()
+                who = [self.names[c] for c in idx if c < len(self.names)] if nm == "d" else idx
+                print(f"    [{it}] 비유한 {nm}: {who}", flush=True)
+
     @staticmethod
     def _pseudo_huber(r: torch.Tensor) -> torch.Tensor:
         """후버의 매끄러운 형태. torch.where 는 1 차 도함수만 이어져 C² 가 아니다.
@@ -911,6 +938,7 @@ class CopySynthFitter:
                     if verbose:
                         print(f"    [{it}] 수렴 ({patience} 회 정체) — 조기 종료")
                     break
+            stall_before = stall
             l.backward()
             ps = [self.w, self.d, self.log_gain, self.pulse_phi0]
             # **비유한 기울기로 걸음을 딛으면 안 된다.** Adam 의 모멘트가 NaN 으로
@@ -918,9 +946,19 @@ class CopySynthFitter:
             # 터진다(실측: 탄음 구간에서 int(NaN)). 그런 회차는 건너뛴다.
             if any(p.grad is not None and not torch.isfinite(p.grad).all() for p in ps):
                 bad_grads += 1
+                if DEBUG_NONFINITE:
+                    self._report_nonfinite(it, ps, ["w", "d", "log_gain", "pulse_phi0"])
                 for p in ps:
                     p.grad = None
                 sch.step()
+                # **건너뛴 회차는 정체로 세지 않는다.** 걸음을 안 딛었으니 손실이
+                # 안 변하는 것이 당연한데, 그걸 "수렴" 으로 세면 비유한 기울기가
+                # 잦은 구간에서 단계가 통째로 조기 종료된다. 실측(v13/s040):
+                # 3 단계 42 회 중 27 회가 건너뛰어져 정체 30 이 먼저 찼고, 위상
+                # 단계의 **골짜기 한복판**에서 멈췄다 — 포락 90.63 -> 84.29 %.
+                # (위상 단계는 항상 한 번 꺾였다가 200 회에 걸쳐 회복한다:
+                #  room2/s040 은 92.34 -> 84.67 [50] -> 93.05 [199].)
+                stall = stall_before
                 continue
             torch.nn.utils.clip_grad_norm_(ps, 5.0)
             opt.step(); sch.step()
