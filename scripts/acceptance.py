@@ -19,8 +19,15 @@
 
 3. **파형 장기 추이곡선 일치.** 25 ms / 100 ms rms 포락선의 상관과 dB 오차.
 
-4. **지터 낮음.** 적합이 내놓은 `jitter`·`shimmer` 궤적의 중앙값. 이 값이 곧
-   학습 데이터로 나가는 물리량이다. 사람의 모달 발성은 지터 0.2~1 % 다.
+4. **지터 낮음.** 두 가지를 같이 본다.
+
+   (a) 적합이 내놓은 `jitter`·`shimmer` 궤적의 중앙값 — 이 값이 곧 학습 데이터로
+       나가는 물리량이다. 사람의 모달 발성은 지터 0.2~1 % 다.
+   (b) **실현 지터** — 합성음의 성문 펄스열에서 직접 잰 국소 지터를 **목표의 그것과
+       비교**한다. (a) 는 파라미터일 뿐이고 실제로 소리에 실린 요동이 아니기
+       때문이다: `f0_target` 이 펄스에서 온 비평활 트랙이라 화자의 실제 지터를 이미
+       담고 있어서, `jitter`=0 에서도 목표만큼의 지터가 나온다 (MEASUREMENTS §28).
+       그러니 "낮다" 가 아니라 **"목표와 같다"** 가 맞는 조건이다.
 
 조건 2 에는 **F0 아래 초과**를 같이 잰다. 성문 소스는 k·F0 의 합이라 F0 아래에
 아무것도 없어야 하는데, 제어열이 프레임마다 흔들리면 그 변조가 F0 의 아래쪽 측대역이
@@ -64,6 +71,10 @@ THRESHOLDS = dict(
     env_r=0.95, env_rms_db=2.0,
     # 지터·시머 [비율]. 사람 모달 발성 0.2~1 % / 시머 2~5 %.
     jitter=0.010, shimmer=0.050,
+    # 실현 지터의 **목표 대비 비**. 1.0 이 "목표와 똑같이 흔들린다". 목표보다 크게
+    # 흔들리면 거칠게 들리고, 작으면 기계적으로 들린다. 추정기 자체의 흩어짐이
+    # 있으므로 ±35 % 를 준다 (실측: 같은 트랙 재렌더에서 1.61~1.68 %).
+    jitter_ratio=1.35,
     # F0 **아래** 대역의 초과 [dB]. 하모닉이 원리적으로 없는 자리이므로 목표와 같아야
     # 한다. 측정 잡음(방·코덱·잡음제거 잔여)이 있으므로 3 dB 를 준다 — 실측에서
     # 잔물결이 살아 있으면 +15~+27 dB 가 나온다(§26.1).
@@ -155,6 +166,34 @@ def subf0_excess(tgt, syn, live, f0_hz, n_fft=4096, hop=1024):
     return float(out[1] - out[0])
 
 
+def realized_jitter(x, f0_lo=70.0, f0_hi=500.0):
+    """성문 펄스열에서 직접 잰 **국소 지터** [%] — mean|T_i−T_{i+1}| / mean(T) 의 중앙값.
+
+    Praat 의 PointProcess (cc) 를 쓴다. 부분 표본 정밀도라 48 kHz 격자의 양자화가
+    지터로 새지 않는다. 유성이 끊긴 자리는 주기 범위로 걸러 낸다.
+    """
+    try:
+        import parselmouth
+        from parselmouth.praat import call
+    except Exception:
+        return float("nan")
+    snd = parselmouth.Sound(np.asarray(x, np.float64), int(FS))
+    pt = snd.to_pitch(time_step=0.001, pitch_floor=max(60.0, f0_lo * 0.6),
+                      pitch_ceiling=f0_hi * 1.3)
+    pp = call([snd, pt], "To PointProcess (cc)")
+    n = int(call(pp, "Get number of points"))
+    if n < 6:
+        return float("nan")
+    p = np.array([call(pp, "Get time from index", i + 1) for i in range(n)])
+    T = np.diff(p)
+    ok = (T > 1.0 / f0_hi) & (T < 1.0 / f0_lo)
+    good = ok[:-1] & ok[1:]
+    if good.sum() < 10:
+        return float("nan")
+    d = np.abs(np.diff(T))[good]
+    return float(100.0 * np.median(d / T[:-1][good]))
+
+
 def _r(a, b):
     n = min(len(a), len(b))
     a, b = a[:n], b[:n]
@@ -209,6 +248,9 @@ def check(stem: str) -> dict:
     f0m = float(np.median(f0v)) if len(f0v) else 200.0
     out["subf0_excess_db"] = subf0_excess(tgt, syn, lf, f0m)
     out["_f0"] = f0m
+    jt, js = realized_jitter(tgt), realized_jitter(syn)
+    out["_jit"] = (jt, js)
+    out["jitter_ratio"] = float(js / jt) if jt and np.isfinite(jt) and jt > 0 else float("nan")
     out["jitter"] = float(np.median(v[voiced, INDEX["jitter"]]))
     out["shimmer"] = float(np.median(v[voiced, INDEX["shimmer"]]))
     return out
@@ -227,16 +269,22 @@ def report(stem: str, res: dict) -> bool:
               ("2 스펙트럼·추이", ("band_mae_db", "centroid_r", "centroid_err_hz",
                                   "tilt_r", "tilt_err_db", "subf0_excess_db")),
               ("3 장기 추이곡선", ("env_r", "env_rms_db")),
-              ("4 지터", ("jitter", "shimmer")))
+              ("4 지터", ("jitter", "shimmer", "jitter_ratio")))
     for title, keys in groups:
         print(f"  {title}")
         for k in keys:
             got, want = res[k], THRESHOLDS[k]
-            ok = (got <= want) if k in LOWER_IS_BETTER else (got >= want)
+            if k == "jitter_ratio":
+                # 1 을 가운데 두고 양쪽으로 본다 — 크면 거칠고 작으면 기계적이다.
+                ok = np.isfinite(got) and (1.0 / want) <= got <= want
+            else:
+                ok = (got <= want) if k in LOWER_IS_BETTER else (got >= want)
             ok_all &= bool(ok)
-            print(f"    {'OK ' if ok else '**' } {k:18s} {got:9.3f}   "
-                  f"{'≤' if k in LOWER_IS_BETTER else '≥'} {want}")
-    print(f"    (참고) env100_r {res['env100_r']:.3f}   F0 중앙 {res['_f0']:.0f} Hz")
+            rel = (f"{1/want:.2f}~{want}" if k == "jitter_ratio"
+                   else f"{'≤' if k in LOWER_IS_BETTER else '≥'} {want}")
+            print(f"    {'OK ' if ok else '**' } {k:18s} {got:9.3f}   {rel}")
+    print(f"    (참고) env100_r {res['env100_r']:.3f}   F0 중앙 {res['_f0']:.0f} Hz   "
+          f"실현 지터 목표 {res['_jit'][0]:.2f} % -> 합성 {res['_jit'][1]:.2f} %")
     return ok_all
 
 
