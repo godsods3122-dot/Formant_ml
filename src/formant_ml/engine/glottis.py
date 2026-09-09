@@ -38,6 +38,14 @@ CMH2O = 980.665          # 1 cmH2O = 980.665 dyn/cm²
 
 
 # ------------------------------------------------------------------ LF 모델
+#: 협착부(혀끝-치경 간극)의 길이 [cm]. /s/ 의 혀끝 협착은 1 cm 안팎이다.
+CONSTRICTION_LEN = 1.0
+#: 협착 앞쪽 공동(앞니까지)의 길이 [cm]. /s/ 는 1.5 cm 안팎 — 치찰음 앞공동 극과 같은 기하.
+FRONT_CAVITY_LEN = 1.5
+#: 협착이 없는 중립 성도의 단면적 [cm²]. 협착의 '좁음' 을 재는 기준이다.
+NEUTRAL_TRACT_AREA = 3.0
+
+
 def lf_pulse(rd: float, n: int = 4096) -> np.ndarray:
     """LF 유량미분 E(t) 한 주기 (Ee = 1 로 정규화). Fant(1995) 의 Rd 파라미터화."""
     rd = float(np.clip(rd, 0.3, 2.7))
@@ -182,8 +190,33 @@ class GlottalSource(nn.Module):
         # 성문 기식이 1~6 kHz 를 채우던 원인(측정: 앞공동 경로와 같은 크기).
         a_c = c["a_c"].clamp_min(1e-3)
         frac = a_c ** 2 / (a_c ** 2 + ag_dc ** 2)                  # ΔPg/Ps
+        # **그리고 난 잡음이 협착을 지나 나와야 한다.** 위 `frac` 은 성문에서 난류가
+        # 얼마나 **생기는가** 이고, 이건 그게 얼마나 **나오는가** 다 — 서로 다른 물리라
+        # 둘 다 곱한다 (v1 `aeroacoustic.constriction_transmission`).
+        #
+        # 저역에서(파장 ≫ 길이) 협착과 앞공동은 둘 다 관성 임피던스 Z ∝ L/A 이므로,
+        # 협착이 없을 때(전부 A0) 대비 전달비는 임피던스 분배로
+        #
+        #     T = (Lc + Lf)·Ac / (Lc·A0 + Lf·Ac)
+        #
+        # Ac → A0 이면 정확히 1, Ac = 0.10 cm² 이면 0.079 (−22 dB). 단순 면적비
+        # Ac/A0 를 쓰면 협착이 풀리는 도중을 과소평가한다 (해제 중반 0.23 vs 0.42).
+        #
+        # **이게 없으면 성문 잡음이 성도가 열려 있는 것처럼 방사된다.** 협착 뒤에
+        # 갇혀 있어야 할 뒤공동 공진이 /s/ 스펙트럼에 서고, 실제 /s/ 에는 거의 없는
+        # 1~2 kHz 가 마찰음을 어둡게 만든다 (v1 실측: 봉우리 대비 −1.8 dB, 에너지의
+        # 9.8 %). v2 는 이 항이 없어서 적합기가 그걸 **`aspiration` 을 전 구간
+        # 0.031 로 내려** 막고 있었다 — 협착 구간만 끌 수단이 없으니 모음의 기식까지
+        # 같이 죽인 것이다 (docs/MEASUREMENTS.md §18.1 의 "갚아야 할 빚").
+        #
+        # 협착이 풀리면 1 로 가므로 전이에서 기식이 제 세기를 되찾는다. 발성이 아니라
+        # **혀**가 여는 것이라 전이가 비지 않는다(성문파열음이 안 된다).
+        trans = ((CONSTRICTION_LEN + FRONT_CAVITY_LEN) * a_c
+                 / (CONSTRICTION_LEN * NEUTRAL_TRACT_AREA
+                    + FRONT_CAVITY_LEN * a_c).clamp_min(1e-9)).clamp(0.0, 1.0)
         # 세기는 ΔPg 에 선형 (√ 로 두면 /s/ 중 기식이 실측보다 10 dB 크다 — 같은 화자 A/B).
-        asp = (1.0 - add) ** 2 * frac * torch.sqrt(ps.clamp_min(0.0) + 1e-12) * c["aspiration"]
+        asp = ((1.0 - add) ** 2 * frac * trans
+               * torch.sqrt(ps.clamp_min(0.0) + 1e-12) * c["aspiration"])
         return dict(f0=f0, amp=amp, amp_raw=amp_raw, rd=rd, ag_dc=ag_dc, asp=asp, pth=pth)
 
     # ---------------------------------------------------------- 파형

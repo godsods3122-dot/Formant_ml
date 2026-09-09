@@ -87,3 +87,37 @@ def test_spectrum_falls_with_frequency_and_tilt_raises_it():
         return 10 * np.log10(Y[(f > 4000) & (f < 8000)].sum() / Y[(f > 200) & (f < 1000)].sum())
     assert ratio(y0) < -20
     assert ratio(y1) > ratio(y0) + 6
+
+
+def test_aspiration_is_attenuated_by_the_oral_constriction():
+    """성문 잡음은 협착을 지나 **나와야** 한다 (v1 `constriction_transmission`).
+
+    `frac`(= 성문에서 난류가 얼마나 **생기는가**)만 있고 이 항이 없으면 성문 잡음이
+    성도가 열려 있는 것처럼 방사된다. 그러면 협착 뒤에 갇혀 있어야 할 뒤공동 공진이
+    /s/ 스펙트럼에 서고, 실제 /s/ 에는 거의 없는 1~2 kHz 가 마찰음을 어둡게 만든다.
+    v2 는 이 항이 없어서 적합기가 `aspiration` 을 전 구간 0.031 로 내려 막고 있었다
+    (docs/MEASUREMENTS.md §21).
+
+    저역 임피던스 분배 T = (Lc+Lf)·Ac / (Lc·A0 + Lf·Ac): Ac → A0 이면 1,
+    Ac = 0.10 cm² 이면 0.079 (−22 dB).
+    """
+    import torch
+    from formant_ml.engine.glottis import (CONSTRICTION_LEN, FRONT_CAVITY_LEN,
+                                           NEUTRAL_TRACT_AREA, GlottalSource)
+
+    g = GlottalSource(48000.0, 48)
+    n = 8
+
+    def asp_for(a_c):
+        c = {k: torch.full((1, n), v) for k, v in
+             dict(p_sub=7.5, adduction=0.06, tension=0.5, f0_target=250.0,
+                  rd_offset=0.0, f0_scale=1.0, aspiration=1.0).items()}
+        c["a_c"] = torch.full((1, n), float(a_c))
+        return float(g.physiology(c)["asp"][0, -1])
+
+    open_, narrow = asp_for(NEUTRAL_TRACT_AREA), asp_for(0.10)
+    assert narrow < open_
+    # 전달비만으로도 −22 dB 다. `frac` 이 같은 방향으로 더 깎으므로 그보다 크게 준다.
+    assert 20 * math.log10(narrow / open_) < -22.0
+    # 협착이 풀리면 1 로 돌아온다 — 전이가 비면 성문파열음이 된다.
+    assert asp_for(NEUTRAL_TRACT_AREA) == open_
