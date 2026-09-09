@@ -858,7 +858,18 @@ class CopySynthFitter:
                 k = self.names.index(nm)
                 lg = torch.log(self._to_val(u[:, k], self.specs[k]).clamp_min(1e-4))
                 rate = (lg[1:] - lg[:-1]).abs() / dt
-                pen = pen + ARTIC_VEL_W * self._pseudo_huber(rate / knee).mean()
+                # **문턱 위만 문다.** 처음에는 `pseudo_huber(rate/knee)` 를 썼는데
+                # 그건 무릎 **아래**에서도 이차로 벌하므로 실제 제스처까지 눌린다.
+                # 실측 (yang_00000040 0.18~0.55 s, ARTIC_VEL_W=1.0):
+                #     a_c 속도 95 분위 0.449 -> **0.015** neper/ms
+                # 가장 빠른 실제 제스처가 0.172 인데 그 11 배 **아래**로 얼렸다.
+                # 대가는 포락 90.67 -> 87.85 %, 무게중심 r 0.983 -> 0.880 이었다
+                # (§27.3). 스파이크만 깎아야 하는데 조음 자체를 죽인 것이다.
+                #
+                # softplus 로 초과분만 취하면 한계 아래는 정확히 공짜다. 폭은
+                # 무릎의 20 % — relu 에 충분히 가깝고 C² 는 지킨다.
+                over = self._soft_over(rate - knee, 0.2 * knee) / knee
+                pen = pen + ARTIC_VEL_W * self._pseudo_huber(over).mean()
         if RIPPLE_W > 0 and self.w.shape[0] >= 3:
             # 격자 간격은 **stride 를 곱한 실제 시간**이다. 성긴 격자에서 같은
             # 증분은 훨씬 느린 변화이므로 벌점도 그만큼 작아야 한다.
