@@ -103,3 +103,78 @@ def test_wall_sources_keep_their_anatomy():
     prof.sibilant["peak_hz"] = 6000.0
     for nm in ("whisper", "h", "f"):
         assert sb.from_profile(nm, prof) is sb.PRESETS[nm]
+
+
+def _render(spec, prof, dur=0.400, t0=0.180):
+    import torch
+    from formant_ml.engine.control import track_from_keyframes
+    from formant_ml.engine.voice import EngineConfig, VoiceEngine
+    torch.set_num_threads(2)
+    eng = VoiceEngine(EngineConfig(sample_rate=48000, frame_ms=1.0, speaker="female",
+                                   residual=False), prof)
+    kf = sb.gesture_keyframes(spec, prof, dur=dur, t0=t0)
+    return eng.render(track_from_keyframes(kf, frame_ms=1.0))
+
+
+def test_no_voicing_before_a_voiceless_sibilant():
+    """개시 전에 성문이 열렸다 **다시 닫히면** 안 된다 — 그러면 목소리가 난다.
+
+    실측으로 잡은 회귀: 옛 키프레임이 남아 adduction 이 0.06 -> 0.6 으로 되돌아갔고,
+    선행 구간이 치찰음 고원보다 3.7 dB **더 컸다**.
+    """
+    from formant_ml.engine.control import INDEX, track_from_keyframes
+    from formant_ml.engine.profile import SpeakerProfile
+    prof = SpeakerProfile.load("profiles/yang_female.json")
+    spec = sb.from_profile("s", prof)
+    trk = track_from_keyframes(sb.gesture_keyframes(spec, prof, dur=0.400, t0=0.180),
+                               frame_ms=1.0)
+    add = trk.values[100:170, INDEX["adduction"]]
+    assert add.max() < 0.25, f"개시 전 성문이 다시 닫힌다 (adduction {add.max():.2f})"
+
+    y = _render(spec, prof)
+    fs = 48000
+    pre = y[int(0.100 * fs):int(0.170 * fs)]
+    plateau = y[int(0.267 * fs):int(0.510 * fs)]
+    d = 20 * np.log10((np.sqrt((pre ** 2).mean()) + 1e-12)
+                      / (np.sqrt((plateau ** 2).mean()) + 1e-12))
+    assert d < -15.0, f"개시 전 소리가 고원보다 {d:+.1f} dB (−15 아래여야 한다)"
+
+
+def test_fade_in_grows_with_duration():
+    """페이드 인은 길이에 비례해야 한다 (§14.3). 절대값으로 박으면 안 된다."""
+    from formant_ml.engine.profile import SpeakerProfile
+    prof = SpeakerProfile.load("profiles/yang_female.json")
+    spec = sb.from_profile("s", prof)
+    fs = 48000.0
+
+    def t6(x, lo, hi):
+        n = len(x)
+        X = np.fft.rfft(x)
+        f = np.fft.rfftfreq(n, 1 / fs)
+        X[(f < lo) | (f >= hi)] = 0
+        e = np.abs(np.fft.irfft(X, n) + 1j * np.fft.irfft(-1j * X, n))
+        k = int(0.005 * fs)
+        e = np.convolve(e, np.ones(k) / k, "same")
+        return int(np.argmax(e > e.max() * 10 ** (-6 / 20))) / fs * 1000
+
+    lags = []
+    for dur in (0.130, 0.400, 0.600):
+        y = _render(spec, prof, dur=dur)
+        hi = max(t6(y, 7000, 11000), t6(y, 11000, 16000))
+        mid = min(t6(y, 2000, 4000), t6(y, 4000, 7000))
+        lags.append(hi - mid)
+    assert lags[0] < lags[1] < lags[2], f"길이에 안 비례한다: {lags}"
+    assert lags[2] > 60.0, f"긴 /s/ 의 페이드 인이 {lags[2]:.0f} ms 로 짧다"
+
+
+def test_plateau_is_a_sibilant():
+    """고원부가 치찰음 지문을 낸다 — 프로파일 실측 봉우리 근처."""
+    from formant_ml.engine import turbulence as tb
+    from formant_ml.engine.profile import SpeakerProfile
+    prof = SpeakerProfile.load("profiles/yang_female.json")
+    y = _render(sb.from_profile("s", prof), prof)
+    plateau = y[int(0.267 * 48000):int(0.510 * 48000)]
+    c = tb.compare(plateau, plateau, 48000.0)["target"]
+    assert c["centroid"] > 8000.0, c["centroid"]
+    assert abs(c["peak"] - prof.sibilant["peak_hz"]) < 1500.0, c["peak"]
+    assert c["sibilance"] > 25.0, c["sibilance"]

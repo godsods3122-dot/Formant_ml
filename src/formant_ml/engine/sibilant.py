@@ -175,6 +175,147 @@ def control_values(spec: SibilantSpec, p_sub: float, a_g: float,
                 front_peak_hz=front_peak_hz(spec, tract_cm))
 
 
+# ------------------------------------------------------------------ 제스처
+# **혀 제스처의 모양은 손으로 그리지 말 것** (docs/MEASUREMENTS.md §14.3, §29).
+#
+# 처음 이 모듈의 데모는 `a_c` 를 3.0 -> 목표까지 올림 코사인으로 긋고 `obstacle` 과
+# `fric_gain` 에도 같은 램프를 곱했다. 셋 다 틀렸다.
+#
+#  1. **시작값.** 모음에서 오는 혀는 완전 개방(3.0 cm²)에서 출발하지 않는다.
+#     `phones.sibilant` 은 개시에 이미 0.35 로 좁혀 두고 거기서 목표로 간다.
+#     3.0 에서 선형으로 그으면 가청 구간(≈0.35 아래)을 마지막 몇 ms 에 몰아서
+#     지나므로 페이드 인이 사라진다 — 소스 세기가 `1/a_c^2.5` 로 가기 때문이다.
+#  2. **이중 계상.** 다이폴의 페이드는 엔진이 기하항 `(A_ref/a_c)^2.5` 로 이미 만든다.
+#     `obstacle` 에 램프를 또 곱하면 2.5 제곱이 두 번 걸린다.
+#  3. **삼중 계상.** 진폭 포락도 레이놀즈/Stevens 가 `a_c` 와 `p_sub` 에서 만든다.
+#     `fric_gain` 에 램프를 곱하는 것은 물리가 낸 포락 위에 손으로 하나 더 얹는 것이다.
+#
+# 그래서 **움직이는 것은 `a_c` 와 성문뿐**이고 나머지는 상수다. 포락은 물리가 낸다.
+TONGUE_RISE_FRAC = 0.217        # v1 TONGUE_SUSTAIN_HOLD 0.62 / TONGUE_CLOSE_FRAC 0.57
+TONGUE_FALL_FRAC = 0.163        # 그 비대칭이 실측 상승/하강비 1.28~1.35
+TONGUE_RISE_MIN_S = 0.040       # 짧은 CV 의 바닥 (v2 가 절대값으로 쓰던 값)
+TONGUE_FALL_MIN_S = 0.018
+A_APPROACH = 0.35               # 개시 시점의 협착 — 이미 좁혀져 있다
+PRESSURE_LEAD_S = 0.080         # 폐압이 혀보다 먼저 자리를 잡는다 (아래 주석)
+GLOTTAL_LEAD_S = 0.040          # 성문은 폐압보다 **더** 먼저 열린다 (아래 주석)
+# **성문 기식을 협착이 억누른다** — 지금 엔진에 없는 물리의 대리 손잡이.
+#
+# `glottis.physiology` 의 기식 포락은 `(1−adduction)²·√Ps` 다. 성문이 넓을수록
+# **커지고**, 구강 협착을 **안 본다**. 그래서 /s/ 자세(성문 활짝 + 구강 좁힘)에서
+# 기식이 최대로 나오고, 측정에서 개시 직전 구간이 치찰음 고원보다 3.7 dB 더 컸다 —
+# 매 /s/ 앞에 "하—" 가 붙는다.
+#
+# 실제로는 좁은 구강 협착 뒤에 구강내압 Pm 이 쌓여 경성문 압력차(Ps − Pm)를 깎으므로
+# 성문 기식이 억제된다 (v1 `aeroacoustic.py` 의 "구강내압과 발성 억제" 가 같은 물리를
+# 파열음에 대해 적어 두었다). 엔진은 그 Pm 을 **버스트에만** 쓰고 기식에는 안 건다.
+#
+# 그 물리가 들어올 때까지(§19.5-1) `aspiration` 배율로 대신한다. **대리 손잡이임을
+# 잊지 말 것** — 협착 면적에서 유도된 값이 아니라 자세에 붙인 상수다.
+ASP_AT_APPROACH = 0.25          # 접근 자세에서 기식 배율
+ASP_AT_PLATEAU = 0.10           # 고원(최협착)에서
+CV_UNDERSHOOT = 2.2             # 130 ms 급 음절은 목표의 2.2 배 (v1 TONGUE_CV_A_MIN)
+
+
+def undershoot(dur_s: float) -> float:
+    """짧은 음절은 목표까지 못 간다. 130 ms 에서 2.2 배, 400 ms 이상이면 1.0."""
+    x = min(max((0.40 - dur_s) / (0.40 - 0.13), 0.0), 1.0)
+    return 1.0 + (CV_UNDERSHOOT - 1.0) * x
+
+
+def gesture_keyframes(spec: SibilantSpec, prof, dur: float = 0.220,
+                      t0: float = 0.060, p_sub: float = 8.0,
+                      fric_gain: float = 24.0, tract_cm: float = 14.6,
+                      vowel: str = "eu") -> list[dict]:
+    """자세 하나를 내는 키프레임. `control.track_from_keyframes` 에 그대로 넣는다.
+
+    보간은 엔진이 한다 (파라미터마다 독립 시간축, minjerk). 여기서는 **어느 시각에
+    어떤 값인지**만 정하고 그 사이는 안 그린다.
+
+    `obstacle` 소스는 혀가 제스처를 만들고, `wall` 소스(속삭임·/h/)는 **성문이**
+    만든다 — 혀 협착이 없으므로 `a_c` 가 안 움직인다.
+    """
+    c = control_values(spec, p_sub=p_sub, a_g=0.20, tract_cm=tract_cm)
+    f1, f2, f3 = (prof.vowels.get(vowel) or [464.0, 1608.0, 2906.0])
+    # **폐압은 제스처가 아니다.** 발화 중 폐압은 이미 서 있고, 치찰음을 만드는 것은
+    # 혀뿐이다. p_sub 를 개시 시각에 같이 올리면 그 계단이 성문 기식을 광대역으로
+    # 켜서, 저·중역이 혀와 **무관하게** t0 에 선다 (측정: 0~2k 40 ms / 2~4k 60 ms 가
+    # 지속시간을 130 → 600 ms 로 바꿔도 안 움직였다 — 고역만 76 → 112 ms 로 늘었다).
+    # 그러면 페이드 인이 고역에만 생기고 개시가 "퍽" 하고 터진다.
+    #
+    # 그래서 폐압은 **개시보다 먼저** 자리를 잡는다. `PRESSURE_LEAD_S` 만큼 앞서
+    # 목표값에 도달하고, 그 구간에는 성문이 벌어져 있어 소리가 안 난다.
+    # **순서가 있다: 성문을 먼저 열고, 그 다음 폐압, 마지막에 혀.**
+    # 폐압을 먼저 올리면 아직 내전된 성문이 울려 목소리가 난다 (측정: 치찰도가
+    # 38.9 → 4.2 dB 로 무너지고 무게중심이 9461 → 6630 Hz 로 내려왔다).
+    # 순서는 **성문 → 혀 → 폐압** 이다.
+    #
+    # 성문이 먼저다: 폐압을 먼저 올리면 아직 내전된 성문이 울려 목소리가 난다
+    # (측정: 치찰도 38.9 → 4.2 dB, 무게중심 9461 → 6630 Hz).
+    #
+    # 그런데 성문만 열고 폐압을 올리면 이번에는 **/h/ 가 먼저 난다**. 이 엔진의
+    # 기식 포락은 `(1−adduction)²·√Ps` 라 성문이 넓을수록 **커지고**, 구강이 열려
+    # 있으면 그 소리가 성도 전체를 울린다. 측정: 선행 구간이 고원보다 3.7 dB 더
+    # 컸다 — 매 /s/ 앞에 "하—" 가 붙는다.
+    #
+    # 그래서 **혀가 폐압보다 먼저** 자리를 잡는다. `A_APPROACH` 로 좁혀 두면 직렬
+    # 오리피스에서 유량이 구강에 묶여 기식이 억제되고, 폐압이 오를 때 이미 마찰
+    # 자세다. 실제 발화에서도 폐압 상승은 앞 음소 **동안** 일어나지 침묵에서
+    # 시작하지 않는다.
+    abd = 0.06 if not spec.voiced else 0.55
+    t_gl = max(0.0, t0 - PRESSURE_LEAD_S - GLOTTAL_LEAD_S)
+    kf: list[dict] = [
+        {"t": 0.0, "p_sub": 0.0, "adduction": 0.6, "a_c": 3.0},
+        {"t": t_gl, "adduction": abd},
+        {"t": max(0.0, t0 - PRESSURE_LEAD_S), "a_c": A_APPROACH, "p_sub": p_sub,
+         "aspiration": ASP_AT_APPROACH},
+    ]
+
+    if spec.source == "wall" and spec.place < 0.5:
+        # 성문 협착 — 속삭임/기식. 혀는 모음 자세 그대로 두고 성문만 조인다.
+        # 하류가 성도 전체이므로 포먼트가 출력을 정한다 (§19.6).
+        #
+        # **한계.** 지금 `FricationNoise` 는 협착을 구강 한 곳(`a_c`)으로 못박아
+        # 두어 성문 협착의 난류를 레이놀즈로 못 만든다 (§19.5-1 미구현). 그래서
+        # 여기서는 `adduction` 으로만 세기를 가른다 — 속삭임은 성문을 더 조이고
+        # (`a_target` 작음) /h/ 는 덜 조인다. 물리가 아니라 **대리 손잡이**다.
+        add_g = float(min(0.30, max(0.04, 0.02 + 0.9 * spec.a_target)))
+        kf += [
+            {"t": t0, "adduction": add_g, "a_c": 3.0,
+             "c_place": spec.place, "front_len": c["front_len"], "obstacle": 0.0,
+             "back_leak": spec.back_leak, "fric_gain": fric_gain,
+             "f1": f1, "f2": f2, "f3": f3, "oral_open": 1.0},
+            {"t": t0 + dur, "adduction": add_g},
+            {"t": t0 + dur + 0.040, "p_sub": 0.0, "adduction": 0.6},
+        ]
+        return kf
+
+    rise = max(TONGUE_RISE_MIN_S, TONGUE_RISE_FRAC * dur)
+    fall = max(TONGUE_FALL_MIN_S, TONGUE_FALL_FRAC * dur)
+    a_min = spec.a_target * undershoot(dur)
+    adduct = 0.55 if spec.voiced else 0.06
+    lead, lag = 0.035, 0.055                    # 성문이 먼저 열리고 늦게 닫힌다
+    kf += [
+        # **여기에 `adduction: 0.6` 을 두면 안 된다.** 원래 설계는 모음에서 오는
+        # 경우라 개시 직전까지 성문이 닫혀 있었는데, 지금은 위에서 이미 열어 두었다.
+        # 둘을 같이 두면 성문이 열렸다 **다시 닫혔다** 열린다 — 그 사이에 폐압이 이미
+        # 서 있어서 목소리가 난다. 측정: 선행 구간의 `du` 가 −15.5 dB (고원에서는
+        # −240 dB), adduction 중앙값이 0.516. 그것이 /s/ 앞에 붙던 소리의 정체다.
+        # 기식이 아니라 **유성**이었고, `aspiration` 을 낮춰도 안 없어졌던 이유다.
+        # 개시: 이미 0.35 로 좁혀져 있고, 그 밖의 손잡이는 **여기서 상수로 고정**된다.
+        {"t": t0, "adduction": adduct, "a_c": A_APPROACH,
+         "c_place": spec.place, "front_len": c["front_len"],
+         "obstacle": spec.obstacle, "back_leak": spec.back_leak,
+         "fric_gain": fric_gain, "oral_open": 1.0, "tract_gain": 0.9,
+         "f1": f1, "f2": f2, "f3": f3},
+        {"t": t0 + rise, "a_c": a_min, "aspiration": ASP_AT_PLATEAU},   # 고원 도달
+        {"t": t0 + dur - fall, "a_c": a_min, "adduction": adduct},
+        {"t": t0 + dur, "a_c": 3.0, "obstacle": 0.0, "back_leak": 0.3,
+         "aspiration": 1.0},                                  # 해제 뒤 기식 꼬리
+        {"t": t0 + dur + lag, "adduction": 0.6, "fric_gain": 1.0, "p_sub": 0.0},
+    ]
+    return kf
+
+
 # ------------------------------------------------------------------ 합격 조건
 #: §27 이 빠뜨렸던 칸. 크기 스펙트럼·포락 통계는 소스의 **종류**를 못 본다.
 #: `obst_eff` 가 기준의 이 배수 아래로 내려가면 다이폴이 꺼진 것이다 — 실격.

@@ -19,7 +19,7 @@ import torch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from formant_ml.engine import sibilant as sb                       # noqa: E402
 from formant_ml.engine import turbulence as tb                     # noqa: E402
-from formant_ml.engine.control import PARAMS, ControlTrack         # noqa: E402
+from formant_ml.engine.control import track_from_keyframes          # noqa: E402
 from formant_ml.engine.profile import SpeakerProfile               # noqa: E402
 from formant_ml.engine.voice import EngineConfig, VoiceEngine      # noqa: E402
 
@@ -28,31 +28,10 @@ FS, HOP = 48000, 48
 
 def build_track(spec: sb.SibilantSpec, prof: SpeakerProfile, ms: int = 220,
                 a_g: float = 0.20, p_sub: float = 8.0, fric_gain: float = 24.0):
-    """자세 하나를 고원으로 유지하는 트랙. 개시/종결만 코사인으로 연다."""
-    n = ms
-    vals = np.zeros((n, len(PARAMS)), dtype=np.float32)
-    names = list(PARAMS)
-    for i, nm in enumerate(names):
-        vals[:, i] = PARAMS[nm].default
-    c = sb.control_values(spec, p_sub=p_sub, a_g=a_g)
-    f1, f2, f3 = prof.vowels["eu"]                     # 중립 혀 자세의 성도
-    rise, fall = int(0.20 * n), int(0.16 * n)          # §14.3 의 비례 전이
-    ramp = np.ones(n)
-    ramp[:rise] = 0.5 * (1 - np.cos(np.pi * np.arange(rise) / rise))
-    ramp[n - fall:] = 0.5 * (1 + np.cos(np.pi * np.arange(fall) / fall))
-    rest = 3.0
-    set_ = lambda nm, v: vals.__setitem__((slice(None), names.index(nm)), v)
-    set_("a_c", rest + (c["a_c"] - rest) * ramp)
-    set_("c_place", c["c_place"]); set_("front_len", c["front_len"])
-    set_("obstacle", c["obstacle"] * ramp); set_("back_leak", c["back_leak"])
-    set_("fric_gain", fric_gain * ramp); set_("p_sub", p_sub)
-    set_("f1", f1); set_("f2", f2); set_("f3", f3)
-    # 유성이면 성대를 울리고, 무성/속삭임이면 끈다. 속삭임은 성문을 벌린 채 압력만.
-    set_("adduction", 0.65 if spec.voiced else (0.10 if spec.name == "whisper" else 0.05))
-    set_("tension", 0.5)
-    if not spec.voiced:
-        set_("f0_target", 0.0)
-    return ControlTrack(values=vals, frame_ms=1.0)
+    """제스처는 모듈이 낸다 — 여기서 손으로 그리지 않는다 (§29)."""
+    kf = sb.gesture_keyframes(spec, prof, dur=ms / 1000.0, t0=0.180,
+                              p_sub=p_sub, fric_gain=fric_gain)
+    return track_from_keyframes(kf, frame_ms=1.0)
 
 
 def main() -> None:
