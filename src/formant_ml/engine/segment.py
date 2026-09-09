@@ -120,3 +120,47 @@ def fricative_mask(y: np.ndarray, sr: int, prof: SpeakerProfile,
     if n == 0:
         return np.zeros(0, dtype=bool)
     return (db > ACTIVE_DB) & (~voi) & (hl > FRICATIVE_HL_DB)
+
+def speech_likeness(x: np.ndarray, fs: float, win_ms: float = 30.0,
+                    f0_lo: float = 70.0, f0_hi: float = 400.0) -> dict:
+    """이 신호가 **말소리인가** — 주기성과 레벨로 본다.
+
+    코퍼스에 말소리가 아닌 파일이 섞여 있다(방 잡음·숨소리). 실측
+    (docs/MEASUREMENTS.md §23.9):
+
+        yang_00000101 (발화)   rms −34.1 dB   자기상관 정점 중앙 0.752   주기 74 %
+        yang_00000040 (발화)   rms −26.5 dB                    0.672        64 %
+        yang_00000025 (잡음)   rms −44.8 dB                    **0.162**    **19 %**
+
+    그런 파일도 **적합은 잘 된다** — 오히려 성적이 제일 좋았다(포락 95.0 %). 크기
+    스펙트럼을 맞추는 일이니 당연하다. 문제는 그렇게 나온 파라미터다: 적합기가 방
+    잡음을 `p_sub` 15.8 cmH₂O(외치는 값)에 `a_c` 1.19(내내 협착)로 흉내 냈다.
+    그대로 학습에 들어가면 신경망이 그걸 목소리로 배운다.
+
+    그래서 **적합 성적이 아니라 입력에 거는 걸림쇠**다.
+
+    반환: periodic(주기 프레임 비율), autocorr(자기상관 정점 중앙), rms_db.
+    """
+    x = np.asarray(x, float)
+    w = max(64, int(win_ms * 1e-3 * fs))
+    m = len(x) // w
+    lo, hi = int(fs / f0_hi), int(fs / f0_lo)
+    peaks = []
+    for i in range(m):
+        s = x[i * w:(i + 1) * w]
+        if s.std() < 1e-6:
+            continue
+        s = s - s.mean()
+        a = np.correlate(s, s, "full")[len(s) - 1:]
+        a = a / (a[0] + 1e-12)
+        if hi < len(a):
+            peaks.append(float(a[lo:hi].max()))
+    peaks = np.asarray(peaks) if peaks else np.zeros(1)
+    return dict(periodic=float((peaks > 0.5).mean()),
+                autocorr=float(np.median(peaks)),
+                rms_db=float(20.0 * np.log10(x.std() + 1e-12)))
+
+
+#: 말소리로 인정하는 하한. §23.9 의 세 파일 사이에 넉넉히 들어간다
+#: (발화 64~74 % 대 잡음 19 %).
+SPEECH_PERIODIC_MIN = 0.35

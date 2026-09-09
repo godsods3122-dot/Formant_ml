@@ -44,6 +44,7 @@ import soundfile as sf
 import torch
 
 from formant_ml.engine import turbulence as tb
+from formant_ml.engine import segment
 from formant_ml.engine.analyze import analyze, glottal_pulses
 from formant_ml.engine.control import PARAM_NAMES
 from formant_ml.engine.denoise import denoise, noise_profile
@@ -89,6 +90,17 @@ def fit_one(path: str, t0: float, t1: float, kind: str, prof: SpeakerProfile,
     """
     y, sr = clean if clean is not None else load_clean(path)
     seg = y[int(t0 * sr):int(t1 * sr)]
+    # **말소리가 아닌 입력은 여기서 막는다.** 코퍼스에 방 잡음·숨소리 파일이 섞여
+    # 있고, 그런 것도 적합은 잘 된다 — 크기 스펙트럼을 맞추는 일이니 당연하다.
+    # 문제는 나오는 파라미터다: 실측에서 적합기가 방 잡음을 `p_sub` 15.8 cmH₂O
+    # (외치는 값)에 `a_c` 1.19(내내 협착)로 흉내 냈다. 그대로 학습에 들어가면
+    # 신경망이 그걸 목소리로 배운다 (docs/MEASUREMENTS.md §23.9).
+    # **적합 성적으로는 못 거른다** — 그 파일의 포락 일치가 95.0 % 로 제일 높았다.
+    sl = segment.speech_likeness(seg, float(sr))
+    if sl["periodic"] < segment.SPEECH_PERIODIC_MIN:
+        return dict(stem=_name(path, t0, t1), file=os.path.basename(path),
+                    t0=t0, t1=t1, kind=kind, ok=False,
+                    skipped="not_speech", **sl)
     hop = max(1, int(round(frame_ms * sr / 1000.0)))
     track = analyze(seg, sr, prof, hop, t0=t0, full=y, pulses=pulses)
     eng = VoiceEngine(EngineConfig(sample_rate=48000, frame_ms=frame_ms,
