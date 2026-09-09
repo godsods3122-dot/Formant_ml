@@ -46,13 +46,28 @@ import torch
 
 #: 기본 탭 수. 85 ms — 위 표에서 시험 상관이 포화하는 지점이고, 그 위는 과적합이다.
 DEFAULT_TAPS = 4096
-#: 정규화 세기 (입력 전력 평균 대비). 0.1 이 시험 상관을 최대로 했다.
-DEFAULT_LAMBDA = 0.1
+#: 정규화 세기 (입력 전력 평균 대비). **사전이 0 이 아니라 δ 라는 점이 중요하다** —
+#: 아래 `estimate_ir` 참조. 0.3 은 응답의 저역-고역 기울기가 −0.7 dB(사실상 평평)
+#: 이면서 세로 얼룩이 합격선 안에 드는 값이다 (§23).
+DEFAULT_LAMBDA = 0.3
 
 
 def estimate_ir(dry: np.ndarray, target: np.ndarray, taps: int = DEFAULT_TAPS,
                 lam: float = DEFAULT_LAMBDA) -> np.ndarray:
-    """`target ≈ dry * h` 의 h 를 낸다. 주파수 영역 정규화 최소제곱.
+    """`target ≈ dry * h` 의 h 를 낸다. **투명한 채널(δ)로 수축하는** 정규화 최소제곱.
+
+        H = (conj(X)·Y + λ·P) / (|X|² + λ·P),   P = mean|X|²
+
+    분자의 `λ·P` 가 핵심이다. 보통의 위너 역합성곱은 그 항이 없어 **H 를 0 으로**
+    수축시키는데, 그러면 입력 에너지가 약한 주파수에서 응답이 −50 dB 로 파여
+    IR 이 방이 아니라 **임의의 이퀄라이저**가 된다. 실측 (yang_00000101):
+
+        사전 0 : 응답 범위 54 dB, 저역−고역 기울기 **+15~23 dB**
+        사전 δ : 응답 범위 24 dB, 저역−고역 기울기 **−0.7 dB** (λ=0.3)
+
+    그 28 dB 짜리 기울기를 순방향에 넣으면 적합기가 그만큼 밝은 마른 소리를 내야
+    하는데 파라미터 상한에 걸린다 — 실제로 대역 MAE 가 0.248 → 0.664 dB 로 나빠졌다.
+    δ 로 수축시키면 데이터가 받쳐 주는 곳에서만 응답이 움직인다.
 
     정규화 항은 **입력 전력의 평균**에 비례한다 — 절대값으로 두면 신호 크기에 따라
     세기가 달라져 파일마다 다른 필터가 나온다.
@@ -67,7 +82,8 @@ def estimate_ir(dry: np.ndarray, target: np.ndarray, taps: int = DEFAULT_TAPS,
     X = np.fft.rfft(x, size)
     Y = np.fft.rfft(y, size)
     px = np.abs(X) ** 2
-    H = (np.conj(X) * Y) / (px + lam * px.mean() + 1e-30)
+    p = px.mean()
+    H = (np.conj(X) * Y + lam * p) / (px + lam * p + 1e-30)
     return np.fft.irfft(H, size)[:taps]
 
 

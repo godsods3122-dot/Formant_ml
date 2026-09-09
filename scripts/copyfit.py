@@ -132,14 +132,18 @@ def main() -> None:
     room_ir = None
     if a.room_from:
         from formant_ml.engine import room as _room
-        dry, _ = sf.read(a.room_from + "_fit.wav")
+        # **마른 출력이 있으면 그쪽을 쓴다.** 이미 방을 넣고 적합한 결과라면
+        # `_fit.wav` 는 방을 통과한 소리다 — 그걸로 다시 추정하면 방이 두 번 들어간다.
+        src = (a.room_from + "_dry.wav" if os.path.exists(a.room_from + "_dry.wav")
+               else a.room_from + "_fit.wav")
+        dry, _ = sf.read(src)
         ref, _ = sf.read(a.room_from + "_target.wav")
         dry = dry.mean(1) if dry.ndim > 1 else dry
         ref = ref.mean(1) if ref.ndim > 1 else ref
         m = min(len(dry), len(ref))
         room_ir = _room.estimate_ir(dry[:m], ref[:m],
                                     taps=a.room_taps or _room.DEFAULT_TAPS)
-        print(f"녹음 경로 IR: {a.room_from} 에서 {len(room_ir)} 탭 "
+        print(f"녹음 경로 IR: {src} 에서 {len(room_ir)} 탭 "
               f"({len(room_ir)/48000*1000:.0f} ms) 추정, 직접음 {_room.direct_gain(room_ir):.3f}",
               flush=True)
     fit = CopySynthFitter(eng, seg, sr, track, phase_weight=a.phase, room_ir=room_ir)
