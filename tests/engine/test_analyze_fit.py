@@ -415,3 +415,46 @@ def test_ripple_penalty_is_off_by_default():
     """기본값이 0 이어야 한다 — A/B 로 세기를 정하기 전에는 거동을 안 바꾼다."""
     from formant_ml.engine import fit as F
     assert F.RIPPLE_W == 0.0
+
+
+def test_articulator_velocity_penalty_spares_real_gestures(_engine):
+    """조음 속도 벌점의 **특이성** — 실제 제스처는 통과하고 1 ms 스위칭만 물어야 한다.
+
+    한계 0.20 neper/ms 는 v1 의 최소저크 제스처가 내는 최대(28 ms CV 에서 0.172)
+    바로 위이고, 적합 트랙에서 관찰된 이탈(0.87~1.90)보다 4~10 배 아래다
+    (docs/MEASUREMENTS.md §24). 이 여백이 무너지면 조음을 뭉개거나 스위칭을 놓친다.
+    """
+    from formant_ml.engine import fit as F
+    from formant_ml.engine.control import INDEX
+
+    tr = _track(n=200)
+    target = _engine.render(tr)
+    f = CopySynthFitter(_engine, target, 48000, tr)
+    k = f.names.index("a_c")
+    old = F.ARTIC_VEL_W
+    F.ARTIC_VEL_W = 1.0
+    try:
+        def pen_for(a_c_track):
+            with torch.no_grad():
+                raw = f._to_raw(torch.as_tensor(a_c_track, dtype=torch.float64), f.specs[k])
+                f.w.copy_(torch.zeros_like(f.w))
+                f.w[:, k] = (raw - f.u0[:, k]) / f.scale[k]
+                return float(f.penalty())
+
+        n = f.n_frames
+        t = np.arange(n)
+        # (a) 실제 제스처: `phones.sibilant` 이 실제로 그리는 것 — 40 ms 에 걸쳐
+        #     0.35 -> 0.08 을 로그·최소저크로 (최대 0.071 neper/ms).
+        u = np.clip((t - 60) / 40.0, 0.0, 1.0)
+        mj = u ** 3 * (10 - 15 * u + 6 * u ** 2)
+        gesture = np.exp(np.log(0.35) + (np.log(0.08) - np.log(0.35)) * mj)
+        # (b) 1 ms 스위칭: 같은 진폭을 한 프레임에
+        switch = np.full(n, 0.35)
+        switch[100] = 0.08
+        base = pen_for(np.full(n, 0.35))
+        pg, ps = pen_for(gesture) - base, pen_for(switch) - base
+    finally:
+        F.ARTIC_VEL_W = old
+        with torch.no_grad():
+            f.w.copy_(torch.zeros_like(f.w))
+    assert ps > 10.0 * max(pg, 1e-9)

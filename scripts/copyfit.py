@@ -94,16 +94,22 @@ def main() -> None:
     ap.add_argument("--prior", action="append", default=None, metavar="이름=값",
                     help="사전 가중(fit.PRIOR_W) 덮어쓰기. 여러 번 줄 수 있다. "
                          "예: --prior aspiration=3.0")
+    ap.add_argument("--artic-vel", type=float, default=None,
+                    help="조음 속도 한계 벌점의 세기 (fit.ARTIC_VEL_W, 기본 1.0). "
+                         "0 이면 끈다 — 마찰음이 유성 구간에서 1 ms 만에 켜지는 것을 "
+                         "막는 항이다 (MEASUREMENTS §24)")
     ap.add_argument("--ripple", type=float, default=None,
                     help="제어열 잔물결 벌점 세기 (fit.RIPPLE_W). 조음 대역(0~20 Hz) "
                          "위에서 트랙이 흔들리는 것만 문다 — 지지직과 저역 초과가 "
                          "둘 다 여기서 온다 (docs/MEASUREMENTS.md §13, §16)")
     a = ap.parse_args()
     torch.set_num_threads(a.threads)
-    if a.ripple is not None or a.prior:
+    if a.ripple is not None or a.prior or a.artic_vel is not None:
         from formant_ml.engine import fit as _fit
         if a.ripple is not None:
             _fit.RIPPLE_W = float(a.ripple)
+        if a.artic_vel is not None:
+            _fit.ARTIC_VEL_W = float(a.artic_vel)
         for item in (a.prior or ()):
             k, _, v = item.partition("=")
             if k not in _fit.PRIOR_W and k not in _fit.DEFAULT_PARAMS:
