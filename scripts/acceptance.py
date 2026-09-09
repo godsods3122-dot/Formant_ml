@@ -210,11 +210,24 @@ def check(stem: str) -> dict:
     v, fm = d["values"], float(d["frame_ms"])
     ps = v[:, INDEX["p_sub"]]
 
+    # **소리가 나는 프레임의 기준은 목표의 레벨이다.** 전에는 적합 트랙의 `p_sub > 2`
+    # 를 썼는데, 적합기는 무음 구간에서 `p_sub` 를 아무 데나 둔다 (손실이 그 자리에서
+    # 0 이라 기울기가 없다). 실측: s040 의 목표 무음 21 프레임에서 `p_sub` 중앙이
+    # 6.63 이라 **100 % 가 "소리남" 으로 셈해졌다.** 그 프레임들의 합성 레벨은
+    # −82 dB 로 목표(−79 dB)보다 오히려 **조용한데**, −80 dB 짜리 대역 dB 는 잘게
+    # 흔들려 세로 얼룩 지표를 통째로 오염시켰다 (s040 의 최악 구간 0.065~0.155 s 가
+    # 통째로 무음이었다). 목표 정점 대비 −45 dB 를 문턱으로 쓴다.
+    lvl_w = int(0.010 * FS)
+    m_lvl = max(1, len(tgt) // lvl_w)
+    lvl = 20 * np.log10(np.sqrt((tgt[:m_lvl * lvl_w] ** 2).reshape(m_lvl, lvl_w).mean(1)) + 1e-12)
+    audible = lvl > lvl.max() - 45.0
+
     def live_at(hop_samples):
         """소리가 나는 프레임만. 무음의 −200 dB 가 상관을 부풀리는 것을 막는다."""
         step = hop_samples * 1000.0 / FS / fm
         idx = (np.arange(int(n / hop_samples)) * step).astype(int).clip(0, len(ps) - 1)
-        return ps[idx] > 2.0
+        li = (np.arange(int(n / hop_samples)) * hop_samples // lvl_w).clip(0, m_lvl - 1)
+        return (ps[idx] > 2.0) & audible[li]
 
     out = {}
     lf = live_at(240)
