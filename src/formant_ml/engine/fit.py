@@ -300,6 +300,36 @@ W_RATE_KNEE = 0.1
 # 세기. 0 이면 항이 빠진다. `copyfit --w-rate` 로 켠다.
 W_RATE_W = 0.0
 
+# **확률적 시드** — 외울 실현을 없앤다.
+#
+# 왜 (docs/MEASUREMENTS.md §24). 적합기는 시드 0 으로 렌더하고 시드 0 으로 채점하므로,
+# 손실의 영공간에 남은 자유도를 **그 시드의 난류를 재현하는 데** 쓴다. 실측: 시간평균
+# 스펙트럼이 학습 시드에서 60.1 % 인데 검증 실현에서 40.3 % 다 — 격차 19.8 %p 가
+# 외운 양이고, 1 ms 격자의 잔물결이 그 기억이다.
+#
+# 평활(`NOISE_EXPECT_MS`)과 벌점(`RIPPLE_W` 등)은 **외우기 어렵게** 만드는 간접
+# 대책이다. 여기는 직접 대책이다 — 매 반복 다른 실현으로 렌더하면 외울 대상이
+# 없어지고, 최적화 대상이 한 실현의 손실이 아니라 **실현에 대한 기댓값**이 된다.
+# (미니배치 SGD 가 표본에 대해 하는 것과 같다.)
+#
+# 대가는 기울기 분산이다. 난류가 든 대역에서 한 실현의 손실은 크게 흔들리므로
+# 수렴이 느려질 수 있다. 그래서 기본값은 꺼 둔다.
+STOCHASTIC_SEED = False
+
+# **제어열의 하드 재매개화** — 인접 프레임의 상관을 벌점이 아니라 **구조**로 건다.
+#
+# 벌점(RIPPLE/W_RATE/DB_RATE)은 잔물결에 **값을 매길** 뿐이라, 손실이 그만큼 이득을
+# 보면 적합기가 값을 치르고 흔든다. 실측(§22): dB/ms 를 6.16 → 0.80 으로 눌러도
+# 적합기는 같은 요동을 필터 주파수로 옮겨 갔다.
+#
+# 여기서는 `w` 를 시간축으로 **고정 커널로 평활한 뒤** 쓴다. 그러면 빠른 흔들림이
+# 비싼 것이 아니라 **표현 불가능**해진다 — 영공간이 사라지므로 외울 자유도도 같이
+# 사라진다(§24). 기울기는 커널을 타고 그대로 흐르므로 미분가능성은 유지된다.
+#
+# sigma 는 **상관 길이**다. 조음의 상단(음소률 16 Hz)이 주기 62 ms 이므로 그 1/10 인
+# 6 ms 면 조음을 안 건드리면서 그 위를 지운다. 0 이면 항이 빠진다.
+W_SMOOTH_MS = 0.0
+
 PRIOR_W: dict[str, float] = {
     "f0_target": 40.0, "f1": 40.0, "f2": 40.0, "f3": 20.0, "f4": 10.0,
     # 곁가지는 분석이 못 재는 양이다. 세게 묶으면 적합기가 열지를 못한다 —
@@ -515,8 +545,26 @@ class CopySynthFitter:
         return lo + x * (hi - lo)
 
     def _delta(self) -> torch.Tensor:
-        """격자 위 증분 -> 프레임별 raw 증분 (선형 보간)."""
+        """격자 위 증분 -> 프레임별 raw 증분 (선형 보간).
+
+        `W_SMOOTH_MS` > 0 이면 격자 위에서 먼저 가우시안으로 평활한다 — 인접 프레임의
+        상관을 구조로 거는 하드 재매개화다 (벌점이 아니다).
+        """
         w = self.w
+        if W_SMOOTH_MS > 0 and w.shape[0] >= 3:
+            dt = max(self.track.frame_ms, 1e-6) * max(getattr(self, "stride", 1), 1)
+            sig = W_SMOOTH_MS / dt
+            if sig > 0.2:
+                r = max(1, int(math.ceil(3.0 * sig)))
+                t = torch.arange(-r, r + 1, dtype=w.dtype, device=w.device)
+                k = torch.exp(-0.5 * (t / sig) ** 2)
+                k = k / k.sum()
+                # 반사 패딩 — 가장자리에서 0 으로 끌려 들어가면 개시/종결이 뭉개진다.
+                x = w.t().unsqueeze(0)                          # (1, P, Tc)
+                x = torch.nn.functional.pad(x, (r, r), mode="reflect")
+                w = torch.nn.functional.conv1d(
+                    x, k.view(1, 1, -1).expand(w.shape[1], 1, -1),
+                    groups=w.shape[1])[0].t()
         if w.shape[0] != self.n_frames:
             w = torch.nn.functional.interpolate(
                 w.t().unsqueeze(0), size=self.n_frames, mode="linear",
@@ -593,6 +641,10 @@ class CopySynthFitter:
 
     # ------------------------------------------------------------ 손실
     def synth(self, want_phase: bool = False):
+        if STOCHASTIC_SEED:
+            # `reset()` 이 `NoiseBank(cfg.seed)` 를 다시 만드므로 시드만 바꾸면 된다.
+            self._sto_n = getattr(self, "_sto_n", 0) + 1
+            self.eng.cfg.seed = 100003 + self._sto_n
         self.eng.reset()
         out = self.eng(self.control(), self.track.events, 0.0)
         y = out["audio"] * torch.exp(self.log_gain).to(torch.float32)
