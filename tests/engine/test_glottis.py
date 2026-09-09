@@ -90,20 +90,20 @@ def test_spectrum_falls_with_frequency_and_tilt_raises_it():
 
 
 def test_aspiration_is_attenuated_by_the_oral_constriction():
-    """성문 잡음은 협착을 지나 **나와야** 한다 (v1 `constriction_transmission`).
+    """성문 잡음은 구강 협착이 좁을수록 약해져야 한다 — 그리고 **한 항으로만** 깎인다.
 
-    `frac`(= 성문에서 난류가 얼마나 **생기는가**)만 있고 이 항이 없으면 성문 잡음이
-    성도가 열려 있는 것처럼 방사된다. 그러면 협착 뒤에 갇혀 있어야 할 뒤공동 공진이
-    /s/ 스펙트럼에 서고, 실제 /s/ 에는 거의 없는 1~2 kHz 가 마찰음을 어둡게 만든다.
-    v2 는 이 항이 없어서 적합기가 `aspiration` 을 전 구간 0.031 로 내려 막고 있었다
-    (docs/MEASUREMENTS.md §21).
+    v2 는 `frac = Ac²/(Ac²+Ag²)`(성문에서 난류가 얼마나 **생기는가**) 하나로 깎는다.
+    v1 은 여기에 `constriction_transmission`(얼마나 **나오는가**)을 또 곱하는데,
+    v2 는 성문을 훨씬 넓게 열어 두므로(무성 마찰음 자세에서 Ag 0.448 cm² 대 v1 의
+    0.12~0.25) `frac` 하나가 이미 v1 의 두 항 몫을 한다. 실제로 전달비를 얹어 재적합
+    하니 포락이 94.67 → 93.19 % 로 떨어지고 유성 프레임 변조가 전부 나빠졌다
+    (docs/MEASUREMENTS.md §22). 그래서 **일부러 한 항만 쓴다.**
 
-    저역 임피던스 분배 T = (Lc+Lf)·Ac / (Lc·A0 + Lf·Ac): Ac → A0 이면 1,
-    Ac = 0.10 cm² 이면 0.079 (−22 dB).
+    이 테스트가 지키는 것: (1) 협착이 좁으면 기식이 크게 줄고, (2) 협착이 풀리면
+    정확히 되돌아온다(전이가 비면 성문파열음이 된다), (3) 감쇠가 **이중이 아니다**.
     """
     import torch
-    from formant_ml.engine.glottis import (CONSTRICTION_LEN, FRONT_CAVITY_LEN,
-                                           NEUTRAL_TRACT_AREA, GlottalSource)
+    from formant_ml.engine.glottis import NEUTRAL_TRACT_AREA, GlottalSource
 
     g = GlottalSource(48000.0, 48)
     n = 8
@@ -116,8 +116,7 @@ def test_aspiration_is_attenuated_by_the_oral_constriction():
         return float(g.physiology(c)["asp"][0, -1])
 
     open_, narrow = asp_for(NEUTRAL_TRACT_AREA), asp_for(0.10)
-    assert narrow < open_
-    # 전달비만으로도 −22 dB 다. `frac` 이 같은 방향으로 더 깎으므로 그보다 크게 준다.
-    assert 20 * math.log10(narrow / open_) < -22.0
-    # 협착이 풀리면 1 로 돌아온다 — 전이가 비면 성문파열음이 된다.
-    assert asp_for(NEUTRAL_TRACT_AREA) == open_
+    db = 20 * math.log10(narrow / open_)
+    assert db < -20.0                    # 좁으면 크게 준다
+    assert db > -35.0                    # 그러나 **이중으로** 깎지는 않는다
+    assert asp_for(NEUTRAL_TRACT_AREA) == open_   # 풀리면 정확히 되돌아온다
