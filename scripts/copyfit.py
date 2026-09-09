@@ -84,11 +84,18 @@ def main() -> None:
                     help="이득류(tract_gain/fric_gain/aspiration)의 가속도 벌점 세기. "
                          "마찰 구간에서 적합기가 못 맞출 난류 요동을 이득으로 좇는 것을 "
                          "막는다 (fit.GAIN_ACC_W). 생략하면 모듈 기본값")
+    ap.add_argument("--ripple", type=float, default=None,
+                    help="제어열 잔물결 벌점 세기 (fit.RIPPLE_W). 조음 대역(0~20 Hz) "
+                         "위에서 트랙이 흔들리는 것만 문다 — 지지직과 저역 초과가 "
+                         "둘 다 여기서 온다 (docs/MEASUREMENTS.md §13, §16)")
     a = ap.parse_args()
     torch.set_num_threads(a.threads)
-    if a.gain_acc is not None:
+    if a.gain_acc is not None or a.ripple is not None:
         from formant_ml.engine import fit as _fit
-        _fit.GAIN_ACC_W = float(a.gain_acc)
+        if a.gain_acc is not None:
+            _fit.GAIN_ACC_W = float(a.gain_acc)
+        if a.ripple is not None:
+            _fit.RIPPLE_W = float(a.ripple)
 
     y, sr = sf.read(a.wav)
     if y.ndim > 1:
