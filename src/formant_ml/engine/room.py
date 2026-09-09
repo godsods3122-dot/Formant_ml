@@ -56,27 +56,63 @@ DEFAULT_TAPS = 4096
 #: 크게 넘었다(λ 없이 마른 적합이 1.242 였는데도). 처음에 0.3 을 고른 근거는
 #: **재적합 없이** IR 만 걸어 본 근사였고, 그 근사가 재적합 결과를 예측하지 못했다.
 DEFAULT_LAMBDA = 0.1
+#: 거친 EQ 를 빼는 평활 반복 횟수. 3 이면 두 파일 다 저역−고역 기울기가 1 dB 안이다.
+FLATTEN_PASSES = 3
+
+
+def flatten_response(h: np.ndarray, octaves: float = 0.5, size: int = 16384,
+                     fs: float = 48000.0) -> np.ndarray:
+    """IR 에서 **거친 이퀄라이저 몫만** 뺀다 — 잔결과 꼬리는 그대로.
+
+    옥타브 평활한 크기응답으로 나눈다. 위상과 미세 구조는 손대지 않으므로 방의
+    **시간 구조**는 남고, 역합성곱이 잡아 버린 거친 EQ 만 사라진다.
+
+    왜 필요한가: 최소제곱 해는 방뿐 아니라 **합성의 계통적 스펙트럼 오차까지**
+    흡수한다. 실측에서 저역−고역 기울기가 +17~18 dB 였는데, 그걸 순방향에 넣으면
+    적합기가 그만큼 밝은 마른 소리를 내야 하고 파라미터 상한에 걸린다.
+
+    **그리고 이 평탄화는 홀드아웃 상관을 올린다** — 즉 그 EQ 는 과적합이었다:
+
+        s101 뒤 절반 상관   평탄 x0 0.780 → x1 **0.803** → x2 0.801 → x3 0.797
+        s040 뒤 절반 상관   평탄 x0 0.758 → x1 0.838 → x2 0.864 → x3 **0.871**
+        저역−고역 기울기    x0 +18.4/+17.0 dB → x3 **−0.1/+0.6 dB**
+        직접음 몫          x0 0.114/0.176 → x3 0.838/0.931
+
+    한 번으로는 0.5 옥타브 이동평균이 그 눈금의 구조를 다 못 없앤다. 세 번이면
+    두 파일 다 기울기가 1 dB 안으로 들어온다.
+    """
+    H = np.fft.rfft(np.asarray(h, float), size)
+    fr = np.fft.rfftfreq(size, 1.0 / fs)
+    db = 20.0 * np.log10(np.abs(H) + 1e-12)
+    # 로그 주파수 격자에서 상자 평활 — 빈마다 마스크를 만들면 O(N²) 이라 못 쓴다.
+    lf = np.log2(np.maximum(fr, 20.0))
+    grid = np.linspace(lf[0], lf[-1], 2048)
+    g = np.interp(grid, lf, db)
+    w = max(1, int(round(octaves / (grid[1] - grid[0]))))
+    c = np.concatenate([[0.0], np.cumsum(g)])
+    lo = np.clip(np.arange(len(g)) - w // 2, 0, len(g))
+    hi = np.clip(np.arange(len(g)) + w // 2 + 1, 0, len(g))
+    sm = (c[hi] - c[lo]) / np.maximum(hi - lo, 1)
+    corr = np.interp(lf, grid, sm)
+    return np.fft.irfft(H / (10.0 ** (corr / 20.0) + 1e-12), size)[:len(h)]
 
 
 def estimate_ir(dry: np.ndarray, target: np.ndarray, taps: int = DEFAULT_TAPS,
-                lam: float = DEFAULT_LAMBDA) -> np.ndarray:
-    """`target ≈ dry * h` 의 h 를 낸다. **투명한 채널(δ)로 수축하는** 정규화 최소제곱.
+                lam: float = DEFAULT_LAMBDA, flatten_passes: int = FLATTEN_PASSES
+                ) -> np.ndarray:
+    """`target ≈ dry * h` 의 h 를 낸다 — 최소제곱 뒤 **거친 EQ 를 뺀다.**
 
-        H = (conj(X)·Y + λ·P) / (|X|² + λ·P),   P = mean|X|²
-
-    분자의 `λ·P` 가 핵심이다. 보통의 위너 역합성곱은 그 항이 없어 **H 를 0 으로**
-    수축시키는데, 그러면 입력 에너지가 약한 주파수에서 응답이 −50 dB 로 파여
-    IR 이 방이 아니라 **임의의 이퀄라이저**가 된다. 실측 (yang_00000101):
-
-        사전 0 : 응답 범위 54 dB, 저역−고역 기울기 **+15~23 dB**
-        사전 δ : 응답 범위 24 dB, 저역−고역 기울기 **−0.7 dB** (λ=0.3)
-
-    그 28 dB 짜리 기울기를 순방향에 넣으면 적합기가 그만큼 밝은 마른 소리를 내야
-    하는데 파라미터 상한에 걸린다 — 실제로 대역 MAE 가 0.248 → 0.664 dB 로 나빠졌다.
-    δ 로 수축시키면 데이터가 받쳐 주는 곳에서만 응답이 움직인다.
+        H = conj(X)·Y / (|X|² + λ·mean|X|²)   →   flatten_response ×3
 
     정규화 항은 **입력 전력의 평균**에 비례한다 — 절대값으로 두면 신호 크기에 따라
     세기가 달라져 파일마다 다른 필터가 나온다.
+
+    .. note::
+       사전을 δ 쪽으로 수축시키는 판(`+λ·P` 를 분자에 더하는 것)도 시험했다.
+       기울기는 없어지지만 **방의 시간 구조까지 같이 없어진다** — s040 에서 직접음
+       몫이 0.954 가 되고, 그 IR 로 재적합하니 세로 얼룩이 1.532 로 마른 적합
+       (1.242)보다 나빠졌다. 시간 구조는 남기고 크기만 펴는 `flatten_response`
+       쪽이 맞다 (docs/MEASUREMENTS.md §23.10).
     """
     x = np.asarray(dry, float)
     y = np.asarray(target, float)
@@ -88,9 +124,11 @@ def estimate_ir(dry: np.ndarray, target: np.ndarray, taps: int = DEFAULT_TAPS,
     X = np.fft.rfft(x, size)
     Y = np.fft.rfft(y, size)
     px = np.abs(X) ** 2
-    p = px.mean()
-    H = (np.conj(X) * Y + lam * p) / (px + lam * p + 1e-30)
-    return np.fft.irfft(H, size)[:taps]
+    H = (np.conj(X) * Y) / (px + lam * px.mean() + 1e-30)
+    h = np.fft.irfft(H, size)[:taps]
+    for _ in range(max(0, int(flatten_passes))):
+        h = flatten_response(h)
+    return h
 
 
 def apply_ir(x: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
@@ -111,3 +149,39 @@ def direct_gain(h: np.ndarray, ms: float = 2.0, fs: float = 48000.0) -> float:
     """직접음 몫의 크기 — IR 이 이득으로 흡수한 양을 보고할 때."""
     k = max(1, int(ms * 1e-3 * fs))
     return float(np.sqrt((np.asarray(h, float)[:k] ** 2).sum()))
+
+def holdout_gain(dry: np.ndarray, target: np.ndarray, mask: np.ndarray | None = None,
+                 **kw) -> dict:
+    """**앞 절반으로 추정하고 뒤 절반에서 시험한다.** 방을 쓸지 말지의 판단 근거.
+
+    IR 이 항상 도움이 되는 것은 아니다. 마른 모형이 이미 잘 맞는 파일에서는 역합성곱이
+    잡을 계통 성분이 별로 없고, 그때 IR 은 오히려 못 본 구간을 나빠지게 한다. 실측:
+
+        s101  기준 0.672 → IR 0.798   (크게 좋아진다 — 방이 필요하다)
+        s040  기준 0.902 → IR 0.869   (나빠진다 — 이 파일은 마른 모형으로 충분하다)
+
+    그래서 파일마다 이 값을 보고 정한다. 문턱을 감으로 두지 말고 **못 본 절반에서
+    실제로 좋아지는가**만 본다.
+
+    반환: before(IR 없이), after(IR 걸고), improves(bool).
+    """
+    x = np.asarray(dry, float)
+    y = np.asarray(target, float)
+    n = min(len(x), len(y))
+    x, y = x[:n], y[:n]
+    m = (np.ones(n, bool) if mask is None else np.asarray(mask, bool)[:n])
+    half = n // 2
+    h = estimate_ir(x[:half], y[:half], **kw)
+    z = apply_ir(torch.as_tensor(x[None, half:]), torch.as_tensor(h))[0].numpy()
+
+    def corr(a, b, mm):
+        a, b = a[mm], b[mm]
+        if a.size < 16:
+            return float("nan")
+        a, b = a - a.mean(), b - b.mean()
+        return float((a * b).sum() / np.sqrt((a * a).sum() * (b * b).sum() + 1e-30))
+
+    mh = m[half:]
+    before, after = corr(y[half:], x[half:], mh), corr(y[half:], z, mh)
+    return dict(before=before, after=after, improves=bool(after > before))
+

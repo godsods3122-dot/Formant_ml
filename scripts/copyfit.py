@@ -86,6 +86,8 @@ def main() -> None:
                          "응답을 성도·소스 파라미터로 흡수하지 않아 추정되는 물리량이 "
                          "**마른 목소리**의 것이 된다 (engine/room.py, MEASUREMENTS §23)")
     ap.add_argument("--room-taps", type=int, default=None, help="IR 탭 수 (기본 4096 = 85 ms)")
+    ap.add_argument("--room-force", action="store_true",
+                    help="홀드아웃에서 좋아지지 않아도 방을 넣는다")
     ap.add_argument("--room-lambda", type=float, default=None,
                     help="IR 추정의 정규화 세기 (기본 0.1). 크면 IR 이 δ 에 가까워져 "
                          "방의 시간 구조가 사라진다")
@@ -144,13 +146,21 @@ def main() -> None:
         dry = dry.mean(1) if dry.ndim > 1 else dry
         ref = ref.mean(1) if ref.ndim > 1 else ref
         m = min(len(dry), len(ref))
-        room_ir = _room.estimate_ir(dry[:m], ref[:m],
-                                    taps=a.room_taps or _room.DEFAULT_TAPS,
-                                    lam=a.room_lambda if a.room_lambda is not None
-                                    else _room.DEFAULT_LAMBDA)
+        kw = dict(taps=a.room_taps or _room.DEFAULT_TAPS,
+                  lam=a.room_lambda if a.room_lambda is not None else _room.DEFAULT_LAMBDA)
+        # **못 본 절반에서 실제로 좋아지는지 먼저 본다.** IR 이 항상 도움이 되지는
+        # 않는다 — 마른 모형이 이미 잘 맞는 파일에서는 역합성곱이 잡을 계통 성분이
+        # 없고, 그때 IR 은 오히려 나빠지게 한다 (engine/room.holdout_gain).
+        hg = _room.holdout_gain(dry[:m], ref[:m], **kw)
+        room_ir = _room.estimate_ir(dry[:m], ref[:m], **kw)
         print(f"녹음 경로 IR: {src} 에서 {len(room_ir)} 탭 "
               f"({len(room_ir)/48000*1000:.0f} ms) 추정, 직접음 {_room.direct_gain(room_ir):.3f}",
               flush=True)
+        print(f"  홀드아웃(앞 절반 추정 → 뒤 절반 시험): {hg['before']:.3f} -> {hg['after']:.3f}"
+              f"  {'쓴다' if hg['improves'] else '**안 좋아진다**'}", flush=True)
+        if not hg["improves"] and not a.room_force:
+            print("  -> 방을 넣지 않는다 (--room-force 로 강제 가능)", flush=True)
+            room_ir = None
     fit = CopySynthFitter(eng, seg, sr, track, phase_weight=a.phase, room_ir=room_ir)
     kw = {} if a.lr_global is None else {"lr_global": a.lr_global}
     rep = fit.fit_staged(global_iters=a.global_iters, stage_iters=a.stage_iters,
