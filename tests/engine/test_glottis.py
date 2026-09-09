@@ -162,3 +162,44 @@ def test_tilt_shelf_keeps_the_pulse_from_becoming_a_square_wave():
     # 셸프는 LF 본래 모양 쪽으로 되돌려야 한다.
     assert abs(shelf - base) < 0.7 * abs(flat - base)
     assert G.TILT_MAX_HZ == 5000.0     # 기본으로 켜져 있어야 한다
+
+
+def test_lf_coefficients_cross_zero_between_table_rows():
+    """`cj` 가 실제로 0 을 지난다 — 그래서 `abs`·`angle` 을 쓰면 안 된다.
+
+    `cj` 는 표의 두 행을 `rd` 로 **선형 보간한 복소수**다. 이웃 행의 부호가 반대면
+    보간이 0 을 지나고, 그 자리에서 `|z|` 는 미분이 0/0, `∠z` 는 발산이다.
+    """
+    g = GlottalSource(FS, HOP)
+    c = g.lf_coef
+    flip = (c[:-1] * c[1:].conj()).real < 0
+    assert float(flip.float().mean()) > 0.2, "표가 바뀌었으면 이 테스트의 전제를 다시 볼 것"
+
+
+def test_harmonic_sum_has_finite_gradient_where_cj_vanishes():
+    """`rd` 를 훑어도 기울기가 유한해야 한다 (MEASUREMENTS §31).
+
+    `|cj|·cos(θ+∠cj) = Re[cj·e^{iθ}]` 항등식으로 `abs`·`angle` 을 없앴다. 그 둘을
+    쓰면 보간이 0 을 지나는 `rd` 에서 NaN 기울기가 나고, 적합기의 가드가 그 회차를
+    버리면 파라미터가 안 변해 **결정적으로 갇힌다**.
+    """
+    g = GlottalSource(FS, HOP)
+    for rd_off in np.linspace(-0.35, 0.35, 15):
+        c = _ctrl(40, p_sub=7.0, adduction=0.6, tension=0.5, f0_target=220.0,
+                  rd_offset=float(rd_off))
+        c = {k: v.clone().requires_grad_(True) for k, v in c.items()}
+        g(c)["du"].pow(2).mean().backward()
+        for k in ("adduction", "rd_offset"):
+            gr = c[k].grad
+            assert gr is not None and torch.isfinite(gr).all(), \
+                f"rd_offset={rd_off:+.2f} 에서 {k} 기울기가 비유한"
+
+
+def test_identity_replaces_abs_and_angle_exactly():
+    """|c|·cos(θ+∠c) = c.real·cosθ − c.imag·sinθ — float32 정밀도까지 같다."""
+    torch.manual_seed(0)
+    c = torch.randn(20000, dtype=torch.complex64)
+    th = torch.rand(20000) * 20.0 - 10.0
+    lhs = c.abs() * torch.cos(th + torch.angle(c))
+    rhs = c.real * torch.cos(th) - c.imag * torch.sin(th)
+    assert float((lhs - rhs).abs().max()) < 1e-5

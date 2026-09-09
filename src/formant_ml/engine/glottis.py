@@ -381,9 +381,22 @@ class GlottalSource(nn.Module):
                 gain = 10.0 ** (tilt * oct_ / 20.0)
             else:
                 gain = 10.0 ** (tilt * (log2f0 + math.log2(float(kk))) / 20.0)
-            ph = phase * kk + torch.angle(cj)
+            # **`|cj|` 와 `∠cj` 를 따로 구하지 않는다.**
+            #
+            #     |cj|·cos(θ + ∠cj) = Re[cj·e^{iθ}] = cj.real·cosθ − cj.imag·sinθ
+            #
+            # 항등식이므로 결과는 완전히 같은데, `abs` 와 `angle` 이 사라진다. 그 둘은
+            # cj = 0 에서 미분이 정의되지 않아 **NaN 기울기**를 낸다:
+            #   ∂|z|/∂x = x/|z| → 0/0,   ∂∠z/∂x = −y/|z|² → 발산.
+            # 그리고 `cj` 는 표의 두 행을 `rd` 로 **선형 보간한 값**이라 실제로 0 을
+            # 지난다 — 이웃 행의 실수부 내적이 음수인 항목이 **47.2 %** 다 (11063 개 중
+            # 5224 개). `rd` 는 `adduction` · `rd_offset` 에서 나오는 적합 파라미터이므로
+            # 그 NaN 이 그대로 적합기로 흘러 들어간다 (MEASUREMENTS §31).
+            #
+            # 덤으로 삼각함수 호출이 하나 늘고 `abs`·`angle` 둘이 빠져 조금 싸다.
+            th = phase * kk
             if rps is not None:
-                ph = ph + rps[..., j]
+                th = th + rps[..., j]
             if dispersion != 0.0:
                 # **하모닉 위상 분산.** 고역일수록 지연되는 이차 위상 −D·(f/f_nyq)²
                 # (= 주파수에 선형인 그룹 지연 = 시간축으로 퍼지는 chirp). 실제 성대는
@@ -391,13 +404,13 @@ class GlottalSource(nn.Module):
                 # 생긴다. `rps` 와 달리 **샘플률 fk 를 그대로 써서** (B,N,K) 텐서를
                 # 만들지 않는다 — K=240 이면 그것만 65 MB 다.
                 xn = (fk / (0.5 * fs)).clamp(0.0, 1.0)
-                ph = ph - dispersion * xn * xn
-            amp_k = cj.abs()
+                th = th - dispersion * xn * xn
+            w_k = mask * gain
             if GLOTTAL_CLOSURE_SPREAD_S > 0.0:
                 # 폐쇄 시각의 흩어짐 -> **영위상** 크기 테이퍼 (위 상수 참조).
-                amp_k = amp_k * torch.exp(
+                w_k = w_k * torch.exp(
                     -0.5 * (2.0 * math.pi * fk * GLOTTAL_CLOSURE_SPREAD_S) ** 2)
-            du = du + 2.0 * amp_k * mask * gain * torch.cos(ph)
+            du = du + 2.0 * w_k * (cj.real * torch.cos(th) - cj.imag * torch.sin(th))
         du = du * amp
         # 성문 개방기 (LF: 0 ~ te 가 열림) -> 기식 AM 마스크
         frac = phase / (2 * math.pi)

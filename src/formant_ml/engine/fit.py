@@ -258,6 +258,27 @@ PRIOR_W: dict[str, float] = {
     # 적합 대상에서 빼 두면 다른 파라미터가 그 초과분을 메우려고 비틀린다.
     "jitter": 0.1, "shimmer": 0.1,
 }
+# **크기 스펙트럼의 완화 상수 η** (목표 크기의 평균 대비 비율).
+#
+# `|z| = √(x²+y²)` 는 z = 0 에서 미분이 정의되지 않는다 — `∂|z|/∂x = x/|z|` 가 0/0 이다.
+# torch 는 그 자리에서 **NaN 기울기**를 낸다. STFT 빈은 무음 구간에서 실제로 0 에
+# 임의로 가까워지므로(부동소수 언더플로 포함) 이 자리가 비유한 기울기의 원인이 된다.
+#
+# 실측 (out/sw/r000, yang_00000040 전체, 예전 가드): 모든 단계가 "[30] 수렴 +
+# 비유한 29 회 건너뜀" 으로 끝났다 — 단계당 실제 걸음이 1 번뿐이었고 포락이
+# 82.7 % 에 머물렀다 (같은 파일의 정상 적합은 93.1 %).
+#
+# 받개는 **크기 자체를 완화하는 것**이다: `|z|_η = √(x²+y²+η²)`. 이러면
+#   * 어디서나 C^∞ 이고 기울기 상한이 1 이다 (`∂|z|_η/∂x = x/|z|_η ≤ 1`),
+#   * η ≪ |z| 인 곳에서는 `|z|` 와 구별되지 않으며,
+#   * 로그를 씌워도 `log(|z|_η) ≥ log η` 로 아래가 막혀 있다.
+# 즉 로그 처리와 완화가 같은 상수 하나로 맞물린다.
+#
+# 크기는 **목표 스펙트럼의 평균 크기에 비례**시킨다 — 절대값으로 두면 녹음 레벨에
+# 따라 의미가 달라진다. 1e-6 이면 목표 평균보다 120 dB 아래이고, 손실이 보는 하한
+# (`DB_RANGE` = 정점 −70 dB)보다 한참 밑이라 편향이 없다.
+MAG_ETA_REL = 1e-6
+
 F_MARGIN_HZ = 120.0        # 인접 포먼트 최소 간격
 
 #: 비유한 기울기가 났을 때 어느 파라미터·격자점인지 찍는다 (느리지 않다 — 났을 때만).
@@ -427,6 +448,12 @@ class CopySynthFitter:
         self.bin_max = {k: int(math.ceil(self.f_max / (self.fs / k))) + 1 for k in FFT_SIZES}
         # 목표의 조화/잔차 분해. 위상 항(조화부만 본다)과 크기 항(난류부는 기대
         # 스펙트럼으로 본다)이 같은 것을 쓰므로 한 번만 만든다.
+        # **η 를 먼저 정한다.** 아래의 모든 크기·로그가 이 값을 쓴다. 목표의 평균
+        # 크기에 비례시키므로 녹음 레벨과 무관하게 같은 뜻을 갖는다. 여기 한 번만
+        # 쓰는 `.abs()` 는 `no_grad` 안이라 기울기가 없다.
+        with torch.no_grad():
+            _m = _stft(self.target, MEL_FFT, self.wins[MEL_FFT]).abs().mean()
+            self.mag_eta = float(MAG_ETA_REL * _m.clamp_min(1e-12))
         self._har_res = self._decompose_target()
         with torch.no_grad():
             self._harm_w = {k: self._harmonic_weight(k) for k in FFT_SIZES}
@@ -434,7 +461,7 @@ class CopySynthFitter:
             self._sm_frames = {k: max(1, int(round(NOISE_EXPECT_MS
                                                    / (1000.0 * (k // 4) / self.fs))))
                                for k in FFT_SIZES}
-            raw = {k: _stft(self.target, k, self.wins[k]).abs()[:, :self.bin_max[k]]
+            raw = {k: self._cabs(_stft(self.target, k, self.wins[k]))[:, :self.bin_max[k]]
                    for k in FFT_SIZES}
             self.tgt_S = {k: self._expect(v, k) for k, v in raw.items()}
             self.tgt_M = self.mel[:, :self.tgt_S[MEL_FFT].shape[1]] @ self.tgt_S[MEL_FFT]
@@ -575,15 +602,35 @@ class CopySynthFitter:
         ph = phase[0].index_select(0, idx).double()
         return (1.0 - torch.cos(ph - self.pulse_phi0)).mean()
 
-    @staticmethod
-    def _db(x: torch.Tensor) -> torch.Tensor:
-        return 20.0 * torch.log10(x + 1e-10)
+    def _cabs(self, z: torch.Tensor) -> torch.Tensor:
+        """완화된 복소 크기 `√(x²+y²+η²)` — `z.abs()` 대신 쓴다.
 
-    @staticmethod
-    def _sc(at: torch.Tensor, ap: torch.Tensor) -> torch.Tensor:
+        `z.abs()` 는 z=0 에서 기울기가 0/0 이라 NaN 이다 (`MAG_ETA_REL` 주석 참조).
+        η 를 더하면 어디서나 미분 가능하고 기울기 상한이 1 이다.
+        """
+        return torch.sqrt(z.real ** 2 + z.imag ** 2 + self.mag_eta ** 2)
+
+    def _db(self, x: torch.Tensor) -> torch.Tensor:
+        """dB. **로그의 인자를 η 로 막는다** — `log 0 = −∞` 도, 그 기울기 발산도 없다.
+
+        `_cabs` 를 지난 크기는 이미 η 이상이므로 여기 더하는 η 는 이중 안전장치이자
+        멜 합성 뒤(선형 결합이라 0 이 될 수 있다)의 바닥이다.
+        """
+        return 20.0 * torch.log10(x + self.mag_eta)
+
+    def _sc(self, at: torch.Tensor, ap: torch.Tensor) -> torch.Tensor:
+        """스펙트럼 수렴도. **놈도 완화한다** — `‖v‖` 는 v=0 에서 같은 0/0 이다.
+
+        적합이 완벽해질수록 `at − ap → 0` 이므로 그 자리로 **다가가는 것이 목적**이다.
+        완화하지 않으면 잘 맞을수록 기울기가 불안정해진다.
+        """
         m = min(at.shape[-1], ap.shape[-1])
         at, ap = at[..., :m], ap[..., :m]
-        return torch.linalg.norm(at - ap) / (torch.linalg.norm(at) + 1e-9)
+        e2 = self.mag_eta ** 2
+        d = at - ap
+        num = torch.sqrt((d * d).sum() + e2)
+        den = torch.sqrt((at * at).sum() + e2)
+        return num / (den + 1e-9)
 
     def spectral_loss(self, y: torch.Tensor):
         """(정밀 SC, 포락 dB 오차, 포락 SC, 창별 SC%).
@@ -597,7 +644,7 @@ class CopySynthFitter:
         sc_sum, per = 0.0, {}
         Smel = None
         for k in self.sizes:
-            Sp = self._expect(_stft(y, k, self.wins[k]).abs()[:, :self.bin_max[k]], k)
+            Sp = self._expect(self._cabs(_stft(y, k, self.wins[k]))[:, :self.bin_max[k]], k)
             if k == MEL_FFT:
                 Smel = Sp
             sc = self._sc(self.tgt_S[k], Sp)
@@ -605,7 +652,8 @@ class CopySynthFitter:
             per[k] = float(100.0 * (1.0 - sc.detach()))
         if Smel is None:
             Smel = self._expect(
-                _stft(y, MEL_FFT, self.wins[MEL_FFT]).abs()[:, :self.bin_max[MEL_FFT]], MEL_FFT)
+                self._cabs(_stft(y, MEL_FFT, self.wins[MEL_FFT]))[:, :self.bin_max[MEL_FFT]],
+                MEL_FFT)
         Mp = self.mel[:, :Smel.shape[1]] @ Smel
         m = min(Mp.shape[-1], self.tgt_M.shape[-1])
         Mp, Mt = Mp[..., :m], self.tgt_M[..., :m]
@@ -659,13 +707,13 @@ class CopySynthFitter:
             m = min(Sp.shape[-1], St.shape[-1])
             b = self.bin_max[k]
             St, Sp = St[:, :b, :m], Sp[:, :b, :m]
-            at = St.abs()
+            at = self._cabs(St)
             w = self._harm_w[k][:, :, :m] * at
             # 단위 크기로 정규화. δ 는 크기가 0 에 가까운 빈에서 방향이 폭주하는 것을
             # 막는다 (그런 빈은 w 도 작아 어차피 기여가 없다).
             dt = 1e-4 * at.mean().detach() + 1e-12
-            ut = St / torch.sqrt(at ** 2 + dt ** 2)
-            up = Sp / torch.sqrt(Sp.abs() ** 2 + dt ** 2)
+            ut = St / torch.sqrt(St.real ** 2 + St.imag ** 2 + dt ** 2)
+            up = Sp / torch.sqrt(Sp.real ** 2 + Sp.imag ** 2 + dt ** 2)
             d = ut - up
             # √(|z|²+δ²)−δ — |z| 는 0 에서 곡률이 발산한다. 적합이 좋아질수록 그리로
             # 가므로 바닥을 깔아 둔다 (relu 제거와 같은 부류, C² 유지).
@@ -707,10 +755,12 @@ class CopySynthFitter:
         if self._har_res is None:
             return torch.ones(1, b, 1, device=self.device)
         har, res = self._har_res
-        H = _stft(torch.as_tensor(har, dtype=torch.float32,
-                                  device=self.device).unsqueeze(0), k, self.wins[k]).abs()[:, :b]
-        R = _stft(torch.as_tensor(res, dtype=torch.float32,
-                                  device=self.device).unsqueeze(0), k, self.wins[k]).abs()[:, :b]
+        H = self._cabs(_stft(torch.as_tensor(har, dtype=torch.float32,
+                                             device=self.device).unsqueeze(0),
+                             k, self.wins[k]))[:, :b]
+        R = self._cabs(_stft(torch.as_tensor(res, dtype=torch.float32,
+                                             device=self.device).unsqueeze(0),
+                             k, self.wins[k]))[:, :b]
         return (H / (H + R + 1e-9)).detach()
 
     def _time_smooth(self, S: torch.Tensor, k: int) -> torch.Tensor:
