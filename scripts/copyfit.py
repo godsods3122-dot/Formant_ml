@@ -80,22 +80,24 @@ def main() -> None:
     ap.add_argument("--patience", type=int, default=0,
                     help="이 회차 동안 손실이 안 줄면 그 단계를 끝낸다 (0 = 끔). "
                          "긴 음원에서는 켜는 편이 낫다 — 수렴한 단계에 예산을 다 쓴다")
-    ap.add_argument("--gain-acc", type=float, default=None,
-                    help="이득류(tract_gain/fric_gain/aspiration)의 가속도 벌점 세기. "
-                         "마찰 구간에서 적합기가 못 맞출 난류 요동을 이득으로 좇는 것을 "
-                         "막는다 (fit.GAIN_ACC_W). 생략하면 모듈 기본값")
+    ap.add_argument("--prior", action="append", default=None, metavar="이름=값",
+                    help="사전 가중(fit.PRIOR_W) 덮어쓰기. 여러 번 줄 수 있다. "
+                         "예: --prior aspiration=3.0")
     ap.add_argument("--ripple", type=float, default=None,
                     help="제어열 잔물결 벌점 세기 (fit.RIPPLE_W). 조음 대역(0~20 Hz) "
                          "위에서 트랙이 흔들리는 것만 문다 — 지지직과 저역 초과가 "
                          "둘 다 여기서 온다 (docs/MEASUREMENTS.md §13, §16)")
     a = ap.parse_args()
     torch.set_num_threads(a.threads)
-    if a.gain_acc is not None or a.ripple is not None:
+    if a.ripple is not None or a.prior:
         from formant_ml.engine import fit as _fit
-        if a.gain_acc is not None:
-            _fit.GAIN_ACC_W = float(a.gain_acc)
         if a.ripple is not None:
             _fit.RIPPLE_W = float(a.ripple)
+        for item in (a.prior or ()):
+            k, _, v = item.partition("=")
+            if k not in _fit.PRIOR_W and k not in _fit.DEFAULT_PARAMS:
+                raise SystemExit(f"--prior: 모르는 파라미터 {k!r}")
+            _fit.PRIOR_W[k] = float(v)
 
     y, sr = sf.read(a.wav)
     if y.ndim > 1:

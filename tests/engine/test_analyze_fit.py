@@ -415,4 +415,3 @@ def test_ripple_penalty_is_off_by_default():
     """기본값이 0 이어야 한다 — A/B 로 세기를 정하기 전에는 거동을 안 바꾼다."""
     from formant_ml.engine import fit as F
     assert F.RIPPLE_W == 0.0
-    assert F.GAIN_ACC_W == 0.0
