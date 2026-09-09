@@ -94,6 +94,11 @@ def main() -> None:
     ap.add_argument("--prior", action="append", default=None, metavar="이름=값",
                     help="사전 가중(fit.PRIOR_W) 덮어쓰기. 여러 번 줄 수 있다. "
                          "예: --prior aspiration=3.0")
+    ap.add_argument("--flux", type=float, default=None,
+                    help="세로 얼룩(스펙트럼 플럭스) **일치** 항의 세기 (fit.FLUX_W). "
+                         "지금 손실은 _expect 때문에 얼룩을 원리적으로 못 본다 — "
+                         "이 항이 멜 대역 dB 의 프레임 간 |Δ| 통계를 목표와 맞춘다. "
+                         "최소화가 아니라 일치다 (난류는 원래 흔들린다)")
     ap.add_argument("--vel-w", type=float, default=None,
                     help="포먼트 가속도 벌점 세기 (fit.VEL_W, 기본 0). 무릎은 실측 "
                          "중앙 가속도 (F1 0.7 / F2 1.9 / F3 3.4 / F4 3.5 Hz/ms²)")
@@ -112,7 +117,7 @@ def main() -> None:
     a = ap.parse_args()
     torch.set_num_threads(a.threads)
     if (a.ripple is not None or a.prior or a.artic_vel is not None
-            or a.vel_w is not None):
+            or a.vel_w is not None or a.flux is not None):
         from formant_ml.engine import fit as _fit
         if a.ripple is not None:
             _fit.RIPPLE_W = float(a.ripple)
@@ -120,6 +125,8 @@ def main() -> None:
             _fit.ARTIC_VEL_W = float(a.artic_vel)
         if a.vel_w is not None:
             _fit.VEL_W = float(a.vel_w)
+        if a.flux is not None:
+            _fit.FLUX_W = float(a.flux)
     if a.tilt_cap is not None:
         from formant_ml.engine import glottis as _g
         _g.TILT_MAX_HZ = float(a.tilt_cap)

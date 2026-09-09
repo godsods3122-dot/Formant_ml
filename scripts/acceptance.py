@@ -202,7 +202,39 @@ def _r(a, b):
     return float(np.corrcoef(a, b)[0, 1])
 
 
-def check(stem: str) -> dict:
+def render_seed(stem: str, seed: int) -> np.ndarray | None:
+    """적합 트랙을 **다른 난수 시드**로 다시 렌더한다.
+
+    난류의 실현은 시드마다 다르고, 세로 얼룩·F0 아래 초과 같은 **분산 통계**는 그
+    차이에 크게 흔들린다 (실측: 같은 설정이 flux 비 1.23 / 1.46 / 1.46).
+    시드 하나로 설정을 비교하면 틀린 결론이 난다 (MEASUREMENTS §18 과 같은 교훈).
+    """
+    import torch
+
+    from formant_ml.engine.control import ControlTrack
+    from formant_ml.engine.profile import DEFAULT_PROFILE, SpeakerProfile
+    from formant_ml.engine.voice import EngineConfig, VoiceEngine
+
+    d = np.load(stem + "_track.npz")
+    fm = float(d["frame_ms"])
+    pf = "profiles/yang_female.json"
+    prof = SpeakerProfile.load(pf) if os.path.exists(pf) else DEFAULT_PROFILE
+    tr = ControlTrack(np.asarray(d["values"], float), frame_ms=fm)
+    eng = VoiceEngine(EngineConfig(sample_rate=int(FS), frame_ms=fm,
+                                   speaker="female" if prof.f0_nominal > 165 else "male",
+                                   residual=False, seed=seed), prof)
+    eng.reset()
+    with torch.no_grad():
+        y = eng(tr.to_tensor(), [], 0.0)["audio"].squeeze().numpy()
+    ir = stem + "_room.npy"
+    if os.path.exists(ir):
+        from formant_ml.engine import room as _room
+        y = _room.apply_ir(torch.as_tensor(y, dtype=torch.float32),
+                           torch.as_tensor(np.load(ir), dtype=torch.float32)).numpy()
+    return np.asarray(y, float)
+
+
+def check(stem: str, seeds: int = 0) -> dict:
     tgt, syn = _read(stem + "_target.wav"), _read(stem + "_fit.wav")
     n = min(len(tgt), len(syn))
     tgt, syn = tgt[:n], syn[:n]
@@ -266,6 +298,29 @@ def check(stem: str) -> dict:
     out["jitter_ratio"] = float(js / jt) if jt and np.isfinite(jt) and jt > 0 else float("nan")
     out["jitter"] = float(np.median(v[voiced, INDEX["jitter"]]))
     out["shimmer"] = float(np.median(v[voiced, INDEX["shimmer"]]))
+
+    # **시드에 민감한 통계는 여러 실현에서 잰다.** 아래 셋은 난류의 실현마다 크게
+    # 흔들리므로 (§18) 한 벌로 설정을 비교하면 틀린 결론이 난다.
+    if seeds > 1:
+        keys = ("flux_p95_ratio", "flux_over_pct", "subf0_excess_db")
+        acc_ = {k: [out[k]] for k in keys}
+        for sd in range(1, seeds):
+            y = render_seed(stem, sd)
+            if y is None:
+                continue
+            n2 = min(len(y), len(tgt))
+            g = np.sqrt((tgt[:n2] ** 2).mean() / max((y[:n2] ** 2).mean(), 1e-20))
+            y = y[:n2] * g
+            f2 = flux(y, lf)
+            acc_["flux_p95_ratio"].append(
+                float(np.percentile(f2, 95) / max(np.percentile(ft, 95), 1e-9)))
+            acc_["flux_over_pct"].append(
+                float(100.0 * (f2 > np.percentile(ft, 99)).mean()))
+            acc_["subf0_excess_db"].append(subf0_excess(tgt[:n2], y, lf, f0m))
+        for k in keys:
+            a = np.array(acc_[k], float)
+            out[k] = float(np.median(a))
+            out["_" + k + "_rng"] = (float(a.min()), float(a.max()), len(a))
     return out
 
 
@@ -298,6 +353,9 @@ def report(stem: str, res: dict) -> bool:
             print(f"    {'OK ' if ok else '**' } {k:18s} {got:9.3f}   {rel}")
     print(f"    (참고) env100_r {res['env100_r']:.3f}   F0 중앙 {res['_f0']:.0f} Hz   "
           f"실현 지터 목표 {res['_jit'][0]:.2f} % -> 합성 {res['_jit'][1]:.2f} %")
+    rng = {k[1:-4]: v for k, v in res.items() if k.endswith("_rng")}
+    for k, (lo, hi, n) in rng.items():
+        print(f"    (시드 {n} 벌) {k:18s} 범위 {lo:.3f} ~ {hi:.3f}")
     return ok_all
 
 
@@ -306,11 +364,13 @@ def main() -> None:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("stems", nargs="+")
     ap.add_argument("--json", default=None)
+    ap.add_argument("--seeds", type=int, default=1,
+                    help="시드 몇 벌로 잴까 (>1 이면 flux·F0 아래 초과를 중앙값으로 낸다)")
     a = ap.parse_args()
     allres = {}
     passed = 0
     for s in a.stems:
-        r = check(s)
+        r = check(s, seeds=a.seeds)
         allres[s] = {k: v for k, v in r.items() if not k.startswith("_")}
         passed += bool(report(s, r))
     print(f"\n합격 {passed}/{len(a.stems)}")

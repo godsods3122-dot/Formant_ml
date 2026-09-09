@@ -279,6 +279,27 @@ PRIOR_W: dict[str, float] = {
 # (`DB_RANGE` = 정점 −70 dB)보다 한참 밑이라 편향이 없다.
 MAG_ETA_REL = 1e-6
 
+# **세로 얼룩(스펙트럼 플럭스) 일치 항.**
+#
+# 사용자 조건 1 은 "세로 얼룩 없음" 인데, **지금 손실은 그것을 원리적으로 못 본다.**
+# `_expect` 가 난류 우세 빈을 시간 평활한 기대 스펙트럼으로 갈아 끼워 비교하기
+# 때문이다 (그 자체는 옳다 — 난류의 실현을 맞추라고 하면 기울기가 잡음이다).
+# 그래서 적합기에게 프레임 간 급변을 줄일 이유가 없었다.
+#
+# 실현이 아니라 **통계**를 맞춘다 (§9 와 같은 철학):
+#
+#     F(k) = mean_t |dB_mel(t+L, k) − dB_mel(t, k)|      (L = 4 프레임 ≈ 5.3 ms)
+#
+# 그리고 **최소화가 아니라 일치**다. 난류는 원래 흔들리므로 목표보다 매끈하면 그것도
+# 틀린 것이다 — 짧은 창의 스펙트럼이 안 흔들리는 잡음은 잡음이 아니라 음(音)이다.
+# 사용자가 말한 "이전 창을 많이 반영하면 주기적 소리가 난다" 가 바로 그 이야기다.
+# 그래서 `|F_합성 − F_목표|` 를 벌한다.
+#
+# 시간 간격 L: 합격 판정(`scripts/acceptance.py`)이 5 ms 격자에서 재므로 같은 눈금을
+# 쓴다. MEL_FFT=256 의 홉이 64 표본(1.33 ms)이라 L=4 가 5.3 ms 다.
+FLUX_LAG = 4
+FLUX_W = 0.0               # 0 이면 항이 빠진다. `copyfit --flux` 로 켠다.
+
 F_MARGIN_HZ = 120.0        # 인접 포먼트 최소 간격
 
 #: 비유한 기울기가 났을 때 어느 파라미터·격자점인지 찍는다 (느리지 않다 — 났을 때만).
@@ -373,6 +394,9 @@ class CopySynthFitter:
         self.room_ir = (None if room_ir is None else
                         torch.as_tensor(np.asarray(room_ir, np.float32), device=device))
         self._last_pulse = float("nan")
+        self._last_flux = float("nan")
+        self._flux_db = None
+        self.flux_live = None
         self.sizes = list(FFT_SIZES)
 
         # 녹음의 원래 나이퀴스트. **손실에서 그 위를 보면 안 된다.**
@@ -467,6 +491,11 @@ class CopySynthFitter:
             self.tgt_M = self.mel[:, :self.tgt_S[MEL_FFT].shape[1]] @ self.tgt_S[MEL_FFT]
             self.tgt_Mdb = self._db(self.tgt_M)
             self.db_floor = float(self.tgt_Mdb.max()) - DB_RANGE
+            # **플럭스 통계는 `_expect` 를 지나기 전의 날것에서 잰다.** 평활된
+            # 스펙트럼에서 재면 재려는 흔들림이 이미 지워져 있다.
+            raw_mel = self.mel[:, :raw[MEL_FFT].shape[1]] @ raw[MEL_FFT]
+            self.tgt_flux, self.flux_live = self._flux_stat(self._db(raw_mel),
+                                                            make_mask=True)
         self.calibrate_gain()
 
     # ------------------------------------------------------- 재매개화
@@ -642,18 +671,19 @@ class CopySynthFitter:
         로 재고 (로그 주파수 = 대역마다 같은 무게), 정점 −70 dB 아래는 잘라 낸다.
         """
         sc_sum, per = 0.0, {}
-        Smel = None
+        Smel = Smel_raw = None
         for k in self.sizes:
-            Sp = self._expect(self._cabs(_stft(y, k, self.wins[k]))[:, :self.bin_max[k]], k)
+            raw = self._cabs(_stft(y, k, self.wins[k]))[:, :self.bin_max[k]]
+            Sp = self._expect(raw, k)
             if k == MEL_FFT:
-                Smel = Sp
+                Smel, Smel_raw = Sp, raw
             sc = self._sc(self.tgt_S[k], Sp)
             sc_sum = sc_sum + sc
             per[k] = float(100.0 * (1.0 - sc.detach()))
         if Smel is None:
-            Smel = self._expect(
-                self._cabs(_stft(y, MEL_FFT, self.wins[MEL_FFT]))[:, :self.bin_max[MEL_FFT]],
-                MEL_FFT)
+            Smel_raw = self._cabs(
+                _stft(y, MEL_FFT, self.wins[MEL_FFT]))[:, :self.bin_max[MEL_FFT]]
+            Smel = self._expect(Smel_raw, MEL_FFT)
         Mp = self.mel[:, :Smel.shape[1]] @ Smel
         m = min(Mp.shape[-1], self.tgt_M.shape[-1])
         Mp, Mt = Mp[..., :m], self.tgt_M[..., :m]
@@ -664,7 +694,40 @@ class CopySynthFitter:
         b = self._soft_floor(self._db(Mp), self.db_floor, 0.5)
         env_db = self._soft_abs(a - b, 0.5).mean() / 20.0
         env_sc = self._sc(Mt, Mp)
+        if FLUX_W > 0.0:
+            # **날것 멜**로 잰다 (`_expect` 를 지나면 재려는 흔들림이 이미 없다).
+            self._flux_db = self._db(self.mel[:, :Smel_raw.shape[1]] @ Smel_raw)
         return sc_sum / len(self.sizes), env_db, env_sc, per
+
+    def _flux_stat(self, mdb: torch.Tensor, make_mask: bool = False):
+        """멜 대역별 **시간 변화율** `mean_t |Δ dB|` — 세로 얼룩의 통계.
+
+        `make_mask=True` 면 "소리 나는 프레임" 마스크도 같이 만든다. 무음의 −∞ 근처
+        dB 는 잘게 흔들려 통계를 통째로 오염시킨다 (§30 에서 합격 판정이 같은 이유로
+        틀렸다). 목표 정점 대비 −45 dB 를 문턱으로 쓴다.
+        """
+        L = max(1, int(FLUX_LAG))
+        if mdb.shape[-1] <= L:
+            z = torch.zeros(mdb.shape[-2], dtype=mdb.dtype, device=mdb.device)
+            return (z, None) if make_mask else z
+        d = self._soft_abs(mdb[..., L:] - mdb[..., :-L], 0.5)
+        if make_mask:
+            lvl = mdb.mean(-2)                                   # 프레임 평균 dB
+            live = (lvl > float(lvl.max()) - 45.0)
+            live = (live[..., L:] & live[..., :-L]).to(mdb.dtype)
+            w = live / live.sum().clamp_min(1.0)
+            return (d * w).sum(-1), live
+        live = self.flux_live
+        if live is None or live.shape[-1] != d.shape[-1]:
+            return d.mean(-1)
+        w = live.to(d.dtype) / live.sum().clamp_min(1.0)
+        return (d * w).sum(-1)
+
+    def flux_loss(self, raw_mel_db: torch.Tensor) -> torch.Tensor:
+        """플럭스를 **일치**시킨다 — 크면 세로 줄, 작으면 기계적이다."""
+        f = self._flux_stat(raw_mel_db)
+        m = min(f.shape[-1], self.tgt_flux.shape[-1])
+        return self._soft_abs(f[..., :m] - self.tgt_flux[..., :m], 0.1).mean() / 20.0
 
     def phase_loss(self, y: torch.Tensor) -> torch.Tensor:
         """**단위 크기** 복소 잔차 — 크기와 직교한 순수 위상 거리, 조화 우세부에만.
@@ -944,6 +1007,10 @@ class CopySynthFitter:
             l = l + self.pulse_weight * pl
         if self.phase_weight > 0:
             l = l + self.phase_weight * self.phase_loss(y)
+        if FLUX_W > 0.0 and getattr(self, "_flux_db", None) is not None:
+            fl = self.flux_loss(self._flux_db)
+            self._last_flux = float(fl.detach()) * 20.0
+            l = l + FLUX_W * fl
         if self.lam_smooth > 0 and self.w.shape[0] > 1:
             d = self.w[1:] - self.w[:-1]
             l = l + self.lam_smooth * (d * d).mean()
