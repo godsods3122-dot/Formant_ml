@@ -866,8 +866,11 @@ class CopySynthFitter:
                 # 대가는 포락 90.67 -> 87.85 %, 무게중심 r 0.983 -> 0.880 이었다
                 # (§27.3). 스파이크만 깎아야 하는데 조음 자체를 죽인 것이다.
                 #
-                # softplus 로 초과분만 취하면 한계 아래는 정확히 공짜다. 폭은
+                # softplus 로 초과분만 취하면 한계 아래는 사실상 공짜다. 폭은
                 # 무릎의 20 % — relu 에 충분히 가깝고 C² 는 지킨다.
+                # (정확히 0 은 아니다: 속도 0 에서 softplus(−5) = 6.7e-3 이 새고
+                #  의사후버를 지나 프레임당 ~9e-7 로 남는다. 손실이 ~1.0 이므로
+                #  무시할 양이고, 대신 미분이 어디서나 살아 있다.)
                 over = self._soft_over(rate - knee, 0.2 * knee) / knee
                 pen = pen + ARTIC_VEL_W * self._pseudo_huber(over).mean()
         if RIPPLE_W > 0 and self.w.shape[0] >= 3:

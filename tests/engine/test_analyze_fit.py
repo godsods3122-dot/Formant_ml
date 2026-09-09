@@ -195,6 +195,13 @@ def test_global_offset_never_touches_formants(_engine):
 
 
 def test_penalty_punishes_out_of_order_formants(_engine):
+    """포먼트 순서가 뒤집히면 벌점이 **자릿수로** 커져야 한다.
+
+    바닥값은 0 이 아니다. `a_c` 속도 벌점이 `softplus` 로 문턱을 뭉개므로 속도 0
+    에서도 `softplus(−5) = 6.7e-3` 만큼 새고, 그것이 의사후버를 지나 프레임당
+    ~9e-7 로 남는다 (§29.3). 손실이 ~1.0 인 것에 비하면 무시할 양이지만 정확히
+    0 은 아니므로, "바닥은 0" 이 아니라 "바닥은 위반의 자릿수 아래" 를 건다.
+    """
     tr = _track()
     f = CopySynthFitter(_engine, _engine.render(tr), 48000, tr)
     with torch.no_grad():
@@ -202,7 +209,8 @@ def test_penalty_punishes_out_of_order_formants(_engine):
         i2 = f.names.index("f2")
         f.w[:, i2] = -20.0 / float(f.scale[i2])       # F2 를 F1 아래로
         p1 = float(f.penalty())
-    assert p0 < 1e-9 < p1
+    assert p0 < 1e-5, f"위반이 없는데 벌점이 {p0:.3g} 이다"
+    assert p1 > 1e3 * max(p0, 1e-12), f"순서 위반 {p1:.3g} 이 바닥 {p0:.3g} 과 비슷하다"
 
 
 @pytest.mark.parametrize("name", ["f0_target", "p_sub", "f1", "bw1", "a_c", "velum"])
