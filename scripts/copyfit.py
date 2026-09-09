@@ -86,6 +86,9 @@ def main() -> None:
                          "응답을 성도·소스 파라미터로 흡수하지 않아 추정되는 물리량이 "
                          "**마른 목소리**의 것이 된다 (engine/room.py, MEASUREMENTS §23)")
     ap.add_argument("--room-taps", type=int, default=None, help="IR 탭 수 (기본 4096 = 85 ms)")
+    ap.add_argument("--room-lambda", type=float, default=None,
+                    help="IR 추정의 정규화 세기 (기본 0.1). 크면 IR 이 δ 에 가까워져 "
+                         "방의 시간 구조가 사라진다")
     ap.add_argument("--prior", action="append", default=None, metavar="이름=값",
                     help="사전 가중(fit.PRIOR_W) 덮어쓰기. 여러 번 줄 수 있다. "
                          "예: --prior aspiration=3.0")
@@ -142,7 +145,9 @@ def main() -> None:
         ref = ref.mean(1) if ref.ndim > 1 else ref
         m = min(len(dry), len(ref))
         room_ir = _room.estimate_ir(dry[:m], ref[:m],
-                                    taps=a.room_taps or _room.DEFAULT_TAPS)
+                                    taps=a.room_taps or _room.DEFAULT_TAPS,
+                                    lam=a.room_lambda if a.room_lambda is not None
+                                    else _room.DEFAULT_LAMBDA)
         print(f"녹음 경로 IR: {src} 에서 {len(room_ir)} 탭 "
               f"({len(room_ir)/48000*1000:.0f} ms) 추정, 직접음 {_room.direct_gain(room_ir):.3f}",
               flush=True)
