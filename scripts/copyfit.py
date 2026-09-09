@@ -80,6 +80,12 @@ def main() -> None:
     ap.add_argument("--patience", type=int, default=0,
                     help="이 회차 동안 손실이 안 줄면 그 단계를 끝낸다 (0 = 끔). "
                          "긴 음원에서는 켜는 편이 낫다 — 수렴한 단계에 예산을 다 쓴다")
+    ap.add_argument("--room-from", default=None, metavar="STEM",
+                    help="이미 있는 **마른** 적합 결과(copyfit --out 값)에서 녹음 경로 IR 을 "
+                         "추정해 순방향 모형에 넣는다. 그러면 적합기가 방·마이크·코덱의 "
+                         "응답을 성도·소스 파라미터로 흡수하지 않아 추정되는 물리량이 "
+                         "**마른 목소리**의 것이 된다 (engine/room.py, MEASUREMENTS §23)")
+    ap.add_argument("--room-taps", type=int, default=None, help="IR 탭 수 (기본 4096 = 85 ms)")
     ap.add_argument("--prior", action="append", default=None, metavar="이름=값",
                     help="사전 가중(fit.PRIOR_W) 덮어쓰기. 여러 번 줄 수 있다. "
                          "예: --prior aspiration=3.0")
@@ -123,7 +129,20 @@ def main() -> None:
     eng = VoiceEngine(EngineConfig(sample_rate=48000, frame_ms=a.frame_ms,
                                    speaker="female" if prof.f0_nominal > 165 else "male",
                                    residual=False), prof)
-    fit = CopySynthFitter(eng, seg, sr, track, phase_weight=a.phase)
+    room_ir = None
+    if a.room_from:
+        from formant_ml.engine import room as _room
+        dry, _ = sf.read(a.room_from + "_fit.wav")
+        ref, _ = sf.read(a.room_from + "_target.wav")
+        dry = dry.mean(1) if dry.ndim > 1 else dry
+        ref = ref.mean(1) if ref.ndim > 1 else ref
+        m = min(len(dry), len(ref))
+        room_ir = _room.estimate_ir(dry[:m], ref[:m],
+                                    taps=a.room_taps or _room.DEFAULT_TAPS)
+        print(f"녹음 경로 IR: {a.room_from} 에서 {len(room_ir)} 탭 "
+              f"({len(room_ir)/48000*1000:.0f} ms) 추정, 직접음 {_room.direct_gain(room_ir):.3f}",
+              flush=True)
+    fit = CopySynthFitter(eng, seg, sr, track, phase_weight=a.phase, room_ir=room_ir)
     kw = {} if a.lr_global is None else {"lr_global": a.lr_global}
     rep = fit.fit_staged(global_iters=a.global_iters, stage_iters=a.stage_iters,
                          lr_frame=a.lr_frame, phase_iters=a.phase_iters,
@@ -141,6 +160,11 @@ def main() -> None:
     os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
     sf.write(a.out + "_target.wav", seg, sr)
     sf.write(a.out + "_fit.wav", out, 48000)
+    if room_ir is not None:
+        # 마른 출력도 같이 낸다 — 학습 데이터로 나가는 것은 이쪽의 파라미터다.
+        with torch.no_grad():
+            sf.write(a.out + "_dry.wav", fit.synth_dry()[0].cpu().numpy(), 48000)
+        np.save(a.out + "_room.npy", room_ir)
     res = fit.result_track()
     np.savez(a.out + "_track.npz", values=res.values, frame_ms=res.frame_ms,
              names=np.array(PARAM_NAMES))

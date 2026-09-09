@@ -43,6 +43,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import torch
 
+from . import room
 from .control import INDEX, PARAMS, ControlTrack
 
 FFT_SIZES = (256, 512, 1024, 2048, 4096)
@@ -302,7 +303,8 @@ class CopySynthFitter:
                  params: tuple[str, ...] = DEFAULT_PARAMS,
                  lam_smooth: float = 3e-3, lam_prior: float = 1e-4,
                  phase_weight: float = 0.0, pulse_weight: float = 1.0,
-                 n_mels: int = 48, device: str = "cpu"):
+                 n_mels: int = 48, device: str = "cpu",
+                 room_ir: np.ndarray | None = None):
         self.eng = engine
         self.hop = engine.cfg.hop
         self.fs = engine.cfg.sample_rate
@@ -310,6 +312,8 @@ class CopySynthFitter:
         self.lam_smooth, self.lam_prior = lam_smooth, lam_prior
         self.phase_weight = phase_weight
         self.pulse_weight = pulse_weight
+        self.room_ir = (None if room_ir is None else
+                        torch.as_tensor(np.asarray(room_ir, np.float32), device=device))
         self._last_pulse = float("nan")
         self.sizes = list(FFT_SIZES)
 
@@ -498,10 +502,25 @@ class CopySynthFitter:
 
     # ------------------------------------------------------------ 손실
     def synth(self, want_phase: bool = False):
+        """엔진을 돌리고, **녹음 경로**가 주어졌으면 그것까지 통과시킨다.
+
+        `room_ir` 은 방·마이크·코덱을 녹음에서 추정한 필터다 (engine/room.py). 이걸
+        순방향에 넣으면 적합기가 그 응답을 성도·소스 파라미터로 흡수하지 않는다 —
+        추정되는 물리량이 **마른 목소리**의 것이 된다. 위상(`out["phase"]`)은 성문
+        위상이라 방을 안 통과한다: 펄스 항은 소스의 시각을 거는 것이므로 그대로 둔다.
+        """
         self.eng.reset()
         out = self.eng(self.control(), self.track.events, 0.0)
         y = out["audio"] * torch.exp(self.log_gain).to(torch.float32)
+        if self.room_ir is not None:
+            y = room.apply_ir(y, self.room_ir)
         return (y, out["phase"]) if want_phase else y
+
+    def synth_dry(self) -> torch.Tensor:
+        """녹음 경로를 빼고 렌더한다 — 이게 **목소리 자체**다."""
+        self.eng.reset()
+        out = self.eng(self.control(), self.track.events, 0.0)
+        return out["audio"] * torch.exp(self.log_gain).to(torch.float32)
 
     def pulse_loss(self, phase: torch.Tensor) -> torch.Tensor:
         """성문 펄스 위치를 목표의 폐쇄 시각에 건다.
