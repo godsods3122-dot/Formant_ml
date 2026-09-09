@@ -943,13 +943,13 @@ class CopySynthFitter:
                 best = (score, (self.w.detach().clone(), self.d.detach().clone()),
                         self.log_gain.detach().clone(),
                         (env, fine, self._last_db, float(l.detach()), per))
+            stall_before = stall          # 증가 **전** 값 — 건너뛴 회차에 되돌린다
             if patience > 0:
                 stall = 0 if gain > tol * abs(score) else stall + 1
                 if stall >= patience:
                     if verbose:
                         print(f"    [{it}] 수렴 ({patience} 회 정체) — 조기 종료")
                     break
-            stall_before = stall
             l.backward()
             ps = [self.w, self.d, self.log_gain, self.pulse_phi0]
             # **비유한 기울기로 걸음을 딛으면 안 된다.** Adam 의 모멘트가 NaN 으로

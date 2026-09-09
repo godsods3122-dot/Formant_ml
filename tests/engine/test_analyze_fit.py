@@ -458,3 +458,46 @@ def test_articulator_velocity_penalty_spares_real_gestures(_engine):
         with torch.no_grad():
             f.w.copy_(torch.zeros_like(f.w))
     assert ps > 10.0 * max(pg, 1e-9)
+    # **한계 아래는 정확히 공짜여야 한다.** 처음 쓴 `pseudo_huber(rate/knee)` 는
+    # 무릎 아래에서도 이차로 벌해서 실제 제스처까지 얼렸다 (§29: a_c 속도 95 분위가
+    # 0.449 -> 0.015 로, 가장 빠른 실제 제스처의 11 배 **아래**로 눌렸다).
+    # 이 제스처의 최대 속도는 0.071 로 한계(0.20)의 3 분의 1 이다.
+    assert pg < 0.01 * ps
+
+
+def test_skipped_iterations_do_not_count_as_convergence(_engine):
+    """비유한 기울기로 **건너뛴** 회차를 정체로 세면 안 된다.
+
+    걸음을 안 딛었으면 손실이 안 변하는 것이 당연한데 그걸 "수렴" 으로 세면, 비유한
+    기울기가 잦은 구간에서 단계가 통째로 조기 종료된다. 실측(out/v13/s040): 위상
+    단계 42 회 중 27 회가 건너뛰어져 정체 30 이 먼저 찼고, 위상 단계는 항상 한 번
+    꺾였다가 회복하므로 **골짜기 한복판**에서 멈췄다 — 포락 90.63 -> 84.29 %
+    (docs/MEASUREMENTS.md §27).
+
+    √x 는 x=0 에서 기울기가 무한이다. 그걸로 비유한 기울기를 확실히 만든다.
+    """
+    tr = _track(n=60)
+    target = _engine.render(tr)
+
+    def run(poison: bool) -> int:
+        f = CopySynthFitter(_engine, target, 48000, tr)
+        real_loss = f.loss
+        calls = {"n": 0}
+
+        def wrapped():
+            l, sc, env_sc, per = real_loss()
+            calls["n"] += 1
+            if poison and calls["n"] % 2 == 0:        # 절반의 회차에서 ∞ 기울기
+                l = l + torch.sqrt((f.w * 0.0).sum())
+            return l, sc, env_sc, per
+
+        f.loss = wrapped
+        f.fit(iters=12, lr=0.02, verbose=False, patience=3)
+        return calls["n"]
+
+    # 목표가 같은 트랙의 렌더라 실제 걸음도 손실을 못 줄인다 — 그래서 오염 없는
+    # 실행은 정당하게 patience 회 만에 멈춘다. 오염된 실행은 **건너뛴 회차가 정체로
+    # 세어지지 않는다면** 그만큼 더 돌아야 한다.
+    clean, poisoned = run(False), run(True)
+    assert poisoned > clean, (
+        f"건너뛴 회차가 정체로 세어졌다 — 오염 {poisoned} 회 vs 정상 {clean} 회")
