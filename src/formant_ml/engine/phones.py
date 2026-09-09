@@ -183,20 +183,46 @@ class Builder:
         self.t = t0 + dur
         return self
 
-    def affricate(self, next_vowel="a", aspirated=False, tense=False):
+    def affricate(self, next_vowel="a", aspirated=False, tense=False, voiced=False):
         """/ㅈ, ㅊ, ㅉ/ — 폐쇄(구강압 축적) → 방전 버스트 → 마찰 → 기식 → 모음.
 
         실측: 개시가 10 ms 안에 −70 → −30 dB 로 서고, 그 뒤 100 ms 에 걸쳐 감쇠한다.
         ㅊ 의 해제 뒤 스펙트럼은 100 Hz~5 kHz 가 거의 **평탄**했다 — 마찰이 아니라 성문
         기식이 지배한다는 뜻이다. 그래서 격음은 성문을 협착보다 훨씬 늦게 닫는다.
+
+        `voiced` — 한국어 치찰음 중 **유성으로 실현되는 것은 ㅈ 하나**다(모음 사이).
+        그때 다른 것은 **성문 자세 하나**이고 나머지는 저절로 따라온다:
+
+        * 성문이 발성 자세로 남는다(내전 0.55). 그래서 성문 면적 Ag 가 작고,
+          직렬 오리피스에서 유량이 성문에 묶여 협착부 속도가 떨어진다 → 마찰이
+          약해진다. `series_flow` 가 이미 그렇게 계산한다.
+        * 폐쇄 뒤에 구강압 Po 가 오르는데 성문이 닫혀 있으니 경성문압차
+          (Ps − Po)가 빠르게 줄어 발성 역치 아래로 간다 — Ohala 의 **유성 저해음
+          공기역학 제약**이다. `noise.oral_cavity` 의 1 차 계가 그 감쇠를 낸다.
+          그래서 유성 마찰은 오래 못 간다: 마찰 구간을 짧게 잡는다.
+        * 기식 꼬리가 없다. 성문이 벌어진 적이 없으므로 `lag` 도 짧다.
+
+        즉 **따로 만든 소리가 아니라 같은 물리에 성문 자세만 바꾼 것**이다.
+        합성 결과 (여성 프로파일, 마찰 구간에서 잰 값):
+
+            무성 ㅈ  발성바(0-300 Hz) −43.1 dB  마찰대역(4-12 k)  −0.8 dB  주기성 38.2 %
+            유성 ㅈ                   −12.8              −20.9              95.4 %
+
+        내전 하나를 0.07 → 0.55 로 바꾼 것뿐인데 셋이 다 같이 움직인다.
+
+        .. note::
+           **세기는 아직 보정 전이다.** 방향(발성이 켜지고 마찰이 약해진다)은 물리가
+           내지만, 마찰이 20 dB 나 죽는 것이 실측과 맞는지는 확인하지 않았다.
+           모음 사이 ㅈ 토큰을 코퍼스에서 골라 같은 자로 재야 `adduct` 0.55 와
+           `fric` 0.050 s 를 확정할 수 있다.
         """
         S = self.p.sibilant
         v1, v2, v3 = self.V(next_vowel)
-        closure = 0.060
-        fric = 0.110 if aspirated else 0.080
+        closure = 0.050 if voiced else 0.060
+        fric = 0.110 if aspirated else (0.050 if voiced else 0.080)
         front = self.p.sib_front_len_cm * 1.25
-        adduct = 0.10 if tense else (0.03 if aspirated else 0.07)
-        lag = self.ms(20 if tense else (110 if aspirated else 55))
+        adduct = 0.55 if voiced else (0.10 if tense else (0.03 if aspirated else 0.07))
+        lag = self.ms(10 if voiced else (20 if tense else (110 if aspirated else 55)))
         lvl = S.get("aspirated_level_db" if aspirated else "affricate_level_db", -7.0)
         gain = 10 ** ((lvl - SIB_REF_DB) / 20.0)
         l1, l2, l3 = S.get("locus", [470.0, 1800.0, 2700.0])
@@ -298,6 +324,14 @@ def ma(profile=None, f0=None, p_sub=None) -> ControlTrack:
 def ja(profile=None, f0=None, p_sub=None) -> ControlTrack:
     b = _b(profile, f0, p_sub); f = b.f0
     b.affricate("a"); b.vowel("a", f0_end=f * 0.85, final=True); b.silence()
+    return b.build()
+
+
+def aja(profile=None, f0=None, p_sub=None) -> ControlTrack:
+    """/아ㅈ아/ — **유성** 치찰음. 모음 사이의 ㅈ 하나만 이렇게 실현된다."""
+    b = _b(profile, f0, p_sub); f = b.f0
+    b.vowel("a"); b.affricate("a", voiced=True)
+    b.vowel("a", f0_end=f * 0.85, final=True); b.silence()
     return b.build()
 
 
