@@ -94,6 +94,9 @@ def main() -> None:
     ap.add_argument("--prior", action="append", default=None, metavar="이름=값",
                     help="사전 가중(fit.PRIOR_W) 덮어쓰기. 여러 번 줄 수 있다. "
                          "예: --prior aspiration=3.0")
+    ap.add_argument("--vel-w", type=float, default=None,
+                    help="포먼트 가속도 벌점 세기 (fit.VEL_W, 기본 0). 무릎은 실측 "
+                         "중앙 가속도 (F1 0.7 / F2 1.9 / F3 3.4 / F4 3.5 Hz/ms²)")
     ap.add_argument("--tilt-cap", type=float, default=None,
                     help="소스 기울기(tilt)가 먹히는 상한 주파수 [Hz] "
                          "(glottis.TILT_MAX_HZ, 기본 5000). 0 이면 상한 없음 — "
@@ -108,12 +111,15 @@ def main() -> None:
                          "둘 다 여기서 온다 (docs/MEASUREMENTS.md §13, §16)")
     a = ap.parse_args()
     torch.set_num_threads(a.threads)
-    if a.ripple is not None or a.prior or a.artic_vel is not None:
+    if (a.ripple is not None or a.prior or a.artic_vel is not None
+            or a.vel_w is not None):
         from formant_ml.engine import fit as _fit
         if a.ripple is not None:
             _fit.RIPPLE_W = float(a.ripple)
         if a.artic_vel is not None:
             _fit.ARTIC_VEL_W = float(a.artic_vel)
+        if a.vel_w is not None:
+            _fit.VEL_W = float(a.vel_w)
     if a.tilt_cap is not None:
         from formant_ml.engine import glottis as _g
         _g.TILT_MAX_HZ = float(a.tilt_cap)
