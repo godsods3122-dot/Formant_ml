@@ -223,11 +223,27 @@ class GlottalSource(nn.Module):
         amp = []
         a = torch.full_like(ps[:, 0], seed) if amp0 is None else amp0.clone()
         for i in range(ps.shape[1]):
-            tgt = a_star[:, i]
+            tgt = a_star[:, i].clamp_min(seed)
             grow = self.k_growth * f0[:, i] * over[:, i] / pth[:, i]
-            up = a + dt * grow * a * (1.0 - a / tgt.clamp_min(seed))
+            # **로지스틱은 닫힌 해로 적분한다** — 전방 오일러가 아니라.
+            #
+            #   dA/dt = σ·A·(1 − A/A*)  ⇒  A(t+dt) = A*·A / (A*·q + A·(1−q)),  q = e^{−σ·dt}
+            #
+            # 전방 오일러 `A + dt·σ·A·(1−A/A*)` 는 `dt·σ > 2` 에서 **불안정**하다.
+            # 여기서 σ = k·f0·(Ps−Pth)/Pth 이고 k=0.25, dt=1 ms 이므로, 적합기가
+            # p_sub 를 17 cmH2O(외치는 값)까지 밀고 f0 가 높으면 dt·σ 가 2 를 넘는다.
+            # 그러면 1420 단계 재귀를 지나며 기울기가 폭주해 **비유한**이 된다.
+            # 실측(FORMANT_ML_DEBUG_NONFINITE=1, yang_00000040 전체): 비유한 기울기가
+            # 정확히 `p_sub` · `adduction` · `f0_target` 세 파라미터에서만, 격자점의
+            # 절반(701/1420)에서 한꺼번에 났다 — 이 셋이 σ 와 A* 를 정하는 값이다.
+            #
+            # 닫힌 해는 어떤 dt·σ 에서도 안정이고 [0, A*] 를 벗어나지 않으며,
+            # 프레임률이 바뀌어도 기동 모양이 같다. 분모는 A ≥ seed, A* ≥ seed 이므로
+            # seed 아래로 내려가지 않는다.
+            q = torch.exp(-(dt * grow).clamp_min(0.0))
+            up = tgt * a / (tgt * q + a * (1.0 - q)).clamp_min(1e-6)
             down = a * torch.exp(-dt * f0[:, i] / self.cycles_decay)
-            a = torch.where(tgt > seed, up, down.clamp_min(seed))
+            a = torch.where(a_star[:, i] > seed, up, down.clamp_min(seed))
             amp.append(a)
         amp_raw = torch.stack(amp, 1)
         amp = (amp_raw - seed).clamp_min(0.0) / (1.0 - seed)
