@@ -80,6 +80,9 @@ def main() -> None:
     ap.add_argument("--no-denoise", action="store_true")
     ap.add_argument("--phase", type=float, default=0.0, help="복소 STFT 항 가중(2 단계용)")
     ap.add_argument("--threads", type=int, default=2)
+    ap.add_argument("--device", default="cpu",
+                    help="cpu / cuda / mps. 적합 한 건이 RSS 3.8 GB 를 쓴다 — 병렬로 "
+                         "돌릴 개수는 GPU 메모리가 아니라 그것으로 정하라")
     ap.add_argument("--patience", type=int, default=0,
                     help="이 회차 동안 손실이 안 줄면 그 단계를 끝낸다 (0 = 끔). "
                          "긴 음원에서는 켜는 편이 낫다 — 수렴한 단계에 예산을 다 쓴다")
@@ -214,7 +217,10 @@ def main() -> None:
         if not hg["improves"] and not a.room_force:
             print("  -> 방을 넣지 않는다 (--room-force 로 강제 가능)", flush=True)
             room_ir = None
-    fit = CopySynthFitter(eng, seg, sr, track, phase_weight=a.phase, room_ir=room_ir)
+    if a.device != "cpu":
+        eng = eng.to(a.device)
+    fit = CopySynthFitter(eng, seg, sr, track, phase_weight=a.phase, room_ir=room_ir,
+                          device=a.device)
     kw = {} if a.lr_global is None else {"lr_global": a.lr_global}
     rep = fit.fit_staged(global_iters=a.global_iters, stage_iters=a.stage_iters,
                          lr_frame=a.lr_frame, phase_iters=a.phase_iters,
