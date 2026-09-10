@@ -45,37 +45,28 @@ class VocalTract(nn.Module):
         self.length_cm = length_cm
         self.bw_floor, self.bw_slope = bw_floor, bw_slope
         self.K = n_formants
-        # 고차 극 보정. 세 가지가 **함께** 바뀌어야 한다 (하나만 바꾸면 전부 실패한다).
-        #
-        #   (1) 위치를 마지막 포먼트에 **상대**로 둔다.  관의 극 간격 c/(2L) 는
-        #       조음과 무관한 절대 제약이다 (웹스터 방정식의 경계조건이 정한다).
-        #       고정 위치 (2n−1)c/4L 에 두면 F_K 가 피팅으로 내려갈 때 F_K 와 첫
-        #       고차 극 사이가 벌어져 **구멍**이 생긴다 — 실측 8990 Hz, §7.6 의
-        #       미해결 항목. 재현했다: F8=7900 일 때 −5.22 dB @ 9110 Hz.
-        #       상대 배치로 바꾸면 같은 조건에서 −3.37 dB @ 6025 Hz 로, 그것도
-        #       인공물이 아니라 진짜 포먼트 사이 골이다.
-        #   (2) 대역폭을 손실 법칙 (`default_bw`) 으로 좁힌다.  Q≈1 은 극을
-        #       실질적으로 없앴다.  **위치를 안 바꾸고 대역폭만 좁히면 더 나쁘다**
-        #       (−8.18 dB) — 좁은 극이 구멍의 가장자리를 더 또렷하게 만든다.
-        #   (3) 상한을 0.70·fs/2 로 둔다.  0.98 까지 채웠던 예전 시도가 +151 dB 로
-        #       폭주한 것은 Klatt 공명기의 분자가 상수라 z=−1 에서 이득이
-        #       (1+r)²/(1−r)² (절당 +51 dB) 이기 때문이다.  아날로그 원형에는 없는
-        #       인공물이라 상한으로 막아야 한다.  상한을 쓸어 측정한 결과 (면적
-        #       함수 8 종, 0.2~12 kHz 모양 오차 RMS):
-        #           0.55  11.4 dB | 0.60  7.2 | 0.65  2.5 | **0.70  1.5** | 0.80  5.8 | 0.90  11.5
-        #       현행 (0.60 + Q≈1) 은 26.6 dB 였다.
-        #
-        # 합쳐서 8~10 kHz 레벨이 −68.3 dB → −9.3 dB 로 **59 dB** 올라온다.  곁가지의
-        # +20/+35 dB 고역 셸프가 메우고 있던 것이 바로 이 구멍이다.
-        self.extra_cap = 0.70
-        self.n_extra = 6 if n_extra is None else int(n_extra)
-        self.extra_spacing = C_SOUND / (2.0 * length_cm)
+        self.extra_cap = 0.60
         f1 = C_SOUND / (4.0 * length_cm)
+        # 고차 극 보정. **나이퀴스트까지 채우면 안 된다.** 이산 공명기는 θ→π 에서 극쌍이
+        # z=−1 의 이중 실극으로 붙고, DC 정규화된 이득이 (1+r)²/(1−r)² 로 뛴다. 실제로
+        # 0.98·fs/2 까지 12 개를 채웠더니 이 종속이 10 kHz 에서 +97 dB, 22 kHz 에서
+        # **+151 dB** 였다(측정). 그게 복사합성에서 7 kHz 위 오차 +14~+22 dB 의 정체다.
+        # Fant 의 고차 극 보정은 원래 "완만히 올라갔다가 내려오는" 몇 dB~10 dB 짜리다.
+        # 그 모양이 나오는 지점: 0.60·fs/2 까지, 대역폭 Q≈1 (고역의 벽·점성·방사·횡모드
+        # 손실). 그러면 DC 0 dB, 4 kHz +4, 10 kHz +13, 22 kHz −0.4 dB 가 된다.
+        fixed = [(2 * n - 1) * f1 for n in range(n_formants + 1, 128)
+                 if (2 * n - 1) * f1 < self.extra_cap * fs / 2]
+        if n_extra is not None:
+            fixed = fixed[:n_extra]
         self.register_buffer("uniform_formants",
                              torch.tensor([(2 * n - 1) * f1 for n in range(1, n_formants + 1)]))
+        self.register_buffer("extra_formants", torch.tensor(fixed, dtype=torch.float32))
         # 학습 파라미터: 고차 극 보정의 대역폭 배율(화자 고역 손실), 앞공동 대역폭 배율
         self.log_extra_bw = nn.Parameter(torch.tensor(0.0))
         self.log_front_bw = nn.Parameter(torch.tensor(0.0))
+        # 고차 극의 손실 (벽·점성·방사·횡모드). Q≈1 — ADR 0012.
+        self.extra_bw_floor = 800.0
+        self.extra_bw_slope = 1.00
         # 앞공동 극의 대역폭 = 500 + 이 값 × f_p. **화자 프로파일이 준다** — 한 상수로
         # 두면 두 화자가 반대로 잡아당긴다. 실측 적합: 남 /ㅅ/ 0.08, 여 /ㅆ/ 0.36.
         self.front_bw_slope = float(front_bw_slope)
@@ -104,47 +95,6 @@ class VocalTract(nn.Module):
         골은 남은 문제로 MEASUREMENTS §7.6 에 적어 둔다.
         """
         return self.bw_floor + self.bw_slope * f
-    # 사다리 혼합비. `w_k = 1/(1 + LADDER_BETA·(k − k_last))` — 가까운 극은 실측된
-    # 마지막 포먼트를 따르고, 먼 극은 성도 길이가 정한 절대 위치로 수렴한다.
-    LADDER_W = 0.6
-    # 이웃 극의 최소 간격 / (c/2L). 실제 관 300 종에서 모드 4 이상의 간격은 최소
-    # 0.256, 1 % 분위 0.629 였다 (F4→F5 만 1 % 분위 0.382). 0.30 은 그 아래라
-    # 평소에는 걸리지 않는 **안전망**이다 — F4 가 절대 앵커보다 훨씬 위인 프레임에서
-    # 혼합이 F5 를 F4 쪽으로 끌어내리는 것만 막는다.
-    LADDER_MIN_GAP = 0.30
-
-    def ladder_pole(self, prev, k: int, like):
-        """실측되지 않은 k 번째 극의 위치. 두 앵커를 섞는다.
-
-        * **상대 앵커** `F_{k−1} + c/(2L)` — 조음을 따라간다. 가까운 극에 정확하지만
-          멀어질수록 오차가 쌓인다.
-        * **절대 앵커** `(2k−1)·c/(4L)` — 성도 길이가 정한다. 조음을 못 따라가지만
-          오차가 쌓이지 않는다.
-
-        면적 함수 400 종으로 잰 모드 5~15 의 예측 오차 표준편차 [Hz] (§41):
-
-            상대만 (w=1)   110 124 157 181 200 214 226 235 243 249 255   <- 발산한다
-            절대만 (w=0)   251 211 177 152 132 118 106  97  89  82  77
-            **혼합 w=0.6**  78  94 106 109 107 103  97  91  86  80  76
-
-        혼합은 두 앵커 중 어느 쪽보다도 낫고, 무엇보다 **발산하지 않는다** — 상대
-        앵커만 쓰면 오차가 모드마다 쌓여 255 Hz 까지 간다. 시드와 면적 변동 폭을
-        바꿔도 같다. 부수 효과가 하나 더 있다: 마지막 자유 포먼트가 위쪽 극 전체를
-        끌고 다니지 않게 된다. 무너진 창의 책임 귀속에서 `f4` 가 기울기의 36 % 를
-        쥐고 있었는데 (§41.2), 한 단계마다 0.6 씩 줄어드니 F8 에 미치는 영향은
-        0.6⁴ = 0.13 이다.
-
-        **절대 앵커는 프로파일의 `tract_length_cm` 을 믿는다.** 그 값이 틀리면 먼 극이
-        통째로 치우친다 — 화자 프로파일을 잡을 때 확인할 것.
-        """
-        ab = (2 * k - 1) * C_SOUND / (4.0 * self.length_cm)
-        if prev is None:
-            return torch.full_like(like, ab)
-        w = self.LADDER_W
-        f = w * (prev + self.extra_spacing) + (1.0 - w) * ab
-        gap = self.LADDER_MIN_GAP * self.extra_spacing
-        return prev + gap + self._soft_over(f - prev - gap, 0.2 * gap)
-
     def _up(self, v):
         return frames_to_samples(v.unsqueeze(-1), self.hop)[..., 0][:, :self._n_emit]
 
@@ -155,13 +105,9 @@ class VocalTract(nn.Module):
         0 ↔ 값 사이를 선형 보간하며 F1 이 10 Hz 를 지나간다(첫 렌더의 폭주 원인 2).
         """
         out = []
-        prev = None
         for k in range(1, self.K + 1):
             f = c[f"f{k}"]
-            # **원소별로** 고른다. 텐서 값으로 파이썬 분기를 걸면 청크 렌더와 통짜
-            # 렌더가 갈라진다 (`test_streaming_equals_offline` 이 그것을 잡았다).
-            f = torch.where(f > 0, f, self.ladder_pole(prev, k, f))
-            prev = f
+            f = torch.where(f > 0, f, self.uniform_formants[k - 1].to(f.dtype).expand_as(f))
             bw = c[f"bw{k}"]
             bw = torch.where(bw >= 20.0, bw, self.default_bw(f))   # 20 Hz 미만 = 기본
             if k == 1:      # 연구개가 열리면 F1 이 넓어진다 (에너지가 비강으로 샌다)
@@ -176,47 +122,13 @@ class VocalTract(nn.Module):
             x, state[key] = tv_biquad(x, *resonator_coeffs(f, bw, self.fs), zi=state.get(key))
         return x
 
-    @staticmethod
-    def _soft_over(x, w: float):
-        """0 이상만 남기는 부드러운 문턱. `w·softplus(x/w)`."""
-        return w * torch.nn.functional.softplus(x / w)
-
-    @staticmethod
-    def _soft_cap(x, cap, w: float = 400.0):
-        """상한에 부드럽게 붙는 최소값. 상한을 넘는 극들이 **겹치지 않게** 한다.
-
-        `clamp` 를 쓰면 상한 위의 극이 전부 같은 자리에 쌓여 거기 날카로운 봉우리가
-        선다 (F8 이 11.9 kHz 까지 가는 프레임이 있다). 이 식은 순증가라 순서를
-        보존하면서 [cap − w·ln2, cap) 안으로 압축한다. 미분 가능하다.
-        """
-        return cap - w * torch.nn.functional.softplus((cap - x) / w)
-
-    def _extra_cascade(self, x, tracks, state):
-        """마지막 포먼트 위로 c/(2L) 간격의 극을 이어 붙인다.
-
-        `tracks` 의 마지막 항목이 F_K 다 — 위치가 거기에 묶여 있으므로 F_K 가
-        피팅으로 움직여도 그 위에 구멍이 남지 않는다.  상한에 닿으면 clamp 하지만,
-        정상적인 F_K (~9 kHz) 에서는 마지막 극이 16.2 kHz 라 걸리지 않는다.
-        """
-        if self.n_extra <= 0:
-            return x
+    def _extra_cascade(self, x, state):
         bw_scale = torch.exp(self.log_extra_bw)
-        f_last = tracks[-1][0]
-        cap = self.extra_cap * self.fs / 2.0
-        for i in range(self.n_extra):
+        for i, f in enumerate(self.extra_formants):
             key = f"x{i}"
-            # **여기서는 순수 사다리다** (혼합하지 않는다). F5~F8 은 들리는 포먼트라
-            # 위치 정확도가 중요해 절대 앵커를 섞지만, 보정 극에서 중요한 것은
-            # 정확도가 아니라 **틈이 없는 것**이다 — 틈은 −5 dB 짜리 구멍을 만들고
-            # (§35.3), 12 kHz 짜리 넓은 극이 150 Hz 어긋나는 것은 안 들린다.
-            raw = f_last + self.extra_spacing
-            f_last = raw
-            fk = self._soft_cap(raw, cap)
-            # 상한에 눌린 만큼 대역폭을 넓힌다. 안 그러면 눌린 극들이 상한 근처에
-            # 25 Hz 간격으로 쌓여 거기 날카로운 봉우리가 선다 (F8 이 11.9 kHz 인
-            # 프레임에서 실제로 그렇다). 상한은 1 차원 관 모형이 끝나는 자리라
-            # 거기서 손실이 커지는 것은 물리적으로도 맞다 (횡모드·벽 손실).
-            bw = (self.default_bw(fk) + (raw - fk)) * bw_scale
+            fk = f.to(x.dtype).expand_as(x)
+            bw = torch.clamp(self.bw_floor + self.extra_bw_slope * fk,
+                             min=self.extra_bw_floor) * bw_scale
             x, state[key] = tv_biquad(x, *resonator_coeffs(fk, bw, self.fs), zi=state.get(key))
         return x
 
@@ -353,7 +265,7 @@ class VocalTract(nn.Module):
         tot = (vel + opn).clamp_min(1e-3)
         oral, nas = opn / tot, vel / tot
         tracks = self._formant_tracks(c)
-        y_g = self._extra_cascade(self._cascade(x_g * oral, tracks, state, "f"), tracks, state)
+        y_g = self._extra_cascade(self._cascade(x_g * oral, tracks, state, "f"), state)
         y_f = self._front_cavity((1.0 - leak) * fr_r * oral, c, state)
         # 비강도 같은 이유로 **입력에** 건다. 출력에 걸면 연구개가 닫힌 동안에도 분기가
         # 소스를 받아 울리고, 열리는 순간 그 에너지가 통째로 튀어나온다(측정: 12 배 클릭).

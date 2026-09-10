@@ -444,52 +444,6 @@ def test_fitting_defaults_are_the_measured_ones():
     assert F.BW_LAW_W == 0.0
 
 
-def test_missing_formants_become_a_physics_ladder():
-    """빠진 포먼트는 **직전 + c/(2L)** 이 된다 — 적합된 F4 를 따라 함께 움직인다.
-
-    F5~F8 을 자유 파라미터로 풀어 봤다가 되돌렸다 (§40). 열이 32 → 40 개가 되자
-    같은 예산으로 2.4 단계가 회복을 못 했고 (87.45 → 85.31), 위상 단계가 66.79 % /
-    43.94 % 로 무너졌다. `STEP` 과 `PRIOR_W` 에 항목이 없어 **가장 큰 걸음과 가장
-    약한 사전확률**을 받은 것도 겹쳤다.
-
-    위쪽 포먼트는 자유도가 아니라 물리다. 극 간격 c/(2L) 는 조음과 무관한 절대
-    제약이고, 5 번 모드부터는 무작위 면적 함수 8 종에서 그 20 Hz 안에 든다 (§35.1).
-    """
-    import torch
-    from formant_ml.engine.control import N_FORMANTS
-    from formant_ml.engine.fit import DEFAULT_PARAMS
-    from formant_ml.engine.noise import C_SOUND
-    from formant_ml.engine.tract import VocalTract
-    tr = VocalTract(48000.0, 48)
-    tr._n_emit = 480
-    sp = C_SOUND / (2.0 * 14.6)
-    T = 12
-    for f4 in (4000.0, 4936.0, 6500.0):
-        c = {f"f{k}": torch.zeros(1, T) for k in range(1, N_FORMANTS + 1)}
-        c.update({f"bw{k}": torch.zeros(1, T) for k in range(1, N_FORMANTS + 1)})
-        c["velum"] = torch.zeros(1, T)
-        for k, v in enumerate([600.0, 1800.0, 3000.0, f4], start=1):
-            c[f"f{k}"] = torch.full((1, T), v)
-        got = [float(t[0].reshape(-1)[0]) for t in tr._formant_tracks(c)]
-        assert abs(got[3] - f4) < 1.0
-        w, Lc = tr.LADDER_W, tr.length_cm
-        prev = got[3]
-        for k in range(5, N_FORMANTS + 1):
-            want = w * (prev + sp) + (1.0 - w) * (2 * k - 1) * C_SOUND / (4.0 * Lc)
-            assert got[k - 1] >= want - 1.0, (f4, k)          # 바닥이 걸리면 위로만 간다
-            # 부드러운 바닥이라 문턱 근처에서 ln2·폭 만큼 위로 새어 나온다.
-            slack = 0.2 * tr.LADDER_MIN_GAP * sp
-            assert got[k - 1] <= max(want, prev + tr.LADDER_MIN_GAP * sp) + slack, (f4, k)
-            prev = got[k - 1]
-        # 순서와 최소 간격은 F4 가 어디에 있든 지켜져야 한다. 실제 관 300 종에서
-        # 모드 4 이상의 간격은 최소 0.256·c/2L 이었다.
-        assert all(b - a > 0.25 * sp for a, b in zip(got[3:], got[4:])), (f4, got)
-    # 그리고 자유 파라미터는 넷뿐이어야 한다 — 위쪽은 사다리가 만든다.
-    for k in range(1, 5):
-        assert f"f{k}" in DEFAULT_PARAMS and f"bw{k}" in DEFAULT_PARAMS, k
-    for k in range(5, N_FORMANTS + 1):
-        assert f"f{k}" not in DEFAULT_PARAMS and f"bw{k}" not in DEFAULT_PARAMS, k
-
 def test_articulator_velocity_penalty_spares_real_gestures(_engine):
     """조음 속도 벌점의 **특이성** — 실제 제스처는 통과하고 1 ms 스위칭만 물어야 한다.
 
@@ -608,3 +562,86 @@ def test_skipped_iterations_do_not_count_as_convergence(_engine):
     clean, poisoned = run(False), run(True)
     assert poisoned > clean, (
         f"건너뛴 회차가 정체로 세어졌다 — 오염 {poisoned} 회 vs 정상 {clean} 회")
+
+
+def _fitter_on(y, fs, **flags):
+    from formant_ml.engine import fit as F
+    from formant_ml.engine.analyze import analyze
+    from formant_ml.engine.profile import DEFAULT_PROFILE
+    from formant_ml.engine.voice import EngineConfig, VoiceEngine
+    old = {k: getattr(F, k) for k in flags}
+    for k, v in flags.items():
+        setattr(F, k, v)
+    try:
+        tr = analyze(y, fs, DEFAULT_PROFILE, int(0.001 * fs), full=y)
+        f = F.CopySynthFitter(VoiceEngine(EngineConfig()), y, fs, tr)
+        f.sizes = list(F.FFT_SIZES)
+        return f
+    finally:
+        for k, v in old.items():
+            setattr(F, k, v)
+
+
+def test_waveform_correlation_penalty_sees_what_the_envelope_cannot():
+    """위상만 뒤집힌 신호를 문다. 멜 오차는 그 사건을 못 본다.
+
+    실측(`out/lad/s040`, §44): 0.41 s 에서 파형 상관이 −0.80 인데 그 자리의 멜 dB
+    오차는 오히려 `out/fix` 보다 **낮다**. 크기 스펙트럼이 멀쩡하고 위상만
+    뒤집혔기 때문이다. 연속 벌점을 멜 오차 위에 걸면 아무것도 안 문다.
+    """
+    import numpy as np
+    import torch
+    from formant_ml.engine import fit as F
+    fs = 48000
+    t = np.arange(int(0.3 * fs)) / fs
+    env = np.exp(-((t - 0.15) / 0.09) ** 2)
+    good = (np.sin(2 * np.pi * 180 * t) + 0.4 * np.sin(2 * np.pi * 540 * t)) * env * 0.2
+    f = _fitter_on(good, fs, CORR_W=1.0)
+    a = torch.as_tensor(good, dtype=torch.float32).unsqueeze(0)
+    # 반 주기 어긋난 판 — 스펙트럼 크기는 그대로다.
+    k = int(round(fs / 180.0)) // 2
+    flip = np.roll(good, k)
+    b = torch.as_tensor(flip, dtype=torch.float32).unsqueeze(0)
+    l_good = float(f.corr_loss(a))
+    l_flip = float(f.corr_loss(b))
+    assert l_good < 1e-3, l_good
+    assert l_flip > 100.0 * max(l_good, 1e-6), (l_good, l_flip)
+    # 크기 스펙트럼은 거의 같다 — 그것이 요점이다.
+    A = torch.stft(a, 256, 64, 256, torch.hann_window(256), center=True,
+                   return_complex=True).abs()
+    B = torch.stft(b, 256, 64, 256, torch.hann_window(256), center=True,
+                   return_complex=True).abs()
+    n = min(A.shape[-1], B.shape[-1])
+    rel = float((A[..., :n] - B[..., :n]).abs().sum() / A[..., :n].abs().sum())
+    assert rel < 0.20, rel
+
+
+def test_periodicity_penalty_punishes_trading_harmonics_for_noise():
+    """하모닉을 잡음으로 바꾸면 문다. 총 레벨이 같아도 문다.
+
+    이 항이 없어서 적합기가 `p_sub` 를 반 토막 내고 `fric_gain` 을 11 배로 올려
+    같은 스펙트럼을 만들었다 (§44). 크기 항만으로는 그 해가 공짜다.
+    """
+    import numpy as np
+    import torch
+    rng = np.random.RandomState(0)
+    fs = 48000
+    t = np.arange(int(0.3 * fs)) / fs
+    env = np.exp(-((t - 0.15) / 0.09) ** 2)
+    tone = (np.sin(2 * np.pi * 180 * t) + 0.4 * np.sin(2 * np.pi * 540 * t)) * env
+    clean = tone * 0.2
+    f = _fitter_on(clean, fs, HNR_W=1.0)
+    l = []
+    for mix in (0.0, 0.3, 0.6):
+        noisy = (tone * (1 - mix) + mix * rng.randn(len(t)) * env * 0.7) * 0.2
+        y = torch.as_tensor(noisy, dtype=torch.float32).unsqueeze(0)
+        l.append(float(f.hnr_loss(y)))
+    assert l[0] < l[1] < l[2], l
+    assert l[2] > 5.0 * max(l[0], 1e-6), l
+
+
+def test_new_penalties_are_off_by_default():
+    """셋 다 A/B 로 세기를 정하기 전에는 꺼져 있어야 한다."""
+    from formant_ml.engine import fit as F
+    assert F.CORR_W == 0.0 and F.HNR_W == 0.0
+    assert F.CONT_W == 0.0 and F.SHARP_W == 0.0 and F.SUBF0_W == 0.0

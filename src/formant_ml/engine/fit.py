@@ -378,6 +378,46 @@ FLUX_W = 2.0               # 0 이면 항이 빠진다. `copyfit --flux 0` 으�
 # 들린다. 하나의 원인이 두 증상을 만든다 (MEASUREMENTS §35).
 #
 # 세기 0 이면 항이 빠진다. `copyfit --bw-law` 로 조절한다.
+#: **파형 상관의 붕괴를 문다** (사용자 요청: "연속 조건을 더 강화").
+#:
+#: 20 ms 창의 정규화 파형 상관 `r_t = <a·b>/√(<a²><b²>)`. 유성 구간에서 1 에 가까워야
+#: 하고, **0 근처로 떨어지거나 음수가 되는 곳이 귀에 끊겨 들리는 곳**이다 (펄스열이
+#: 반 주기 어긋나면 음수까지 간다).
+#:
+#: **이 항이 필요한 이유는 멜 오차가 그 사건을 못 보기 때문이다.** 실측
+#: (`out/lad/s040`): 0.41 s 에서 상관이 −0.80 인데 그 자리의 **멜 dB 오차는 오히려
+#: `out/fix` 보다 낮다.** 크기 스펙트럼은 멀쩡하고 위상만 뒤집혔다. 그래서 연속
+#: 벌점을 멜 오차 위에 걸면 아무것도 안 문다 — 상관 위에 걸어야 한다.
+#:
+#: `softplus(knee − r)^POW` 로, **큰 붕괴가 지배하도록** 제곱한다. 평균 손실에서
+#: 한 창은 1/1000 무게인데, 그 한 창이 들리는 결함의 전부다.
+CORR_W = 0.0
+CORR_WIN_MS = 20.0
+CORR_HOP_MS = 5.0
+CORR_KNEE = 0.90           # 이 아래로 떨어진 만큼 문다
+CORR_POW = 2.0             # 1 이면 선형, 2 면 큰 붕괴가 지배한다
+
+#: **주기성(조화 대 비조화)을 목표에 일치시킨다** (사용자 요청).
+#:
+#: F0 지연에서의 정규화 자기상관 `r(t) = <x(t)x(t+T₀)>/√(<x²><x(t+T₀)²>)` — Praat 의
+#: HNR 이 쓰는 것과 같은 양이고 텐서 연산만으로 미분 가능하다.
+#:
+#: **왜 이 항이 없으면 안 되는가.** 손실의 크기 항은 난류부를 *기대* 스펙트럼으로
+#: 비교하므로 **하모닉과 잡음이 서로 교환 가능하다.** 실제로 고차 극을 늘렸더니
+#: 적합기가 `p_sub` 를 9.82 → 4.55 로 반 토막 내고 `fric_gain` 을 6.29 → **70.53**
+#: (+1022 %) 으로 올려 같은 스펙트럼을 만들었다. 총 레벨이 같으니 포락 점수는 안
+#: 떨어지고 소리만 망가진다 (§44). 실측 주기성 (yang_00000040):
+#:
+#:     대역        목표     fix    pole     lad
+#:     전대역    0.8616  0.8436  0.7698  0.8179
+#:     1~4 kHz   0.3760  0.3789  0.2916  0.2707
+#:
+#: **최대화가 아니라 일치**다. 잡음을 다 죽이면 그것대로 틀린다 — 실제 음성의 난류는
+#: 목표에도 있다. 다만 **시끄러운 쪽을 더 세게** 문다 (`HNR_ASYM`).
+HNR_W = 0.0
+HNR_ASYM = 3.0             # r 이 목표보다 낮을 때(더 시끄러울 때)의 가중
+HNR_HP_HZ = 1000.0         # 두 번째 대역: 이 위만 보는 고역통과
+
 #: **창별 손실이 악화되면 문다** (사용자 요청). 평균 손실은 국소 붕괴를 못 본다 —
 #: 실측(§38.2c): 50 ms 구간별 파형 상관이 대부분 1.00 인데 한 구간만 0.88 → **−0.06**
 #: 으로 뒤집힌다(펄스가 1/3 주기 미끄러짐). 그 한 구간은 평균에서 1/28 의 무게다.
@@ -627,6 +667,7 @@ class CopySynthFitter:
             self.tgt_flux, self.flux_live = self._flux_stat(self._db(raw_mel),
                                                             make_mask=True)
             self._prepare_voice_stats(raw)
+        self._prepare_corr()
         self.calibrate_gain()
 
     # ------------------------------------------------------- 재매개화
@@ -880,6 +921,90 @@ class CopySynthFitter:
             w = live[..., :m].to(d.dtype)
             return (d * w).sum() / w.sum().clamp_min(1.0) / 20.0
         return d.mean() / 20.0
+
+    # ------------------------------------------- 파형 상관 · 주기성 (사용자 요청)
+    def _frames(self, x: torch.Tensor, win: int, hop: int) -> torch.Tensor:
+        """(1, n) -> (T, win). 마지막 자투리는 버린다."""
+        return x[0].unfold(0, win, hop)
+
+    def _prepare_corr(self) -> None:
+        """상관·주기성 항이 쓸 창 격자와 유성 마스크를 만든다."""
+        self._corr_win = max(64, int(CORR_WIN_MS * self.fs / 1000.0))
+        self._corr_hop = max(16, int(CORR_HOP_MS * self.fs / 1000.0))
+        tf = self._frames(self.target, self._corr_win, self._corr_hop)
+        self._corr_tgt = tf
+        self._corr_te = (tf * tf).sum(-1)
+        v = np.asarray(getattr(self.track, "voiced", np.zeros(0, dtype=bool)))
+        T = tf.shape[0]
+        if v.size:
+            c = (np.arange(T) * self._corr_hop + self._corr_win // 2) / self.hop
+            vm = v[np.clip(c.astype(int), 0, v.size - 1)]
+        else:
+            vm = np.ones(T, dtype=bool)
+        lvl = self._corr_te.detach()
+        live = lvl > float(lvl.max()) * 1e-4          # 정점 대비 −40 dB
+        self._corr_live = torch.as_tensor(vm, device=live.device) & live
+        # --- 주기성 ---
+        f0 = np.asarray(self.track["f0_target"], dtype=np.float64)
+        c = (np.arange(T) * self._corr_hop + self._corr_win // 2) / self.hop
+        f0f = f0[np.clip(c.astype(int), 0, max(f0.size - 1, 0))] if f0.size else np.zeros(T)
+        lag = np.where(f0f > 50.0, np.round(self.fs / np.maximum(f0f, 50.0)), 0).astype(int)
+        self._per_lag = lag
+        self._per_ok = torch.as_tensor((lag > 0) & (lag < self._corr_win // 2),
+                                       device=live.device) & self._corr_live
+        # 고역통과 커널 (창 씌운 sinc). 고정 상수라 미분에 영향이 없다.
+        n = 129
+        t = np.arange(n) - n // 2
+        fc = HNR_HP_HZ / self.fs
+        lp = np.sinc(2 * fc * t) * np.hanning(n)
+        lp = lp / lp.sum()
+        hp = -lp
+        hp[n // 2] += 1.0
+        self._hp = torch.as_tensor(hp, dtype=self.target.dtype,
+                                   device=self.target.device).view(1, 1, n)
+        with torch.no_grad():
+            self.tgt_per = self._periodicity(self.target)
+
+    def _periodicity(self, y: torch.Tensor) -> torch.Tensor:
+        """(2, T) — 전대역과 고역의 F0 지연 정규화 자기상관."""
+        hp = torch.nn.functional.conv1d(y.unsqueeze(1), self._hp,
+                                        padding=self._hp.shape[-1] // 2)[:, 0]
+        out = []
+        for sig in (y, hp):
+            w, h = self._corr_win, self._corr_hop
+            n = sig.shape[-1]
+            T = self._per_ok.shape[0]
+            idx = torch.arange(T, device=sig.device) * h
+            lag = torch.as_tensor(self._per_lag, device=sig.device)
+            ar = torch.arange(w, device=sig.device)
+            a = sig[0][(idx[:, None] + ar[None, :]).clamp(max=n - 1)]
+            b = sig[0][(idx[:, None] + lag[:, None] + ar[None, :]).clamp(max=n - 1)]
+            num = (a * b).sum(-1)
+            den = torch.sqrt((a * a).sum(-1) * (b * b).sum(-1) + 1e-20)
+            out.append(num / den)
+        return torch.stack(out)
+
+    def corr_loss(self, y: torch.Tensor) -> torch.Tensor:
+        """유성 구간에서 파형 상관이 무릎 아래로 떨어진 만큼. 큰 붕괴가 지배한다."""
+        pf = self._frames(y, self._corr_win, self._corr_hop)
+        m = min(pf.shape[0], self._corr_tgt.shape[0])
+        a, b = self._corr_tgt[:m], pf[:m]
+        num = (a * b).sum(-1)
+        den = torch.sqrt(self._corr_te[:m] * (b * b).sum(-1) + 1e-20)
+        r = num / den
+        w = self._corr_live[:m].to(r.dtype)
+        over = self._soft_over(CORR_KNEE - r, 0.05)
+        if CORR_POW != 1.0:
+            over = over ** CORR_POW
+        return (over * w).sum() / w.sum().clamp_min(1.0)
+
+    def hnr_loss(self, y: torch.Tensor) -> torch.Tensor:
+        """주기성을 목표에 **일치**시킨다. 시끄러운 쪽을 더 세게 문다."""
+        p = self._periodicity(y)
+        d = self.tgt_per - p                      # + 면 합성이 더 시끄럽다
+        pen = self._soft_over(d, 0.02) * HNR_ASYM + self._soft_over(-d, 0.02)
+        w = self._per_ok.to(pen.dtype)
+        return (pen * w).sum() / (w.sum().clamp_min(1.0) * pen.shape[0])
 
     # ------------------------------------------------- 유성 구간의 세 통계
     def _contrast(self, db: torch.Tensor, k: int, win_hz: float,
@@ -1294,6 +1419,12 @@ class CopySynthFitter:
             fl = self.flux_loss(self._flux_db)
             self._last_flux = float(fl.detach()) * 20.0
             l = l + FLUX_W * fl
+        if CORR_W > 0.0:
+            cl = self.corr_loss(y)
+            self._last_corr = float(cl.detach())
+            l = l + CORR_W * cl
+        if HNR_W > 0.0:
+            l = l + HNR_W * self.hnr_loss(y)
         if CONT_W > 0.0 and self._mel_err is not None:
             l = l + CONT_W * self.continuity_loss(self._mel_err)
         if SHARP_W > 0.0 and self._mel_raw_db is not None:

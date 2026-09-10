@@ -121,6 +121,14 @@ def main() -> None:
                     help="조음 속도 한계 벌점의 세기 (fit.ARTIC_VEL_W, 기본 1.0). "
                          "0 이면 끈다 — 마찰음이 유성 구간에서 1 ms 만에 켜지는 것을 "
                          "막는 항이다 (MEASUREMENTS §24)")
+    ap.add_argument("--corr", type=float, default=None,
+                    help="유성 구간에서 20 ms 파형 상관이 무너진 만큼을 문다 (기본 0 = 끔). "
+                         "**끊겨 들리는 결함을 잡는 항이다** — 그 자리의 멜 오차는 오히려 "
+                         "낮을 수 있다(위상만 뒤집힌 것). MEASUREMENTS §44")
+    ap.add_argument("--hnr", type=float, default=None,
+                    help="주기성(조화 대 비조화)을 목표에 일치시킨다 (기본 0 = 끔). "
+                         "없으면 적합기가 하모닉을 잡음으로 바꿔 같은 스펙트럼을 만든다 "
+                         "— 실측 fric_gain +1022 %%. MEASUREMENTS §44")
     ap.add_argument("--cont", type=float, default=None,
                     help="창별 손실이 직전 창보다 나빠진 만큼을 문다 (기본 0 = 끔). "
                          "평균 손실은 국소 붕괴를 못 본다 — 50 ms 구간 상관이 1.00 인데 "
@@ -151,6 +159,10 @@ def main() -> None:
             _fit.FLUX_W = float(a.flux)
         if a.bw_law is not None:
             _fit.BW_LAW_W = float(a.bw_law)
+        if a.corr is not None:
+            _fit.CORR_W = float(a.corr)
+        if a.hnr is not None:
+            _fit.HNR_W = float(a.hnr)
         if a.cont is not None:
             _fit.CONT_W = float(a.cont)
         if a.sharp is not None:
