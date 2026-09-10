@@ -121,6 +121,10 @@ def main() -> None:
                     help="조음 속도 한계 벌점의 세기 (fit.ARTIC_VEL_W, 기본 1.0). "
                          "0 이면 끈다 — 마찰음이 유성 구간에서 1 ms 만에 켜지는 것을 "
                          "막는 항이다 (MEASUREMENTS §24)")
+    ap.add_argument("--l1", type=float, default=None,
+                    help="제어열 증분에 L1 (기본 0 = 끔). 지금 정칙화가 전부 L2 라 "
+                         "적합기가 격자 전체에 자잘한 보정을 흩뿌린다 — 희소하게 만들면 "
+                         "어떤 파라미터가 실제로 움직여야 하는지도 드러난다")
     ap.add_argument("--corr", type=float, default=None,
                     help="유성 구간에서 20 ms 파형 상관이 무너진 만큼을 문다 (기본 0 = 끔). "
                          "**끊겨 들리는 결함을 잡는 항이다** — 그 자리의 멜 오차는 오히려 "
@@ -232,7 +236,7 @@ def main() -> None:
     if a.device != "cpu":
         eng = eng.to(a.device)
     fit = CopySynthFitter(eng, seg, sr, track, phase_weight=a.phase, room_ir=room_ir,
-                          device=a.device)
+                          device=a.device, lam_l1=float(a.l1 or 0.0))
     kw = {} if a.lr_global is None else {"lr_global": a.lr_global}
     rep = fit.fit_staged(global_iters=a.global_iters, stage_iters=a.stage_iters,
                          lr_frame=a.lr_frame, phase_iters=a.phase_iters,

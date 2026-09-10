@@ -640,8 +640,51 @@ def test_periodicity_penalty_punishes_trading_harmonics_for_noise():
     assert l[2] > 5.0 * max(l[0], 1e-6), l
 
 
-def test_new_penalties_are_off_by_default():
-    """셋 다 A/B 로 세기를 정하기 전에는 꺼져 있어야 한다."""
+def test_corr_and_hnr_are_on_by_default():
+    """이 둘은 **측정으로 켰다** (§45). 나머지 셋은 아직 A/B 를 안 했으므로 꺼 둔다.
+
+    끊김이 있는 구간(yang_00000040 0.38~0.60 s)에서:
+
+        기준 (전부 0)        포락 86.63  정밀 72.57  조화÷비조화 11.6/−0.9/−3.2  끊김 2 창
+        --hnr 2 만          83.15       70.48       13.8/ 1.7/−1.4       **13 창** (6 창은 음수)
+        --corr 2 --hnr 2    84.90     **80.85**   **14.2/ 1.2/−3.3**     **0 창**
+        목표                    —           —       14.5/ 1.2/−3.4          0 창
+
+    `--hnr` 단독은 비조화를 목표 쪽으로 끌어당기지만 **위상 잠금을 잃는다.**
+    둘은 상보적이다. 바꾸려면 같은 자 셋(조화÷비조화, 끊김 개수, 정밀)으로 근거를 대라.
+    """
     from formant_ml.engine import fit as F
-    assert F.CORR_W == 0.0 and F.HNR_W == 0.0
+    assert F.CORR_W == 2.0 and F.HNR_W == 2.0
     assert F.CONT_W == 0.0 and F.SHARP_W == 0.0 and F.SUBF0_W == 0.0
+
+
+def test_l1_makes_the_control_track_sparse():
+    """L1 은 격자 증분을 **희소하게** 만든다 — 어떤 파라미터가 실제로 움직여야
+    하는지가 드러난다.
+
+    사용자 제안. 지금 정칙화가 전부 L2(`lam_smooth`, `lam_prior`)라 적합기가
+    격자 전체에 자잘한 보정을 흩뿌리고, 그 흩뿌림이 국소 위상 미끄러짐(§38.2c)의
+    유력한 후보다. `|w|` 는 0 에서 미분이 없으므로 √(w²+δ²)−δ 로 깐다.
+    """
+    import numpy as np
+    import torch
+    from formant_ml.engine import fit as F
+    from formant_ml.engine.analyze import analyze
+    from formant_ml.engine.profile import DEFAULT_PROFILE
+    from formant_ml.engine.voice import EngineConfig, VoiceEngine
+    fs = 48000
+    y = _synthetic_vowel(fs, dur=0.2)
+    tr = analyze(y, fs, DEFAULT_PROFILE, int(0.001 * fs), full=y)
+    sparse = []
+    for lam in (0.0, 3.0):
+        f = F.CopySynthFitter(VoiceEngine(EngineConfig()), y, fs, tr, lam_l1=lam)
+        f.set_grid(20.0)
+        f.fit(12, 0.05, 10 ** 9, False, sizes=(256, 512))
+        w = (f.w.detach() * f.scale).abs()
+        sparse.append(float((w < 0.02).to(torch.float64).mean()))
+    assert sparse[1] > sparse[0], sparse          # 0 에 붙은 증분이 늘어야 한다
+    # 그리고 기울기가 유한해야 한다 (|w| 의 0 에서의 특이점을 깔았는지)
+    f = F.CopySynthFitter(VoiceEngine(EngineConfig()), y, fs, tr, lam_l1=3.0)
+    l, _, _, _ = f.loss()
+    l.backward()
+    assert torch.isfinite(f.w.grad).all()

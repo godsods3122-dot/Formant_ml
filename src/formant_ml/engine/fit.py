@@ -391,7 +391,17 @@ FLUX_W = 2.0               # 0 이면 항이 빠진다. `copyfit --flux 0` 으�
 #:
 #: `softplus(knee − r)^POW` 로, **큰 붕괴가 지배하도록** 제곱한다. 평균 손실에서
 #: 한 창은 1/1000 무게인데, 그 한 창이 들리는 결함의 전부다.
-CORR_W = 0.0
+#: **세기 2.0 은 측정으로 정했다** (§45). 끊김이 있는 구간(0.38~0.60 s)에서:
+#:
+#:                        포락    정밀 | 조화÷비조화 [dB]  | 끊김<0.5  <0  최소상관
+#:     목표                     —      — | 14.5   1.2  −3.4 |     0    0    1.00
+#:     기준 (전부 0)        86.63  72.57 | 11.6  −0.9  −3.2 |     2    0    0.21
+#:     --hnr 2 만          83.15  70.48 | 13.8   1.7  −1.4 |  **13    6  −0.25**
+#:     **--corr 2 --hnr 2** 84.90 **80.85**| **14.2 1.2 −3.3**| **0    0    0.74**
+#:
+#: `--hnr` 단독은 비조화를 목표 쪽으로 끌어당기지만 **그 대가로 위상 잠금을 잃는다**
+#: (끊김 2 → 13 창). 둘은 상보적이라 같이 켜야 한다.
+CORR_W = 2.0
 CORR_WIN_MS = 20.0
 CORR_HOP_MS = 5.0
 CORR_KNEE = 0.90           # 이 아래로 떨어진 만큼 문다
@@ -414,7 +424,7 @@ CORR_POW = 2.0             # 1 이면 선형, 2 면 큰 붕괴가 지배한다
 #:
 #: **최대화가 아니라 일치**다. 잡음을 다 죽이면 그것대로 틀린다 — 실제 음성의 난류는
 #: 목표에도 있다. 다만 **시끄러운 쪽을 더 세게** 문다 (`HNR_ASYM`).
-HNR_W = 0.0
+HNR_W = 2.0
 HNR_ASYM = 3.0             # r 이 목표보다 낮을 때(더 시끄러울 때)의 가중
 HNR_HP_HZ = 1000.0         # 두 번째 대역: 이 위만 보는 고역통과
 
@@ -548,6 +558,7 @@ class CopySynthFitter:
     def __init__(self, engine, target: np.ndarray, sr: int, init: ControlTrack,
                  params: tuple[str, ...] = DEFAULT_PARAMS,
                  lam_smooth: float = 3e-3, lam_prior: float = 1e-4,
+                 lam_l1: float = 0.0,
                  phase_weight: float = 0.0, pulse_weight: float = 1.0,
                  n_mels: int = 48, device: str = "cpu",
                  room_ir: np.ndarray | None = None):
@@ -556,6 +567,7 @@ class CopySynthFitter:
         self.fs = engine.cfg.sample_rate
         self.device = device
         self.lam_smooth, self.lam_prior = lam_smooth, lam_prior
+        self.lam_l1 = float(lam_l1)
         self.phase_weight = phase_weight
         self.pulse_weight = pulse_weight
         self.room_ir = (None if room_ir is None else
@@ -1431,6 +1443,17 @@ class CopySynthFitter:
             l = l + SHARP_W * self.sharpness_loss(self._mel_raw_db, self._harm_db)
         if SUBF0_W > 0.0 and self._harm_db is not None and self.tgt_subf0 is not None:
             l = l + SUBF0_W * self.subf0_loss(self._harm_db)
+        if self.lam_l1 > 0:
+            # **L1 — 희소한 제어열.** 사용자 제안. 지금 정칙화가 전부 L2(`lam_smooth`,
+            # `lam_prior`)라 적합기가 40×1420 격자에 자잘한 보정을 흩뿌린다. 그
+            # 흩뿌림이 국소 위상 미끄러짐(§38.2c)의 유력한 후보이고, 학습 데이터로
+            # 나가는 제어열의 해석 가능성도 떨어뜨린다.
+            #
+            # **|w| 는 0 에서 미분이 없다.** √(w²+δ²)−δ 로 깐다 (§31 과 같은 부류).
+            # δ 는 한 걸음 크기의 1/10 — 그보다 작은 증분은 사실상 0 으로 본다.
+            d = self.w * self.scale
+            dl = 0.1 * self.scale
+            l = l + self.lam_l1 * (torch.sqrt(d * d + dl * dl) - dl).mean()
         if self.lam_smooth > 0 and self.w.shape[0] > 1:
             d = self.w[1:] - self.w[:-1]
             l = l + self.lam_smooth * (d * d).mean()
