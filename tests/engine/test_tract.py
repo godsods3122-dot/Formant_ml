@@ -98,3 +98,56 @@ def test_streaming_state_matches_offline():
         st = o["state"]; outs.append(o["audio"])
     torch.set_grad_enabled(True)
     assert torch.allclose(torch.cat(outs, -1), full, atol=1e-4, rtol=1e-4)
+
+
+def test_side_branches_do_not_boost_the_high_band():
+    """**곁가지는 '꺼짐' 에서 통과여야 하고, 켜도 고역을 들어올리면 안 된다.**
+
+    영점쌍만 DC 에서 정규화하면 먼 대역이 통째로 뜬다. 실측 (MEASUREMENTS §34):
+
+    * 설측: 예전에는 깊이를 `lat_bw / lat_mix` 로 줬다. 적합값(lat_mix 0.065,
+      lat_bw 296)이면 실효 대역폭 4554 Hz 가 되어 **8 k +7.4 / 12 k +11.0 /
+      16 k +12.6 dB**. 영점이 둘이라 합치면 +20 dB 를 넘는다. 적합기는 이것을
+      공짜 고역 셸프로 썼고, 그것이 파찰음 /ㅊ/ 의 "튀는 파형" 이었다
+      (첨도 14.15, 목표 3.49; 설측을 끄면 9.45).
+    * 비강 안티포먼트: `antiresonator_coeffs` (영점만) 로 1400 Hz 영점을 두면
+      **12 k +35 / 20 k +41 dB**.
+
+    둘 다 극쌍 보정(`notch_coeffs`)과 젖음/마름 섞기로 고쳤다.
+    """
+    import numpy as np
+    import torch
+
+    from formant_ml.engine.control import INDEX, PARAM_NAMES, default_vector
+    from formant_ml.engine.tract import VocalTract
+
+    fs, hop, n = 48000, 48, 200
+    N = n * hop
+
+    def ctrl(**kw):
+        v = np.tile(default_vector(), (n, 1))
+        for k, x in kw.items():
+            v[:, INDEX[k]] = x
+        t = torch.tensor(v, dtype=torch.float64).unsqueeze(0)
+        return {m: t[..., INDEX[m]] for m in PARAM_NAMES}
+
+    torch.manual_seed(0)
+    x = torch.randn(1, N, dtype=torch.float64)
+    f = np.fft.rfftfreq(N, 1.0 / fs)
+
+    def band_db(y):
+        Y = torch.fft.rfft(y[0]).abs().numpy()
+        return np.array([10 * np.log10((Y[(f >= lo) & (f < hi)] ** 2).mean() + 1e-30)
+                         for lo, hi in ((200, 1000), (1000, 4000), (4000, 8000),
+                                        (8000, 12000), (12000, 20000))])
+
+    base = band_db(x)
+    for mix in (0.02, 0.065, 0.3, 1.0):
+        tr = VocalTract(fs, hop)
+        tr._n_emit = N
+        y = tr._lateral(x.clone(), ctrl(lat_mix=mix, lat_bw=296.0,
+                                        lat_z1=3300.0, lat_z2=4400.0), {})
+        d = band_db(y) - base
+        assert d[3] < 1.0 and d[4] < 1.0, f"lat_mix={mix} 에서 고역이 {d[3]:.1f}/{d[4]:.1f} dB 떴다"
+        if mix <= 0.065:                       # 거의 꺼진 상태는 전 대역 통과
+            assert np.abs(d).max() < 0.5, f"lat_mix={mix} 인데 {np.abs(d).max():.2f} dB 바뀐다"

@@ -38,6 +38,62 @@ CMH2O = 980.665          # 1 cmH2O = 980.665 dyn/cm²
 
 
 # ------------------------------------------------------------------ LF 모델
+#: **추가 기울기(`tilt`)가 먹히는 상한 주파수** [Hz]. 0 이면 상한 없음(예전 거동).
+#:
+#: `tilt` 은 하모닉마다 10^(tilt·log2(f/1kHz)/20) 을 곱하는 **거듭제곱**이라, 상한이
+#: 없으면 나이퀴스트까지 계속 오른다 — 적합값 +4.77 dB/oct 면 16 kHz 에서 +23 dB 다.
+#: 그 결과 성문 유량미분이 **사각파처럼 날카로워진다.** 실측 (|Δdu|max / rms,
+#: 유성 구간):
+#:
+#:     이상적 LF (tilt 0)      1.99
+#:     적합값 tilt (+4.77)    **12.46**   <- 6.3 배
+#:     tilt 상한 (+12)          37.03
+#:
+#: 물리적으로 성문 소스의 기울기는 귀환 위상(Ta)이 만드는 **1 차 저역통과**이지
+#: 무한히 오르는 부스트가 아니다. 그래서 셸프로 만들어 어느 위에서 포화시킨다.
+#:
+#: A/B (같은 적합 트랙, 렌더만 다시):
+#:
+#:   | 상한 | du 날카로움 | 하모닉 스펙트럼 차 rms | 세로 얼룩 |
+#:   |---|---|---|---|
+#:   | 없음 | **12.47** | 1.11 dB | 1.520 |
+#:   | 2 kHz | 2.56 | 3.07 | 1.525 |
+#:   | 3 kHz | 2.54 | 1.81 | 1.521 |
+#:   | **5 kHz** | **3.82** | **1.15** | 1.520 |
+#:   | 8 kHz | 6.26 | 1.11 | 1.520 |
+#:   | 12 kHz | 8.86 | 1.11 | 1.520 |
+#:
+#: 5 kHz 면 날카로움이 3.3 배 내려가는데 스펙트럼 대가가 0.04 dB 다 — 사실상 공짜다.
+#: 3 kHz 는 더 부드럽지만 0.7 dB 를 문다.
+#:
+#: 왜 하필 그 언저리인가: 이 화자의 4~12 kHz 는 85 % 가 난류다(§11.1). 그 위에서
+#: **하모닉 기울기를 더 올릴 대상 자체가 없다** — 올려 봐야 펄스만 날카로워진다.
+TILT_MAX_HZ = 5000.0
+
+#: **성문 폐쇄 시각의 흩어짐** [s]. 성대는 부드러운 물질이라 성문 길이를 따라
+#: **동시에 닫히지 않는다** — 앞뒤로 지퍼처럼 닫힌다. 길이 방향의 면적 요소들은
+#: 병렬이므로 총 유량은 그 합이고, 따라서 유량미분은 이상적인 펄스를 **국소 폐쇄
+#: 시각의 분포로 합성곱한 것**이 된다.
+#:
+#: 분포가 대칭이면 그 합성곱은 **영위상**이다 — 위상은 그대로 두고 크기만 깎는다.
+#: 사용자가 지적한 "스무딩은 위상만 바꾸는 게 아니라 불필요한 고조파를 줄이는 것"이
+#: 정확히 이 성질이다. 가우시안 분포(표준편차 σ)면 하모닉 진폭에 걸리는 배율이
+#: exp(−(2πfσ)²/2) 다.
+#:
+#: 0 이면 항이 빠진다. **값은 A/B 로 정한다** — 실측에서 우리 유성 소스는 3~12 kHz
+#: 하모닉이 오히려 2~5 dB **모자라고**(§15.2) 12~20 kHz 만 +1.4 dB 과하다. 그러니
+#: 이 항은 "고역 전체를 깎는" 것이 아니라 **맨 위만 깎아** 적합기가 그 아래를 채울
+#: 여지를 주는 쪽으로 써야 한다 (σ 가 작을수록 모서리가 높다).
+GLOTTAL_CLOSURE_SPREAD_S = 0.0
+
+#: 협착 전달비 T = (Lc+Lf)·Ac / (Lc·A0 + Lf·Ac) 의 기하 상수. **지금은 안 쓴다** —
+#: 왜 안 쓰는지는 `physiology` 안의 주석과 docs/MEASUREMENTS.md §22 에 있다.
+#: `ag_dc` 를 문헌 범위로 고치면 그때 같이 살릴 값이라 지우지 않고 둔다.
+CONSTRICTION_LEN = 1.0      # 협착부(혀끝-치경 간극) 길이 [cm]
+FRONT_CAVITY_LEN = 1.5      # 협착 앞쪽 공동(앞니까지) 길이 [cm]
+NEUTRAL_TRACT_AREA = 3.0    # 협착 없는 중립 성도 단면적 [cm²]
+
+
 def lf_pulse(rd: float, n: int = 4096) -> np.ndarray:
     """LF 유량미분 E(t) 한 주기 (Ee = 1 로 정규화). Fant(1995) 의 Rd 파라미터화."""
     rd = float(np.clip(rd, 0.3, 2.7))
@@ -167,11 +223,27 @@ class GlottalSource(nn.Module):
         amp = []
         a = torch.full_like(ps[:, 0], seed) if amp0 is None else amp0.clone()
         for i in range(ps.shape[1]):
-            tgt = a_star[:, i]
+            tgt = a_star[:, i].clamp_min(seed)
             grow = self.k_growth * f0[:, i] * over[:, i] / pth[:, i]
-            up = a + dt * grow * a * (1.0 - a / tgt.clamp_min(seed))
+            # **로지스틱은 닫힌 해로 적분한다** — 전방 오일러가 아니라.
+            #
+            #   dA/dt = σ·A·(1 − A/A*)  ⇒  A(t+dt) = A*·A / (A*·q + A·(1−q)),  q = e^{−σ·dt}
+            #
+            # 전방 오일러 `A + dt·σ·A·(1−A/A*)` 는 `dt·σ > 2` 에서 **불안정**하다.
+            # 여기서 σ = k·f0·(Ps−Pth)/Pth 이고 k=0.25, dt=1 ms 이므로, 적합기가
+            # p_sub 를 17 cmH2O(외치는 값)까지 밀고 f0 가 높으면 dt·σ 가 2 를 넘는다.
+            # 그러면 1420 단계 재귀를 지나며 기울기가 폭주해 **비유한**이 된다.
+            # 실측(FORMANT_ML_DEBUG_NONFINITE=1, yang_00000040 전체): 비유한 기울기가
+            # 정확히 `p_sub` · `adduction` · `f0_target` 세 파라미터에서만, 격자점의
+            # 절반(701/1420)에서 한꺼번에 났다 — 이 셋이 σ 와 A* 를 정하는 값이다.
+            #
+            # 닫힌 해는 어떤 dt·σ 에서도 안정이고 [0, A*] 를 벗어나지 않으며,
+            # 프레임률이 바뀌어도 기동 모양이 같다. 분모는 A ≥ seed, A* ≥ seed 이므로
+            # seed 아래로 내려가지 않는다.
+            q = torch.exp(-(dt * grow).clamp_min(0.0))
+            up = tgt * a / (tgt * q + a * (1.0 - q)).clamp_min(1e-6)
             down = a * torch.exp(-dt * f0[:, i] / self.cycles_decay)
-            a = torch.where(tgt > seed, up, down.clamp_min(seed))
+            a = torch.where(a_star[:, i] > seed, up, down.clamp_min(seed))
             amp.append(a)
         amp_raw = torch.stack(amp, 1)
         amp = (amp_raw - seed).clamp_min(0.0) / (1.0 - seed)
@@ -182,6 +254,34 @@ class GlottalSource(nn.Module):
         # 성문 기식이 1~6 kHz 를 채우던 원인(측정: 앞공동 경로와 같은 크기).
         a_c = c["a_c"].clamp_min(1e-3)
         frac = a_c ** 2 / (a_c ** 2 + ag_dc ** 2)                  # ΔPg/Ps
+        # **v1 의 `constriction_transmission` 은 여기 붙이지 않는다 — 옮겨 봤다가
+        # 측정이 반증했다** (docs/MEASUREMENTS.md §22).
+        #
+        # v1 은 성문 난류가 (1) 얼마나 **생기고**(위 `frac` = `glottal_drop_fraction`)
+        # (2) 얼마나 협착을 지나 **나오는가**(`constriction_transmission`) 를 **둘 다**
+        # 곱한다. 물리는 맞다. 그런데 v2 에 그대로 얹으면 이중으로 깎인다 — 두 모형의
+        # 성문 면적이 다르기 때문이다:
+        #
+        #     무성 마찰음의 Ag        v1 0.12~0.25 cm²      v2 `ag_dc` = 0.448 cm²
+        #     그때 frac 이 주는 감쇠   −7.7 dB               **−26 dB**
+        #
+        # v2 는 성문을 3.7 배 넓게 열어 두므로 `frac` 하나가 이미 v1 의 두 항을 합친
+        # 것(−30 dB)에 가깝다. 거기에 전달비(−22 dB)를 또 곱하면 −48 dB 다.
+        #
+        # 실측 (yang_00000101 전체, 전달비만 켜고 재적합):
+        #     포락 94.67 → 93.19 %,  정밀 85.86 → 84.44 %,  손실 2.343 → 2.699
+        #     유성 프레임 변조 1.50 → 2.46 / 4.19 → 5.63 / 1.32 → 2.37 (전부 악화,
+        #       6 시드 범위가 안 겹친다 — 프레임의 77~82 % 가 여기다)
+        #     마찰 60~150 Hz 만 4.99 → 2.74 로 좋아진다
+        #     `aspiration` 0.031 → **0.011** — 붕괴가 오히려 깊어졌다
+        #
+        # 마지막 줄이 특히 중요하다. 이 항을 넣은 이유가 "적합기가 협착 구간만 기식을
+        # 끌 수단이 없어 전역 배율로 끈다" 는 가설이었는데, 넣어도 전역 배율이 더
+        # 내려갔다. **가설이 틀렸다** — 기식이 과한 곳은 협착 구간이 아니다.
+        #
+        # 다시 볼 때는 `ag_dc` 부터 봐라. 0.02 + 0.5·(1−add)^2.5 가 무성 마찰음
+        # 자세(add 0.06)에서 0.448 cm² 를 주는데, 문헌의 개대 성문은 0.1~0.3 cm² 다
+        # (Löfqvist; Cho·Jun·Ladefoged 2002). 거기가 맞으면 전달비도 같이 산다.
         # 세기는 ΔPg 에 선형 (√ 로 두면 /s/ 중 기식이 실측보다 10 dB 크다 — 같은 화자 A/B).
         asp = (1.0 - add) ** 2 * frac * torch.sqrt(ps.clamp_min(0.0) + 1e-12) * c["aspiration"]
         return dict(f0=f0, amp=amp, amp_raw=amp_raw, rd=rd, ag_dc=ag_dc, asp=asp, pth=pth)
@@ -291,10 +391,28 @@ class GlottalSource(nn.Module):
                 continue
             cj = self.lf_coef[i0, j] * (1 - wrd) + self.lf_coef[i0 + 1, j] * wrd   # (B,N)
             mask = torch.sigmoid((f_nyq - fk) / width) * live
-            gain = 10.0 ** (tilt * (log2f0 + math.log2(float(kk))) / 20.0)
-            ph = phase * kk + torch.angle(cj)
+            if TILT_MAX_HZ > 0.0:
+                # 셸프: 상한 위에서는 기울기가 더 안 오른다 (TILT_MAX_HZ 주석 참조).
+                oct_ = torch.log2(fk.clamp(20.0, TILT_MAX_HZ) / 1000.0)
+                gain = 10.0 ** (tilt * oct_ / 20.0)
+            else:
+                gain = 10.0 ** (tilt * (log2f0 + math.log2(float(kk))) / 20.0)
+            # **`|cj|` 와 `∠cj` 를 따로 구하지 않는다.**
+            #
+            #     |cj|·cos(θ + ∠cj) = Re[cj·e^{iθ}] = cj.real·cosθ − cj.imag·sinθ
+            #
+            # 항등식이므로 결과는 완전히 같은데, `abs` 와 `angle` 이 사라진다. 그 둘은
+            # cj = 0 에서 미분이 정의되지 않아 **NaN 기울기**를 낸다:
+            #   ∂|z|/∂x = x/|z| → 0/0,   ∂∠z/∂x = −y/|z|² → 발산.
+            # 그리고 `cj` 는 표의 두 행을 `rd` 로 **선형 보간한 값**이라 실제로 0 을
+            # 지난다 — 이웃 행의 실수부 내적이 음수인 항목이 **47.2 %** 다 (11063 개 중
+            # 5224 개). `rd` 는 `adduction` · `rd_offset` 에서 나오는 적합 파라미터이므로
+            # 그 NaN 이 그대로 적합기로 흘러 들어간다 (MEASUREMENTS §31).
+            #
+            # 덤으로 삼각함수 호출이 하나 늘고 `abs`·`angle` 둘이 빠져 조금 싸다.
+            th = phase * kk
             if rps is not None:
-                ph = ph + rps[..., j]
+                th = th + rps[..., j]
             if dispersion != 0.0:
                 # **하모닉 위상 분산.** 고역일수록 지연되는 이차 위상 −D·(f/f_nyq)²
                 # (= 주파수에 선형인 그룹 지연 = 시간축으로 퍼지는 chirp). 실제 성대는
@@ -302,8 +420,13 @@ class GlottalSource(nn.Module):
                 # 생긴다. `rps` 와 달리 **샘플률 fk 를 그대로 써서** (B,N,K) 텐서를
                 # 만들지 않는다 — K=240 이면 그것만 65 MB 다.
                 xn = (fk / (0.5 * fs)).clamp(0.0, 1.0)
-                ph = ph - dispersion * xn * xn
-            du = du + 2.0 * cj.abs() * mask * gain * torch.cos(ph)
+                th = th - dispersion * xn * xn
+            w_k = mask * gain
+            if GLOTTAL_CLOSURE_SPREAD_S > 0.0:
+                # 폐쇄 시각의 흩어짐 -> **영위상** 크기 테이퍼 (위 상수 참조).
+                w_k = w_k * torch.exp(
+                    -0.5 * (2.0 * math.pi * fk * GLOTTAL_CLOSURE_SPREAD_S) ** 2)
+            du = du + 2.0 * w_k * (cj.real * torch.cos(th) - cj.imag * torch.sin(th))
         du = du * amp
         # 성문 개방기 (LF: 0 ~ te 가 열림) -> 기식 AM 마스크
         frac = phase / (2 * math.pi)

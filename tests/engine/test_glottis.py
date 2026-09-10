@@ -87,3 +87,119 @@ def test_spectrum_falls_with_frequency_and_tilt_raises_it():
         return 10 * np.log10(Y[(f > 4000) & (f < 8000)].sum() / Y[(f > 200) & (f < 1000)].sum())
     assert ratio(y0) < -20
     assert ratio(y1) > ratio(y0) + 6
+
+
+def test_aspiration_is_attenuated_by_the_oral_constriction():
+    """성문 잡음은 구강 협착이 좁을수록 약해져야 한다 — 그리고 **한 항으로만** 깎인다.
+
+    v2 는 `frac = Ac²/(Ac²+Ag²)`(성문에서 난류가 얼마나 **생기는가**) 하나로 깎는다.
+    v1 은 여기에 `constriction_transmission`(얼마나 **나오는가**)을 또 곱하는데,
+    v2 는 성문을 훨씬 넓게 열어 두므로(무성 마찰음 자세에서 Ag 0.448 cm² 대 v1 의
+    0.12~0.25) `frac` 하나가 이미 v1 의 두 항 몫을 한다. 실제로 전달비를 얹어 재적합
+    하니 포락이 94.67 → 93.19 % 로 떨어지고 유성 프레임 변조가 전부 나빠졌다
+    (docs/MEASUREMENTS.md §22). 그래서 **일부러 한 항만 쓴다.**
+
+    이 테스트가 지키는 것: (1) 협착이 좁으면 기식이 크게 줄고, (2) 협착이 풀리면
+    정확히 되돌아온다(전이가 비면 성문파열음이 된다), (3) 감쇠가 **이중이 아니다**.
+    """
+    import torch
+    from formant_ml.engine.glottis import NEUTRAL_TRACT_AREA, GlottalSource
+
+    g = GlottalSource(48000.0, 48)
+    n = 8
+
+    def asp_for(a_c):
+        c = {k: torch.full((1, n), v) for k, v in
+             dict(p_sub=7.5, adduction=0.06, tension=0.5, f0_target=250.0,
+                  rd_offset=0.0, f0_scale=1.0, aspiration=1.0).items()}
+        c["a_c"] = torch.full((1, n), float(a_c))
+        return float(g.physiology(c)["asp"][0, -1])
+
+    open_, narrow = asp_for(NEUTRAL_TRACT_AREA), asp_for(0.10)
+    db = 20 * math.log10(narrow / open_)
+    assert db < -20.0                    # 좁으면 크게 준다
+    assert db > -35.0                    # 그러나 **이중으로** 깎지는 않는다
+    assert asp_for(NEUTRAL_TRACT_AREA) == open_   # 풀리면 정확히 되돌아온다
+
+
+def test_tilt_shelf_keeps_the_pulse_from_becoming_a_square_wave():
+    """`tilt` 이 나이퀴스트까지 오르면 성문 펄스가 **사각파처럼 날카로워진다.**
+
+    tilt 은 하모닉마다 10^(tilt·log2(f/1kHz)/20) 을 곱하는 거듭제곱이라, 상한이
+    없으면 적합값 +4.8 dB/oct 에서 16 kHz 에 +23 dB 가 걸린다. 실측 |Δdu|max/rms:
+    이상적 LF 1.99 → 상한 없음 **12.47** → 5 kHz 셸프 3.82 (docs/MEASUREMENTS §25).
+
+    성대는 부드러운 물질이라 그런 소스를 못 낸다. 이 테스트는 셸프가 실제로 물고
+    있는지를 건다.
+    """
+    import numpy as np
+    import torch
+
+    from formant_ml.engine import glottis as G
+
+    fs, hop, n = 48000.0, 48, 400
+    g = G.GlottalSource(fs, hop)
+    c = {k: torch.full((1, n), v) for k, v in
+         dict(p_sub=7.0, adduction=0.6, tension=0.5, f0_target=200.0, rd_offset=0.0,
+              f0_scale=1.0, aspiration=1.0, a_c=3.0, jitter=0.0, shimmer=0.0,
+              tilt=6.0).items()}
+
+    def sharpness(cap):
+        old = G.TILT_MAX_HZ
+        G.TILT_MAX_HZ = cap
+        try:
+            with torch.no_grad():
+                du = g(c)["du"][0].numpy()
+        finally:
+            G.TILT_MAX_HZ = old
+        s = du[len(du) // 4:]
+        return float(np.abs(np.diff(s)).max() / (s.std() + 1e-12))
+
+    flat = sharpness(0.0)          # 상한 없음
+    shelf = sharpness(5000.0)
+    c["tilt"] = torch.zeros_like(c["tilt"])
+    base = sharpness(0.0)          # tilt 자체가 없는 LF 그대로
+    # 셸프는 LF 본래 모양 쪽으로 되돌려야 한다.
+    assert abs(shelf - base) < 0.7 * abs(flat - base)
+    assert G.TILT_MAX_HZ == 5000.0     # 기본으로 켜져 있어야 한다
+
+
+def test_lf_coefficients_cross_zero_between_table_rows():
+    """`cj` 가 실제로 0 을 지난다 — 그래서 `abs`·`angle` 을 쓰면 안 된다.
+
+    `cj` 는 표의 두 행을 `rd` 로 **선형 보간한 복소수**다. 이웃 행의 부호가 반대면
+    보간이 0 을 지나고, 그 자리에서 `|z|` 는 미분이 0/0, `∠z` 는 발산이다.
+    """
+    g = GlottalSource(FS, HOP)
+    c = g.lf_coef
+    flip = (c[:-1] * c[1:].conj()).real < 0
+    assert float(flip.float().mean()) > 0.2, "표가 바뀌었으면 이 테스트의 전제를 다시 볼 것"
+
+
+def test_harmonic_sum_has_finite_gradient_where_cj_vanishes():
+    """`rd` 를 훑어도 기울기가 유한해야 한다 (MEASUREMENTS §31).
+
+    `|cj|·cos(θ+∠cj) = Re[cj·e^{iθ}]` 항등식으로 `abs`·`angle` 을 없앴다. 그 둘을
+    쓰면 보간이 0 을 지나는 `rd` 에서 NaN 기울기가 나고, 적합기의 가드가 그 회차를
+    버리면 파라미터가 안 변해 **결정적으로 갇힌다**.
+    """
+    g = GlottalSource(FS, HOP)
+    for rd_off in np.linspace(-0.35, 0.35, 15):
+        c = _ctrl(40, p_sub=7.0, adduction=0.6, tension=0.5, f0_target=220.0,
+                  rd_offset=float(rd_off))
+        c = {k: v.clone().requires_grad_(True) for k, v in c.items()}
+        g(c)["du"].pow(2).mean().backward()
+        for k in ("adduction", "rd_offset"):
+            gr = c[k].grad
+            assert gr is not None and torch.isfinite(gr).all(), \
+                f"rd_offset={rd_off:+.2f} 에서 {k} 기울기가 비유한"
+
+
+def test_identity_replaces_abs_and_angle_exactly():
+    """|c|·cos(θ+∠c) = c.real·cosθ − c.imag·sinθ — float32 정밀도까지 같다."""
+    torch.manual_seed(0)
+    c = torch.randn(20000, dtype=torch.complex64)
+    th = torch.rand(20000) * 20.0 - 10.0
+    lhs = c.abs() * torch.cos(th + torch.angle(c))
+    rhs = c.real * torch.cos(th) - c.imag * torch.sin(th)
+    assert float((lhs - rhs).abs().max()) < 1e-5

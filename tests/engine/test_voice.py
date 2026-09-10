@@ -52,10 +52,14 @@ def test_lateral_onset_is_quieter_than_vowel_but_voiced(eng):
     hop = eng.cfg.hop
     mix, ps = tr["lat_mix"], tr["p_sub"]
     after = np.flatnonzero(mix > 0.1)
-    hold = (mix > 0.9) & (ps > 0)
+    # **압력이 다 선 프레임만** 쓴다. `phones.BREATH_ONSET_S` 가 45 ms 램프라
+    # `ps > 0` 은 소리가 거의 없는 개시 램프까지 끌어들여 rms 를 −45 dB 로 끌어내린다
+    # (계단으로 세우면 개시에 파열음 버스트가 난다 — 실측 1.57 → 0.27).
+    on = ps >= 0.999 * ps.max()      # 고원만 — 램프의 꼬리도 뺀다
+    hold = (mix > 0.9) & on
     vowel = np.zeros(tr.n_frames, dtype=bool)
     vowel[after[-1] + 40:] = True
-    vowel &= ps > 0
+    vowel &= on
 
     def rms_db(m):
         i = np.flatnonzero(m)

@@ -132,3 +132,30 @@ def test_silence_has_no_spectral_shape_or_corrected_score():
     assert np.isnan(tb.spectrum_match(x, x, FS))
     assert np.isnan(tb.spectrum_match(np.ones(10), np.ones(10), FS))
     assert np.isnan(tb.corrected_sc(np.zeros((10, 10)), np.zeros((10, 10)), None)["sc"])
+
+
+def test_speech_likeness_separates_noise_from_voice():
+    """**말소리가 아닌 입력을 걸러야 한다** — 적합 성적으로는 못 거른다.
+
+    코퍼스에 방 잡음 파일이 섞여 있고 그런 것도 적합은 잘 된다(포락 95.0 %가
+    나왔다). 문제는 나오는 파라미터다 — 적합기가 방 잡음을 p_sub 15.8 cmH₂O 에
+    a_c 1.19 로 흉내 냈다 (docs/MEASUREMENTS.md §23.9). 그래서 **입력**에 건다.
+    """
+    import numpy as np
+
+    from formant_ml.engine.segment import SPEECH_PERIODIC_MIN, speech_likeness
+
+    fs = 48000.0
+    n = int(1.0 * fs)
+    rng = np.random.default_rng(0)
+    # 목소리 비슷한 것: 200 Hz 펄스 열을 공진기에 통과
+    v = np.zeros(n)
+    v[::int(fs / 200)] = 1.0
+    ir = np.exp(-np.arange(400) / 60.0) * np.sin(2 * np.pi * 800 * np.arange(400) / fs)
+    v = np.convolve(v, ir)[:n] + 0.02 * rng.standard_normal(n)
+    noise = rng.standard_normal(n) * 0.01
+
+    sv, sn = speech_likeness(v, fs), speech_likeness(noise, fs)
+    assert sv["periodic"] > SPEECH_PERIODIC_MIN
+    assert sn["periodic"] < SPEECH_PERIODIC_MIN
+    assert sv["autocorr"] > 3 * sn["autocorr"]

@@ -65,7 +65,7 @@ classDiagram
   class FricationNoise { +log_beta +log_knee +log_amp +log_lp_ratio +forward(c, ag_dc, phase, voiced) dict }
   class AspirationNoise { +log_amp +forward(asp_env) Tensor }
   class TransientTemplateBank { +bank: Parameter(M,L) +names +add(name, wave) int +render(events, n) Tensor }
-  class VocalTract { +uniform_formants +extra_formants +log_extra_bw +log_front_bw +forward(du, fric, asp, transient, c, state) dict }
+  class VocalTract { +uniform_formants +extra_spacing +log_extra_bw +log_front_bw +forward(du, fric, asp, transient, c, state) dict }
   class ResidualCorrector { +body: SSPTCN +eq_f +forward(ctrl_frames, cond) dict +apply(audio, heads, mix, extra, state) dict }
   class TokenRegistry { +tokens: dict +budget +allowed +spawn() Token +apply(track, name, t0, t1, strength) +strip(track, names) +freeze() +exclude() +prune() +markers(track) +save()/load() }
   class Token { +id +name +emotion +delta: list +reason +usage_count +frozen +excluded +tags +support +describe() }

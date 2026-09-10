@@ -37,16 +37,20 @@
 """
 from __future__ import annotations
 
+import os
+
 import math
 from dataclasses import dataclass, field
 
 import numpy as np
 import torch
 
+from . import room
 from .control import INDEX, PARAMS, ControlTrack
 
 FFT_SIZES = (256, 512, 1024, 2048, 4096)
 MEL_FFT = 256              # 포락용 창 (5.3 ms @48 kHz) — 하모닉이 분해되지 않는다
+HARM_FFT = 2048            # 하모닉용 창 (43 ms, 분해능 23 Hz) — F0 빗살이 보인다
 DB_RANGE = 70.0            # 정점 아래 이만큼까지만 본다
 # **난류 우세 빈에서 기대 스펙트럼을 볼 시간 폭 (ms). 0 이면 끈다.**
 #
@@ -154,40 +158,22 @@ ACC_KNEE_HZ_PER_MS2: dict[str, float] = {
 # 균일한 격자든 균일한 벌점이든 모든 시점에 똑같이 자유도를 주거나 뺏는데, 조음은
 # "대부분 정지, 짧은 순간에 급전" 이라 그 틀로는 두 요구를 동시에 못 맞춘다.
 VEL_MODE = "accel"
-# 기본값 0 — **아직 켜지 않는다.** 기구와 계측 상수는 여기 있지만, 세기(VEL_W)가
-# 포락 일치를 얼마나 깎는지 A/B 로 확인하기 전에는 모든 적합의 거동을 바꿀 수 없다.
+# **0.001 로 켠다** (0.3.15). 오래 기본값 0 이었는데, 그 이유였던 "포락을 얼마나
+# 깎는지 모른다" 가 이제 측정됐다 — **깎지 않고 오히려 올린다.**
+#
+# 실측 (yang_00000040 **전체**, tilt 셸프 + a_c 속도 벌점 고정, 같은 코드):
+#
+#   | | 포락 | 정밀 | 제어열 곡률 rms | 95 분위 |
+#   |---|---|---|---|---|
+#   | 벌점 없음 | 90.47 % | 83.04 % | 147.97 | 256.90 |
+#   | 잔물결 0.01 | 91.23 % | 84.05 % | **87.90** | **93.81** |
+#   | **가속도 0.001** | **93.17 %** | **86.96 %** | 100.30 | 139.93 |
+#
+# 이전 세션의 세 구간 벤치와도 일치한다 (docs/HANDOFF.md §4: 모음 4.3→3.7°,
+# 씨 17.6→12.1°, 설측 33.8→32.4° — 어디서도 무너지지 않는다).
+#
 # 힌지 자체는 검증했다: F2 이동 10/50/93 Hz/ms 는 벌점 0, 150 은 0.97, 309 는 14.0.
-VEL_W = 0.0
-
-# **이득류의 가속도 무릎 (dB/ms²).** 포먼트와 같은 논리를 세기 쪽에 건 것이다.
-#
-# 왜 필요한가. 마찰 구간에서 목표의 순시 진폭은 **원리적으로 재현 불가능**하다 —
-# 난류의 실현은 시드가 다르면 다르다(engine/turbulence.py). 그런데 `tract_gain` 은
-# 1 ms 격자에서 자유롭고 사전이 약해서(PRIOR_W 0.3), 적합기가 그 못 맞출 요동을
-# **이득으로 좇는다**. 그 결과가 합성음에 얹히는 진폭 잔물결이다.
-#
-# 실측 (yang_00000101 마찰 프레임, 4~12 kHz 포락선의 변조 지수, 목표 대비):
-#
-#   |                                   조건 | F0 대역 | 60-150 Hz | 150-400 Hz |
-#   |----------------------------------------|---------|-----------|------------|
-#   | 적합된 트랙 그대로                     | 10.79x  |   5.94x   |   11.58x   |
-#   | fric_gain 만 25 ms 평활                |  9.74x  |   5.48x   |   11.50x   |
-#   | + a_c + p_sub 도 평활                  |  9.74x  |   6.43x   |   11.09x   |
-#   | + **tract_gain** 도 평활               |  5.46x  |   3.42x   |    5.47x   |
-#
-# 즉 잔물결의 **절반이 tract_gain 하나**에서 나온다. 사용자가 "지글거린다" 고 한
-# 성분이 이것이다.
-#
-# 무릎은 어디서 오는가. 성도의 출력 이득은 조음기 위치와 방사가 정하는 양이라
-# 그 변조는 조음 속도로 묶인다. 사람 말의 진폭 변조는 음절률 4 Hz, 음소률
-# 10~16 Hz 에 몰려 있고(Greenberg), **50 Hz 위의 조음성 변조는 없다** — 그 위는
-# 전부 소스(F0)와 난류다. 진폭 A dB, 주파수 f 의 정현 변조는 2 차 차분 크기가
-# A·(2πf·dt)² 이므로, dt = 1 ms · f = 50 Hz · A = 1 dB 에서 0.099 dB/ms² 다.
-GAIN_ACC_KNEE_DB_MS2: dict[str, float] = {
-    "tract_gain": 0.10, "fric_gain": 0.10, "aspiration": 0.10,
-}
-# 세기. 0 이면 항이 빠진다. 값은 A/B 로 정한다 (docs/MEASUREMENTS.md §13).
-GAIN_ACC_W = 0.0
+VEL_W = 0.001
 
 # **잔물결 벌점** — 제어열이 조음 대역 **위에서** 흔들리는 것만 문다.
 #
@@ -232,8 +218,53 @@ GAIN_ACC_W = 0.0
 # 그래서 **세기는 작아야 한다.** 위 트랙에서 의사후버 평균이 44.66 이므로
 # RIPPLE_W = 0.01 이면 벌점이 0.45 — 그 구간 손실 1.06 과 같은 자릿수다.
 RIPPLE_KNEE = 0.02
-# 세기. 0 이면 항이 빠진다. `copyfit --ripple` 로 켠다.
-RIPPLE_W = 0.0
+# **0.01 로 켠다** (0.3.15). §23 의 A/B 가 "판정 불가" 였던 것은 자가 틀렸기
+# 때문이다 — F0 아래 대역은 유성 총에너지의 1 % 미만이라 멜 포락 손실에 안 보인다
+# (§26.4). 제대로 된 자로 다시 재니 결정적이다.
+#
+# 실측 (yang_00000040 **전체**, 나머지 기본값 전부 켠 채 잔물결만 갈라):
+#
+#   | | 포락 | 정밀 | 스펙트럼 |
+#   |---|---|---|---|
+#   | 0 | 90.71 % | 82.48 % | 71.15 % |
+#   | **0.01** | **94.06 %** | **88.06 %** | **73.95 %** |
+#
+# +3.4 / +5.6 점이다. 제어열 곡률도 함께 내려간다 (§26.35 의 자로 rms 148 → 88).
+# 이동평균과 달리 곡률의 L1 은 "움직이고 멈추는" 조각별 선형 궤적을 선호하므로
+# 치찰음의 앞공동 공명이 이동하는 것은 그대로 두고 프레임률 잔떨림만 지운다 (§32.2).
+RIPPLE_W = 0.01
+
+# **조음기의 속도 한계** [neper/ms] — 협착 면적의 **로그**가 1 ms 에 이만큼 넘게
+# 못 움직인다.
+#
+# 왜 로그인가: 조음기가 일정 속도로 움직이면 면적은 **지수적으로** 변한다(간극이
+# 좁아질수록 같은 변위가 면적을 더 크게 바꾼다). 면적 그 자체에 한계를 걸면 실제
+# 제스처(3.0 → 0.08 cm²)도 걸려 버린다 — 한 번 그렇게 해 보고 알았다.
+#
+# 왜 필요한가 (docs/MEASUREMENTS.md §24). 마찰음이 **유성 구간 한가운데서 1 ms 만에
+# 켜졌다 꺼진다.** 그 순간의 `a_c`:
+#
+#     s040 프레임 295:  a_c  3.864 → 4.910 → **0.732**  (2 ms 안에)
+#     s101 프레임 299:  a_c  1.775 → 1.089            (그때 fric_gain 208 배)
+#
+# 에너지로는 −36~−44 dB 라 레벨을 오염시키지는 않지만, 1 ms 짜리 광대역 스위칭이라
+# 스펙트로그램에 세로 줄로 남고 고역 대역 에너지를 흔든다(마찰을 끄면 유성 구간의
+# 세로 얼룩이 1.649 → 1.365).
+#
+# 한계값의 근거는 **v1 의 제스처 모형이 실제로 내는 값**이다 (최소 저크, 로그 면적):
+#
+#   | 제스처 | 중앙 | 95 분위 | 최대 |
+#   |---|---|---|---|
+#   | 130 ms 지속음 (0.35→0.08) | 0.0122 | 0.0213 | 0.0215 |
+#   | 40 ms CV (0.35→0.08) | 0.0385 | 0.0706 | 0.0709 |
+#   | **28 ms 가장 빠른 CV (0.60→0.05)** | 0.0922 | 0.1705 | **0.1724** |
+#   | 적합 트랙 s101 | 0.0004 | 0.2250 | **0.8731** |
+#   | 적합 트랙 s040 | 0.0019 | 0.4284 | **1.9032** |
+#
+# 0.20 은 가장 빠른 제스처(0.172) 바로 위이고 이탈(0.87~1.90)보다 4~10 배 아래다.
+ARTIC_VEL_KNEE: dict[str, float] = {"a_c": 0.20}
+# 세기. 이 항은 **기본으로 켠다** — 위 이탈이 물리적으로 불가능한 양이다.
+ARTIC_VEL_W = 1.0
 
 PRIOR_W: dict[str, float] = {
     "f0_target": 40.0, "f1": 40.0, "f2": 40.0, "f3": 20.0, "f4": 10.0,
@@ -253,7 +284,187 @@ PRIOR_W: dict[str, float] = {
     # 적합 대상에서 빼 두면 다른 파라미터가 그 초과분을 메우려고 비틀린다.
     "jitter": 0.1, "shimmer": 0.1,
 }
+# **크기 스펙트럼의 완화 상수 η** (목표 크기의 평균 대비 비율).
+#
+# `|z| = √(x²+y²)` 는 z = 0 에서 미분이 정의되지 않는다 — `∂|z|/∂x = x/|z|` 가 0/0 이다.
+# torch 는 그 자리에서 **NaN 기울기**를 낸다. STFT 빈은 무음 구간에서 실제로 0 에
+# 임의로 가까워지므로(부동소수 언더플로 포함) 이 자리가 비유한 기울기의 원인이 된다.
+#
+# 실측 (out/sw/r000, yang_00000040 전체, 예전 가드): 모든 단계가 "[30] 수렴 +
+# 비유한 29 회 건너뜀" 으로 끝났다 — 단계당 실제 걸음이 1 번뿐이었고 포락이
+# 82.7 % 에 머물렀다 (같은 파일의 정상 적합은 93.1 %).
+#
+# 받개는 **크기 자체를 완화하는 것**이다: `|z|_η = √(x²+y²+η²)`. 이러면
+#   * 어디서나 C^∞ 이고 기울기 상한이 1 이다 (`∂|z|_η/∂x = x/|z|_η ≤ 1`),
+#   * η ≪ |z| 인 곳에서는 `|z|` 와 구별되지 않으며,
+#   * 로그를 씌워도 `log(|z|_η) ≥ log η` 로 아래가 막혀 있다.
+# 즉 로그 처리와 완화가 같은 상수 하나로 맞물린다.
+#
+# 크기는 **목표 스펙트럼의 평균 크기에 비례**시킨다 — 절대값으로 두면 녹음 레벨에
+# 따라 의미가 달라진다. 1e-6 이면 목표 평균보다 120 dB 아래이고, 손실이 보는 하한
+# (`DB_RANGE` = 정점 −70 dB)보다 한참 밑이라 편향이 없다.
+MAG_ETA_REL = 1e-6
+
+# **세로 얼룩(스펙트럼 플럭스) 일치 항.**
+#
+# 사용자 조건 1 은 "세로 얼룩 없음" 인데, **지금 손실은 그것을 원리적으로 못 본다.**
+# `_expect` 가 난류 우세 빈을 시간 평활한 기대 스펙트럼으로 갈아 끼워 비교하기
+# 때문이다 (그 자체는 옳다 — 난류의 실현을 맞추라고 하면 기울기가 잡음이다).
+# 그래서 적합기에게 프레임 간 급변을 줄일 이유가 없었다.
+#
+# 실현이 아니라 **통계**를 맞춘다 (§9 와 같은 철학):
+#
+#     F(k) = mean_t |dB_mel(t+L, k) − dB_mel(t, k)|      (L = 4 프레임 ≈ 5.3 ms)
+#
+# 그리고 **최소화가 아니라 일치**다. 난류는 원래 흔들리므로 목표보다 매끈하면 그것도
+# 틀린 것이다 — 짧은 창의 스펙트럼이 안 흔들리는 잡음은 잡음이 아니라 음(音)이다.
+# 사용자가 말한 "이전 창을 많이 반영하면 주기적 소리가 난다" 가 바로 그 이야기다.
+# 그래서 `|F_합성 − F_목표|` 를 벌한다.
+#
+# 시간 간격 L: 합격 판정(`scripts/acceptance.py`)이 5 ms 격자에서 재므로 같은 눈금을
+# 쓴다. MEL_FFT=256 의 홉이 64 표본(1.33 ms)이라 L=4 가 5.3 ms 다.
+FLUX_LAG = 4
+# **2.0 로 켠다** (0.3.15). 세기를 쓸어 보니 2 가 정확한 지점이다 — 같은 구간
+# (yang_00000040 0.18~0.55 s), 시드 5 벌 중앙과 범위:
+#
+#   | 세기 | 포락 | 얼룩 p95 비 (범위) | 목표 p99 초과 % | 기울기 r |
+#   |---|---|---|---|---|
+#   | 0 | 91.96 % | 1.125 (1.050~1.204) | 3.08 | 0.836 |
+#   | **2** | **94.04 %** | **1.058 (1.037~1.073)** | **0.000 (5 벌 전부)** | 0.834 |
+#   | 5 | 93.84 % | 1.112 (1.075~1.129) | 1.54 | **0.598** (무너진다) |
+#
+# 2 에서 **목표 p99 를 넘는 프레임이 한 개도 없고** p95 비가 1.06 으로 목표에 붙는다.
+# 시드 간 편차도 0.154 -> 0.036 으로 줄어든다 (통계를 맞추므로 실현 의존이 준다).
+# 포락은 오히려 2.1 점 오른다 — 얼룩을 만들던 잔떨림이 스펙트럼에도 손해였다는 뜻이다.
+# 5 는 과하다: 고역 기울기 궤적(`tilt_r`)이 0.836 -> 0.598 로 무너진다.
+FLUX_W = 2.0               # 0 이면 항이 빠진다. `copyfit --flux 0` 으로 끈다.
+
+# **포먼트 대역폭의 손실 법칙** — 공진의 "경계조건" 을 강제하는 항.
+#
+# 대역폭은 기하가 정하는 양이 아니라 **손실 기전**이 정한다: 벽 진동(저역 지배),
+# 점성·열(∝√f), 방사(∝f²), 그리고 성문 손실(내전에 따라). 그래서 포먼트 주파수와
+# 달리 **자유 파라미터로 두면 안 된다** — 자유롭게 두면 적합기가 극을 뭉개서
+# 스펙트럼 기울기를 흉내 내는 데 쓴다.
+#
+# 실측 (out/fin/s040, 유성 프레임 중앙; 법칙은 `tract.default_bw` = 40 + 0.05·F):
+#
+#   | F [Hz] | 법칙 | 적합값 | 배수 |
+#   |---|---|---|---|
+#   | 647 | 72 | 160 | 2.21 |
+#   | 1890 | 134 | 209 | 1.55 |
+#   | 3125 | 196 | 351 | 1.79 |
+#   | 4206 | 250 | **679** | **2.71** |
+#
+# 다른 적합에서는 `bw4` 가 2526 Hz 까지 간다 — 그건 극이 아니라 완만한 경사다.
+#
+# 그 결과가 사용자가 지적한 "울림이 부족하고 살짝 플랫" 이다. 포먼트 사이 골의
+# 깊이를 재면 (300~5000 Hz, 유성): 목표 5.49 / 5.07 / 4.54 dB 에 대해 합성이
+# 3.37 / 3.49 / 3.29 dB — **1.25~2.12 dB 얕다** (s040 / s101 / s034).
+#
+# **구역별로 보면 저역이 아니라 상위 포먼트다** (s040):
+#
+#   | 구역 [Hz] | 300~1200 | 1200~2600 | **2600~4200** | 4200~6500 | 6500~9000 |
+#   |---|---|---|---|---|---|
+#   | 목표 | 6.10 | 4.93 | 4.88 | 4.48 | 3.30 |
+#   | 합성 | 6.34 | 5.87 | **2.69** | 3.77 | 2.82 |
+#
+# F1·F2 구역은 이미 목표보다 또렷하다. 그래서 **일률 배율은 틀린 처방이다** —
+# 전 대역 ×0.35 로 좁히면 1200~2600 Hz 가 10.09 dB 로 목표(4.93)의 두 배가 된다.
+# 주파수 의존 법칙이라야 한다.
+#
+# 그리고 이것은 "노이즈가 들린다" 와 같은 결함이다. 유성 구간의 조화/잡음비는
+# 이미 목표와 ±1 dB 로 맞는다(전 대역). 2.6~5 kHz 는 목표조차 HNR 이 1~3 dB 인
+# 반쯤 잡음인 대역이므로, 거기서 골이 안 닫히면 **울림 부족으로도 잡음으로도**
+# 들린다. 하나의 원인이 두 증상을 만든다 (MEASUREMENTS §35).
+#
+# 세기 0 이면 항이 빠진다. `copyfit --bw-law` 로 조절한다.
+#: **파형 상관의 붕괴를 문다** (사용자 요청: "연속 조건을 더 강화").
+#:
+#: 20 ms 창의 정규화 파형 상관 `r_t = <a·b>/√(<a²><b²>)`. 유성 구간에서 1 에 가까워야
+#: 하고, **0 근처로 떨어지거나 음수가 되는 곳이 귀에 끊겨 들리는 곳**이다 (펄스열이
+#: 반 주기 어긋나면 음수까지 간다).
+#:
+#: **이 항이 필요한 이유는 멜 오차가 그 사건을 못 보기 때문이다.** 실측
+#: (`out/lad/s040`): 0.41 s 에서 상관이 −0.80 인데 그 자리의 **멜 dB 오차는 오히려
+#: `out/fix` 보다 낮다.** 크기 스펙트럼은 멀쩡하고 위상만 뒤집혔다. 그래서 연속
+#: 벌점을 멜 오차 위에 걸면 아무것도 안 문다 — 상관 위에 걸어야 한다.
+#:
+#: `softplus(knee − r)^POW` 로, **큰 붕괴가 지배하도록** 제곱한다. 평균 손실에서
+#: 한 창은 1/1000 무게인데, 그 한 창이 들리는 결함의 전부다.
+CORR_W = 0.0
+CORR_WIN_MS = 20.0
+CORR_HOP_MS = 5.0
+CORR_KNEE = 0.90           # 이 아래로 떨어진 만큼 문다
+CORR_POW = 2.0             # 1 이면 선형, 2 면 큰 붕괴가 지배한다
+
+#: **주기성(조화 대 비조화)을 목표에 일치시킨다** (사용자 요청).
+#:
+#: F0 지연에서의 정규화 자기상관 `r(t) = <x(t)x(t+T₀)>/√(<x²><x(t+T₀)²>)` — Praat 의
+#: HNR 이 쓰는 것과 같은 양이고 텐서 연산만으로 미분 가능하다.
+#:
+#: **왜 이 항이 없으면 안 되는가.** 손실의 크기 항은 난류부를 *기대* 스펙트럼으로
+#: 비교하므로 **하모닉과 잡음이 서로 교환 가능하다.** 실제로 고차 극을 늘렸더니
+#: 적합기가 `p_sub` 를 9.82 → 4.55 로 반 토막 내고 `fric_gain` 을 6.29 → **70.53**
+#: (+1022 %) 으로 올려 같은 스펙트럼을 만들었다. 총 레벨이 같으니 포락 점수는 안
+#: 떨어지고 소리만 망가진다 (§44). 실측 주기성 (yang_00000040):
+#:
+#:     대역        목표     fix    pole     lad
+#:     전대역    0.8616  0.8436  0.7698  0.8179
+#:     1~4 kHz   0.3760  0.3789  0.2916  0.2707
+#:
+#: **최대화가 아니라 일치**다. 잡음을 다 죽이면 그것대로 틀린다 — 실제 음성의 난류는
+#: 목표에도 있다. 다만 **시끄러운 쪽을 더 세게** 문다 (`HNR_ASYM`).
+HNR_W = 0.0
+HNR_ASYM = 3.0             # r 이 목표보다 낮을 때(더 시끄러울 때)의 가중
+HNR_HP_HZ = 1000.0         # 두 번째 대역: 이 위만 보는 고역통과
+
+#: **창별 손실이 악화되면 문다** (사용자 요청). 평균 손실은 국소 붕괴를 못 본다 —
+#: 실측(§38.2c): 50 ms 구간별 파형 상관이 대부분 1.00 인데 한 구간만 0.88 → **−0.06**
+#: 으로 뒤집힌다(펄스가 1/3 주기 미끄러짐). 그 한 구간은 평균에서 1/28 의 무게다.
+#: `softplus(e_t − e_{t−L})` 로 **악화분만** 문다 — 절대 수준 항(`env_db`)이 그대로
+#: 있으므로 "전부 고르게 나쁘게" 로는 회피할 수 없다.
+CONT_W = 0.0
+CONT_LAG = 4               # 프레임. 256 창의 hop 이 64 샘플이라 4 = 창 하나 (5.3 ms)
+CONT_KNEE_DB = 0.5         # 이만큼의 악화는 공짜 (계측 잡음)
+
+#: **유성 구간의 스펙트럼 첨예도** (사용자 요청). 포락 일치율은 이것을 볼 수 없다 —
+#: 멜 48 밴드는 6 kHz 에서 폭이 700~900 Hz 인데 포먼트 간격은 c/(2L) ≈ 1199 Hz 라
+#: 봉우리와 골이 한 밴드 안에서 평균되어 사라진다 (§37).
+#:
+#: 실측 비(적합/목표): 포먼트 대비 0.867~0.932, 하모닉 첨예 0.850~0.927. 두 자 다
+#: 적합이 **덜 첨예**하다고 말한다.
+#:
+#: **한쪽 방향으로만 문다.** 목표보다 뭉툭할 때만 벌하고 날카로울 때는 공짜다 —
+#: 양쪽으로 물면 목표보다 날카로운 해를 만들어 낼 이유가 생기고, 그건 그것대로
+#: 인공적이다.
+SHARP_W = 0.0
+SHARP_WIN_HZ = 2000.0      # 포먼트 대비: 극 간격보다 넓어야 봉우리와 골이 모두 남는다
+SHARP_LO_HZ, SHARP_HI_HZ = 300.0, 12000.0
+HARM_WIN_HZ = 900.0        # 하모닉 첨예: 긴 창(2048)에서 F0 빗살이 보이는 폭
+HARM_LO_HZ, HARM_HI_HZ = 100.0, 4000.0
+
+#: **F0 아래의 진동** (사용자 요청). 실측(`out/fix/s040`): 목표는 F0 아래가 기준대역
+#: 대비 −20.99 dB 인데 적합은 −9.31 dB — **+11.7 dB 초과**다 (s101 +2.5, out/pole 은
+#: +15.0 까지 나빠졌다).
+#:
+#: **"F0 아래를 금지" 가 아니라 "목표보다 초과한 만큼" 을 문다.** 사용자가 지적한
+#: 대로 금지하면 성대 프라이나 서브하모닉까지 억누른다 — 목표에 진짜 프라이가 있으면
+#: 목표의 F0 아래 레벨도 높으므로 벌점이 저절로 0 이 된다. 기준 F0 는 **목표의 것**을
+#: 쓴다 (적합된 F0 를 쓰면 벌점이 제 꼬리를 문다).
+SUBF0_W = 0.0
+SUBF0_HI = 0.75            # F0 의 이 배율 아래를 "F0 아래" 로 본다
+SUBF0_REF = (0.9, 3.0)     # 기준 대역 (F0 배율)
+SUBF0_KNEE_DB = 1.0
+
+BW_LAW_W = 0.0
+#: 허용 배수의 로그. 0.3 이면 법칙의 ×/÷ 1.35 배까지는 사실상 공짜다 — 화자·모음마다
+#: 실제로 그만큼 흔들리기 때문이다(기식도, 성문 손실). 그 밖은 값을 치른다.
+BW_LAW_TOL = 0.3
+
 F_MARGIN_HZ = 120.0        # 인접 포먼트 최소 간격
+
+#: 비유한 기울기가 났을 때 어느 파라미터·격자점인지 찍는다 (느리지 않다 — 났을 때만).
+DEBUG_NONFINITE = bool(os.environ.get("FORMANT_ML_DEBUG_NONFINITE"))
 
 # 프레임별 적합의 **한 걸음 크기**(raw 좌표). Adam 은 기울기 크기와 무관하게 lr 만큼
 # 걷기 때문에, 모든 파라미터에 같은 lr 을 주면 F0 가 한 걸음에 11 % 씩 뛴다(실측:
@@ -275,6 +486,12 @@ GRID_MS = (20.0, 10.0, 5.0, 1.0)
 DEFAULT_PARAMS = (
     "p_sub", "adduction", "f0_target", "rd_offset", "tilt", "aspiration",
     "jitter", "shimmer",
+    # **F1~F4 만 자유다.** F5~F8 을 자유 파라미터로 풀어 봤다가 되돌렸다 (§40):
+    # 열이 32 → 40 개가 되자 같은 예산으로 2.4 단계가 회복을 못 했고 (87.45 → 85.31,
+    # `out/pole` 은 같은 자리에서 88.81 → 90.63), 위상 단계가 66.79 % / 43.94 % 로
+    # 무너졌다. 위쪽 포먼트는 **자유도가 아니라 물리**다 — 극 간격 c/(2L) 는 조음과
+    # 무관한 절대 제약이고, 실제로 5 번 모드부터 무작위 면적 함수 8 종에서 그 20 Hz
+    # 안에 든다 (§35.1). `_formant_tracks` 가 "빠진 포먼트 = 직전 + c/(2L)" 로 만든다.
     "f1", "f2", "f3", "f4", "bw1", "bw2", "bw3", "bw4",
     "tract_gain", "a_c", "fric_gain", "obstacle", "back_leak", "front_len",
     "velum", "oral_open", "nasal_f", "nasal_f2", "nasal_f3", "nasal_z",
@@ -332,7 +549,8 @@ class CopySynthFitter:
                  params: tuple[str, ...] = DEFAULT_PARAMS,
                  lam_smooth: float = 3e-3, lam_prior: float = 1e-4,
                  phase_weight: float = 0.0, pulse_weight: float = 1.0,
-                 n_mels: int = 48, device: str = "cpu"):
+                 n_mels: int = 48, device: str = "cpu",
+                 room_ir: np.ndarray | None = None):
         self.eng = engine
         self.hop = engine.cfg.hop
         self.fs = engine.cfg.sample_rate
@@ -340,7 +558,13 @@ class CopySynthFitter:
         self.lam_smooth, self.lam_prior = lam_smooth, lam_prior
         self.phase_weight = phase_weight
         self.pulse_weight = pulse_weight
+        self.room_ir = (None if room_ir is None else
+                        torch.as_tensor(np.asarray(room_ir, np.float32), device=device))
         self._last_pulse = float("nan")
+        self._last_flux = float("nan")
+        self._flux_db = None
+        self.flux_live = None
+        self._mel_err = self._mel_raw_db = self._harm_db = None
         self.sizes = list(FFT_SIZES)
 
         # 녹음의 원래 나이퀴스트. **손실에서 그 위를 보면 안 된다.**
@@ -396,8 +620,10 @@ class CopySynthFitter:
                                    device=device)
         self.prior_w = torch.tensor([PRIOR_W.get(n, 1.0) for n in self.names],
                                     dtype=torch.float64, device=device)
+        # 자유 포먼트만. F5~F8 은 `_formant_tracks` 가 c/(2L) 사다리로 만들므로
+        # 순서가 구조적으로 보장된다 — 벌점을 걸 대상이 아니다.
         self.f_idx = [i for i, n in enumerate(self.names)
-                      if n in ("f1", "f2", "f3", "f4")]
+                      if len(n) == 2 and n[0] == "f" and n[1].isdigit()]
         self.log_gain = torch.zeros(1, dtype=torch.float64, device=device,
                                     requires_grad=True)
 
@@ -416,6 +642,12 @@ class CopySynthFitter:
         self.bin_max = {k: int(math.ceil(self.f_max / (self.fs / k))) + 1 for k in FFT_SIZES}
         # 목표의 조화/잔차 분해. 위상 항(조화부만 본다)과 크기 항(난류부는 기대
         # 스펙트럼으로 본다)이 같은 것을 쓰므로 한 번만 만든다.
+        # **η 를 먼저 정한다.** 아래의 모든 크기·로그가 이 값을 쓴다. 목표의 평균
+        # 크기에 비례시키므로 녹음 레벨과 무관하게 같은 뜻을 갖는다. 여기 한 번만
+        # 쓰는 `.abs()` 는 `no_grad` 안이라 기울기가 없다.
+        with torch.no_grad():
+            _m = _stft(self.target, MEL_FFT, self.wins[MEL_FFT]).abs().mean()
+            self.mag_eta = float(MAG_ETA_REL * _m.clamp_min(1e-12))
         self._har_res = self._decompose_target()
         with torch.no_grad():
             self._harm_w = {k: self._harmonic_weight(k) for k in FFT_SIZES}
@@ -423,12 +655,19 @@ class CopySynthFitter:
             self._sm_frames = {k: max(1, int(round(NOISE_EXPECT_MS
                                                    / (1000.0 * (k // 4) / self.fs))))
                                for k in FFT_SIZES}
-            raw = {k: _stft(self.target, k, self.wins[k]).abs()[:, :self.bin_max[k]]
+            raw = {k: self._cabs(_stft(self.target, k, self.wins[k]))[:, :self.bin_max[k]]
                    for k in FFT_SIZES}
             self.tgt_S = {k: self._expect(v, k) for k, v in raw.items()}
             self.tgt_M = self.mel[:, :self.tgt_S[MEL_FFT].shape[1]] @ self.tgt_S[MEL_FFT]
             self.tgt_Mdb = self._db(self.tgt_M)
             self.db_floor = float(self.tgt_Mdb.max()) - DB_RANGE
+            # **플럭스 통계는 `_expect` 를 지나기 전의 날것에서 잰다.** 평활된
+            # 스펙트럼에서 재면 재려는 흔들림이 이미 지워져 있다.
+            raw_mel = self.mel[:, :raw[MEL_FFT].shape[1]] @ raw[MEL_FFT]
+            self.tgt_flux, self.flux_live = self._flux_stat(self._db(raw_mel),
+                                                            make_mask=True)
+            self._prepare_voice_stats(raw)
+        self._prepare_corr()
         self.calibrate_gain()
 
     # ------------------------------------------------------- 재매개화
@@ -528,10 +767,25 @@ class CopySynthFitter:
 
     # ------------------------------------------------------------ 손실
     def synth(self, want_phase: bool = False):
+        """엔진을 돌리고, **녹음 경로**가 주어졌으면 그것까지 통과시킨다.
+
+        `room_ir` 은 방·마이크·코덱을 녹음에서 추정한 필터다 (engine/room.py). 이걸
+        순방향에 넣으면 적합기가 그 응답을 성도·소스 파라미터로 흡수하지 않는다 —
+        추정되는 물리량이 **마른 목소리**의 것이 된다. 위상(`out["phase"]`)은 성문
+        위상이라 방을 안 통과한다: 펄스 항은 소스의 시각을 거는 것이므로 그대로 둔다.
+        """
         self.eng.reset()
         out = self.eng(self.control(), self.track.events, 0.0)
         y = out["audio"] * torch.exp(self.log_gain).to(torch.float32)
+        if self.room_ir is not None:
+            y = room.apply_ir(y, self.room_ir)
         return (y, out["phase"]) if want_phase else y
+
+    def synth_dry(self) -> torch.Tensor:
+        """녹음 경로를 빼고 렌더한다 — 이게 **목소리 자체**다."""
+        self.eng.reset()
+        out = self.eng(self.control(), self.track.events, 0.0)
+        return out["audio"] * torch.exp(self.log_gain).to(torch.float32)
 
     def pulse_loss(self, phase: torch.Tensor) -> torch.Tensor:
         """성문 펄스 위치를 목표의 폐쇄 시각에 건다.
@@ -549,15 +803,35 @@ class CopySynthFitter:
         ph = phase[0].index_select(0, idx).double()
         return (1.0 - torch.cos(ph - self.pulse_phi0)).mean()
 
-    @staticmethod
-    def _db(x: torch.Tensor) -> torch.Tensor:
-        return 20.0 * torch.log10(x + 1e-10)
+    def _cabs(self, z: torch.Tensor) -> torch.Tensor:
+        """완화된 복소 크기 `√(x²+y²+η²)` — `z.abs()` 대신 쓴다.
 
-    @staticmethod
-    def _sc(at: torch.Tensor, ap: torch.Tensor) -> torch.Tensor:
+        `z.abs()` 는 z=0 에서 기울기가 0/0 이라 NaN 이다 (`MAG_ETA_REL` 주석 참조).
+        η 를 더하면 어디서나 미분 가능하고 기울기 상한이 1 이다.
+        """
+        return torch.sqrt(z.real ** 2 + z.imag ** 2 + self.mag_eta ** 2)
+
+    def _db(self, x: torch.Tensor) -> torch.Tensor:
+        """dB. **로그의 인자를 η 로 막는다** — `log 0 = −∞` 도, 그 기울기 발산도 없다.
+
+        `_cabs` 를 지난 크기는 이미 η 이상이므로 여기 더하는 η 는 이중 안전장치이자
+        멜 합성 뒤(선형 결합이라 0 이 될 수 있다)의 바닥이다.
+        """
+        return 20.0 * torch.log10(x + self.mag_eta)
+
+    def _sc(self, at: torch.Tensor, ap: torch.Tensor) -> torch.Tensor:
+        """스펙트럼 수렴도. **놈도 완화한다** — `‖v‖` 는 v=0 에서 같은 0/0 이다.
+
+        적합이 완벽해질수록 `at − ap → 0` 이므로 그 자리로 **다가가는 것이 목적**이다.
+        완화하지 않으면 잘 맞을수록 기울기가 불안정해진다.
+        """
         m = min(at.shape[-1], ap.shape[-1])
         at, ap = at[..., :m], ap[..., :m]
-        return torch.linalg.norm(at - ap) / (torch.linalg.norm(at) + 1e-9)
+        e2 = self.mag_eta ** 2
+        d = at - ap
+        num = torch.sqrt((d * d).sum() + e2)
+        den = torch.sqrt((at * at).sum() + e2)
+        return num / (den + 1e-9)
 
     def spectral_loss(self, y: torch.Tensor):
         """(정밀 SC, 포락 dB 오차, 포락 SC, 창별 SC%).
@@ -569,17 +843,21 @@ class CopySynthFitter:
         로 재고 (로그 주파수 = 대역마다 같은 무게), 정점 −70 dB 아래는 잘라 낸다.
         """
         sc_sum, per = 0.0, {}
-        Smel = None
+        Smel = Smel_raw = harm_raw = None
         for k in self.sizes:
-            Sp = self._expect(_stft(y, k, self.wins[k]).abs()[:, :self.bin_max[k]], k)
+            raw = self._cabs(_stft(y, k, self.wins[k]))[:, :self.bin_max[k]]
+            Sp = self._expect(raw, k)
             if k == MEL_FFT:
-                Smel = Sp
+                Smel, Smel_raw = Sp, raw
+            if k == HARM_FFT:
+                harm_raw = self._db(raw)
             sc = self._sc(self.tgt_S[k], Sp)
             sc_sum = sc_sum + sc
             per[k] = float(100.0 * (1.0 - sc.detach()))
         if Smel is None:
-            Smel = self._expect(
-                _stft(y, MEL_FFT, self.wins[MEL_FFT]).abs()[:, :self.bin_max[MEL_FFT]], MEL_FFT)
+            Smel_raw = self._cabs(
+                _stft(y, MEL_FFT, self.wins[MEL_FFT]))[:, :self.bin_max[MEL_FFT]]
+            Smel = self._expect(Smel_raw, MEL_FFT)
         Mp = self.mel[:, :Smel.shape[1]] @ Smel
         m = min(Mp.shape[-1], self.tgt_M.shape[-1])
         Mp, Mt = Mp[..., :m], self.tgt_M[..., :m]
@@ -590,7 +868,258 @@ class CopySynthFitter:
         b = self._soft_floor(self._db(Mp), self.db_floor, 0.5)
         env_db = self._soft_abs(a - b, 0.5).mean() / 20.0
         env_sc = self._sc(Mt, Mp)
+        if FLUX_W > 0.0:
+            # **날것 멜**로 잰다 (`_expect` 를 지나면 재려는 흔들림이 이미 없다).
+            self._flux_db = self._db(self.mel[:, :Smel_raw.shape[1]] @ Smel_raw)
+        # 사용자 요청 세 항이 쓸 재료. 첨예도·F0 아래는 **평활 전** 스펙트럼이라야 한다.
+        self._mel_err = (self._soft_abs(a - b, 0.5).mean(-2)
+                         if CONT_W > 0.0 else None)
+        self._mel_raw_db = self._db(Smel_raw) if SHARP_W > 0.0 else None
+        self._harm_db = (harm_raw if (SHARP_W > 0.0 or SUBF0_W > 0.0) else None)
         return sc_sum / len(self.sizes), env_db, env_sc, per
+
+    def _flux_stat(self, mdb: torch.Tensor, make_mask: bool = False):
+        """**프레임별** 대역평균 변화율 `mean_k |Δ dB(t,k)|` — 세로 얼룩 그 자체.
+
+        **대역 평균이 아니라 프레임별로 낸다.** 대역별 시간평균으로 재면 프레임이
+        많은 계급이 통계를 지배한다 — 실측(out/room2/s040): 얼룩이 몰려 있는 마찰
+        프레임은 살아있는 238 개 중 **16 개(7 %)** 뿐이다. 계급별 얼룩 비는
+
+            전체 1.150,  **마찰 1.856**,  유성 1.128        (s040)
+            전체 1.198,    마찰 1.232,    유성 1.024        (s101)
+
+        이므로 고쳐야 할 곳은 마찰인데, 대역평균 항은 거기에 7 % 의 무게만 준다.
+        프레임별로 맞추면 모든 프레임이 같은 무게를 갖는다. 정의도 합격 판정
+        (`scripts/acceptance.py:flux`)과 정확히 같아진다.
+
+        `make_mask=True` 면 "소리 나는 프레임" 마스크도 같이 만든다. 무음의 −∞ 근처
+        dB 는 잘게 흔들려 통계를 통째로 오염시킨다 (§30 에서 합격 판정이 같은 이유로
+        틀렸다). 목표 정점 대비 −45 dB 를 문턱으로 쓴다.
+        """
+        L = max(1, int(FLUX_LAG))
+        if mdb.shape[-1] <= L:
+            z = torch.zeros(1, dtype=mdb.dtype, device=mdb.device)
+            return (z, None) if make_mask else z
+        f = self._soft_abs(mdb[..., L:] - mdb[..., :-L], 0.5).mean(-2)   # (…, T−L)
+        if make_mask:
+            lvl = mdb.mean(-2)
+            live = lvl > float(lvl.max()) - 45.0
+            return f, (live[..., L:] & live[..., :-L])
+        return f
+
+    def flux_loss(self, raw_mel_db: torch.Tensor) -> torch.Tensor:
+        """플럭스를 **일치**시킨다 — 크면 세로 줄, 작으면 기계적이다.
+
+        최소화가 아니라 일치인 이유: 짧은 창의 스펙트럼이 안 흔들리는 잡음은 잡음이
+        아니라 음(音)이다. 목표의 마찰음도 flux p95 가 4.85 dB 로 흔들린다.
+        """
+        f = self._flux_stat(raw_mel_db)
+        m = min(f.shape[-1], self.tgt_flux.shape[-1])
+        d = self._soft_abs(f[..., :m] - self.tgt_flux[..., :m], 0.1)
+        live = self.flux_live
+        if live is not None and live.shape[-1] >= m:
+            w = live[..., :m].to(d.dtype)
+            return (d * w).sum() / w.sum().clamp_min(1.0) / 20.0
+        return d.mean() / 20.0
+
+    # ------------------------------------------- 파형 상관 · 주기성 (사용자 요청)
+    def _frames(self, x: torch.Tensor, win: int, hop: int) -> torch.Tensor:
+        """(1, n) -> (T, win). 마지막 자투리는 버린다."""
+        return x[0].unfold(0, win, hop)
+
+    def _prepare_corr(self) -> None:
+        """상관·주기성 항이 쓸 창 격자와 유성 마스크를 만든다."""
+        self._corr_win = max(64, int(CORR_WIN_MS * self.fs / 1000.0))
+        self._corr_hop = max(16, int(CORR_HOP_MS * self.fs / 1000.0))
+        tf = self._frames(self.target, self._corr_win, self._corr_hop)
+        self._corr_tgt = tf
+        self._corr_te = (tf * tf).sum(-1)
+        v = np.asarray(getattr(self.track, "voiced", np.zeros(0, dtype=bool)))
+        T = tf.shape[0]
+        if v.size:
+            c = (np.arange(T) * self._corr_hop + self._corr_win // 2) / self.hop
+            vm = v[np.clip(c.astype(int), 0, v.size - 1)]
+        else:
+            vm = np.ones(T, dtype=bool)
+        lvl = self._corr_te.detach()
+        live = lvl > float(lvl.max()) * 1e-4          # 정점 대비 −40 dB
+        self._corr_live = torch.as_tensor(vm, device=live.device) & live
+        # --- 주기성 ---
+        f0 = np.asarray(self.track["f0_target"], dtype=np.float64)
+        c = (np.arange(T) * self._corr_hop + self._corr_win // 2) / self.hop
+        f0f = f0[np.clip(c.astype(int), 0, max(f0.size - 1, 0))] if f0.size else np.zeros(T)
+        lag = np.where(f0f > 50.0, np.round(self.fs / np.maximum(f0f, 50.0)), 0).astype(int)
+        self._per_lag = lag
+        self._per_ok = torch.as_tensor((lag > 0) & (lag < self._corr_win // 2),
+                                       device=live.device) & self._corr_live
+        # 고역통과 커널 (창 씌운 sinc). 고정 상수라 미분에 영향이 없다.
+        n = 129
+        t = np.arange(n) - n // 2
+        fc = HNR_HP_HZ / self.fs
+        lp = np.sinc(2 * fc * t) * np.hanning(n)
+        lp = lp / lp.sum()
+        hp = -lp
+        hp[n // 2] += 1.0
+        self._hp = torch.as_tensor(hp, dtype=self.target.dtype,
+                                   device=self.target.device).view(1, 1, n)
+        with torch.no_grad():
+            self.tgt_per = self._periodicity(self.target)
+
+    def _periodicity(self, y: torch.Tensor) -> torch.Tensor:
+        """(2, T) — 전대역과 고역의 F0 지연 정규화 자기상관."""
+        hp = torch.nn.functional.conv1d(y.unsqueeze(1), self._hp,
+                                        padding=self._hp.shape[-1] // 2)[:, 0]
+        out = []
+        for sig in (y, hp):
+            w, h = self._corr_win, self._corr_hop
+            n = sig.shape[-1]
+            T = self._per_ok.shape[0]
+            idx = torch.arange(T, device=sig.device) * h
+            lag = torch.as_tensor(self._per_lag, device=sig.device)
+            ar = torch.arange(w, device=sig.device)
+            a = sig[0][(idx[:, None] + ar[None, :]).clamp(max=n - 1)]
+            b = sig[0][(idx[:, None] + lag[:, None] + ar[None, :]).clamp(max=n - 1)]
+            num = (a * b).sum(-1)
+            den = torch.sqrt((a * a).sum(-1) * (b * b).sum(-1) + 1e-20)
+            out.append(num / den)
+        return torch.stack(out)
+
+    def corr_loss(self, y: torch.Tensor) -> torch.Tensor:
+        """유성 구간에서 파형 상관이 무릎 아래로 떨어진 만큼. 큰 붕괴가 지배한다."""
+        pf = self._frames(y, self._corr_win, self._corr_hop)
+        m = min(pf.shape[0], self._corr_tgt.shape[0])
+        a, b = self._corr_tgt[:m], pf[:m]
+        num = (a * b).sum(-1)
+        den = torch.sqrt(self._corr_te[:m] * (b * b).sum(-1) + 1e-20)
+        r = num / den
+        w = self._corr_live[:m].to(r.dtype)
+        over = self._soft_over(CORR_KNEE - r, 0.05)
+        if CORR_POW != 1.0:
+            over = over ** CORR_POW
+        return (over * w).sum() / w.sum().clamp_min(1.0)
+
+    def hnr_loss(self, y: torch.Tensor) -> torch.Tensor:
+        """주기성을 목표에 **일치**시킨다. 시끄러운 쪽을 더 세게 문다."""
+        p = self._periodicity(y)
+        d = self.tgt_per - p                      # + 면 합성이 더 시끄럽다
+        pen = self._soft_over(d, 0.02) * HNR_ASYM + self._soft_over(-d, 0.02)
+        w = self._per_ok.to(pen.dtype)
+        return (pen * w).sum() / (w.sum().clamp_min(1.0) * pen.shape[0])
+
+    # ------------------------------------------------- 유성 구간의 세 통계
+    def _contrast(self, db: torch.Tensor, k: int, win_hz: float,
+                  lo: float, hi: float) -> torch.Tensor:
+        """국소 이동평균 대비 잔차의 평균 |·| — 봉우리와 골이 얼마나 뚜렷한가. (…,T)
+
+        창 `win_hz` 는 보려는 구조의 간격보다 **넓어야** 한다. 극 간격 1199 Hz 짜리
+        포먼트 골을 보려면 2 kHz, F0 빗살을 보려면 900 Hz 다.
+        """
+        bw = self.fs / k
+        w = max(3, int(round(win_hz / bw)) | 1)
+        f = torch.arange(db.shape[-2], device=db.device, dtype=db.dtype) * bw
+        x = db.transpose(-1, -2)                       # (…, T, F)
+        sh = x.shape
+        env = torch.nn.functional.conv1d(
+            x.reshape(-1, 1, sh[-1]),
+            torch.ones(1, 1, w, dtype=db.dtype, device=db.device) / w,
+            padding=w // 2).reshape(sh).transpose(-1, -2)
+        m = (f >= lo) & (f < hi)
+        return self._soft_abs(db - env, 0.1)[..., m, :].mean(-2)
+
+    def _subf0_rel(self, db: torch.Tensor) -> torch.Tensor:
+        """F0 아래 대역의 레벨 − 기준 대역의 레벨 [dB]. (T,)"""
+        sub, ref = self._subf0_m, self._subf0_r
+        t = min(db.shape[-1], sub.shape[-1])
+        d, sub, ref = db[..., :t], sub[..., :t], ref[..., :t]
+        a = (d * sub).sum(-2) / sub.sum(-2).clamp_min(1.0)
+        b = (d * ref).sum(-2) / ref.sum(-2).clamp_min(1.0)
+        return a - b
+
+    def _prepare_voice_stats(self, raw: dict) -> None:
+        """목표의 첨예도·F0 아래 레벨과 유성 마스크를 **한 번** 만든다.
+
+        `no_grad` 안에서 부른다. F0 는 **목표의 것**을 쓴다 — 적합된 F0 로 재면
+        벌점이 제 꼬리를 문다.
+        """
+        self._sharp_k = HARM_FFT if HARM_FFT in raw else None
+        mdb = self._db(raw[MEL_FFT])
+        lvl = mdb.mean(-2)
+        live = lvl > float(lvl.max()) - 45.0
+        v = np.asarray(getattr(self.track, "voiced", np.zeros(0, dtype=bool)))
+        hop = MEL_FFT // 4
+        if v.size:
+            idx = np.clip((np.arange(mdb.shape[-1]) * hop / self.hop).astype(int),
+                          0, v.size - 1)
+            vm = torch.as_tensor(v[idx], device=mdb.device)
+        else:
+            vm = torch.ones_like(live)
+        self._voiced_short = (live & vm)
+        self.tgt_sharp = self._contrast(mdb, MEL_FFT, SHARP_WIN_HZ,
+                                        SHARP_LO_HZ, SHARP_HI_HZ)
+        self.tgt_cont = None
+        self._subf0_m = self._subf0_r = self.tgt_subf0 = None
+        self.tgt_harm = self._voiced_long = None
+        if self._sharp_k is None:
+            return
+        k = self._sharp_k
+        hdb = self._db(raw[k])
+        hop = k // 4
+        f0 = np.asarray(self.track["f0_target"], dtype=np.float64)
+        idx = np.clip((np.arange(hdb.shape[-1]) * hop / self.hop).astype(int),
+                      0, max(f0.size - 1, 0))
+        f0f = torch.as_tensor(f0[idx] if f0.size else np.zeros(len(idx)),
+                              dtype=hdb.dtype, device=hdb.device)
+        fr = (torch.arange(hdb.shape[-2], device=hdb.device, dtype=hdb.dtype)
+              * (self.fs / k)).unsqueeze(-1)
+        ok = f0f > 50.0
+        f0s = f0f.clamp_min(50.0)
+        self._subf0_m = ((fr > 40.0) & (fr < SUBF0_HI * f0s)).to(hdb.dtype)
+        self._subf0_r = ((fr >= SUBF0_REF[0] * f0s)
+                         & (fr < SUBF0_REF[1] * f0s)).to(hdb.dtype)
+        hl = hdb.mean(-2)
+        lv = (hl > float(hl.max()) - 45.0) & ok & (self._subf0_m.sum(-2) > 0)
+        self._voiced_long = lv
+        self.tgt_subf0 = self._subf0_rel(hdb)
+        self.tgt_harm = self._contrast(hdb, k, HARM_WIN_HZ, HARM_LO_HZ, HARM_HI_HZ)
+
+    def continuity_loss(self, mel_err: torch.Tensor) -> torch.Tensor:
+        """창별 오차가 **직전 창보다 나빠진 만큼**을 문다. 좋아진 것은 공짜다."""
+        L = max(1, int(CONT_LAG))
+        if mel_err.shape[-1] <= L:
+            return torch.zeros((), dtype=mel_err.dtype, device=mel_err.device)
+        d = mel_err[..., L:] - mel_err[..., :-L]
+        over = self._soft_over(d - CONT_KNEE_DB, 0.3 * CONT_KNEE_DB)
+        live = self._voiced_short
+        if live is not None and live.shape[-1] >= over.shape[-1] + L:
+            w = (live[..., L:] & live[..., :-L])[..., :over.shape[-1]].to(over.dtype)
+            return (over * w).sum() / w.sum().clamp_min(1.0) / 20.0
+        return over.mean() / 20.0
+
+    def sharpness_loss(self, mel_raw_db: torch.Tensor,
+                       harm_db: torch.Tensor | None) -> torch.Tensor:
+        """유성 구간이 목표보다 **뭉툭한 만큼**을 문다. 날카로운 것은 공짜다."""
+        z = torch.zeros((), dtype=mel_raw_db.dtype, device=mel_raw_db.device)
+        tot, n = z, 0
+        c = self._contrast(mel_raw_db, MEL_FFT, SHARP_WIN_HZ, SHARP_LO_HZ, SHARP_HI_HZ)
+        m = min(c.shape[-1], self.tgt_sharp.shape[-1])
+        d = self._soft_over(self.tgt_sharp[..., :m] - c[..., :m], 0.05)
+        w = self._voiced_short[..., :m].to(d.dtype)
+        tot, n = tot + (d * w).sum() / w.sum().clamp_min(1.0), n + 1
+        if harm_db is not None and self.tgt_harm is not None:
+            c = self._contrast(harm_db, self._sharp_k, HARM_WIN_HZ, HARM_LO_HZ, HARM_HI_HZ)
+            m = min(c.shape[-1], self.tgt_harm.shape[-1])
+            d = self._soft_over(self.tgt_harm[..., :m] - c[..., :m], 0.05)
+            w = self._voiced_long[..., :m].to(d.dtype)
+            tot, n = tot + (d * w).sum() / w.sum().clamp_min(1.0), n + 1
+        return tot / max(n, 1) / 20.0
+
+    def subf0_loss(self, harm_db: torch.Tensor) -> torch.Tensor:
+        """F0 아래가 **목표보다** 시끄러운 만큼을 문다. 목표의 프라이는 벌하지 않는다."""
+        r = self._subf0_rel(harm_db)
+        m = min(r.shape[-1], self.tgt_subf0.shape[-1])
+        d = self._soft_over(r[..., :m] - self.tgt_subf0[..., :m] - SUBF0_KNEE_DB, 0.3)
+        w = self._voiced_long[..., :m].to(d.dtype)
+        return (d * w).sum() / w.sum().clamp_min(1.0) / 20.0
 
     def phase_loss(self, y: torch.Tensor) -> torch.Tensor:
         """**단위 크기** 복소 잔차 — 크기와 직교한 순수 위상 거리, 조화 우세부에만.
@@ -633,13 +1162,13 @@ class CopySynthFitter:
             m = min(Sp.shape[-1], St.shape[-1])
             b = self.bin_max[k]
             St, Sp = St[:, :b, :m], Sp[:, :b, :m]
-            at = St.abs()
+            at = self._cabs(St)
             w = self._harm_w[k][:, :, :m] * at
             # 단위 크기로 정규화. δ 는 크기가 0 에 가까운 빈에서 방향이 폭주하는 것을
             # 막는다 (그런 빈은 w 도 작아 어차피 기여가 없다).
             dt = 1e-4 * at.mean().detach() + 1e-12
-            ut = St / torch.sqrt(at ** 2 + dt ** 2)
-            up = Sp / torch.sqrt(Sp.abs() ** 2 + dt ** 2)
+            ut = St / torch.sqrt(St.real ** 2 + St.imag ** 2 + dt ** 2)
+            up = Sp / torch.sqrt(Sp.real ** 2 + Sp.imag ** 2 + dt ** 2)
             d = ut - up
             # √(|z|²+δ²)−δ — |z| 는 0 에서 곡률이 발산한다. 적합이 좋아질수록 그리로
             # 가므로 바닥을 깔아 둔다 (relu 제거와 같은 부류, C² 유지).
@@ -681,10 +1210,12 @@ class CopySynthFitter:
         if self._har_res is None:
             return torch.ones(1, b, 1, device=self.device)
         har, res = self._har_res
-        H = _stft(torch.as_tensor(har, dtype=torch.float32,
-                                  device=self.device).unsqueeze(0), k, self.wins[k]).abs()[:, :b]
-        R = _stft(torch.as_tensor(res, dtype=torch.float32,
-                                  device=self.device).unsqueeze(0), k, self.wins[k]).abs()[:, :b]
+        H = self._cabs(_stft(torch.as_tensor(har, dtype=torch.float32,
+                                             device=self.device).unsqueeze(0),
+                             k, self.wins[k]))[:, :b]
+        R = self._cabs(_stft(torch.as_tensor(res, dtype=torch.float32,
+                                             device=self.device).unsqueeze(0),
+                             k, self.wins[k]))[:, :b]
         return (H / (H + R + 1e-9)).detach()
 
     def _time_smooth(self, S: torch.Tensor, k: int) -> torch.Tensor:
@@ -747,6 +1278,28 @@ class CopySynthFitter:
         """clamp_min 의 부드러운 대체. floor + softplus(x − floor)."""
         return floor + width * torch.nn.functional.softplus((x - floor) / width)
 
+    def _report_nonfinite(self, it: int, ps, names) -> None:
+        """비유한 기울기가 **어느 파라미터의 어느 프레임**에서 나는지 찍는다.
+
+        `w` 는 (Tc, P_fit) 이므로 열 = 파라미터, 행 = 격자점이다. 열 이름을 붙여
+        주면 원인 파라미터가 바로 보인다. `FORMANT_ML_DEBUG_NONFINITE=1` 로 켠다.
+        """
+        for nm, p in zip(names, ps):
+            if p.grad is None or torch.isfinite(p.grad).all():
+                continue
+            bad = ~torch.isfinite(p.grad)
+            if p.grad.dim() == 2:
+                cols = bad.any(0).nonzero().flatten().tolist()
+                rows = bad.any(1).nonzero().flatten().tolist()
+                who = [self.names[c] for c in cols if c < len(self.names)]
+                print(f"    [{it}] 비유한 {nm}: 파라미터 {who}  "
+                      f"격자점 {rows[:8]}{'...' if len(rows) > 8 else ''} "
+                      f"({len(rows)}/{p.grad.shape[0]})", flush=True)
+            else:
+                idx = bad.nonzero().flatten().tolist()
+                who = [self.names[c] for c in idx if c < len(self.names)] if nm == "d" else idx
+                print(f"    [{it}] 비유한 {nm}: {who}", flush=True)
+
     @staticmethod
     def _pseudo_huber(r: torch.Tensor) -> torch.Tensor:
         """후버의 매끄러운 형태. torch.where 는 1 차 도함수만 이어져 C² 가 아니다.
@@ -799,24 +1352,54 @@ class CopySynthFitter:
                     r = rate / lim
                     h = self._pseudo_huber(r)
                     pen = pen + VEL_W * h.mean()
+        if ARTIC_VEL_W > 0 and u.shape[0] > 1:
+            # **1 차 차분(속도)이다.** 포먼트에는 2 차(가속도)를 쓰지만(빠르게
+            # 움직이는 것은 허용하고 방향을 홱 바꾸는 것만 문다), 여기서 막을 것은
+            # 방향 전환이 아니라 **불가능한 속도** 자체다.
+            dt = max(self.track.frame_ms, 1e-6)
+            for nm, knee in ARTIC_VEL_KNEE.items():
+                if nm not in self.names:
+                    continue
+                k = self.names.index(nm)
+                lg = torch.log(self._to_val(u[:, k], self.specs[k]).clamp_min(1e-4))
+                rate = (lg[1:] - lg[:-1]).abs() / dt
+                # **문턱 위만 문다.** 처음에는 `pseudo_huber(rate/knee)` 를 썼는데
+                # 그건 무릎 **아래**에서도 이차로 벌하므로 실제 제스처까지 눌린다.
+                # 실측 (yang_00000040 0.18~0.55 s, ARTIC_VEL_W=1.0):
+                #     a_c 속도 95 분위 0.449 -> **0.015** neper/ms
+                # 가장 빠른 실제 제스처가 0.172 인데 그 11 배 **아래**로 얼렸다.
+                # 대가는 포락 90.67 -> 87.85 %, 무게중심 r 0.983 -> 0.880 이었다
+                # (§27.3). 스파이크만 깎아야 하는데 조음 자체를 죽인 것이다.
+                #
+                # softplus 로 초과분만 취하면 한계 아래는 사실상 공짜다. 폭은
+                # 무릎의 20 % — relu 에 충분히 가깝고 C² 는 지킨다.
+                # (정확히 0 은 아니다: 속도 0 에서 softplus(−5) = 6.7e-3 이 새고
+                #  의사후버를 지나 프레임당 ~9e-7 로 남는다. 손실이 ~1.0 이므로
+                #  무시할 양이고, 대신 미분이 어디서나 살아 있다.)
+                over = self._soft_over(rate - knee, 0.2 * knee) / knee
+                pen = pen + ARTIC_VEL_W * self._pseudo_huber(over).mean()
+        if BW_LAW_W > 0.0 and len(self.f_idx) >= 1:
+            # **대역폭을 손실 법칙 쪽으로 당긴다.** 포먼트 주파수는 그대로 자유다 —
+            # 조음이 정하는 양이기 때문이다. 묶는 것은 "그 주파수의 극이 얼마나
+            # 감쇠하는가" 뿐이고, 그건 기하가 아니라 손실이 정한다.
+            bw_floor = float(getattr(self.eng.tract, "bw_floor", 40.0))
+            bw_slope = float(getattr(self.eng.tract, "bw_slope", 0.05))
+            for i in self.f_idx:
+                nb = self.names[i].replace("f", "bw")
+                if nb not in self.names:
+                    continue
+                k = self.names.index(nb)
+                f = self._to_val(u[:, i], self.specs[i]).clamp_min(50.0)
+                b = self._to_val(u[:, k], self.specs[k]).clamp_min(1.0)
+                law = bw_floor + bw_slope * f
+                r = torch.log(b / law) / BW_LAW_TOL
+                pen = pen + BW_LAW_W * self._pseudo_huber(r).mean()
         if RIPPLE_W > 0 and self.w.shape[0] >= 3:
             # 격자 간격은 **stride 를 곱한 실제 시간**이다. 성긴 격자에서 같은
             # 증분은 훨씬 느린 변화이므로 벌점도 그만큼 작아야 한다.
             dt = max(self.track.frame_ms, 1e-6) * max(self.stride, 1)
             acc = (self.w[2:] - 2.0 * self.w[1:-1] + self.w[:-2]).abs() / (dt * dt)
             pen = pen + RIPPLE_W * self._pseudo_huber(acc / RIPPLE_KNEE).mean()
-        if GAIN_ACC_W > 0 and u.shape[0] >= 3:
-            # 이득은 **로그(dB)로 본다.** 비율 그대로 2 차 차분을 재면 fric_gain 이
-            # 1 일 때와 67 일 때(실측 범위) 같은 상대 요동에 67 배 다른 벌점이 붙는다.
-            dt = max(self.track.frame_ms, 1e-6)
-            for nm, knee in GAIN_ACC_KNEE_DB_MS2.items():
-                if nm not in self.names:
-                    continue
-                k = self.names.index(nm)
-                v = self._to_val(u[:, k], self.specs[k])
-                g = 20.0 * torch.log10(v.clamp_min(1e-4))
-                acc = (g[2:] - 2.0 * g[1:-1] + g[:-2]).abs() / (dt * dt)
-                pen = pen + GAIN_ACC_W * self._pseudo_huber(acc / knee).mean()
         return pen
 
     def loss(self):
@@ -832,6 +1415,22 @@ class CopySynthFitter:
             l = l + self.pulse_weight * pl
         if self.phase_weight > 0:
             l = l + self.phase_weight * self.phase_loss(y)
+        if FLUX_W > 0.0 and getattr(self, "_flux_db", None) is not None:
+            fl = self.flux_loss(self._flux_db)
+            self._last_flux = float(fl.detach()) * 20.0
+            l = l + FLUX_W * fl
+        if CORR_W > 0.0:
+            cl = self.corr_loss(y)
+            self._last_corr = float(cl.detach())
+            l = l + CORR_W * cl
+        if HNR_W > 0.0:
+            l = l + HNR_W * self.hnr_loss(y)
+        if CONT_W > 0.0 and self._mel_err is not None:
+            l = l + CONT_W * self.continuity_loss(self._mel_err)
+        if SHARP_W > 0.0 and self._mel_raw_db is not None:
+            l = l + SHARP_W * self.sharpness_loss(self._mel_raw_db, self._harm_db)
+        if SUBF0_W > 0.0 and self._harm_db is not None and self.tgt_subf0 is not None:
+            l = l + SUBF0_W * self.subf0_loss(self._harm_db)
         if self.lam_smooth > 0 and self.w.shape[0] > 1:
             d = self.w[1:] - self.w[:-1]
             l = l + self.lam_smooth * (d * d).mean()
@@ -884,6 +1483,7 @@ class CopySynthFitter:
                 best = (score, (self.w.detach().clone(), self.d.detach().clone()),
                         self.log_gain.detach().clone(),
                         (env, fine, self._last_db, float(l.detach()), per))
+            stall_before = stall          # 증가 **전** 값 — 건너뛴 회차에 되돌린다
             if patience > 0:
                 stall = 0 if gain > tol * abs(score) else stall + 1
                 if stall >= patience:
@@ -894,13 +1494,27 @@ class CopySynthFitter:
             ps = [self.w, self.d, self.log_gain, self.pulse_phi0]
             # **비유한 기울기로 걸음을 딛으면 안 된다.** Adam 의 모멘트가 NaN 으로
             # 오염되면 그 뒤 모든 파라미터가 NaN 이 되고, 손실을 보기 전에 엔진 안에서
-            # 터진다(실측: 탄음 구간에서 int(NaN)). 그런 회차는 건너뛴다.
+            # 터진다(실측: 탄음 구간에서 int(NaN)).
             if any(p.grad is not None and not torch.isfinite(p.grad).all() for p in ps):
                 bad_grads += 1
+                if DEBUG_NONFINITE:
+                    self._report_nonfinite(it, ps, ["w", "d", "log_gain", "pulse_phi0"])
+                # **건너뛰지 말고 성분만 지운다.** 예전에는 회차 전체를 버렸는데,
+                # 그러면 파라미터가 안 변하므로 **다음 회차도 똑같이 비유한**이다.
+                # 결정적으로 갇힌다 — 실측(out/sw/r000, yang_00000040 전체):
+                # 모든 단계가 "[30] 수렴 + 비유한 29 회 건너뜀" 으로 끝났다. 즉
+                # 단계당 실제 걸음이 **1 번**뿐이었고 포락이 82.7 % 에 머물렀다
+                # (같은 파일의 정상 적합은 93.1 %).
+                #
+                # 비유한 성분을 0 으로 두면 나머지 성분으로 걸음을 딛으므로 상태가
+                # 바뀌고, 다음 회차에는 그 자리를 벗어난다. Adam 의 모멘트도
+                # 오염되지 않는다 (0 은 유한하다).
                 for p in ps:
-                    p.grad = None
-                sch.step()
-                continue
+                    if p.grad is not None:
+                        torch.nan_to_num_(p.grad, nan=0.0, posinf=0.0, neginf=0.0)
+                # 정체 계수는 되돌린다 — 기울기 일부를 버린 회차의 정체는 수렴의
+                # 증거가 아니다 (§27: 위상 단계가 골짜기 한복판에서 멈췄다).
+                stall = stall_before
             torch.nn.utils.clip_grad_norm_(ps, 5.0)
             opt.step(); sch.step()
             if verbose and (it % log_every == 0 or it == iters - 1):

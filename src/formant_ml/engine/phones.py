@@ -10,6 +10,8 @@
 """
 from __future__ import annotations
 
+import math
+
 from .control import ControlTrack, track_from_keyframes
 from .profile import DEFAULT_PROFILE, SpeakerProfile
 
@@ -18,6 +20,47 @@ from .profile import DEFAULT_PROFILE, SpeakerProfile
 # 소스 스펙트럼을 실측에 맞춰 바꿀 때마다 이 값이 움직이므로 **한 곳에** 둔다.
 # 재보는 법: profiles 의 level_db 를 이 값으로 두고 scripts/ab_male.py 의 "자음 레벨" 을 읽는다.
 SIB_REF_DB = -25.2
+
+
+def min_jerk(u):
+    """최소 저크 변위 프로파일 0 → 1. 양 끝에서 속도·가속도가 0.
+
+    **왜 선형 램프를 쓰면 안 되는가.** 조음기는 질량을 가진 근육이 움직인다. 변위가
+    시간에 대해 조각별 선형이면 꺾은점에서 **가속도가 무한대**이고, 그 불연속이
+    유량 → 난류 진폭으로 그대로 내려가 계단이 된다. v1 실측(합성 '사', 10 ms 프레임):
+    마찰음 포락선이 −74.8 → −58.2 dB 로 **한 프레임에 16.6 dB** 뛰고, 고원 끝에서는
+    40 ms 만에 −40 → −128 dB 로 떨어졌다. 스펙트로그램에서 /s/ 가 **수직 모서리를
+    가진 직사각형 블록**으로 보인다 — 실측 녹음은 같은 자리가 부드러운 혹이다.
+    v1 의 사용자가 "치찰음 중반부에 파열음 같은 소리" 라고 한 것이 그 모서리다.
+
+    조음 운동학의 표준 모형(Nelson 1983; Ostry & Munhall 1985)은 종 모양 속도
+    프로파일이고, s(u) = u³(10 − 15u + 6u²) 가 그 닫힌 해다.
+    """
+    u = min(max(float(u), 0.0), 1.0)
+    return u * u * u * (10.0 - 15.0 * u + 6.0 * u * u)
+
+
+#: 제스처 하나를 몇 개의 마디로 그릴 것인가. 제어열은 마디 사이를 **선형**으로
+#: 잇는다(`control.frames_to_samples`). 그러니 곡선을 내려면 마디를 여러 개 찍는
+#: 수밖에 없고, 그때 남는 꺾임은 마디 간격만큼 작아진다. 8 이면 40 ms 전이에서
+#: 5 ms 마다 한 마디라 가속도 불연속이 사람이 못 듣는 크기로 내려간다.
+GESTURE_KNOTS = 8
+
+#: 발화 개시의 폐압 상승 시간 [s] (raised cosine 전체 길이).
+#:
+#: **계단으로 세우면 안 된다.** 개시에는 혀가 아직 협착을 안 만들었고 성문도 벌어져
+#: 있어 직렬 저항이 양쪽 다 낮다. 압력이 한 프레임에 서면 유량이 즉시 최대가 되어
+#: 성문 난류가 계단으로 켜지고, 그 계단 입력이 성도를 때려 **감쇠 진동 = 파열음
+#: 버스트**가 된다 (v1 `aeroacoustic.breath_onset`).
+#:
+#: 값은 v1 의 `BREATH_ONSET_S` 그대로 45 ms 다 — **문장 안에서 다음 음절로 넘어갈
+#: 때의 값**이고 여기 데모 음절들이 그 경우다. 무음에서 시작하는 **독립 지속
+#: 마찰음**은 훨씬 길어(100~200 ms; Draper, Ladefoged & Whitteridge 1959; Hixon)
+#: v1 이 0.25 s 를 쓰지만, 그때는 포락선을 호흡이 만든다(`ps_drive="breath"`).
+#: CV 음절은 반대다 — 폐압은 거의 일정하고 **혀의 제스처가 포락선을 만든다**
+#: (Signorello et al. 2018; `sibilant()` 의 `rise`/`fall` 과 `Builder.gesture`).
+#: 그래서 여기서 45 ms 는 버스트를 막는 몫이지 페이드 인을 만드는 몫이 아니다.
+BREATH_ONSET_S = 0.045
 
 
 class Builder:
@@ -30,6 +73,7 @@ class Builder:
         self.t = 0.0
         self.f0 = float(f0_hz or self.p.f0_nominal)
         self.ps = float(p_sub or self.p.p_sub)
+        self._pressurized = False
         self.add(0.0, p_sub=0.0, adduction=0.6, tension=0.5, f0_target=self.f0,
                  a_c=3.0, c_place=0.9, velum=0.0, oral_open=1.0, tract_gain=1.0,
                  obstacle=0.0, back_leak=0.3)
@@ -44,6 +88,51 @@ class Builder:
     def V(self, name):
         return self.p.vowels[name]
 
+    def gesture(self, t0, t1, a0, a1, key="a_c", knots=GESTURE_KNOTS, **kw):
+        """`key` 를 t0→t1 동안 a0→a1 로 **최소 저크·로그 눈금**으로 옮긴다.
+
+        로그 눈금인 이유: 조음기가 일정 속도로 움직이면 면적은 **지수적으로** 변한다
+        (간극이 좁아질수록 같은 변위가 면적을 더 크게 바꾼다). 선형 면적 보간은
+        좁은 쪽에서 너무 빨리 지나가 마찰이 계단으로 켜진다.
+
+        마지막 마디에 `kw` 를 같이 실어 준다 (그 시각에 함께 바뀌는 다른 제어들).
+        """
+        lo, hi = math.log(max(float(a0), 1e-6)), math.log(max(float(a1), 1e-6))
+        n = max(2, int(knots))
+        for i in range(1, n + 1):
+            u = i / n
+            self.add(t0 + (t1 - t0) * u, **{key: math.exp(lo + (hi - lo) * min_jerk(u))},
+                     **(kw if i == n else {}))
+        return self
+
+    def breath(self, t0, level=None, onset=BREATH_ONSET_S, knots=GESTURE_KNOTS):
+        """폐압을 raised cosine 으로 세운다 — t0 에서 0, t0+onset 에서 level.
+
+        계단으로 세우면 성도가 아직 열려 있고 성문도 벌어져 있는 첫 프레임에 유량이
+        즉시 최대가 되어, 성문 난류가 계단으로 켜지고 그 계단이 성도를 때려 **파열음
+        버스트**가 된다 (BREATH_ONSET_S 주석 참조).
+        """
+        level = self.ps if level is None else float(level)
+        n = max(2, int(knots))
+        for i in range(n + 1):
+            u = i / n
+            self.add(t0 + onset * u, p_sub=level * 0.5 * (1.0 - math.cos(math.pi * u)))
+        return self
+
+    def _pressure(self, t0, dur=None):
+        """이 시각에 폐압을 세울 때 쓸 kwargs. 무음 뒤면 램프를 찍고 빈 dict 를 준다.
+
+        `dur` 은 이 분절의 길이다. 램프가 그보다 길면 **다음 분절이 찍는 마디와
+        시간축에서 엇갈려** 압력이 도로 내려간다(측정: 7.5 → 3.8 → 5.0 …). 그래서
+        분절 길이로 자른다 — 130 ms 마찰음이면 10→90 % 상승이 75 ms 로 실측
+        46~78 ms 안에 들어온다.
+        """
+        if self._pressurized:
+            return {"p_sub": self.ps}
+        self._pressurized = True
+        self.breath(t0, onset=min(BREATH_ONSET_S, float(dur)) if dur else BREATH_ONSET_S)
+        return {}
+
     def ms(self, x):
         return float(x) / 1000.0
 
@@ -51,13 +140,14 @@ class Builder:
     def silence(self, dur=None):
         dur = self.ms(self.p.timing["silence_ms"]) if dur is None else dur
         self.add(self.t, p_sub=0.0); self.t += dur; self.add(self.t, p_sub=0.0)
+        self._pressurized = False
         return self
 
     def vowel(self, name, dur=None, f0_end=None, final=False):
         f1, f2, f3 = self.V(name)
         dur = self.ms(self.p.timing["final_vowel_ms" if final else "vowel_ms"]) if dur is None else dur
-        self.add(self.t, p_sub=self.ps, adduction=0.6, a_c=3.0, f1=f1, f2=f2, f3=f3,
-                 tract_gain=1.0, f0_target=self.f0, back_leak=0.3)
+        self.add(self.t, **self._pressure(self.t, dur), adduction=0.6, a_c=3.0,
+                 f1=f1, f2=f2, f3=f3, tract_gain=1.0, f0_target=self.f0, back_leak=0.3)
         self.t += dur
         f0e = f0_end or self.f0
         self.add(self.t, f1=f1, f2=f2, f3=f3, f0_target=f0e, p_sub=self.ps)
@@ -74,7 +164,7 @@ class Builder:
         z1, z2 = L["zeros"]
         t0 = self.t
         self.add(t0 - 0.03, lat_z1=z1, lat_z2=z2, lat_mix=0.0)        # 영점 자리는 미리 잡아 둔다
-        self.add(t0, p_sub=self.ps, adduction=0.6, a_c=0.6, c_place=0.85,
+        self.add(t0, **self._pressure(t0), adduction=0.6, a_c=0.6, c_place=0.85,
                  f1=l1, f2=l2, f3=l3, bw1=60, bw2=140, bw3=240,
                  lat_z1=z1, lat_z2=z2, lat_bw=L["zero_bw"], lat_mix=1.0, tract_gain=L["gain"])
         if L.get("transient_amp", 0.0) > 0 and onset:
@@ -98,7 +188,7 @@ class Builder:
         l2 = 0.5 * l2 + 0.25 * (a2 + b2)
         ap, cl, rl = self.ms(T["approach_ms"]), self.ms(T["closure_ms"]), self.ms(T["release_ms"])
         t0 = self.t
-        self.add(t0, f1=a1, f2=a2, f3=a3, tract_gain=1.0, a_c=3.0, p_sub=self.ps)
+        self.add(t0, f1=a1, f2=a2, f3=a3, tract_gain=1.0, a_c=3.0, **self._pressure(t0))
         tc = t0 + ap
         self.add(tc, f1=l1, f2=l2, f3=l3, tract_gain=T["gain"], a_c=0.25, c_place=0.87,
                  bw1=70, bw2=150, bw3=240)
@@ -161,7 +251,7 @@ class Builder:
         lag = self.ms(S.get("abduct_lag_ms", 25 if tense else 55))
         t0 = self.t
         self.add(t0 - lead, adduction=0.6)                        # 성문이 먼저 열리기 시작
-        self.add(t0, p_sub=self.ps, adduction=adduct, a_c=0.35, c_place=0.91,
+        self.add(t0, **self._pressure(t0, dur), adduction=adduct, a_c=0.35, c_place=0.91,
                  back_leak=S["back_leak"], front_len=self.p.sib_front_len_cm,
                  obstacle=S["obstacle"], fric_gain=gain, oral_open=1.0,
                  f1=l1, f2=l2, f3=l3, tract_gain=0.9)
@@ -175,9 +265,13 @@ class Builder:
         # 130 ms 급 음절에서 2.2 배, 400 ms 이상이면 목표 그대로. 그 사이는 선형.
         under = 1.0 + 1.2 * min(max((0.40 - dur) / (0.40 - 0.13), 0.0), 1.0)
         a_min = S["a_min"] * under
-        self.add(t0 + rise, a_c=a_min)
+        # **협착은 최소 저크로, 로그 면적에서 움직인다** (`Builder.gesture`).
+        # 마디 두 개짜리 선형 램프면 양 끝에서 가속도가 불연속이고, 그것이 난류
+        # 진폭의 계단이 되어 /s/ 가 스펙트로그램에서 직사각형 블록이 된다.
+        self.gesture(t0, t0 + rise, 0.35, a_min)
         self.add(t0 + dur - fall, a_c=a_min, adduction=adduct)
-        self.add(t0 + dur, a_c=3.0, obstacle=0.0, front_len=0.0, back_leak=0.3, fric_gain=gain)
+        self.gesture(t0 + dur - fall, t0 + dur, a_min, 3.0,
+                     obstacle=0.0, front_len=0.0, back_leak=0.3, fric_gain=gain)
         self.add(t0 + dur + lag, adduction=0.6, fric_gain=1.0)    # 성문은 늦게 닫힌다 → 기식 꼬리
         self.add(t0 + dur + 0.055, f1=v1, f2=v2, f3=v3, tract_gain=1.0)
         self.t = t0 + dur
@@ -228,7 +322,7 @@ class Builder:
         l1, l2, l3 = S.get("locus", [470.0, 1800.0, 2700.0])
         t0 = self.t
         self.add(t0 - 0.035, adduction=0.6, oral_open=1.0)
-        self.add(t0, p_sub=self.ps, adduction=adduct, a_c=0.0, c_place=0.88,
+        self.add(t0, **self._pressure(t0), adduction=adduct, a_c=0.0, c_place=0.88,
                  back_leak=S["back_leak"], front_len=front, obstacle=0.5,
                  fric_gain=gain, oral_open=0.02,
                  f1=l1, f2=0.5 * l2 + 0.5 * v2, f3=l3, tract_gain=0.85)
@@ -270,7 +364,7 @@ class Builder:
         self.add(t0 - clo, velum=0.9, nasal_f=N["poles"][0], nasal_f2=N["poles"][1],
                  nasal_f3=N["poles"][2], nasal_z=nz, nasal_damp=N["damp"], nasal_gain=ngain,
                  f1=a1 if not coda else a1, f2=a2, f3=a3, oral_open=1.0)
-        self.add(t0, velum=1.0, oral_open=0.02, p_sub=self.ps, adduction=0.6,
+        self.add(t0, velum=1.0, oral_open=0.02, **self._pressure(t0), adduction=0.6,
                  f1=m1, f2=oral_f2, f3=m3, bw1=250, bw2=350, bw3=450, tract_gain=1.0)
         t1 = t0 + dur
         self.add(t1, velum=1.0, oral_open=0.02, f1=m1, f2=oral_f2, f3=m3,

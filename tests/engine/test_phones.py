@@ -53,10 +53,26 @@ def test_affricate_is_voiceless_and_has_abrupt_onset(eng, prof):
     assert band(0, 1000) < -15 and cent > 3000
 
 
+def _after_breath(tr, fs=48000):
+    """폐압이 다 선 뒤의 첫 샘플. 개시 램프를 창에서 빼려고 쓴다.
+
+    `phones.BREATH_ONSET_S` 가 45 ms 짜리 raised cosine 이라(계단으로 세우면 개시에
+    파열음 버스트가 난다 — 실측 개시정점/정상부 1.57 → 0.27), 무음 직후 창은 그
+    램프 안에 들어간다. 시각을 손으로 박으면 상수가 바뀔 때마다 깨지므로 **압력
+    궤적에서 찾는다.**
+    """
+    import numpy as np
+    ps = tr["p_sub"]
+    i = int(np.argmax(ps >= 0.999 * ps.max()))     # 램프의 꼬리까지 지나야 한다
+    return int(i * tr.frame_ms * fs / 1000.0)
+
+
 def test_nasal_murmur_level_and_spectrum(eng, prof):
-    y = eng.render(phones.na(prof))
+    tr = phones.na(prof)
+    y = eng.render(tr)
     fs = 48000
-    m = y[int(0.06 * fs):int(0.10 * fs)]; v = y[int(0.20 * fs):int(0.30 * fs)]
+    i0 = _after_breath(tr, fs)
+    m = y[i0:i0 + int(0.04 * fs)]; v = y[int(0.20 * fs):int(0.30 * fs)]
     lvl = 20 * np.log10(np.sqrt((m ** 2).mean()) / np.sqrt((v ** 2).mean()))
     assert -12 < lvl < -2                          # 계측 −5..−10 dB
     band, _ = _bands(m)
@@ -64,10 +80,13 @@ def test_nasal_murmur_level_and_spectrum(eng, prof):
 
 
 def test_tap_dip_matches_profile_within_tolerance(eng, prof):
-    y = eng.render(phones.ara(prof))
+    tr = phones.ara(prof)
+    y = eng.render(tr)
     e = np.array([20 * np.log10(np.sqrt((y[i:i + 480] ** 2).mean()) + 1e-9)
                   for i in range(0, len(y) - 480, 480)])
-    dip = e[8:15].mean() - e[17:25].min()
+    # 앞모음 창은 **개시 램프가 끝난 뒤**부터 잡는다 (`_after_breath` 참조).
+    b0 = _after_breath(tr) // 480
+    dip = e[b0:b0 + 6].mean() - e[17:25].min()
     assert abs(dip - abs(prof.tap["dip_db"])) < 5.0
 
 
@@ -111,3 +130,37 @@ def test_voiced_affricate_turns_on_voicing_and_weakens_frication():
     lo_v, hi_v = fric_bands(phones.aja)
     assert lo_v - lo_u > 15.0        # 발성 바가 선다
     assert hi_u - hi_v > 8.0         # 마찰이 약해진다
+
+
+def test_breath_onset_removes_the_utterance_initial_burst(eng, prof):
+    """폐압을 **계단으로 세우면 개시가 파열음이 된다** (v1 `breath_onset` 의 근거).
+
+    개시에는 혀가 아직 협착을 안 만들었고 성문도 벌어져 있어 직렬 저항이 양쪽 다
+    낮다. 압력이 한 프레임에 서면 유량이 즉시 최대가 되고, 그 계단 입력이 성도를
+    때려 감쇠 진동 = 버스트가 된다.
+
+    실측 (개시 20 ms 의 정점 / 그 뒤 100 ms 정상부 rms):
+
+        계단      사 1.57   아라 0.42   나 0.26
+        45 ms 램프 사 0.27   아라 0.09   나 0.03
+    """
+    import numpy as np
+    fs = 48000
+
+    def burst_ratio(fn):
+        y = np.asarray(eng.render(fn(prof)), float)
+        i = int(np.argmax(np.abs(y) > 1e-4))
+        peak = float(np.abs(y[i:i + int(0.02 * fs)]).max())
+        body = float(np.sqrt((y[i + int(0.05 * fs):i + int(0.15 * fs)] ** 2).mean())) + 1e-12
+        return peak / body
+
+    old = phones.BREATH_ONSET_S
+    try:
+        phones.BREATH_ONSET_S = 0.0005
+        step = burst_ratio(phones.sa)
+        phones.BREATH_ONSET_S = old
+        ramp = burst_ratio(phones.sa)
+    finally:
+        phones.BREATH_ONSET_S = old
+    assert step > 1.0                    # 계단이면 개시 정점이 정상부보다 크다
+    assert ramp < 0.5 * step             # 램프는 그것을 절반 아래로 내린다

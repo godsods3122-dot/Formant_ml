@@ -71,31 +71,112 @@ def main() -> None:
     ap.add_argument("--stage-iters", type=int, default=100)
     ap.add_argument("--phase-iters", type=int, default=200,
                     help="마지막 위상 단계. 0 이면 끔 (크기만 맞춘다)")
+    ap.add_argument("--lr-phase", type=float, default=None,
+                    help="위상 단계의 lr 을 고정한다. 생략하면 짧은 탐침으로 고르는데, "
+                         "그 탐침은 **짧은 시야로 작은 lr 에 편향**돼 있다 (MEASUREMENTS §39.1)")
     ap.add_argument("--lr-global", type=float, default=None,
                     help="생략하면 짧은 탐침으로 자동 선택 (구간마다 맞는 값이 다르다)")
     ap.add_argument("--lr-frame", type=float, default=0.04)
     ap.add_argument("--no-denoise", action="store_true")
     ap.add_argument("--phase", type=float, default=0.0, help="복소 STFT 항 가중(2 단계용)")
     ap.add_argument("--threads", type=int, default=2)
+    ap.add_argument("--device", default="cpu",
+                    help="cpu / cuda / mps. 적합 한 건이 RSS 3.8 GB 를 쓴다 — 병렬로 "
+                         "돌릴 개수는 GPU 메모리가 아니라 그것으로 정하라")
     ap.add_argument("--patience", type=int, default=0,
                     help="이 회차 동안 손실이 안 줄면 그 단계를 끝낸다 (0 = 끔). "
                          "긴 음원에서는 켜는 편이 낫다 — 수렴한 단계에 예산을 다 쓴다")
-    ap.add_argument("--gain-acc", type=float, default=None,
-                    help="이득류(tract_gain/fric_gain/aspiration)의 가속도 벌점 세기. "
-                         "마찰 구간에서 적합기가 못 맞출 난류 요동을 이득으로 좇는 것을 "
-                         "막는다 (fit.GAIN_ACC_W). 생략하면 모듈 기본값")
+    ap.add_argument("--room-from", default=None, metavar="STEM",
+                    help="이미 있는 **마른** 적합 결과(copyfit --out 값)에서 녹음 경로 IR 을 "
+                         "추정해 순방향 모형에 넣는다. 그러면 적합기가 방·마이크·코덱의 "
+                         "응답을 성도·소스 파라미터로 흡수하지 않아 추정되는 물리량이 "
+                         "**마른 목소리**의 것이 된다 (engine/room.py, MEASUREMENTS §23)")
+    ap.add_argument("--room-taps", type=int, default=None, help="IR 탭 수 (기본 4096 = 85 ms)")
+    ap.add_argument("--room-force", action="store_true",
+                    help="홀드아웃에서 좋아지지 않아도 방을 넣는다")
+    ap.add_argument("--room-lambda", type=float, default=None,
+                    help="IR 추정의 정규화 세기 (기본 0.1). 크면 IR 이 δ 에 가까워져 "
+                         "방의 시간 구조가 사라진다")
+    ap.add_argument("--prior", action="append", default=None, metavar="이름=값",
+                    help="사전 가중(fit.PRIOR_W) 덮어쓰기. 여러 번 줄 수 있다. "
+                         "예: --prior aspiration=3.0")
+    ap.add_argument("--bw-law", type=float, default=None,
+                    help="포먼트 대역폭을 손실 법칙(40+0.05F) 쪽으로 당기는 세기 "
+                         "(fit.BW_LAW_W). 대역폭은 기하가 아니라 손실이 정하는 "
+                         "양이라 자유 파라미터로 두면 적합기가 극을 뭉개 스펙트럼 "
+                         "기울기를 흉내 낸다 (MEASUREMENTS §35)")
+    ap.add_argument("--flux", type=float, default=None,
+                    help="세로 얼룩(스펙트럼 플럭스) **일치** 항의 세기 (fit.FLUX_W). "
+                         "지금 손실은 _expect 때문에 얼룩을 원리적으로 못 본다 — "
+                         "이 항이 멜 대역 dB 의 프레임 간 |Δ| 통계를 목표와 맞춘다. "
+                         "최소화가 아니라 일치다 (난류는 원래 흔들린다)")
+    ap.add_argument("--vel-w", type=float, default=None,
+                    help="포먼트 가속도 벌점 세기 (fit.VEL_W, 기본 0). 무릎은 실측 "
+                         "중앙 가속도 (F1 0.7 / F2 1.9 / F3 3.4 / F4 3.5 Hz/ms²)")
+    ap.add_argument("--tilt-cap", type=float, default=None,
+                    help="소스 기울기(tilt)가 먹히는 상한 주파수 [Hz] "
+                         "(glottis.TILT_MAX_HZ, 기본 5000). 0 이면 상한 없음 — "
+                         "그러면 성문 펄스가 사각파처럼 날카로워진다 (MEASUREMENTS §25)")
+    ap.add_argument("--artic-vel", type=float, default=None,
+                    help="조음 속도 한계 벌점의 세기 (fit.ARTIC_VEL_W, 기본 1.0). "
+                         "0 이면 끈다 — 마찰음이 유성 구간에서 1 ms 만에 켜지는 것을 "
+                         "막는 항이다 (MEASUREMENTS §24)")
+    ap.add_argument("--corr", type=float, default=None,
+                    help="유성 구간에서 20 ms 파형 상관이 무너진 만큼을 문다 (기본 0 = 끔). "
+                         "**끊겨 들리는 결함을 잡는 항이다** — 그 자리의 멜 오차는 오히려 "
+                         "낮을 수 있다(위상만 뒤집힌 것). MEASUREMENTS §44")
+    ap.add_argument("--hnr", type=float, default=None,
+                    help="주기성(조화 대 비조화)을 목표에 일치시킨다 (기본 0 = 끔). "
+                         "없으면 적합기가 하모닉을 잡음으로 바꿔 같은 스펙트럼을 만든다 "
+                         "— 실측 fric_gain +1022 %%. MEASUREMENTS §44")
+    ap.add_argument("--cont", type=float, default=None,
+                    help="창별 손실이 직전 창보다 나빠진 만큼을 문다 (기본 0 = 끔). "
+                         "평균 손실은 국소 붕괴를 못 본다 — 50 ms 구간 상관이 1.00 인데 "
+                         "한 구간만 −0.06 으로 뒤집히는 일이 실제로 있다")
+    ap.add_argument("--sharp", type=float, default=None,
+                    help="유성 구간이 목표보다 뭉툭한 만큼을 문다 (기본 0 = 끔). "
+                         "포락 일치율은 이것을 볼 수 없다 — 멜 밴드가 포먼트 골보다 넓다")
+    ap.add_argument("--subf0", type=float, default=None,
+                    help="F0 아래가 **목표보다** 시끄러운 만큼을 문다 (기본 0 = 끔). "
+                         "목표의 프라이·서브하모닉은 벌하지 않는다")
     ap.add_argument("--ripple", type=float, default=None,
                     help="제어열 잔물결 벌점 세기 (fit.RIPPLE_W). 조음 대역(0~20 Hz) "
                          "위에서 트랙이 흔들리는 것만 문다 — 지지직과 저역 초과가 "
                          "둘 다 여기서 온다 (docs/MEASUREMENTS.md §13, §16)")
     a = ap.parse_args()
     torch.set_num_threads(a.threads)
-    if a.gain_acc is not None or a.ripple is not None:
+    if (a.ripple is not None or a.prior or a.artic_vel is not None
+            or a.vel_w is not None or a.flux is not None
+            or a.bw_law is not None):
         from formant_ml.engine import fit as _fit
-        if a.gain_acc is not None:
-            _fit.GAIN_ACC_W = float(a.gain_acc)
         if a.ripple is not None:
             _fit.RIPPLE_W = float(a.ripple)
+        if a.artic_vel is not None:
+            _fit.ARTIC_VEL_W = float(a.artic_vel)
+        if a.vel_w is not None:
+            _fit.VEL_W = float(a.vel_w)
+        if a.flux is not None:
+            _fit.FLUX_W = float(a.flux)
+        if a.bw_law is not None:
+            _fit.BW_LAW_W = float(a.bw_law)
+        if a.corr is not None:
+            _fit.CORR_W = float(a.corr)
+        if a.hnr is not None:
+            _fit.HNR_W = float(a.hnr)
+        if a.cont is not None:
+            _fit.CONT_W = float(a.cont)
+        if a.sharp is not None:
+            _fit.SHARP_W = float(a.sharp)
+        if a.subf0 is not None:
+            _fit.SUBF0_W = float(a.subf0)
+    if a.tilt_cap is not None:
+        from formant_ml.engine import glottis as _g
+        _g.TILT_MAX_HZ = float(a.tilt_cap)
+        for item in (a.prior or ()):
+            k, _, v = item.partition("=")
+            if k not in _fit.PRIOR_W and k not in _fit.DEFAULT_PARAMS:
+                raise SystemExit(f"--prior: 모르는 파라미터 {k!r}")
+            _fit.PRIOR_W[k] = float(v)
 
     y, sr = sf.read(a.wav)
     if y.ndim > 1:
@@ -121,10 +202,41 @@ def main() -> None:
     eng = VoiceEngine(EngineConfig(sample_rate=48000, frame_ms=a.frame_ms,
                                    speaker="female" if prof.f0_nominal > 165 else "male",
                                    residual=False), prof)
-    fit = CopySynthFitter(eng, seg, sr, track, phase_weight=a.phase)
+    room_ir = None
+    if a.room_from:
+        from formant_ml.engine import room as _room
+        # **마른 출력이 있으면 그쪽을 쓴다.** 이미 방을 넣고 적합한 결과라면
+        # `_fit.wav` 는 방을 통과한 소리다 — 그걸로 다시 추정하면 방이 두 번 들어간다.
+        src = (a.room_from + "_dry.wav" if os.path.exists(a.room_from + "_dry.wav")
+               else a.room_from + "_fit.wav")
+        dry, _ = sf.read(src)
+        ref, _ = sf.read(a.room_from + "_target.wav")
+        dry = dry.mean(1) if dry.ndim > 1 else dry
+        ref = ref.mean(1) if ref.ndim > 1 else ref
+        m = min(len(dry), len(ref))
+        kw = dict(taps=a.room_taps or _room.DEFAULT_TAPS,
+                  lam=a.room_lambda if a.room_lambda is not None else _room.DEFAULT_LAMBDA)
+        # **못 본 절반에서 실제로 좋아지는지 먼저 본다.** IR 이 항상 도움이 되지는
+        # 않는다 — 마른 모형이 이미 잘 맞는 파일에서는 역합성곱이 잡을 계통 성분이
+        # 없고, 그때 IR 은 오히려 나빠지게 한다 (engine/room.holdout_gain).
+        hg = _room.holdout_gain(dry[:m], ref[:m], **kw)
+        room_ir = _room.estimate_ir(dry[:m], ref[:m], **kw)
+        print(f"녹음 경로 IR: {src} 에서 {len(room_ir)} 탭 "
+              f"({len(room_ir)/48000*1000:.0f} ms) 추정, 직접음 {_room.direct_gain(room_ir):.3f}",
+              flush=True)
+        print(f"  홀드아웃(앞 절반 추정 → 뒤 절반 시험): {hg['before']:.3f} -> {hg['after']:.3f}"
+              f"  {'쓴다' if hg['improves'] else '**안 좋아진다**'}", flush=True)
+        if not hg["improves"] and not a.room_force:
+            print("  -> 방을 넣지 않는다 (--room-force 로 강제 가능)", flush=True)
+            room_ir = None
+    if a.device != "cpu":
+        eng = eng.to(a.device)
+    fit = CopySynthFitter(eng, seg, sr, track, phase_weight=a.phase, room_ir=room_ir,
+                          device=a.device)
     kw = {} if a.lr_global is None else {"lr_global": a.lr_global}
     rep = fit.fit_staged(global_iters=a.global_iters, stage_iters=a.stage_iters,
                          lr_frame=a.lr_frame, phase_iters=a.phase_iters,
+                         **({"lr_phase": a.lr_phase} if a.lr_phase else {}),
                          patience=a.patience, **kw)
     print(rep)
 
@@ -139,6 +251,11 @@ def main() -> None:
     os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
     sf.write(a.out + "_target.wav", seg, sr)
     sf.write(a.out + "_fit.wav", out, 48000)
+    if room_ir is not None:
+        # 마른 출력도 같이 낸다 — 학습 데이터로 나가는 것은 이쪽의 파라미터다.
+        with torch.no_grad():
+            sf.write(a.out + "_dry.wav", fit.synth_dry()[0].cpu().numpy(), 48000)
+        np.save(a.out + "_room.npy", room_ir)
     res = fit.result_track()
     np.savez(a.out + "_track.npz", values=res.values, frame_ms=res.frame_ms,
              names=np.array(PARAM_NAMES))

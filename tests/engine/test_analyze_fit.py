@@ -195,6 +195,13 @@ def test_global_offset_never_touches_formants(_engine):
 
 
 def test_penalty_punishes_out_of_order_formants(_engine):
+    """포먼트 순서가 뒤집히면 벌점이 **자릿수로** 커져야 한다.
+
+    바닥값은 0 이 아니다. `a_c` 속도 벌점이 `softplus` 로 문턱을 뭉개므로 속도 0
+    에서도 `softplus(−5) = 6.7e-3` 만큼 새고, 그것이 의사후버를 지나 프레임당
+    ~9e-7 로 남는다 (§29.3). 손실이 ~1.0 인 것에 비하면 무시할 양이지만 정확히
+    0 은 아니므로, "바닥은 0" 이 아니라 "바닥은 위반의 자릿수 아래" 를 건다.
+    """
     tr = _track()
     f = CopySynthFitter(_engine, _engine.render(tr), 48000, tr)
     with torch.no_grad():
@@ -202,7 +209,8 @@ def test_penalty_punishes_out_of_order_formants(_engine):
         i2 = f.names.index("f2")
         f.w[:, i2] = -20.0 / float(f.scale[i2])       # F2 를 F1 아래로
         p1 = float(f.penalty())
-    assert p0 < 1e-9 < p1
+    assert p0 < 1e-5, f"위반이 없는데 벌점이 {p0:.3g} 이다"
+    assert p1 > 1e3 * max(p0, 1e-12), f"순서 위반 {p1:.3g} 이 바닥 {p0:.3g} 과 비슷하다"
 
 
 @pytest.mark.parametrize("name", ["f0_target", "p_sub", "f1", "bw1", "a_c", "velum"])
@@ -411,8 +419,229 @@ def test_ripple_penalty_bites_ripple_and_spares_articulation(_engine):
             f.w.copy_(torch.zeros_like(f.w))
 
 
-def test_ripple_penalty_is_off_by_default():
-    """기본값이 0 이어야 한다 — A/B 로 세기를 정하기 전에는 거동을 안 바꾼다."""
+def test_fitting_defaults_are_the_measured_ones():
+    """다섯 기본값을 못 박는다. 전부 **전체 파일 A/B 로 정한 값**이다 (0.3.15).
+
+    바꾸려면 근거를 새로 대라 — 아래 숫자는 yang_00000040 전체에서 나온 것이다:
+
+      RIPPLE_W  0 → 0.01 로  포락 90.71 → 94.06 %, 정밀 82.48 → 88.06 %
+      VEL_W     0 → 0.001 로 포락 90.47 → 93.17 %, 제어열 곡률 rms 148 → 100
+      FLUX_W    0 → 2.0 로   목표 p99 초과 3.08 → **0.000 %** (시드 5 벌 전부)
+      ARTIC_VEL_W 1.0 은 **문턱 위만 무는 형태**여야 한다 (§29: 의사후버로 걸면
+                  a_c 속도가 0.449 → 0.015 로 얼어 오염이 오히려 늘었다)
+      TILT_MAX_HZ 5000 (성대 스무딩, §25)
+    """
     from formant_ml.engine import fit as F
-    assert F.RIPPLE_W == 0.0
-    assert F.GAIN_ACC_W == 0.0
+    from formant_ml.engine import glottis as G
+    assert F.RIPPLE_W == 0.01
+    assert F.VEL_W == 0.001 and F.VEL_MODE == "accel"
+    assert F.FLUX_W == 2.0
+    assert F.ARTIC_VEL_W == 1.0 and F.ARTIC_VEL_KNEE["a_c"] == 0.20
+    assert G.TILT_MAX_HZ == 5000.0
+    # BW_LAW_W 는 0 이어야 한다. yang_00000040 전체에서 0.5 -> 포락 85.79 %,
+    # 2.0 -> 89.63 %, 둘 다 0 의 92.44 % 보다 나쁘다 (§35.4: 대역폭 과대의 원인이
+    # 극 부족이 아니므로, 법칙으로 좁히면 맞출 수단만 뺏는다).
+    assert F.BW_LAW_W == 0.0
+
+
+def test_articulator_velocity_penalty_spares_real_gestures(_engine):
+    """조음 속도 벌점의 **특이성** — 실제 제스처는 통과하고 1 ms 스위칭만 물어야 한다.
+
+    한계 0.20 neper/ms 는 v1 의 최소저크 제스처가 내는 최대(28 ms CV 에서 0.172)
+    바로 위이고, 적합 트랙에서 관찰된 이탈(0.87~1.90)보다 4~10 배 아래다
+    (docs/MEASUREMENTS.md §24). 이 여백이 무너지면 조음을 뭉개거나 스위칭을 놓친다.
+    """
+    from formant_ml.engine import fit as F
+    from formant_ml.engine.control import INDEX
+
+    tr = _track(n=200)
+    target = _engine.render(tr)
+    f = CopySynthFitter(_engine, target, 48000, tr)
+    k = f.names.index("a_c")
+    old = F.ARTIC_VEL_W
+    F.ARTIC_VEL_W = 1.0
+    try:
+        def pen_for(a_c_track):
+            with torch.no_grad():
+                raw = f._to_raw(torch.as_tensor(a_c_track, dtype=torch.float64), f.specs[k])
+                f.w.copy_(torch.zeros_like(f.w))
+                f.w[:, k] = (raw - f.u0[:, k]) / f.scale[k]
+                return float(f.penalty())
+
+        n = f.n_frames
+        t = np.arange(n)
+        # (a) 실제 제스처: `phones.sibilant` 이 실제로 그리는 것 — 40 ms 에 걸쳐
+        #     0.35 -> 0.08 을 로그·최소저크로 (최대 0.071 neper/ms).
+        u = np.clip((t - 60) / 40.0, 0.0, 1.0)
+        mj = u ** 3 * (10 - 15 * u + 6 * u ** 2)
+        gesture = np.exp(np.log(0.35) + (np.log(0.08) - np.log(0.35)) * mj)
+        # (b) 1 ms 스위칭: 같은 진폭을 한 프레임에
+        switch = np.full(n, 0.35)
+        switch[100] = 0.08
+        base = pen_for(np.full(n, 0.35))
+        pg, ps = pen_for(gesture) - base, pen_for(switch) - base
+    finally:
+        F.ARTIC_VEL_W = old
+        with torch.no_grad():
+            f.w.copy_(torch.zeros_like(f.w))
+    assert ps > 10.0 * max(pg, 1e-9)
+    # **한계 아래는 정확히 공짜여야 한다.** 처음 쓴 `pseudo_huber(rate/knee)` 는
+    # 무릎 아래에서도 이차로 벌해서 실제 제스처까지 얼렸다 (§29: a_c 속도 95 분위가
+    # 0.449 -> 0.015 로, 가장 빠른 실제 제스처의 11 배 **아래**로 눌렸다).
+    # 이 제스처의 최대 속도는 0.071 로 한계(0.20)의 3 분의 1 이다.
+    assert pg < 0.01 * ps
+
+
+def test_nonfinite_gradient_does_not_freeze_the_fit(_engine):
+    """비유한 기울기가 나도 **걸음은 딛어야 한다** — 안 그러면 결정적으로 갇힌다.
+
+    가드가 회차 전체를 버리면 파라미터가 안 변하고, 그러면 다음 회차의 기울기도
+    똑같이 비유한이다. 실측(out/sw/r000, yang_00000040 전체): 모든 단계가
+    "[30] 수렴 + 비유한 29 회 건너뜀" 으로 끝났다 — 단계당 실제 걸음이 1 번뿐이었고
+    포락이 82.7 % 에 머물렀다 (같은 파일의 정상 적합은 93.1 %).
+
+    비유한 **성분만** 0 으로 두면 나머지로 걸음을 딛으므로 그 자리를 벗어난다.
+    """
+    tr = _track(n=60)
+    target = _engine.render(tr)
+    f = CopySynthFitter(_engine, target, 48000, tr)
+    real_loss = f.loss
+
+    def poisoned():
+        l, sc, env_sc, per = real_loss()
+        return l + torch.sqrt((f.w * 0.0).sum()), sc, env_sc, per   # w 기울기가 ∞
+
+    # `fit` 은 끝에서 최선 스냅샷을 복원하므로(목표가 같은 트랙의 렌더라 0 회차가
+    # 최선이다) **도는 동안**의 파라미터를 봐야 한다.
+    seen = []
+
+    def watched():
+        seen.append(f.d.detach().clone())
+        return poisoned()
+
+    f.loss = watched
+    f.fit(iters=6, lr=0.05, verbose=False, patience=0)
+    assert len(seen) >= 3
+    moved = float((seen[-1] - seen[0]).abs().max())
+    assert moved > 1e-6, f"매 회차 비유한인데 파라미터가 안 움직였다 ({moved:.3g})"
+
+
+def test_skipped_iterations_do_not_count_as_convergence(_engine):
+    """비유한 기울기가 든 회차를 정체로 세면 안 된다.
+
+    걸음을 안 딛었으면 손실이 안 변하는 것이 당연한데 그걸 "수렴" 으로 세면, 비유한
+    기울기가 잦은 구간에서 단계가 통째로 조기 종료된다. 실측(out/v13/s040): 위상
+    단계 42 회 중 27 회가 건너뛰어져 정체 30 이 먼저 찼고, 위상 단계는 항상 한 번
+    꺾였다가 회복하므로 **골짜기 한복판**에서 멈췄다 — 포락 90.63 -> 84.29 %
+    (docs/MEASUREMENTS.md §27).
+
+    √x 는 x=0 에서 기울기가 무한이다. 그걸로 비유한 기울기를 확실히 만든다.
+    """
+    tr = _track(n=60)
+    target = _engine.render(tr)
+
+    def run(poison: bool) -> int:
+        f = CopySynthFitter(_engine, target, 48000, tr)
+        real_loss = f.loss
+        calls = {"n": 0}
+
+        def wrapped():
+            l, sc, env_sc, per = real_loss()
+            calls["n"] += 1
+            if poison and calls["n"] % 2 == 0:        # 절반의 회차에서 ∞ 기울기
+                l = l + torch.sqrt((f.w * 0.0).sum())
+            return l, sc, env_sc, per
+
+        f.loss = wrapped
+        f.fit(iters=12, lr=0.02, verbose=False, patience=3)
+        return calls["n"]
+
+    # 목표가 같은 트랙의 렌더라 실제 걸음도 손실을 못 줄인다 — 그래서 오염 없는
+    # 실행은 정당하게 patience 회 만에 멈춘다. 오염된 실행은 **건너뛴 회차가 정체로
+    # 세어지지 않는다면** 그만큼 더 돌아야 한다.
+    clean, poisoned = run(False), run(True)
+    assert poisoned > clean, (
+        f"건너뛴 회차가 정체로 세어졌다 — 오염 {poisoned} 회 vs 정상 {clean} 회")
+
+
+def _fitter_on(y, fs, **flags):
+    from formant_ml.engine import fit as F
+    from formant_ml.engine.analyze import analyze
+    from formant_ml.engine.profile import DEFAULT_PROFILE
+    from formant_ml.engine.voice import EngineConfig, VoiceEngine
+    old = {k: getattr(F, k) for k in flags}
+    for k, v in flags.items():
+        setattr(F, k, v)
+    try:
+        tr = analyze(y, fs, DEFAULT_PROFILE, int(0.001 * fs), full=y)
+        f = F.CopySynthFitter(VoiceEngine(EngineConfig()), y, fs, tr)
+        f.sizes = list(F.FFT_SIZES)
+        return f
+    finally:
+        for k, v in old.items():
+            setattr(F, k, v)
+
+
+def test_waveform_correlation_penalty_sees_what_the_envelope_cannot():
+    """위상만 뒤집힌 신호를 문다. 멜 오차는 그 사건을 못 본다.
+
+    실측(`out/lad/s040`, §44): 0.41 s 에서 파형 상관이 −0.80 인데 그 자리의 멜 dB
+    오차는 오히려 `out/fix` 보다 **낮다**. 크기 스펙트럼이 멀쩡하고 위상만
+    뒤집혔기 때문이다. 연속 벌점을 멜 오차 위에 걸면 아무것도 안 문다.
+    """
+    import numpy as np
+    import torch
+    from formant_ml.engine import fit as F
+    fs = 48000
+    t = np.arange(int(0.3 * fs)) / fs
+    env = np.exp(-((t - 0.15) / 0.09) ** 2)
+    good = (np.sin(2 * np.pi * 180 * t) + 0.4 * np.sin(2 * np.pi * 540 * t)) * env * 0.2
+    f = _fitter_on(good, fs, CORR_W=1.0)
+    a = torch.as_tensor(good, dtype=torch.float32).unsqueeze(0)
+    # 반 주기 어긋난 판 — 스펙트럼 크기는 그대로다.
+    k = int(round(fs / 180.0)) // 2
+    flip = np.roll(good, k)
+    b = torch.as_tensor(flip, dtype=torch.float32).unsqueeze(0)
+    l_good = float(f.corr_loss(a))
+    l_flip = float(f.corr_loss(b))
+    assert l_good < 1e-3, l_good
+    assert l_flip > 100.0 * max(l_good, 1e-6), (l_good, l_flip)
+    # 크기 스펙트럼은 거의 같다 — 그것이 요점이다.
+    A = torch.stft(a, 256, 64, 256, torch.hann_window(256), center=True,
+                   return_complex=True).abs()
+    B = torch.stft(b, 256, 64, 256, torch.hann_window(256), center=True,
+                   return_complex=True).abs()
+    n = min(A.shape[-1], B.shape[-1])
+    rel = float((A[..., :n] - B[..., :n]).abs().sum() / A[..., :n].abs().sum())
+    assert rel < 0.20, rel
+
+
+def test_periodicity_penalty_punishes_trading_harmonics_for_noise():
+    """하모닉을 잡음으로 바꾸면 문다. 총 레벨이 같아도 문다.
+
+    이 항이 없어서 적합기가 `p_sub` 를 반 토막 내고 `fric_gain` 을 11 배로 올려
+    같은 스펙트럼을 만들었다 (§44). 크기 항만으로는 그 해가 공짜다.
+    """
+    import numpy as np
+    import torch
+    rng = np.random.RandomState(0)
+    fs = 48000
+    t = np.arange(int(0.3 * fs)) / fs
+    env = np.exp(-((t - 0.15) / 0.09) ** 2)
+    tone = (np.sin(2 * np.pi * 180 * t) + 0.4 * np.sin(2 * np.pi * 540 * t)) * env
+    clean = tone * 0.2
+    f = _fitter_on(clean, fs, HNR_W=1.0)
+    l = []
+    for mix in (0.0, 0.3, 0.6):
+        noisy = (tone * (1 - mix) + mix * rng.randn(len(t)) * env * 0.7) * 0.2
+        y = torch.as_tensor(noisy, dtype=torch.float32).unsqueeze(0)
+        l.append(float(f.hnr_loss(y)))
+    assert l[0] < l[1] < l[2], l
+    assert l[2] > 5.0 * max(l[0], 1e-6), l
+
+
+def test_new_penalties_are_off_by_default():
+    """셋 다 A/B 로 세기를 정하기 전에는 꺼져 있어야 한다."""
+    from formant_ml.engine import fit as F
+    assert F.CORR_W == 0.0 and F.HNR_W == 0.0
+    assert F.CONT_W == 0.0 and F.SHARP_W == 0.0 and F.SUBF0_W == 0.0
