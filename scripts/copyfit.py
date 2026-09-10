@@ -71,6 +71,9 @@ def main() -> None:
     ap.add_argument("--stage-iters", type=int, default=100)
     ap.add_argument("--phase-iters", type=int, default=200,
                     help="마지막 위상 단계. 0 이면 끔 (크기만 맞춘다)")
+    ap.add_argument("--lr-phase", type=float, default=None,
+                    help="위상 단계의 lr 을 고정한다. 생략하면 짧은 탐침으로 고르는데, "
+                         "그 탐침은 **짧은 시야로 작은 lr 에 편향**돼 있다 (MEASUREMENTS §39.1)")
     ap.add_argument("--lr-global", type=float, default=None,
                     help="생략하면 짧은 탐침으로 자동 선택 (구간마다 맞는 값이 다르다)")
     ap.add_argument("--lr-frame", type=float, default=0.04)
@@ -199,6 +202,7 @@ def main() -> None:
     kw = {} if a.lr_global is None else {"lr_global": a.lr_global}
     rep = fit.fit_staged(global_iters=a.global_iters, stage_iters=a.stage_iters,
                          lr_frame=a.lr_frame, phase_iters=a.phase_iters,
+                         **({"lr_phase": a.lr_phase} if a.lr_phase else {}),
                          patience=a.patience, **kw)
     print(rep)
 
