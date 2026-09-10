@@ -1,7 +1,52 @@
 # 내 컴퓨터에서 돌리기
 
-원격 컨테이너는 격리돼 있어서 여기서 사용자 컴퓨터로 가는 통로가 없다. 대신
-**작업이 전부 브랜치에 푸시돼 있으므로 로컬에서 그대로 돌릴 수 있다.**
+원격 컨테이너는 격리돼 있어서 **거기서 내 컴퓨터로 붙는 통로는 없다.** 세션끼리
+파일시스템을 공유하지 않는다. 대신 **내 컴퓨터에서 Claude Code 세션을 하나 띄우면**
+그 세션은 내 파일시스템에 직접 접근하므로, 원격에서 하던 일을 내 메모리·내 CPU 로
+그대로 이어서 한다.
+
+## 0. 로컬 Claude Code 세션으로 이어받기
+
+1. Claude Code 를 설치한다. 터미널이 편하면 CLI, 아니면 데스크톱 앱(Mac/Windows)
+   이나 IDE 확장(VS Code, JetBrains)도 같은 일을 한다.
+   설치 방법은 https://code.claude.com/docs 를 본다 (CLI 는 npm 패키지
+   `@anthropic-ai/claude-code`).
+2. 저장소를 받고 브랜치를 잡는다.
+
+   ```bash
+   git clone https://github.com/godsods3122-dot/Formant_ml
+   cd Formant_ml
+   git checkout claude/voice-parametrization-engine-fit-jscklg
+   python3.11 -m venv .venv
+   .venv/bin/pip install -e ".[dev]"
+   ```
+
+3. 그 디렉터리에서 `claude` 를 실행하고, 첫 메시지로 이렇게 준다:
+
+   > `docs/HANDOFF.md` 와 `docs/MEASUREMENTS.md` 의 §35~§42 를 읽고 이어서 해줘.
+   > 지금 할 일은 `docs/RUN_LOCAL.md` 의 "지금 남은 A/B" 다. 말은 되도록 한국어로.
+
+   두 문서에 지금까지의 측정과 되돌린 시도가 전부 적혀 있어서, 새 세션이 같은
+   실수를 반복하지 않는다.
+
+4. 원격 세션과 겹치지 않게 **결과 태그(`out/<태그>`)를 다르게** 쓴다. 커밋은 같은
+   브랜치에 해도 되지만, 밀기 전에 `git pull --rebase` 를 한 번 한다.
+
+## 지금 남은 A/B
+
+| 태그 | 명령에 더할 것 | 무엇을 보는가 |
+|---|---|---|
+| `lad` | (없음) | 혼합 사다리가 `out/fix` 보다 나은가 |
+| `ph800` | `--phase-iters 800` | 위상 단계의 예산 (§39) |
+| `ph800lr` | `--phase-iters 800 --lr-phase 0.12` | 탐침 편향까지 우회 (§39.1) |
+| `sub1` | `--subf0 1.0` | F0 아래 초과 (+11.7 dB, 셋 중 가장 큼) |
+| `sharp1` | `--sharp 1.0` | 유성 첨예도 (0.867) |
+| `cont1` | `--cont 1.0` | 창별 악화 |
+
+기준선은 `out/fix` (포락 92.44 / 90.87 %) 다. 파일은 `yang_00000040`,
+`yang_00000101` 두 개를 같이 봐야 한다 — 한 파일만 보면 §38 처럼 결론이 갈린다.
+
+## 준비
 
 원격 컨테이너의 제약은 메모리다 — 적합 한 건이 **RSS 3.8 GB** 를 쓰는데 컨테이너의
 가용 메모리가 9 GB 라 **두 건을 같이 돌리면 OOM 으로 조용히 죽는다** (로그에 아무
@@ -10,16 +55,8 @@
 
 ## 준비
 
-```bash
-git clone https://github.com/godsods3122-dot/Formant_ml
-cd Formant_ml
-git checkout claude/voice-parametrization-engine-fit-jscklg
-
-python3.11 -m venv .venv
-.venv/bin/pip install -e ".[dev]"
-```
-
-`data/voices/` 의 음원과 `profiles/yang_female.json` 은 저장소에 들어 있다.
+위 0 절의 clone·venv 까지 하면 끝이다. `data/voices/` 의 음원과
+`profiles/yang_female.json` 은 저장소에 들어 있다.
 
 ## 한 건 돌리기
 
