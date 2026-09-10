@@ -419,10 +419,25 @@ def test_ripple_penalty_bites_ripple_and_spares_articulation(_engine):
             f.w.copy_(torch.zeros_like(f.w))
 
 
-def test_ripple_penalty_is_off_by_default():
-    """기본값이 0 이어야 한다 — A/B 로 세기를 정하기 전에는 거동을 안 바꾼다."""
+def test_fitting_defaults_are_the_measured_ones():
+    """다섯 기본값을 못 박는다. 전부 **전체 파일 A/B 로 정한 값**이다 (0.3.15).
+
+    바꾸려면 근거를 새로 대라 — 아래 숫자는 yang_00000040 전체에서 나온 것이다:
+
+      RIPPLE_W  0 → 0.01 로  포락 90.71 → 94.06 %, 정밀 82.48 → 88.06 %
+      VEL_W     0 → 0.001 로 포락 90.47 → 93.17 %, 제어열 곡률 rms 148 → 100
+      FLUX_W    0 → 2.0 로   목표 p99 초과 3.08 → **0.000 %** (시드 5 벌 전부)
+      ARTIC_VEL_W 1.0 은 **문턱 위만 무는 형태**여야 한다 (§29: 의사후버로 걸면
+                  a_c 속도가 0.449 → 0.015 로 얼어 오염이 오히려 늘었다)
+      TILT_MAX_HZ 5000 (성대 스무딩, §25)
+    """
     from formant_ml.engine import fit as F
-    assert F.RIPPLE_W == 0.0
+    from formant_ml.engine import glottis as G
+    assert F.RIPPLE_W == 0.01
+    assert F.VEL_W == 0.001 and F.VEL_MODE == "accel"
+    assert F.FLUX_W == 2.0
+    assert F.ARTIC_VEL_W == 1.0 and F.ARTIC_VEL_KNEE["a_c"] == 0.20
+    assert G.TILT_MAX_HZ == 5000.0
 
 
 def test_articulator_velocity_penalty_spares_real_gestures(_engine):

@@ -188,30 +188,52 @@ class VocalTract(nn.Module):
             fk = f.to(y.dtype).expand_as(y)
             y, state[f"nx{j}"] = tv_biquad(
                 y, *resonator_coeffs(fk, (300.0 + 0.25 * fk) * d, self.fs), zi=state.get(f"nx{j}"))
+        # **극쌍 보정이 있는 노치를 쓴다.** `antiresonator_coeffs` 는 영점쌍만 DC 에서
+        # 정규화하므로 먼 대역이 통째로 들린다 — 실측(fz 1400 Hz, bw 200~1400):
+        #   4 kHz +15~17 dB,  12 kHz +33~35 dB,  20 kHz +39~41 dB
+        # `notch_coeffs` 는 같은 각도에 4 배 넓은 극쌍을 두어 노치 바깥을 1 로 되돌린다
+        # (같은 값에서 12 kHz +0.6~+11.6 dB). 그 함수의 주석이 경고하던 바로 그 경우인데
+        # 비강 분기만 옛 형태로 남아 있었다 (MEASUREMENTS §34).
         fz = self._up(c["nasal_z"])
-        y, state["nbz"] = tv_biquad(y, *antiresonator_coeffs(fz, fz * self.nasal_zfrac * d,
-                                                             self.fs), zi=state.get("nbz"))
+        y, state["nbz"] = tv_biquad(y, *notch_coeffs(fz, fz * self.nasal_zfrac * d,
+                                                     self.fs), zi=state.get("nbz"))
         return y * self.nasal_gain * self._up(c["nasal_gain"])
 
     def _lateral(self, x, c, state):
         """설측음의 측지 영점 2 개. 깊이는 `lat_mix` 로 **연속으로** 켜고 끈다.
 
-        mix→0 이면 대역폭이 발산해 노치가 사라진다(응답이 정확히 1). 주파수를 0 으로 껐다
-        켜는 방식은 로그 파라미터의 영차 유지 때문에 한 프레임에 도약하고, 그 계수 도약이
-        필터 상태와 만나 클릭이 된다.
+        **깊이는 젖음/마름 섞기로 준다** — `y = x + mix·(notch(x) − x)`.
+        mix=0 이면 항등이고 mix=1 이면 노치 그대로다. 주파수를 0 으로 껐다 켜는 방식은
+        로그 파라미터의 영차 유지 때문에 한 프레임에 도약하고, 그 계수 도약이 필터
+        상태와 만나 클릭이 되므로 쓰지 않는다. 섞기는 mix 에 대해 연속이라 그 문제가 없다.
+
+        **예전에는 대역폭을 `lat_bw / mix` 로 넓혀서 껐다. 그건 틀렸다.**
+        주석에 "대역폭이 발산하면 응답이 정확히 1" 이라고 적어 두었는데 아니다.
+        `notch_coeffs` 는 영점쌍(반지름 rz)과 4 배 넓은 극쌍(rp)을 두고 **DC 에서**
+        정규화한다. 대역폭을 키우면 둘 다 원점으로 오그라드는데 극이 4 배 빨리
+        오그라들므로, DC 는 1 이어도 **고역이 들린다.** 실측(적합값 lat_z 3300 Hz,
+        lat_mix 0.065 → 실효 대역폭 4554 Hz):
+
+            250 Hz −0.02 | 1 k −0.26 | 4 k −0.07 | 8 k **+7.4** | 12 k **+11.0** | 16 k **+12.6** dB
+
+        영점이 둘이라 12~16 kHz 에서 +20 dB 를 넘는다. 적합기는 이것을 **공짜 고역
+        셸프**로 썼다 — 파찰음 /ㅊ/ 구간에서 설측을 끄면 에너지가 9.5 dB 줄고 파형
+        첨도가 14.15 → 9.45 로 내려간다(목표 3.49). 사용자가 "누가 봐도 튀는 파형"
+        이라고 지적한 것이 이것이다 (MEASUREMENTS §34).
         """
-        mix = self._up(c["lat_mix"]).clamp(1e-3, 1.0)
         if float(c["lat_mix"].detach().max()) <= 1e-3:
             return x
+        mix = self._up(c["lat_mix"]).clamp(0.0, 1.0)
+        y = x
         for k in (1, 2):
             fz = c[f"lat_z{k}"]
             if float(fz.detach().max()) <= 0.0:
                 continue
             fz = torch.where(fz > 0, fz, torch.full_like(fz, 3000.0))
-            bw = self._up(c["lat_bw"]) / mix
-            x, state[f"lz{k}"] = tv_biquad(x, *notch_coeffs(self._up(fz), bw, self.fs),
+            y, state[f"lz{k}"] = tv_biquad(y, *notch_coeffs(self._up(fz),
+                                                            self._up(c["lat_bw"]), self.fs),
                                            zi=state.get(f"lz{k}"))
-        return x
+        return x + mix * (y - x)
 
     # ------------------------------------------------------------ 전체
     def forward(self, du: torch.Tensor, fric: torch.Tensor, asp: torch.Tensor,
