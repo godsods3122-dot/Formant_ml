@@ -1,132 +1,193 @@
-# 내 컴퓨터에서 돌리기
+# 로컬 세션 인계 브리핑
 
-원격 컨테이너는 격리돼 있어서 **거기서 내 컴퓨터로 붙는 통로는 없다.** 세션끼리
-파일시스템을 공유하지 않는다. 대신 **내 컴퓨터에서 Claude Code 세션을 하나 띄우면**
-그 세션은 내 파일시스템에 직접 접근하므로, 원격에서 하던 일을 내 메모리·내 CPU 로
-그대로 이어서 한다.
+원격 컨테이너에서 내 컴퓨터로 붙는 통로는 없다. 대신 **내 컴퓨터에서 Claude Code
+세션을 띄우면** 그 세션이 파일시스템에 직접 접근하므로, 원격에서 하던 일을 내
+메모리·내 CPU 로 이어서 한다. 이 문서는 그 세션에 주는 **작업 지시서**다.
 
-## 0. 로컬 Claude Code 세션으로 이어받기
+## 0. 시작하기
 
-1. Claude Code 를 설치한다. 터미널이 편하면 CLI, 아니면 데스크톱 앱(Mac/Windows)
-   이나 IDE 확장(VS Code, JetBrains)도 같은 일을 한다.
-   설치 방법은 https://code.claude.com/docs 를 본다 (CLI 는 npm 패키지
-   `@anthropic-ai/claude-code`).
-2. 저장소를 받고 브랜치를 잡는다.
+```bash
+git clone https://github.com/godsods3122-dot/Formant_ml
+cd Formant_ml
+git checkout claude/voice-parametrization-engine-fit-jscklg
+python3.11 -m venv .venv
+.venv/bin/pip install -e ".[dev]"
+.venv/bin/python -m pytest tests/engine -q      # 180 개가 통과해야 한다
+```
 
-   ```bash
-   git clone https://github.com/godsods3122-dot/Formant_ml
-   cd Formant_ml
-   git checkout claude/voice-parametrization-engine-fit-jscklg
-   python3.11 -m venv .venv
-   .venv/bin/pip install -e ".[dev]"
-   ```
+그 디렉터리에서 `claude` 를 실행하고 첫 메시지로:
 
-3. 그 디렉터리에서 `claude` 를 실행하고, 첫 메시지로 이렇게 준다:
+> `docs/RUN_LOCAL.md` 를 읽고 그대로 해줘. 배경은 `docs/MEASUREMENTS.md` §35~§44 와
+> `docs/HANDOFF.md` 에 있다. 말은 되도록 한국어로. 결과 태그는 `out/L<번호>` 로 쓴다.
 
-   > `docs/HANDOFF.md` 와 `docs/MEASUREMENTS.md` 의 §35~§42 를 읽고 이어서 해줘.
-   > 지금 할 일은 `docs/RUN_LOCAL.md` 의 "지금 남은 A/B" 다. 말은 되도록 한국어로.
+---
 
-   두 문서에 지금까지의 측정과 되돌린 시도가 전부 적혀 있어서, 새 세션이 같은
-   실수를 반복하지 않는다.
+## 1. 이 프로젝트가 무엇인가 (한 문단)
 
-4. 원격 세션과 겹치지 않게 **결과 태그(`out/<태그>`)를 다르게** 쓴다. 커밋은 같은
-   브랜치에 해도 되지만, 밀기 전에 `git pull --rebase` 를 한 번 한다.
+여성 화자 한 명의 음성을 **물리 인자로 역추정**한다 (성문 압력, 내전, 포먼트,
+협착 면적, 마찰 이득 …). 미분 가능한 물리 엔진(`src/formant_ml/engine/`)으로
+녹음을 복사합성(copy-synthesis)해서, 제어열이 맞을 때까지 경사하강한다. 그 제어열이
+학습 데이터가 된다. 목표는 원음과 ~95 % 일치.
 
-## 지금 남은 A/B
+## 2. **지금 가장 중요한 사실** — 자를 잘못 보면 소리를 망친다
 
-| 태그 | 명령에 더할 것 | 무엇을 보는가 |
+바로 앞 세션에서 성도 구조를 바꿨고, 자 세 개가 전부 "좋아졌다" 고 했는데
+**사용자가 듣고 "노이즈가 10배는 더 심해졌고 훨씬 더 먹먹해졌다" 고 했다. 사용자가
+맞았다.** (§44)
+
+원인: 적합기가 `p_sub` 를 9.82 → 4.55 (−54 %) 로 줄이고 `fric_gain` 을
+6.29 → **70.53 (+1022 %)** 로 올려서 **같은 스펙트럼을 하모닉 대신 잡음으로 만들었다.**
+총 레벨이 같으니 포락 점수는 안 떨어지고 소리만 망가진다.
+
+가능한 이유는 **손실에 조화/잡음 비를 강제하는 항이 없었기 때문**이다. 그리고 내
+자 셋(프레임별 대역 편향, 공진 대비, 장기 평균 대역 오차)은 **전부 스펙트럼 크기만
+재는 자**라 그 사건에 침묵했다.
+
+**그래서 이 규칙을 지켜라:**
+
+> **어떤 변경이든 `scripts/probe_hnr.py` 와 `scripts/plot_breakup.py` 를 통과하기
+> 전에는 "개선" 이라고 부르지 않는다. 포락 일치율만 보고 판단하지 않는다.**
+
+## 3. 지금 저장소의 상태
+
+* 엔진은 **되돌린 상태**다 (`tract.py`·`analyze.py` = `c8a3531`). 기준선은
+  `out/fix` (포락 s040 92.44 % / s101 90.87 %) 와 같은 코드다.
+* 앞 세션의 구조 변경(고차 극을 F_K 상대로, 혼합 사다리, 손실 법칙 대역폭, 상한
+  0.70)은 **폐기가 아니라 보류**다. 커밋 `02dfc27`·`c14ee20`·`8c3b951` 에 있고
+  측정은 §35~§43 에 있다. **§5 의 순서대로** 다시 켠다.
+* 손실 항 다섯 개가 새로 있고 **전부 기본값 0** 이다:
+
+  | 플래그 | 무엇을 무는가 | 검증됨? |
+  |---|---|---|
+  | `--corr` | 20 ms 파형 상관이 무릎(0.90) 아래로 떨어진 만큼, **제곱** | ✅ fix 0.171 < lad 0.253 < pole 0.267 |
+  | `--hnr` | 주기성(F0 지연 자기상관)을 목표에 **일치** | ✅ fix 0.169 < lad 0.241 < pole 0.319 |
+  | `--sharp` | 유성 구간이 목표보다 뭉툭한 만큼 (한쪽 방향) | ✅ 비 0.867~0.932 |
+  | `--subf0` | F0 아래가 **목표보다** 시끄러운 만큼 | ✅ +11.7 dB 초과 |
+  | `--cont` | 멜 오차가 직전 창보다 나빠진 만큼 | ⚠️ **쓰지 마라** — §44.3 |
+
+  `--cont` 는 내가 만들었다가 틀린 것으로 판명됐다. 끊어지는 자리의 **멜 오차는
+  오히려 더 낮다** (크기는 멀쩡하고 위상만 뒤집힘). 연속 조건은 `--corr` 가 맞다.
+
+---
+
+## 4. 지시 — 이 순서로 하라
+
+### 4.1 [최우선] 두 새 항의 세기를 정한다
+
+기준선 `out/fix` 대비. **한 번에 하나씩** 켠다.
+
+```bash
+# 한 건이 RSS 3.8 GB. 메모리 / 3.8 만큼 병렬로 돌려라 (32 GB 면 7 개).
+run() {  # run <태그> <파일> <추가인자...>
+  tag=$1; n=$2; shift 2
+  mkdir -p out/$tag
+  OMP_NUM_THREADS=2 .venv/bin/python scripts/copyfit.py data/voices/yang_00000${n}.wav \
+    --profile profiles/yang_female.json --out out/$tag/s${n} "$@" > log_${tag}_${n}.txt 2>&1
+}
+for n in 040 101; do
+  run L1  $n --corr 2.0            &
+  run L2  $n --hnr 2.0             &
+  run L3  $n --corr 2.0 --hnr 2.0  &
+  run L4  $n --corr 5.0 --hnr 5.0  &
+done; wait
+```
+
+**판정은 이 네 자를 함께 본다** (포락 점수는 참고만):
+
+```bash
+.venv/bin/python scripts/probe_hnr.py     out/fix/s040 out/L1/s040 out/L2/s040 out/L3/s040
+.venv/bin/python scripts/plot_breakup.py  out/fix/s040 out/L3/s040 --out fig_breakup.png
+.venv/bin/python scripts/plot_noise.py    out/fix/s040 out/L3/s040 --out fig_noise.png
+.venv/bin/python scripts/probe_band_bias.py out/fix/s040 out/L3/s040
+```
+
+**이기는 조건** (전부 만족해야 채택):
+1. 1~4 kHz 조화÷비조화가 목표(8.3 dB)에 **더 가까워질 것** — `fix` 는 8.1 이다.
+2. `plot_breakup.py` ①에서 상관이 **0 아래로 내려가는 구간 수가 줄 것**
+   (`fix/s040` 은 0.46 s 와 1.28~1.42 s 두 곳).
+3. 포락 일치율이 **2 점 이상 떨어지지 않을 것**.
+4. 들어 볼 것. 자가 셋 다 좋다고 해도 소리가 나쁘면 자가 틀린 것이다.
+
+### 4.2 F0 아래 잡음 — 이건 `fix` 에도 있는 결함이다
+
+세 판 **전부** 700 Hz 아래가 목표보다 **10~13 dB 시끄럽다**. `--subf0` 가 그것을
+겨냥한다. 4.1 의 승자 위에 얹어서 `--subf0 1.0 / 3.0` 을 시험하라.
+
+주의: 사용자가 지적한 대로 이 항은 **금지가 아니라 초과분만** 문다. 목표에 진짜
+프라이나 서브하모닉이 있으면 벌점이 저절로 0 이 된다. 그 성질이 깨지지 않았는지
+`tests/engine/test_analyze_fit.py` 로 확인하라.
+
+### 4.3 [그 다음] 보류한 구조 변경을 다시 켠다
+
+**4.1·4.2 가 끝난 뒤에** 한다. 순서가 중요하다 — 지금 켜면 그 개선을 또 잡음으로
+지불한다 (§44.5).
+
+```bash
+git checkout 8c3b951 -- src/formant_ml/engine/tract.py src/formant_ml/engine/analyze.py
+```
+
+그러면 §35~§43 의 구조가 돌아온다: 고차 극을 F_K 상대 + `c/(2L)` 사다리로, 대역폭을
+손실 법칙으로, 상한 0.70·fs/2. **되돌리면서 지웠던 테스트도 그 커밋에 있다.**
+그 위에 4.1 의 승자 가중을 켜고 다시 A/B 하라. 기대: 8~12 kHz 의 −6.0 dB 계통
+결손(§38.2b)이 닫히면서 이번에는 잡음이 안 늘어야 한다.
+
+### 4.4 [선택] 위상 단계의 예산
+
+`copyfit.py --phase-iters` 기본값 **200** 은 라이브러리 기본값 **800** 과 어긋난 낡은
+값이다 (§39). 3 단계는 항상 꺾였다 회복하는데 200 회로는 회복을 못 끝낸다 —
+실측 `out/pole/s040`: 90.63 → 85.06 [50] → 89.09 [199], **아직 오르는 중에 끝남**.
+
+`--phase-iters 800` 로 A/B 해서 기본값을 정하라. 시간이 4 배 더 든다.
+
+> 정정: §39.1 에 "lr 탐침이 편향돼 있다" 고 적었는데, 800 회일 때는 탐침 지평이
+> 100 회라 **제대로 가른다** (0.050 → 2.72, 0.120 → 4.37). 200 회일 때만 무의미하다.
+
+---
+
+## 5. 함정 (내가 실제로 밟은 것들)
+
+| 함정 | 증상 | 대처 |
 |---|---|---|
-| `lad` | (없음) | 혼합 사다리가 `out/fix` 보다 나은가 |
-| `ph800` | `--phase-iters 800` | 위상 단계의 예산 (§39) |
-| `ph800lr` | `--phase-iters 800 --lr-phase 0.12` | 탐침 편향까지 우회 (§39.1) |
-| `sub1` | `--subf0 1.0` | F0 아래 초과 (+11.7 dB, 셋 중 가장 큼) |
-| `sharp1` | `--sharp 1.0` | 유성 첨예도 (0.867) |
-| `cont1` | `--cont 1.0` | 창별 악화 |
+| **메모리** | 적합이 **로그도 트레이스백도 없이 사라짐** | 한 건 RSS 3.8 GB. 동시 실행 수 = 가용 메모리 / 3.8 |
+| **고아 프로세스** | 로그가 이진 쓰레기가 되고 `out/` 에 어느 코드의 결과인지 모를 파일이 남음 | `pkill -f "out/lad/s0"` 은 **`s101` 에 안 맞는다.** 시작 전에 `ps` 로 확인, 대기열은 하나만 |
+| **포락 점수만 보기** | 소리가 망가졌는데 점수는 유지 | §2 의 규칙 |
+| **장기 평균 스펙트럼만 보기** | 조용한 프레임의 6~12 dB 결손이 묻힘 | `probe_band_bias.py` 로 프레임별 편향도 볼 것 |
+| **하모닉 빗을 안 지우고 "구멍" 재기** | 목표 자체가 −10.5 dB 구멍을 냄 | `bandcmp.py` 는 250 Hz 로 평활한다 |
+| **위상 단계** | 항상 꺾였다 회복. 중간에 보면 망한 줄 안다 | 끝까지 돌려서 판단 |
+| **자유 파라미터 늘리기** | 같은 예산으로 오히려 수렴이 나빠짐 | §40: 열 32 → 40 으로 늘렸더니 위상 단계가 66.79 % 로 붕괴 |
 
-기준선은 `out/fix` (포락 92.44 / 90.87 %) 다. 파일은 `yang_00000040`,
-`yang_00000101` 두 개를 같이 봐야 한다 — 한 파일만 보면 §38 처럼 결론이 갈린다.
-
-## 준비
-
-원격 컨테이너의 제약은 메모리다 — 적합 한 건이 **RSS 3.8 GB** 를 쓰는데 컨테이너의
-가용 메모리가 9 GB 라 **두 건을 같이 돌리면 OOM 으로 조용히 죽는다** (로그에 아무
-흔적도 안 남는다. `out/lad` 1 차 시도가 그렇게 사라졌다). 그래서 여기서는 직렬로만
-돌린다. 메모리가 넉넉한 기계에서는 병렬로 돌려 훨씬 빨리 끝난다.
-
-## 준비
-
-위 0 절의 clone·venv 까지 하면 끝이다. `data/voices/` 의 음원과
-`profiles/yang_female.json` 은 저장소에 들어 있다.
-
-## 한 건 돌리기
+## 6. 자 (도구) 목록
 
 ```bash
-OMP_NUM_THREADS=2 .venv/bin/python scripts/copyfit.py \
-    data/voices/yang_00000040.wav \
-    --profile profiles/yang_female.json \
-    --out out/lad/s040
+scripts/probe_hnr.py        # 조화 ÷ 비조화 [dB], 대역별. ★ 가장 중요
+scripts/plot_breakup.py     # 시간축 — 어디서 끊어지나 (파형 상관)
+scripts/plot_noise.py       # 주파수축 — 잡음이 어디서 늘었나
+scripts/probe_band_bias.py  # 프레임별 멜 대역 편향 (장기평균이 못 보는 것)
+scripts/probe_contrast.py   # 공진 대비 — "울림이 부족하다"
+scripts/bandcmp.py          # 장기평균 대역 오차 · 구멍 · 골 깊이
+scripts/acceptance.py       # 사용자의 네 합격 조건
 ```
 
-끝나면 `out/lad/s040_target.wav`, `_fit.wav`, `_track.npz`, `_report.json` 이 생긴다.
+**세 개 이상을 함께 읽어라. 하나만 보면 반드시 속는다.**
 
-## 여러 건 병렬로
+## 7. 사용자가 요구한 것 (원문 유지)
 
-메모리 / 3.8 GB 만큼 동시에 돌린다. 16 GB 면 3 개, 32 GB 면 7 개.
+1. 세로 얼룩 없음 / 스펙트럼 일치 / 파형 장기 추이곡선 일치 / 지터 낮음
+2. "치찰음은 파형 자체를 비교하면 문제가 생기니 척도를 잘 찾아봐"
+3. "울림이 부족하고 살짝 플랫하게 들려. 공진 조건이 잘 닫히지 않은 문제처럼 보여"
+4. "손실함수에서 이전 윈도우의 손실함수보다 더 악화되면 큰 벌점" → `--corr`
+5. "성대 진동에 한하여 스펙트럼이 첨예하지 않은 것에 대한 패널티" → `--sharp`
+6. "f0과 연계된 주파수보다 낮은 진동" → `--subf0` (프라이는 억누르지 말 것)
+7. "비조화항도 당연 고려" → `--hnr`
+8. 소스-필터 이론의 근간을 흔들지 말 것 — 필터의 *구현*은 바꿔도 되지만
+   소스와 필터의 분리는 유지한다
+
+## 8. 결과를 원격으로 되돌리기
 
 ```bash
-for n in 040 101 034 094; do
-  OMP_NUM_THREADS=2 .venv/bin/python scripts/copyfit.py \
-      data/voices/yang_00000${n}.wav --profile profiles/yang_female.json \
-      --out out/lad/s${n} > log_${n}.txt 2>&1 &
-done
-wait
+git add -f out/L3 docs/ scripts/ src/ tests/
+git commit -m "로컬 A/B 결과"
+git pull --rebase && git push
 ```
 
-## GPU
-
-`--device cuda` (또는 애플 실리콘이면 `--device mps`). 엔진은 전부 torch 연산이라
-그대로 올라간다. **다만 병렬 개수는 GPU 메모리가 아니라 CPU 메모리로 정하라** —
-목표 신호 분석(Praat)과 STFT 준비가 CPU 쪽에서 그만큼 쓴다.
-
-```bash
-.venv/bin/python scripts/copyfit.py data/voices/yang_00000040.wav \
-    --profile profiles/yang_female.json --out out/lad/s040 --device cuda
-```
-
-## 결과를 읽는 자
-
-```bash
-# 대역 오차 · 구멍 · 골 깊이
-.venv/bin/python scripts/bandcmp.py out/fix/s040 out/lad/s040
-.venv/bin/python scripts/bandcmp.py --valleys out/lad/s040
-
-# 프레임별 대역 편향 (장기 평균이 못 보는 것)
-.venv/bin/python scripts/probe_band_bias.py out/lad/s040
-
-# 공진 대비 — "울림이 부족하다" 를 재는 자
-.venv/bin/python scripts/probe_contrast.py out/fix/s040 out/lad/s040
-
-# 네 합격 조건
-.venv/bin/python scripts/acceptance.py out/lad/s040 --seeds 5
-```
-
-## 요청받은 세 벌점 켜기
-
-전부 기본값 0 이다. 세기는 A/B 로 정해야 한다.
-
-```bash
---cont 1.0     # 창별 손실이 직전 창보다 나빠진 만큼
---sharp 1.0    # 유성 구간이 목표보다 뭉툭한 만큼
---subf0 1.0    # F0 아래가 목표보다 시끄러운 만큼
-```
-
-## 결과를 다시 여기로
-
-```bash
-git add out/<태그>
-git commit -m "로컬 적합 결과"
-git push
-```
-
-`out/` 이 `.gitignore` 에 있으면 `git add -f` 를 쓰거나, `_report.json` 과
-`_track.npz` 만 올려도 된다 — 그 둘이면 여기서 다시 렌더해 분석할 수 있다.
+`_report.json` 과 `_track.npz` 만 있어도 원격에서 다시 렌더해 분석할 수 있다.
