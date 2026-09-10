@@ -45,7 +45,7 @@ class EngineConfig:
     frame_ms: float = 1.0
     speaker: str = "female"
     tract_length_cm: float = 14.6
-    n_extra_formants: int | None = None      # None = 나이퀴스트까지 전부 (고차 극 보정)
+    n_extra_formants: int | None = None      # None = 기본 6 개. F_K 위로 c/(2L) 간격 (고차 극 보정)
     residual: bool = True
     seed: int = 0
     # Experimental A/B only; keep legacy until held-out pronunciation evidence.
