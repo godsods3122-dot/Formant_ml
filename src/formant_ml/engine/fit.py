@@ -700,7 +700,18 @@ class CopySynthFitter:
         return sc_sum / len(self.sizes), env_db, env_sc, per
 
     def _flux_stat(self, mdb: torch.Tensor, make_mask: bool = False):
-        """멜 대역별 **시간 변화율** `mean_t |Δ dB|` — 세로 얼룩의 통계.
+        """**프레임별** 대역평균 변화율 `mean_k |Δ dB(t,k)|` — 세로 얼룩 그 자체.
+
+        **대역 평균이 아니라 프레임별로 낸다.** 대역별 시간평균으로 재면 프레임이
+        많은 계급이 통계를 지배한다 — 실측(out/room2/s040): 얼룩이 몰려 있는 마찰
+        프레임은 살아있는 238 개 중 **16 개(7 %)** 뿐이다. 계급별 얼룩 비는
+
+            전체 1.150,  **마찰 1.856**,  유성 1.128        (s040)
+            전체 1.198,    마찰 1.232,    유성 1.024        (s101)
+
+        이므로 고쳐야 할 곳은 마찰인데, 대역평균 항은 거기에 7 % 의 무게만 준다.
+        프레임별로 맞추면 모든 프레임이 같은 무게를 갖는다. 정의도 합격 판정
+        (`scripts/acceptance.py:flux`)과 정확히 같아진다.
 
         `make_mask=True` 면 "소리 나는 프레임" 마스크도 같이 만든다. 무음의 −∞ 근처
         dB 는 잘게 흔들려 통계를 통째로 오염시킨다 (§30 에서 합격 판정이 같은 이유로
@@ -708,26 +719,29 @@ class CopySynthFitter:
         """
         L = max(1, int(FLUX_LAG))
         if mdb.shape[-1] <= L:
-            z = torch.zeros(mdb.shape[-2], dtype=mdb.dtype, device=mdb.device)
+            z = torch.zeros(1, dtype=mdb.dtype, device=mdb.device)
             return (z, None) if make_mask else z
-        d = self._soft_abs(mdb[..., L:] - mdb[..., :-L], 0.5)
+        f = self._soft_abs(mdb[..., L:] - mdb[..., :-L], 0.5).mean(-2)   # (…, T−L)
         if make_mask:
-            lvl = mdb.mean(-2)                                   # 프레임 평균 dB
-            live = (lvl > float(lvl.max()) - 45.0)
-            live = (live[..., L:] & live[..., :-L]).to(mdb.dtype)
-            w = live / live.sum().clamp_min(1.0)
-            return (d * w).sum(-1), live
-        live = self.flux_live
-        if live is None or live.shape[-1] != d.shape[-1]:
-            return d.mean(-1)
-        w = live.to(d.dtype) / live.sum().clamp_min(1.0)
-        return (d * w).sum(-1)
+            lvl = mdb.mean(-2)
+            live = lvl > float(lvl.max()) - 45.0
+            return f, (live[..., L:] & live[..., :-L])
+        return f
 
     def flux_loss(self, raw_mel_db: torch.Tensor) -> torch.Tensor:
-        """플럭스를 **일치**시킨다 — 크면 세로 줄, 작으면 기계적이다."""
+        """플럭스를 **일치**시킨다 — 크면 세로 줄, 작으면 기계적이다.
+
+        최소화가 아니라 일치인 이유: 짧은 창의 스펙트럼이 안 흔들리는 잡음은 잡음이
+        아니라 음(音)이다. 목표의 마찰음도 flux p95 가 4.85 dB 로 흔들린다.
+        """
         f = self._flux_stat(raw_mel_db)
         m = min(f.shape[-1], self.tgt_flux.shape[-1])
-        return self._soft_abs(f[..., :m] - self.tgt_flux[..., :m], 0.1).mean() / 20.0
+        d = self._soft_abs(f[..., :m] - self.tgt_flux[..., :m], 0.1)
+        live = self.flux_live
+        if live is not None and live.shape[-1] >= m:
+            w = live[..., :m].to(d.dtype)
+            return (d * w).sum() / w.sum().clamp_min(1.0) / 20.0
+        return d.mean() / 20.0
 
     def phase_loss(self, y: torch.Tensor) -> torch.Tensor:
         """**단위 크기** 복소 잔차 — 크기와 직교한 순수 위상 거리, 조화 우세부에만.
