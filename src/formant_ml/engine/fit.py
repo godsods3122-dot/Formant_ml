@@ -407,7 +407,13 @@ GRID_MS = (20.0, 10.0, 5.0, 1.0)
 DEFAULT_PARAMS = (
     "p_sub", "adduction", "f0_target", "rd_offset", "tilt", "aspiration",
     "jitter", "shimmer",
-    "f1", "f2", "f3", "f4", "bw1", "bw2", "bw3", "bw4",
+    # **여덟 개 전부.** 예전에는 f1~f4·bw1~bw4 뿐이었고, 그 이유는 분석기가 F5~F8 을
+    # 0 으로 남기던 것과 맞물려 있었다 (0 이면 `self.names` 가 로그 열을 통째로 뺀다).
+    # 그래서 성도의 **위쪽 절반이 균일관 값에 얼어붙은 채 한 번도 피팅된 적이 없었다** —
+    # 그리고 우리가 쫓던 5.6~8 kHz 와 8~12 kHz 오차가 정확히 그 대역이다. F5~F8 은
+    # LPC 로 재지 않고 관의 극 간격 c/(2L) 로 초기화한 뒤 적합이 다듬는다 (§36).
+    "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8",
+    "bw1", "bw2", "bw3", "bw4", "bw5", "bw6", "bw7", "bw8",
     "tract_gain", "a_c", "fric_gain", "obstacle", "back_leak", "front_len",
     "velum", "oral_open", "nasal_f", "nasal_f2", "nasal_f3", "nasal_z",
     "nasal_damp", "nasal_gain",
@@ -534,8 +540,12 @@ class CopySynthFitter:
                                    device=device)
         self.prior_w = torch.tensor([PRIOR_W.get(n, 1.0) for n in self.names],
                                     dtype=torch.float64, device=device)
+        # **여덟 개 전부.** 예전에는 f1~f4 뿐이었는데, 그것은 분석기가 F5~F8 을 0 으로
+        # 남기고 `self.names` 의 필터가 "로그 파라미터의 초기값이 0 이면 적합 대상에서
+        # 뺀다" 이기 때문이었다 — 성도의 위쪽 절반이 균일관 값에 얼어붙은 채 한 번도
+        # 피팅된 적이 없었다. 순서 벌점은 이제 F8 까지 걸린다.
         self.f_idx = [i for i, n in enumerate(self.names)
-                      if n in ("f1", "f2", "f3", "f4")]
+                      if len(n) == 2 and n[0] == "f" and n[1].isdigit()]
         self.log_gain = torch.zeros(1, dtype=torch.float64, device=device,
                                     requires_grad=True)
 

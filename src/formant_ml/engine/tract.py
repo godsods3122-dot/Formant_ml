@@ -131,6 +131,16 @@ class VocalTract(nn.Module):
             x, state[key] = tv_biquad(x, *resonator_coeffs(f, bw, self.fs), zi=state.get(key))
         return x
 
+    @staticmethod
+    def _soft_cap(x, cap, w: float = 400.0):
+        """상한에 부드럽게 붙는 최소값. 상한을 넘는 극들이 **겹치지 않게** 한다.
+
+        `clamp` 를 쓰면 상한 위의 극이 전부 같은 자리에 쌓여 거기 날카로운 봉우리가
+        선다 (F8 이 11.9 kHz 까지 가는 프레임이 있다). 이 식은 순증가라 순서를
+        보존하면서 [cap − w·ln2, cap) 안으로 압축한다. 미분 가능하다.
+        """
+        return cap - w * torch.nn.functional.softplus((cap - x) / w)
+
     def _extra_cascade(self, x, tracks, state):
         """마지막 포먼트 위로 c/(2L) 간격의 극을 이어 붙인다.
 
@@ -145,8 +155,13 @@ class VocalTract(nn.Module):
         cap = self.extra_cap * self.fs / 2.0
         for i in range(self.n_extra):
             key = f"x{i}"
-            fk = (f_last + (i + 1) * self.extra_spacing).clamp(max=cap)
-            bw = self.default_bw(fk) * bw_scale
+            raw = f_last + (i + 1) * self.extra_spacing
+            fk = self._soft_cap(raw, cap)
+            # 상한에 눌린 만큼 대역폭을 넓힌다. 안 그러면 눌린 극들이 상한 근처에
+            # 25 Hz 간격으로 쌓여 거기 날카로운 봉우리가 선다 (F8 이 11.9 kHz 인
+            # 프레임에서 실제로 그렇다). 상한은 1 차원 관 모형이 끝나는 자리라
+            # 거기서 손실이 커지는 것은 물리적으로도 맞다 (횡모드·벽 손실).
+            bw = (self.default_bw(fk) + (raw - fk)) * bw_scale
             x, state[key] = tv_biquad(x, *resonator_coeffs(fk, bw, self.fs), zi=state.get(key))
         return x
 

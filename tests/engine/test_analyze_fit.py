@@ -438,6 +438,41 @@ def test_fitting_defaults_are_the_measured_ones():
     assert F.FLUX_W == 2.0
     assert F.ARTIC_VEL_W == 1.0 and F.ARTIC_VEL_KNEE["a_c"] == 0.20
     assert G.TILT_MAX_HZ == 5000.0
+    # BW_LAW_W 는 0 이어야 한다. yang_00000040 전체에서 0.5 -> 포락 85.79 %,
+    # 2.0 -> 89.63 %, 둘 다 0 의 92.44 % 보다 나쁘다 (§35.4: 대역폭 과대의 원인이
+    # 극 부족이 아니므로, 법칙으로 좁히면 맞출 수단만 뺏는다).
+    assert F.BW_LAW_W == 0.0
+
+
+def test_all_eight_formants_reach_the_fit():
+    """분석기가 F5~F8 을 채워야 적합기가 그것을 만질 수 있다.
+
+    `CopySynthFitter` 는 "로그 척도 파라미터의 초기값이 어디선가 0 이면 적합
+    대상에서 뺀다". 분석기가 F5~F8 을 0 으로 남기던 동안 **성도의 위쪽 절반이
+    균일관 값에 얼어붙은 채 한 번도 피팅된 적이 없었다** — 그리고 5.6~8 kHz 와
+    8~12 kHz 의 오차가 정확히 그 대역이다.
+    """
+    import numpy as np
+    from formant_ml.engine.analyze import analyze
+    from formant_ml.engine.control import N_FORMANTS
+    from formant_ml.engine.profile import DEFAULT_PROFILE
+    fs = 48000
+    tr = analyze(_synthetic_vowel(fs, dur=0.3), fs, DEFAULT_PROFILE, int(0.001 * fs))
+    sp = 35000.0 / (2.0 * DEFAULT_PROFILE.tract_length_cm)
+    for k in range(1, N_FORMANTS + 1):
+        f, bw = tr[f"f{k}"], tr[f"bw{k}"]
+        # 0 이면 `self.names` 필터가 이 열을 통째로 뺀다 — 그것이 요점이다.
+        assert float(np.min(np.abs(f))) > 0.0, k
+        assert float(np.min(np.abs(bw))) > 0.0, k
+    for k in range(1, N_FORMANTS):
+        assert float((tr[f"f{k+1}"] - tr[f"f{k}"]).min()) > 0.0, k
+    # 채워 넣은 상위 포먼트는 관의 극 간격 c/(2L) 을 따라야 한다.
+    top = tr["f8"] - tr["f7"]
+    assert abs(float(top.mean()) - sp) < 1.0
+    # 그리고 실제로 적합 대상에 들어와야 한다 — 채우기만 하고 목록에 없으면 소용없다.
+    from formant_ml.engine.fit import DEFAULT_PARAMS
+    for k in range(1, N_FORMANTS + 1):
+        assert f"f{k}" in DEFAULT_PARAMS and f"bw{k}" in DEFAULT_PARAMS, k
 
 
 def test_articulator_velocity_penalty_spares_real_gestures(_engine):

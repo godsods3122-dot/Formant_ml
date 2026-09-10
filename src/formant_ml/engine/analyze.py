@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from .control import INDEX, PARAM_NAMES, ControlTrack, default_vector
+from .control import INDEX, N_FORMANTS, PARAM_NAMES, ControlTrack, default_vector
 from .profile import SpeakerProfile
 
 
@@ -149,8 +149,13 @@ def smooth_track(x: np.ndarray, med: int, avg: int) -> np.ndarray:
 OBSTACLE_FLOOR = 0.02
 
 
+#: LPC 로 **실측**하는 포먼트 수. 16 kHz·차수 14 는 5.5 kHz 까지만 담으므로 그 위는
+#: 재지 않고 관의 극 간격 c/(2L) 로 채운다.
+N_MEASURED = 4
+
+
 def analyze(y: np.ndarray, sr: int, prof: SpeakerProfile, hop: int,
-            n_formants: int = 4, order: int | None = None,
+            n_formants: int = N_FORMANTS, order: int | None = None,
             t0: float = 0.0, full: np.ndarray | None = None,
             pulses: np.ndarray | None = None) -> ControlTrack:
     """녹음 -> 제어열 초기값 (프레임 = hop 샘플).
@@ -245,11 +250,14 @@ def analyze(y: np.ndarray, sr: int, prof: SpeakerProfile, hop: int,
             spacing = 35000.0 / (2.0 * prof.tract_length_cm)
             prev, cur = 0.0, []
             for k in range(1, n_formants + 1):
-                if len(fmts) >= k:
+                if k <= N_MEASURED and len(fmts) >= k:
                     f, bw = fmts[k - 1]
                     bwv = float(np.clip(bw, 40.0, 900.0))
                 else:
-                    f, bwv = prev + spacing, 200.0 + 60.0 * k
+                    # 채움 대역폭은 손실 법칙 (`VocalTract.default_bw` 와 같은 식).
+                    # 예전의 `200 + 60k` 는 6~10 kHz 에서 물리값의 1.3~1.5 배였다.
+                    f = prev + spacing
+                    bwv = 40.0 + 0.05 * f
                 f = max(f, prev + 120.0)
                 prev = f
                 cur.append((f, bwv))
