@@ -94,6 +94,11 @@ def main() -> None:
     ap.add_argument("--prior", action="append", default=None, metavar="이름=값",
                     help="사전 가중(fit.PRIOR_W) 덮어쓰기. 여러 번 줄 수 있다. "
                          "예: --prior aspiration=3.0")
+    ap.add_argument("--bw-law", type=float, default=None,
+                    help="포먼트 대역폭을 손실 법칙(40+0.05F) 쪽으로 당기는 세기 "
+                         "(fit.BW_LAW_W). 대역폭은 기하가 아니라 손실이 정하는 "
+                         "양이라 자유 파라미터로 두면 적합기가 극을 뭉개 스펙트럼 "
+                         "기울기를 흉내 낸다 (MEASUREMENTS §35)")
     ap.add_argument("--flux", type=float, default=None,
                     help="세로 얼룩(스펙트럼 플럭스) **일치** 항의 세기 (fit.FLUX_W). "
                          "지금 손실은 _expect 때문에 얼룩을 원리적으로 못 본다 — "
@@ -117,7 +122,8 @@ def main() -> None:
     a = ap.parse_args()
     torch.set_num_threads(a.threads)
     if (a.ripple is not None or a.prior or a.artic_vel is not None
-            or a.vel_w is not None or a.flux is not None):
+            or a.vel_w is not None or a.flux is not None
+            or a.bw_law is not None):
         from formant_ml.engine import fit as _fit
         if a.ripple is not None:
             _fit.RIPPLE_W = float(a.ripple)
@@ -127,6 +133,8 @@ def main() -> None:
             _fit.VEL_W = float(a.vel_w)
         if a.flux is not None:
             _fit.FLUX_W = float(a.flux)
+        if a.bw_law is not None:
+            _fit.BW_LAW_W = float(a.bw_law)
     if a.tilt_cap is not None:
         from formant_ml.engine import glottis as _g
         _g.TILT_MAX_HZ = float(a.tilt_cap)
