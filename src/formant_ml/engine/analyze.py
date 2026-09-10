@@ -149,13 +149,15 @@ def smooth_track(x: np.ndarray, med: int, avg: int) -> np.ndarray:
 OBSTACLE_FLOOR = 0.02
 
 
-#: LPC 로 **실측**하는 포먼트 수. 16 kHz·차수 14 는 5.5 kHz 까지만 담으므로 그 위는
-#: 재지 않고 관의 극 간격 c/(2L) 로 채운다.
+#: LPC 로 **실측**하는 포먼트 수. 16 kHz·차수 14 는 5.5 kHz 까지만 담는다.
+#: 그 위는 여기서 채우지 않고 **0 으로 남긴다** — `VocalTract._formant_tracks` 가
+#: "빠진 포먼트 = 직전 + c/(2L)" 로 만들어 준다. 적합된 F4 를 따라 사다리 전체가
+#: 함께 움직여야 하므로, 분석 시점의 F4 로 굳혀 두면 안 된다 (MEASUREMENTS §40).
 N_MEASURED = 4
 
 
 def analyze(y: np.ndarray, sr: int, prof: SpeakerProfile, hop: int,
-            n_formants: int = N_FORMANTS, order: int | None = None,
+            n_formants: int = N_MEASURED, order: int | None = None,
             t0: float = 0.0, full: np.ndarray | None = None,
             pulses: np.ndarray | None = None) -> ControlTrack:
     """녹음 -> 제어열 초기값 (프레임 = hop 샘플).
@@ -250,7 +252,7 @@ def analyze(y: np.ndarray, sr: int, prof: SpeakerProfile, hop: int,
             spacing = 35000.0 / (2.0 * prof.tract_length_cm)
             prev, cur = 0.0, []
             for k in range(1, n_formants + 1):
-                if k <= N_MEASURED and len(fmts) >= k:
+                if len(fmts) >= k:
                     f, bw = fmts[k - 1]
                     bwv = float(np.clip(bw, 40.0, 900.0))
                 else:

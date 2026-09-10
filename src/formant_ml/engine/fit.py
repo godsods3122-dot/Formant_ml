@@ -50,6 +50,7 @@ from .control import INDEX, PARAMS, ControlTrack
 
 FFT_SIZES = (256, 512, 1024, 2048, 4096)
 MEL_FFT = 256              # 포락용 창 (5.3 ms @48 kHz) — 하모닉이 분해되지 않는다
+HARM_FFT = 2048            # 하모닉용 창 (43 ms, 분해능 23 Hz) — F0 빗살이 보인다
 DB_RANGE = 70.0            # 정점 아래 이만큼까지만 본다
 # **난류 우세 빈에서 기대 스펙트럼을 볼 시간 폭 (ms). 0 이면 끈다.**
 #
@@ -377,6 +378,44 @@ FLUX_W = 2.0               # 0 이면 항이 빠진다. `copyfit --flux 0` 으�
 # 들린다. 하나의 원인이 두 증상을 만든다 (MEASUREMENTS §35).
 #
 # 세기 0 이면 항이 빠진다. `copyfit --bw-law` 로 조절한다.
+#: **창별 손실이 악화되면 문다** (사용자 요청). 평균 손실은 국소 붕괴를 못 본다 —
+#: 실측(§38.2c): 50 ms 구간별 파형 상관이 대부분 1.00 인데 한 구간만 0.88 → **−0.06**
+#: 으로 뒤집힌다(펄스가 1/3 주기 미끄러짐). 그 한 구간은 평균에서 1/28 의 무게다.
+#: `softplus(e_t − e_{t−L})` 로 **악화분만** 문다 — 절대 수준 항(`env_db`)이 그대로
+#: 있으므로 "전부 고르게 나쁘게" 로는 회피할 수 없다.
+CONT_W = 0.0
+CONT_LAG = 4               # 프레임. 256 창의 hop 이 64 샘플이라 4 = 창 하나 (5.3 ms)
+CONT_KNEE_DB = 0.5         # 이만큼의 악화는 공짜 (계측 잡음)
+
+#: **유성 구간의 스펙트럼 첨예도** (사용자 요청). 포락 일치율은 이것을 볼 수 없다 —
+#: 멜 48 밴드는 6 kHz 에서 폭이 700~900 Hz 인데 포먼트 간격은 c/(2L) ≈ 1199 Hz 라
+#: 봉우리와 골이 한 밴드 안에서 평균되어 사라진다 (§37).
+#:
+#: 실측 비(적합/목표): 포먼트 대비 0.867~0.932, 하모닉 첨예 0.850~0.927. 두 자 다
+#: 적합이 **덜 첨예**하다고 말한다.
+#:
+#: **한쪽 방향으로만 문다.** 목표보다 뭉툭할 때만 벌하고 날카로울 때는 공짜다 —
+#: 양쪽으로 물면 목표보다 날카로운 해를 만들어 낼 이유가 생기고, 그건 그것대로
+#: 인공적이다.
+SHARP_W = 0.0
+SHARP_WIN_HZ = 2000.0      # 포먼트 대비: 극 간격보다 넓어야 봉우리와 골이 모두 남는다
+SHARP_LO_HZ, SHARP_HI_HZ = 300.0, 12000.0
+HARM_WIN_HZ = 900.0        # 하모닉 첨예: 긴 창(2048)에서 F0 빗살이 보이는 폭
+HARM_LO_HZ, HARM_HI_HZ = 100.0, 4000.0
+
+#: **F0 아래의 진동** (사용자 요청). 실측(`out/fix/s040`): 목표는 F0 아래가 기준대역
+#: 대비 −20.99 dB 인데 적합은 −9.31 dB — **+11.7 dB 초과**다 (s101 +2.5, out/pole 은
+#: +15.0 까지 나빠졌다).
+#:
+#: **"F0 아래를 금지" 가 아니라 "목표보다 초과한 만큼" 을 문다.** 사용자가 지적한
+#: 대로 금지하면 성대 프라이나 서브하모닉까지 억누른다 — 목표에 진짜 프라이가 있으면
+#: 목표의 F0 아래 레벨도 높으므로 벌점이 저절로 0 이 된다. 기준 F0 는 **목표의 것**을
+#: 쓴다 (적합된 F0 를 쓰면 벌점이 제 꼬리를 문다).
+SUBF0_W = 0.0
+SUBF0_HI = 0.75            # F0 의 이 배율 아래를 "F0 아래" 로 본다
+SUBF0_REF = (0.9, 3.0)     # 기준 대역 (F0 배율)
+SUBF0_KNEE_DB = 1.0
+
 BW_LAW_W = 0.0
 #: 허용 배수의 로그. 0.3 이면 법칙의 ×/÷ 1.35 배까지는 사실상 공짜다 — 화자·모음마다
 #: 실제로 그만큼 흔들리기 때문이다(기식도, 성문 손실). 그 밖은 값을 치른다.
@@ -407,13 +446,13 @@ GRID_MS = (20.0, 10.0, 5.0, 1.0)
 DEFAULT_PARAMS = (
     "p_sub", "adduction", "f0_target", "rd_offset", "tilt", "aspiration",
     "jitter", "shimmer",
-    # **여덟 개 전부.** 예전에는 f1~f4·bw1~bw4 뿐이었고, 그 이유는 분석기가 F5~F8 을
-    # 0 으로 남기던 것과 맞물려 있었다 (0 이면 `self.names` 가 로그 열을 통째로 뺀다).
-    # 그래서 성도의 **위쪽 절반이 균일관 값에 얼어붙은 채 한 번도 피팅된 적이 없었다** —
-    # 그리고 우리가 쫓던 5.6~8 kHz 와 8~12 kHz 오차가 정확히 그 대역이다. F5~F8 은
-    # LPC 로 재지 않고 관의 극 간격 c/(2L) 로 초기화한 뒤 적합이 다듬는다 (§36).
-    "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8",
-    "bw1", "bw2", "bw3", "bw4", "bw5", "bw6", "bw7", "bw8",
+    # **F1~F4 만 자유다.** F5~F8 을 자유 파라미터로 풀어 봤다가 되돌렸다 (§40):
+    # 열이 32 → 40 개가 되자 같은 예산으로 2.4 단계가 회복을 못 했고 (87.45 → 85.31,
+    # `out/pole` 은 같은 자리에서 88.81 → 90.63), 위상 단계가 66.79 % / 43.94 % 로
+    # 무너졌다. 위쪽 포먼트는 **자유도가 아니라 물리**다 — 극 간격 c/(2L) 는 조음과
+    # 무관한 절대 제약이고, 실제로 5 번 모드부터 무작위 면적 함수 8 종에서 그 20 Hz
+    # 안에 든다 (§35.1). `_formant_tracks` 가 "빠진 포먼트 = 직전 + c/(2L)" 로 만든다.
+    "f1", "f2", "f3", "f4", "bw1", "bw2", "bw3", "bw4",
     "tract_gain", "a_c", "fric_gain", "obstacle", "back_leak", "front_len",
     "velum", "oral_open", "nasal_f", "nasal_f2", "nasal_f3", "nasal_z",
     "nasal_damp", "nasal_gain",
@@ -485,6 +524,7 @@ class CopySynthFitter:
         self._last_flux = float("nan")
         self._flux_db = None
         self.flux_live = None
+        self._mel_err = self._mel_raw_db = self._harm_db = None
         self.sizes = list(FFT_SIZES)
 
         # 녹음의 원래 나이퀴스트. **손실에서 그 위를 보면 안 된다.**
@@ -540,10 +580,8 @@ class CopySynthFitter:
                                    device=device)
         self.prior_w = torch.tensor([PRIOR_W.get(n, 1.0) for n in self.names],
                                     dtype=torch.float64, device=device)
-        # **여덟 개 전부.** 예전에는 f1~f4 뿐이었는데, 그것은 분석기가 F5~F8 을 0 으로
-        # 남기고 `self.names` 의 필터가 "로그 파라미터의 초기값이 0 이면 적합 대상에서
-        # 뺀다" 이기 때문이었다 — 성도의 위쪽 절반이 균일관 값에 얼어붙은 채 한 번도
-        # 피팅된 적이 없었다. 순서 벌점은 이제 F8 까지 걸린다.
+        # 자유 포먼트만. F5~F8 은 `_formant_tracks` 가 c/(2L) 사다리로 만들므로
+        # 순서가 구조적으로 보장된다 — 벌점을 걸 대상이 아니다.
         self.f_idx = [i for i, n in enumerate(self.names)
                       if len(n) == 2 and n[0] == "f" and n[1].isdigit()]
         self.log_gain = torch.zeros(1, dtype=torch.float64, device=device,
@@ -588,6 +626,7 @@ class CopySynthFitter:
             raw_mel = self.mel[:, :raw[MEL_FFT].shape[1]] @ raw[MEL_FFT]
             self.tgt_flux, self.flux_live = self._flux_stat(self._db(raw_mel),
                                                             make_mask=True)
+            self._prepare_voice_stats(raw)
         self.calibrate_gain()
 
     # ------------------------------------------------------- 재매개화
@@ -763,12 +802,14 @@ class CopySynthFitter:
         로 재고 (로그 주파수 = 대역마다 같은 무게), 정점 −70 dB 아래는 잘라 낸다.
         """
         sc_sum, per = 0.0, {}
-        Smel = Smel_raw = None
+        Smel = Smel_raw = harm_raw = None
         for k in self.sizes:
             raw = self._cabs(_stft(y, k, self.wins[k]))[:, :self.bin_max[k]]
             Sp = self._expect(raw, k)
             if k == MEL_FFT:
                 Smel, Smel_raw = Sp, raw
+            if k == HARM_FFT:
+                harm_raw = self._db(raw)
             sc = self._sc(self.tgt_S[k], Sp)
             sc_sum = sc_sum + sc
             per[k] = float(100.0 * (1.0 - sc.detach()))
@@ -789,6 +830,11 @@ class CopySynthFitter:
         if FLUX_W > 0.0:
             # **날것 멜**로 잰다 (`_expect` 를 지나면 재려는 흔들림이 이미 없다).
             self._flux_db = self._db(self.mel[:, :Smel_raw.shape[1]] @ Smel_raw)
+        # 사용자 요청 세 항이 쓸 재료. 첨예도·F0 아래는 **평활 전** 스펙트럼이라야 한다.
+        self._mel_err = (self._soft_abs(a - b, 0.5).mean(-2)
+                         if CONT_W > 0.0 else None)
+        self._mel_raw_db = self._db(Smel_raw) if SHARP_W > 0.0 else None
+        self._harm_db = (harm_raw if (SHARP_W > 0.0 or SUBF0_W > 0.0) else None)
         return sc_sum / len(self.sizes), env_db, env_sc, per
 
     def _flux_stat(self, mdb: torch.Tensor, make_mask: bool = False):
@@ -834,6 +880,121 @@ class CopySynthFitter:
             w = live[..., :m].to(d.dtype)
             return (d * w).sum() / w.sum().clamp_min(1.0) / 20.0
         return d.mean() / 20.0
+
+    # ------------------------------------------------- 유성 구간의 세 통계
+    def _contrast(self, db: torch.Tensor, k: int, win_hz: float,
+                  lo: float, hi: float) -> torch.Tensor:
+        """국소 이동평균 대비 잔차의 평균 |·| — 봉우리와 골이 얼마나 뚜렷한가. (…,T)
+
+        창 `win_hz` 는 보려는 구조의 간격보다 **넓어야** 한다. 극 간격 1199 Hz 짜리
+        포먼트 골을 보려면 2 kHz, F0 빗살을 보려면 900 Hz 다.
+        """
+        bw = self.fs / k
+        w = max(3, int(round(win_hz / bw)) | 1)
+        f = torch.arange(db.shape[-2], device=db.device, dtype=db.dtype) * bw
+        x = db.transpose(-1, -2)                       # (…, T, F)
+        sh = x.shape
+        env = torch.nn.functional.conv1d(
+            x.reshape(-1, 1, sh[-1]),
+            torch.ones(1, 1, w, dtype=db.dtype, device=db.device) / w,
+            padding=w // 2).reshape(sh).transpose(-1, -2)
+        m = (f >= lo) & (f < hi)
+        return self._soft_abs(db - env, 0.1)[..., m, :].mean(-2)
+
+    def _subf0_rel(self, db: torch.Tensor) -> torch.Tensor:
+        """F0 아래 대역의 레벨 − 기준 대역의 레벨 [dB]. (T,)"""
+        sub, ref = self._subf0_m, self._subf0_r
+        t = min(db.shape[-1], sub.shape[-1])
+        d, sub, ref = db[..., :t], sub[..., :t], ref[..., :t]
+        a = (d * sub).sum(-2) / sub.sum(-2).clamp_min(1.0)
+        b = (d * ref).sum(-2) / ref.sum(-2).clamp_min(1.0)
+        return a - b
+
+    def _prepare_voice_stats(self, raw: dict) -> None:
+        """목표의 첨예도·F0 아래 레벨과 유성 마스크를 **한 번** 만든다.
+
+        `no_grad` 안에서 부른다. F0 는 **목표의 것**을 쓴다 — 적합된 F0 로 재면
+        벌점이 제 꼬리를 문다.
+        """
+        self._sharp_k = HARM_FFT if HARM_FFT in raw else None
+        mdb = self._db(raw[MEL_FFT])
+        lvl = mdb.mean(-2)
+        live = lvl > float(lvl.max()) - 45.0
+        v = np.asarray(getattr(self.track, "voiced", np.zeros(0, dtype=bool)))
+        hop = MEL_FFT // 4
+        if v.size:
+            idx = np.clip((np.arange(mdb.shape[-1]) * hop / self.hop).astype(int),
+                          0, v.size - 1)
+            vm = torch.as_tensor(v[idx], device=mdb.device)
+        else:
+            vm = torch.ones_like(live)
+        self._voiced_short = (live & vm)
+        self.tgt_sharp = self._contrast(mdb, MEL_FFT, SHARP_WIN_HZ,
+                                        SHARP_LO_HZ, SHARP_HI_HZ)
+        self.tgt_cont = None
+        self._subf0_m = self._subf0_r = self.tgt_subf0 = None
+        self.tgt_harm = self._voiced_long = None
+        if self._sharp_k is None:
+            return
+        k = self._sharp_k
+        hdb = self._db(raw[k])
+        hop = k // 4
+        f0 = np.asarray(self.track["f0_target"], dtype=np.float64)
+        idx = np.clip((np.arange(hdb.shape[-1]) * hop / self.hop).astype(int),
+                      0, max(f0.size - 1, 0))
+        f0f = torch.as_tensor(f0[idx] if f0.size else np.zeros(len(idx)),
+                              dtype=hdb.dtype, device=hdb.device)
+        fr = (torch.arange(hdb.shape[-2], device=hdb.device, dtype=hdb.dtype)
+              * (self.fs / k)).unsqueeze(-1)
+        ok = f0f > 50.0
+        f0s = f0f.clamp_min(50.0)
+        self._subf0_m = ((fr > 40.0) & (fr < SUBF0_HI * f0s)).to(hdb.dtype)
+        self._subf0_r = ((fr >= SUBF0_REF[0] * f0s)
+                         & (fr < SUBF0_REF[1] * f0s)).to(hdb.dtype)
+        hl = hdb.mean(-2)
+        lv = (hl > float(hl.max()) - 45.0) & ok & (self._subf0_m.sum(-2) > 0)
+        self._voiced_long = lv
+        self.tgt_subf0 = self._subf0_rel(hdb)
+        self.tgt_harm = self._contrast(hdb, k, HARM_WIN_HZ, HARM_LO_HZ, HARM_HI_HZ)
+
+    def continuity_loss(self, mel_err: torch.Tensor) -> torch.Tensor:
+        """창별 오차가 **직전 창보다 나빠진 만큼**을 문다. 좋아진 것은 공짜다."""
+        L = max(1, int(CONT_LAG))
+        if mel_err.shape[-1] <= L:
+            return torch.zeros((), dtype=mel_err.dtype, device=mel_err.device)
+        d = mel_err[..., L:] - mel_err[..., :-L]
+        over = self._soft_over(d - CONT_KNEE_DB, 0.3 * CONT_KNEE_DB)
+        live = self._voiced_short
+        if live is not None and live.shape[-1] >= over.shape[-1] + L:
+            w = (live[..., L:] & live[..., :-L])[..., :over.shape[-1]].to(over.dtype)
+            return (over * w).sum() / w.sum().clamp_min(1.0) / 20.0
+        return over.mean() / 20.0
+
+    def sharpness_loss(self, mel_raw_db: torch.Tensor,
+                       harm_db: torch.Tensor | None) -> torch.Tensor:
+        """유성 구간이 목표보다 **뭉툭한 만큼**을 문다. 날카로운 것은 공짜다."""
+        z = torch.zeros((), dtype=mel_raw_db.dtype, device=mel_raw_db.device)
+        tot, n = z, 0
+        c = self._contrast(mel_raw_db, MEL_FFT, SHARP_WIN_HZ, SHARP_LO_HZ, SHARP_HI_HZ)
+        m = min(c.shape[-1], self.tgt_sharp.shape[-1])
+        d = self._soft_over(self.tgt_sharp[..., :m] - c[..., :m], 0.05)
+        w = self._voiced_short[..., :m].to(d.dtype)
+        tot, n = tot + (d * w).sum() / w.sum().clamp_min(1.0), n + 1
+        if harm_db is not None and self.tgt_harm is not None:
+            c = self._contrast(harm_db, self._sharp_k, HARM_WIN_HZ, HARM_LO_HZ, HARM_HI_HZ)
+            m = min(c.shape[-1], self.tgt_harm.shape[-1])
+            d = self._soft_over(self.tgt_harm[..., :m] - c[..., :m], 0.05)
+            w = self._voiced_long[..., :m].to(d.dtype)
+            tot, n = tot + (d * w).sum() / w.sum().clamp_min(1.0), n + 1
+        return tot / max(n, 1) / 20.0
+
+    def subf0_loss(self, harm_db: torch.Tensor) -> torch.Tensor:
+        """F0 아래가 **목표보다** 시끄러운 만큼을 문다. 목표의 프라이는 벌하지 않는다."""
+        r = self._subf0_rel(harm_db)
+        m = min(r.shape[-1], self.tgt_subf0.shape[-1])
+        d = self._soft_over(r[..., :m] - self.tgt_subf0[..., :m] - SUBF0_KNEE_DB, 0.3)
+        w = self._voiced_long[..., :m].to(d.dtype)
+        return (d * w).sum() / w.sum().clamp_min(1.0) / 20.0
 
     def phase_loss(self, y: torch.Tensor) -> torch.Tensor:
         """**단위 크기** 복소 잔차 — 크기와 직교한 순수 위상 거리, 조화 우세부에만.
@@ -1133,6 +1294,12 @@ class CopySynthFitter:
             fl = self.flux_loss(self._flux_db)
             self._last_flux = float(fl.detach()) * 20.0
             l = l + FLUX_W * fl
+        if CONT_W > 0.0 and self._mel_err is not None:
+            l = l + CONT_W * self.continuity_loss(self._mel_err)
+        if SHARP_W > 0.0 and self._mel_raw_db is not None:
+            l = l + SHARP_W * self.sharpness_loss(self._mel_raw_db, self._harm_db)
+        if SUBF0_W > 0.0 and self._harm_db is not None and self.tgt_subf0 is not None:
+            l = l + SUBF0_W * self.subf0_loss(self._harm_db)
         if self.lam_smooth > 0 and self.w.shape[0] > 1:
             d = self.w[1:] - self.w[:-1]
             l = l + self.lam_smooth * (d * d).mean()

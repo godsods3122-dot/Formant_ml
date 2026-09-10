@@ -444,36 +444,51 @@ def test_fitting_defaults_are_the_measured_ones():
     assert F.BW_LAW_W == 0.0
 
 
-def test_all_eight_formants_reach_the_fit():
-    """분석기가 F5~F8 을 채워야 적합기가 그것을 만질 수 있다.
+def test_missing_formants_become_a_physics_ladder():
+    """빠진 포먼트는 **직전 + c/(2L)** 이 된다 — 적합된 F4 를 따라 함께 움직인다.
 
-    `CopySynthFitter` 는 "로그 척도 파라미터의 초기값이 어디선가 0 이면 적합
-    대상에서 뺀다". 분석기가 F5~F8 을 0 으로 남기던 동안 **성도의 위쪽 절반이
-    균일관 값에 얼어붙은 채 한 번도 피팅된 적이 없었다** — 그리고 5.6~8 kHz 와
-    8~12 kHz 의 오차가 정확히 그 대역이다.
+    F5~F8 을 자유 파라미터로 풀어 봤다가 되돌렸다 (§40). 열이 32 → 40 개가 되자
+    같은 예산으로 2.4 단계가 회복을 못 했고 (87.45 → 85.31), 위상 단계가 66.79 % /
+    43.94 % 로 무너졌다. `STEP` 과 `PRIOR_W` 에 항목이 없어 **가장 큰 걸음과 가장
+    약한 사전확률**을 받은 것도 겹쳤다.
+
+    위쪽 포먼트는 자유도가 아니라 물리다. 극 간격 c/(2L) 는 조음과 무관한 절대
+    제약이고, 5 번 모드부터는 무작위 면적 함수 8 종에서 그 20 Hz 안에 든다 (§35.1).
     """
-    import numpy as np
-    from formant_ml.engine.analyze import analyze
+    import torch
     from formant_ml.engine.control import N_FORMANTS
-    from formant_ml.engine.profile import DEFAULT_PROFILE
-    fs = 48000
-    tr = analyze(_synthetic_vowel(fs, dur=0.3), fs, DEFAULT_PROFILE, int(0.001 * fs))
-    sp = 35000.0 / (2.0 * DEFAULT_PROFILE.tract_length_cm)
-    for k in range(1, N_FORMANTS + 1):
-        f, bw = tr[f"f{k}"], tr[f"bw{k}"]
-        # 0 이면 `self.names` 필터가 이 열을 통째로 뺀다 — 그것이 요점이다.
-        assert float(np.min(np.abs(f))) > 0.0, k
-        assert float(np.min(np.abs(bw))) > 0.0, k
-    for k in range(1, N_FORMANTS):
-        assert float((tr[f"f{k+1}"] - tr[f"f{k}"]).min()) > 0.0, k
-    # 채워 넣은 상위 포먼트는 관의 극 간격 c/(2L) 을 따라야 한다.
-    top = tr["f8"] - tr["f7"]
-    assert abs(float(top.mean()) - sp) < 1.0
-    # 그리고 실제로 적합 대상에 들어와야 한다 — 채우기만 하고 목록에 없으면 소용없다.
     from formant_ml.engine.fit import DEFAULT_PARAMS
-    for k in range(1, N_FORMANTS + 1):
+    from formant_ml.engine.noise import C_SOUND
+    from formant_ml.engine.tract import VocalTract
+    tr = VocalTract(48000.0, 48)
+    tr._n_emit = 480
+    sp = C_SOUND / (2.0 * 14.6)
+    T = 12
+    for f4 in (4000.0, 4936.0, 6500.0):
+        c = {f"f{k}": torch.zeros(1, T) for k in range(1, N_FORMANTS + 1)}
+        c.update({f"bw{k}": torch.zeros(1, T) for k in range(1, N_FORMANTS + 1)})
+        c["velum"] = torch.zeros(1, T)
+        for k, v in enumerate([600.0, 1800.0, 3000.0, f4], start=1):
+            c[f"f{k}"] = torch.full((1, T), v)
+        got = [float(t[0].reshape(-1)[0]) for t in tr._formant_tracks(c)]
+        assert abs(got[3] - f4) < 1.0
+        w, Lc = tr.LADDER_W, tr.length_cm
+        prev = got[3]
+        for k in range(5, N_FORMANTS + 1):
+            want = w * (prev + sp) + (1.0 - w) * (2 * k - 1) * C_SOUND / (4.0 * Lc)
+            assert got[k - 1] >= want - 1.0, (f4, k)          # 바닥이 걸리면 위로만 간다
+            # 부드러운 바닥이라 문턱 근처에서 ln2·폭 만큼 위로 새어 나온다.
+            slack = 0.2 * tr.LADDER_MIN_GAP * sp
+            assert got[k - 1] <= max(want, prev + tr.LADDER_MIN_GAP * sp) + slack, (f4, k)
+            prev = got[k - 1]
+        # 순서와 최소 간격은 F4 가 어디에 있든 지켜져야 한다. 실제 관 300 종에서
+        # 모드 4 이상의 간격은 최소 0.256·c/2L 이었다.
+        assert all(b - a > 0.25 * sp for a, b in zip(got[3:], got[4:])), (f4, got)
+    # 그리고 자유 파라미터는 넷뿐이어야 한다 — 위쪽은 사다리가 만든다.
+    for k in range(1, 5):
         assert f"f{k}" in DEFAULT_PARAMS and f"bw{k}" in DEFAULT_PARAMS, k
-
+    for k in range(5, N_FORMANTS + 1):
+        assert f"f{k}" not in DEFAULT_PARAMS and f"bw{k}" not in DEFAULT_PARAMS, k
 
 def test_articulator_velocity_penalty_spares_real_gestures(_engine):
     """조음 속도 벌점의 **특이성** — 실제 제스처는 통과하고 1 ms 스위칭만 물어야 한다.

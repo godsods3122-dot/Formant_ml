@@ -118,6 +118,16 @@ def main() -> None:
                     help="조음 속도 한계 벌점의 세기 (fit.ARTIC_VEL_W, 기본 1.0). "
                          "0 이면 끈다 — 마찰음이 유성 구간에서 1 ms 만에 켜지는 것을 "
                          "막는 항이다 (MEASUREMENTS §24)")
+    ap.add_argument("--cont", type=float, default=None,
+                    help="창별 손실이 직전 창보다 나빠진 만큼을 문다 (기본 0 = 끔). "
+                         "평균 손실은 국소 붕괴를 못 본다 — 50 ms 구간 상관이 1.00 인데 "
+                         "한 구간만 −0.06 으로 뒤집히는 일이 실제로 있다")
+    ap.add_argument("--sharp", type=float, default=None,
+                    help="유성 구간이 목표보다 뭉툭한 만큼을 문다 (기본 0 = 끔). "
+                         "포락 일치율은 이것을 볼 수 없다 — 멜 밴드가 포먼트 골보다 넓다")
+    ap.add_argument("--subf0", type=float, default=None,
+                    help="F0 아래가 **목표보다** 시끄러운 만큼을 문다 (기본 0 = 끔). "
+                         "목표의 프라이·서브하모닉은 벌하지 않는다")
     ap.add_argument("--ripple", type=float, default=None,
                     help="제어열 잔물결 벌점 세기 (fit.RIPPLE_W). 조음 대역(0~20 Hz) "
                          "위에서 트랙이 흔들리는 것만 문다 — 지지직과 저역 초과가 "
@@ -138,6 +148,12 @@ def main() -> None:
             _fit.FLUX_W = float(a.flux)
         if a.bw_law is not None:
             _fit.BW_LAW_W = float(a.bw_law)
+        if a.cont is not None:
+            _fit.CONT_W = float(a.cont)
+        if a.sharp is not None:
+            _fit.SHARP_W = float(a.sharp)
+        if a.subf0 is not None:
+            _fit.SUBF0_W = float(a.subf0)
     if a.tilt_cap is not None:
         from formant_ml.engine import glottis as _g
         _g.TILT_MAX_HZ = float(a.tilt_cap)

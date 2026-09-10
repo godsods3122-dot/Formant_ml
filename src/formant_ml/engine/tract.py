@@ -104,6 +104,47 @@ class VocalTract(nn.Module):
         골은 남은 문제로 MEASUREMENTS §7.6 에 적어 둔다.
         """
         return self.bw_floor + self.bw_slope * f
+    # 사다리 혼합비. `w_k = 1/(1 + LADDER_BETA·(k − k_last))` — 가까운 극은 실측된
+    # 마지막 포먼트를 따르고, 먼 극은 성도 길이가 정한 절대 위치로 수렴한다.
+    LADDER_W = 0.6
+    # 이웃 극의 최소 간격 / (c/2L). 실제 관 300 종에서 모드 4 이상의 간격은 최소
+    # 0.256, 1 % 분위 0.629 였다 (F4→F5 만 1 % 분위 0.382). 0.30 은 그 아래라
+    # 평소에는 걸리지 않는 **안전망**이다 — F4 가 절대 앵커보다 훨씬 위인 프레임에서
+    # 혼합이 F5 를 F4 쪽으로 끌어내리는 것만 막는다.
+    LADDER_MIN_GAP = 0.30
+
+    def ladder_pole(self, prev, k: int, like):
+        """실측되지 않은 k 번째 극의 위치. 두 앵커를 섞는다.
+
+        * **상대 앵커** `F_{k−1} + c/(2L)` — 조음을 따라간다. 가까운 극에 정확하지만
+          멀어질수록 오차가 쌓인다.
+        * **절대 앵커** `(2k−1)·c/(4L)` — 성도 길이가 정한다. 조음을 못 따라가지만
+          오차가 쌓이지 않는다.
+
+        면적 함수 400 종으로 잰 모드 5~15 의 예측 오차 표준편차 [Hz] (§41):
+
+            상대만 (w=1)   110 124 157 181 200 214 226 235 243 249 255   <- 발산한다
+            절대만 (w=0)   251 211 177 152 132 118 106  97  89  82  77
+            **혼합 w=0.6**  78  94 106 109 107 103  97  91  86  80  76
+
+        혼합은 두 앵커 중 어느 쪽보다도 낫고, 무엇보다 **발산하지 않는다** — 상대
+        앵커만 쓰면 오차가 모드마다 쌓여 255 Hz 까지 간다. 시드와 면적 변동 폭을
+        바꿔도 같다. 부수 효과가 하나 더 있다: 마지막 자유 포먼트가 위쪽 극 전체를
+        끌고 다니지 않게 된다. 무너진 창의 책임 귀속에서 `f4` 가 기울기의 36 % 를
+        쥐고 있었는데 (§41.2), 한 단계마다 0.6 씩 줄어드니 F8 에 미치는 영향은
+        0.6⁴ = 0.13 이다.
+
+        **절대 앵커는 프로파일의 `tract_length_cm` 을 믿는다.** 그 값이 틀리면 먼 극이
+        통째로 치우친다 — 화자 프로파일을 잡을 때 확인할 것.
+        """
+        ab = (2 * k - 1) * C_SOUND / (4.0 * self.length_cm)
+        if prev is None:
+            return torch.full_like(like, ab)
+        w = self.LADDER_W
+        f = w * (prev + self.extra_spacing) + (1.0 - w) * ab
+        gap = self.LADDER_MIN_GAP * self.extra_spacing
+        return prev + gap + self._soft_over(f - prev - gap, 0.2 * gap)
+
     def _up(self, v):
         return frames_to_samples(v.unsqueeze(-1), self.hop)[..., 0][:, :self._n_emit]
 
@@ -114,9 +155,13 @@ class VocalTract(nn.Module):
         0 ↔ 값 사이를 선형 보간하며 F1 이 10 Hz 를 지나간다(첫 렌더의 폭주 원인 2).
         """
         out = []
+        prev = None
         for k in range(1, self.K + 1):
             f = c[f"f{k}"]
-            f = torch.where(f > 0, f, self.uniform_formants[k - 1].to(f.dtype).expand_as(f))
+            # **원소별로** 고른다. 텐서 값으로 파이썬 분기를 걸면 청크 렌더와 통짜
+            # 렌더가 갈라진다 (`test_streaming_equals_offline` 이 그것을 잡았다).
+            f = torch.where(f > 0, f, self.ladder_pole(prev, k, f))
+            prev = f
             bw = c[f"bw{k}"]
             bw = torch.where(bw >= 20.0, bw, self.default_bw(f))   # 20 Hz 미만 = 기본
             if k == 1:      # 연구개가 열리면 F1 이 넓어진다 (에너지가 비강으로 샌다)
@@ -130,6 +175,11 @@ class VocalTract(nn.Module):
             key = f"{prefix}{i}"
             x, state[key] = tv_biquad(x, *resonator_coeffs(f, bw, self.fs), zi=state.get(key))
         return x
+
+    @staticmethod
+    def _soft_over(x, w: float):
+        """0 이상만 남기는 부드러운 문턱. `w·softplus(x/w)`."""
+        return w * torch.nn.functional.softplus(x / w)
 
     @staticmethod
     def _soft_cap(x, cap, w: float = 400.0):
@@ -155,7 +205,12 @@ class VocalTract(nn.Module):
         cap = self.extra_cap * self.fs / 2.0
         for i in range(self.n_extra):
             key = f"x{i}"
-            raw = f_last + (i + 1) * self.extra_spacing
+            # **여기서는 순수 사다리다** (혼합하지 않는다). F5~F8 은 들리는 포먼트라
+            # 위치 정확도가 중요해 절대 앵커를 섞지만, 보정 극에서 중요한 것은
+            # 정확도가 아니라 **틈이 없는 것**이다 — 틈은 −5 dB 짜리 구멍을 만들고
+            # (§35.3), 12 kHz 짜리 넓은 극이 150 Hz 어긋나는 것은 안 들린다.
+            raw = f_last + self.extra_spacing
+            f_last = raw
             fk = self._soft_cap(raw, cap)
             # 상한에 눌린 만큼 대역폭을 넓힌다. 안 그러면 눌린 극들이 상한 근처에
             # 25 Hz 간격으로 쌓여 거기 날카로운 봉우리가 선다 (F8 이 11.9 kHz 인
