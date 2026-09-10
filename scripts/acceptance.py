@@ -280,7 +280,14 @@ def check(stem: str, seeds: int = 0) -> dict:
 
     et, es = envelope_db(tgt, 25.0), envelope_db(syn, 25.0)
     k = min(len(et), len(es))
-    keep = et[:k] > et[:k].max() - 60.0
+    # **−45 dB 다, −60 dB 가 아니다.** 이 화자의 녹음은 잡음 제거 뒤에도 무음이
+    # 정점 대비 −50~−60 dB 에 있다(방 잔여). 거기까지 마스크를 열면 **목소리 모형이
+    # 방 잡음을 재현하지 않는 것**을 오차로 센다 — 실측(out/fin/s040): 0.10~0.18 s
+    # 에서 목표 −68~−80 dB 인데 합성이 −90 dB 로 25 dB 더 **조용해서** rms 오차가
+    # 0.230 -> 4.553 dB 로 뛴다. 들리지도 않고 재현할 이유도 없는 양이다.
+    # 문턱을 세로 얼룩·F0 아래 초과와 같은 −45 dB 로 맞춘다 (§30 과 같은 교훈,
+    # 이번이 세 번째다 — **자를 먼저 의심할 것**).
+    keep = et[:k] > et[:k].max() - 45.0
     out["env_r"] = _r(et[:k][keep], es[:k][keep])
     out["env_rms_db"] = float(np.sqrt(((et[:k][keep] - es[:k][keep]) ** 2).mean()))
     e2t, e2s = envelope_db(tgt, 100.0), envelope_db(syn, 100.0)
