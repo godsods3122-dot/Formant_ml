@@ -121,6 +121,14 @@ def main() -> None:
                     help="조음 속도 한계 벌점의 세기 (fit.ARTIC_VEL_W, 기본 1.0). "
                          "0 이면 끈다 — 마찰음이 유성 구간에서 1 ms 만에 켜지는 것을 "
                          "막는 항이다 (MEASUREMENTS §24)")
+    ap.add_argument("--motion", action="store_true",
+                    help="제어열을 값이 아니라 **움직임**으로 매개화한다 (fit.MOTION). "
+                         "자유 파라미터를 가속도로 두고 두 번 적분하므로 위치·속도의 "
+                         "연속성이 벌점이 아니라 구조로 보장되고, 남는 불연속인 "
+                         "가속도는 lam_smooth 가 저크 벌점으로 문다")
+    ap.add_argument("--motion-single", action="store_true",
+                    help="--motion 의 다중 해상도를 끄고 격자 한 층만 쓴다 "
+                         "(fit.MOTION_MULTI=False). 층 쌓기의 몫을 가르는 대조군")
     ap.add_argument("--l1", type=float, default=None,
                     help="제어열 증분에 L1 (기본 0 = 끔). 지금 정칙화가 전부 L2 라 "
                          "적합기가 격자 전체에 자잘한 보정을 흩뿌린다 — 희소하게 만들면 "
@@ -149,38 +157,35 @@ def main() -> None:
                          "둘 다 여기서 온다 (docs/MEASUREMENTS.md §13, §16)")
     a = ap.parse_args()
     torch.set_num_threads(a.threads)
-    if (a.ripple is not None or a.prior or a.artic_vel is not None
-            or a.vel_w is not None or a.flux is not None
-            or a.bw_law is not None):
-        from formant_ml.engine import fit as _fit
-        if a.ripple is not None:
-            _fit.RIPPLE_W = float(a.ripple)
-        if a.artic_vel is not None:
-            _fit.ARTIC_VEL_W = float(a.artic_vel)
-        if a.vel_w is not None:
-            _fit.VEL_W = float(a.vel_w)
-        if a.flux is not None:
-            _fit.FLUX_W = float(a.flux)
-        if a.bw_law is not None:
-            _fit.BW_LAW_W = float(a.bw_law)
-        if a.corr is not None:
-            _fit.CORR_W = float(a.corr)
-        if a.hnr is not None:
-            _fit.HNR_W = float(a.hnr)
-        if a.cont is not None:
-            _fit.CONT_W = float(a.cont)
-        if a.sharp is not None:
-            _fit.SHARP_W = float(a.sharp)
-        if a.subf0 is not None:
-            _fit.SUBF0_W = float(a.subf0)
+    # 손실 가중은 **모듈 전역**이고 CopySynthFitter 가 생성 시점에 읽는다. 그러므로
+    # 적합기를 만들기 전에 여기서 덮어써야 한다.
+    #
+    # **예전 판은 이 덮어쓰기가 조건문 안에 있었고, 그 조건이 ripple·prior·artic_vel·
+    # vel_w·flux·bw_law 만 보았다.** 그래서 `--corr/--hnr/--cont/--sharp/--subf0` 중
+    # 하나만 주면 블록 자체가 안 돌아 가중이 0 인 채로 적합이 돌았다 — 플래그가 조용히
+    # 무시된 것이다. 실측: 같은 짧은 구간에서 `--subf0 1.0` 을 준 손실이 안 준 것과
+    # **바이트 단위로 같았다** (둘 다 2.163376). 표로 바꿔, 손잡이를 새로 달 때
+    # 조건문을 같이 고쳐야 하는 일 자체를 없앤다.
+    from formant_ml.engine import fit as _fit
+    if a.motion:
+        _fit.MOTION = True
+    if a.motion_single:
+        _fit.MOTION_MULTI = False
+    for flag, name in (("ripple", "RIPPLE_W"), ("artic_vel", "ARTIC_VEL_W"),
+                       ("vel_w", "VEL_W"), ("flux", "FLUX_W"), ("bw_law", "BW_LAW_W"),
+                       ("corr", "CORR_W"), ("hnr", "HNR_W"), ("cont", "CONT_W"),
+                       ("sharp", "SHARP_W"), ("subf0", "SUBF0_W")):
+        v = getattr(a, flag)
+        if v is not None:
+            setattr(_fit, name, float(v))
     if a.tilt_cap is not None:
         from formant_ml.engine import glottis as _g
         _g.TILT_MAX_HZ = float(a.tilt_cap)
-        for item in (a.prior or ()):
-            k, _, v = item.partition("=")
-            if k not in _fit.PRIOR_W and k not in _fit.DEFAULT_PARAMS:
-                raise SystemExit(f"--prior: 모르는 파라미터 {k!r}")
-            _fit.PRIOR_W[k] = float(v)
+    for item in (a.prior or ()):       # --tilt-cap 블록 안에 갇혀 있던 것을 꺼냈다
+        k, _, v = item.partition("=")
+        if k not in _fit.PRIOR_W and k not in _fit.DEFAULT_PARAMS:
+            raise SystemExit(f"--prior: 모르는 파라미터 {k!r}")
+        _fit.PRIOR_W[k] = float(v)
 
     y, sr = sf.read(a.wav)
     if y.ndim > 1:

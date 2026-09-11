@@ -433,6 +433,38 @@ HNR_HP_HZ = 1000.0         # 두 번째 대역: 이 위만 보는 고역통과
 #: 으로 뒤집힌다(펄스가 1/3 주기 미끄러짐). 그 한 구간은 평균에서 1/28 의 무게다.
 #: `softplus(e_t − e_{t−L})` 로 **악화분만** 문다 — 절대 수준 항(`env_db`)이 그대로
 #: 있으므로 "전부 고르게 나쁘게" 로는 회피할 수 없다.
+#: 제어열을 **값**이 아니라 **움직임**으로 매개화한다.
+#:
+#: 왜: 지금 `w` 는 격자 위의 값이고 `_delta` 가 그것을 선형 보간한다. 마지막 단계는
+#: 격자를 1 ms 로 내리므로 격자점 수 = 프레임 수가 되어 **파라미터마다 1420 개의
+#: 독립 자유값**이 남는다. 연속성을 강제하는 구조가 하나도 없다. 그 결과가 실측에
+#: 그대로 있다 — `nasal_damp` 는 에너지의 40 %가 150~400 Hz 에 있고(조음은 20 Hz
+#: 아래다), `fric_gain` 은 마찰음 한복판에서 **1 ms 마다 제 값의 23 %씩** 튄다.
+#: 시변 필터의 계수가 그 속도로 흔들리면 통과하는 잡음이 그 속도로 변조된다 —
+#: 고역 포락의 150~400 Hz 변조(목표의 5~10 배)와 지글거림이 여기서 나온다.
+#:
+#: 무엇으로: 자유 파라미터를 **가속도**로 두고 두 번 적분해 궤적을 만든다. 그러면
+#: 사용자가 요구한 세 가지 거동이 그대로 표현되고 (정지 a=v=0, 직선 a=0·v≠0,
+#: 가속 a≠0), **위치와 속도의 연속성이 벌점이 아니라 구조로** 보장된다. 다음
+#: 프레임이 두 양을 계승받는다는 뜻이다. 남는 불연속은 가속도뿐이고 그것은
+#: `lam_smooth`(격자 위 1 차 차분 L2)가 그대로 **저크 벌점**이 된다.
+#:
+#: 덤: 두 번 적분은 1/f² 저역통과라, 같은 크기의 가속도가 만드는 위치 흔들림이
+#: 400 Hz 에서 20 Hz 의 1/400 이다. 난동이 표현 자체로 비싸진다.
+MOTION = False
+MOTION_MIN_GRID_MS = 5.0    # 움직임 모드에서 격자를 이보다 촘촘히 하지 않는다
+#: 다중 해상도. 켜면 `set_grid` 가 격자를 **갈아 끼우지 않고 층을 쌓는다** — 20 / 10 /
+#: 5 ms 의 B-스플라인을 동시에 두고 더한다. 거친 층이 제스처를, 고운 층이 미세구조를
+#: 싣고 **모든 층이 C²** 다. DMP (Ijspeert; 음성 적용은 Parrell 2019) 가 임계감쇠
+#: 2 차 점끌개 위에 강제항을 국소 기저의 가중합으로 펼치는 것과 같은 구성이고,
+#: 계층적 B-스플라인(Forsey & Bartels 1988)의 표준 형태이기도 하다.
+#:
+#: 왜 층을 쌓아야 하는가: 갈아 끼우면 고운 격자가 거친 궤적을 **다시 표현**해야 하고,
+#: 그 과정에서 거친 층이 갖고 있던 권한이 흩어진다. 쌓으면 거친 층은 그대로 서 있고
+#: 고운 층은 잔차만 맡는다 — 생 이중적분(`out/L7`)이 2.1 단계에서 멈춰 버린 것과
+#: 같은 조건수 문제를 피한다.
+MOTION_MULTI = True
+
 CONT_W = 0.0
 CONT_LAG = 4               # 프레임. 256 창의 hop 이 64 샘플이라 4 = 창 하나 (5.3 ms)
 CONT_KNEE_DB = 0.5         # 이만큼의 악화는 공짜 (계측 잡음)
@@ -625,6 +657,7 @@ class CopySynthFitter:
         self.n_frames = u0.shape[0]
         self.stride = 1
         self.w = torch.zeros_like(u0).requires_grad_(True)   # (Tc, P_fit) 격자 위 증분
+        self.w_coarse: list = []        # 다중 해상도의 굳은 거친 층들 (여전히 학습된다)
         self.d = torch.zeros(len(self.names), dtype=torch.float64, device=device,
                              requires_grad=True)          # 파라미터별 전역 오프셋
         self.d_mask = torch.tensor([1.0 if n in GLOBAL_PARAMS else 0.0
@@ -680,6 +713,14 @@ class CopySynthFitter:
                                                             make_mask=True)
             self._prepare_voice_stats(raw)
         self._prepare_corr()
+        # **화자의 고역 손실은 적합 대상이다.** `log_extra_bw`(고차 극 보정의 대역폭
+        # 배율)와 `log_front_bw`(앞공동 대역폭 배율)는 `nn.Parameter` 인데 어느
+        # 옵티마이저 목록에도 없어서 영원히 0(= 배율 1)에 머물렀다 (§37.3 이 지적).
+        # 고차 극이 고정 위치라 화자의 고역을 맞출 수단이 사실상 이 둘뿐인데 그마저
+        # 잠겨 있었다 — 실측으로 8.9 kHz 가 −5.5 dB, 15.9 kHz 가 −4.7 dB 모자란다.
+        self.hf = [q for q in (getattr(self.eng.tract, "log_extra_bw", None),
+                               getattr(self.eng.tract, "log_front_bw", None))
+                   if isinstance(q, torch.nn.Parameter)]
         self.calibrate_gain()
 
     # ------------------------------------------------------- 재매개화
@@ -701,21 +742,81 @@ class CopySynthFitter:
         return lo + x * (hi - lo)
 
     def _delta(self) -> torch.Tensor:
-        """격자 위 증분 -> 프레임별 raw 증분 (선형 보간)."""
-        w = self.w
-        if w.shape[0] != self.n_frames:
-            w = torch.nn.functional.interpolate(
-                w.t().unsqueeze(0), size=self.n_frames, mode="linear",
-                align_corners=True)[0].t()
+        """격자 위 증분 -> 프레임별 raw 증분.
+
+        `MOTION` 이 꺼져 있으면 예전대로 격자 값의 선형 보간이다. 켜면 `w` 를
+        **가속도**로 읽고 두 번 적분한다 (윗쪽 `MOTION` 주석이 근거다).
+        """
+        w = self._expand(self.w)
+        for c in self.w_coarse:
+            w = w + self._expand(c)
         return w * self.scale
+
+    def _expand(self, w: torch.Tensor) -> torch.Tensor:
+        if w.shape[0] == self.n_frames and not MOTION:
+            return w
+        if MOTION:
+            return self._bspline(w)
+        return torch.nn.functional.interpolate(
+            w.t().unsqueeze(0), size=self.n_frames, mode="linear",
+            align_corners=True)[0].t()
+
+    def _bspline(self, w: torch.Tensor) -> torch.Tensor:
+        """격자 값 -> 프레임 값, **균일 3 차 B-스플라인** (C²).
+
+        선형 보간은 격자점마다 **가속도가 불연속**이라 난류 진폭의 계단을 만든다
+        (HANDOFF §11.1 이 `phones.min_jerk` 를 만들며 실측한 것이고, 그때 적합기에는
+        안 붙였다). 3 차 B-스플라인은 위치·속도·가속도가 전부 연속이므로 다음
+        구간이 앞 구간의 속도와 가속도를 **계승**한다 — 사용자가 요구한 "한 창에서
+        정적 물리 변수가 아니라 움직임을 기술한다" 가 이 형태다.
+
+        **생 이중적분(자유 파라미터를 가속도로) 은 먼저 시험했고 실패했다.** 국소
+        수정에 가속도 쌍극자가 필요해 조건수가 나쁘고, 격자를 촘촘히 해도 한
+        격자점의 권한이 사라진다 — 실측(`out/L7`)에서 2.1 단계 68.30 에서 2.4 단계
+        69.79 로 **격자 정교화가 아무 일도 못 했다** (같은 설정의 `out/L6` 은
+        83.92 → 91.34). B-스플라인은 기저가 국소라 그 병이 없고, `w` 가 여전히
+        값이므로 `STEP`·`PRIOR_W`·`scale` 눈금을 그대로 쓸 수 있다.
+        """
+        tc, n = w.shape[0], self.n_frames
+        u = torch.linspace(0.0, float(tc - 1), n, device=w.device, dtype=w.dtype)
+        i0 = torch.floor(u).clamp(0, tc - 1)
+        f = (u - i0).unsqueeze(1)
+        i0 = i0.long()
+
+        def at(k):
+            return w[(i0 + k).clamp(0, tc - 1)]
+
+        f2, f3 = f * f, f * f * f
+        b0 = (1.0 - 3.0 * f + 3.0 * f2 - f3) / 6.0
+        b1 = (4.0 - 6.0 * f2 + 3.0 * f3) / 6.0
+        b2 = (1.0 + 3.0 * f + 3.0 * f2 - 3.0 * f3) / 6.0
+        b3 = f3 / 6.0
+        return b0 * at(-1) + b1 * at(0) + b2 * at(1) + b3 * at(2)
 
     def _u(self) -> torch.Tensor:
         return self.u0 + self._delta() + self.d * self.d_mask
 
     def set_grid(self, grid_ms: float) -> int:
         """제어 격자 간격을 바꾼다. 현재 해를 보간해서 옮기므로 이어서 최적화된다."""
+        if MOTION:
+            grid_ms = max(float(grid_ms), MOTION_MIN_GRID_MS)
         stride = max(1, int(round(grid_ms / self.track.frame_ms)))
         tc = max(2, int(math.ceil(self.n_frames / stride)))
+        if MOTION and MOTION_MULTI:
+            # **층을 쌓는다.** 같은 해상도를 다시 요구받으면(격자 하한에 걸린 경우)
+            # 층을 늘리지 않는다 — 같은 기저를 두 번 두면 중복 매개화가 된다.
+            if self.w.shape[0] == tc:
+                self.stride = stride
+                return tc
+            # **프레임 해상도의 층은 쌓지 않고 버린다.** 초기 `w` 는 1 ms 격자라,
+            # 그것을 층으로 남기면 프레임별 자유가 그대로 살아 있어 움직임 매개화가
+            # 무의미해진다 (실측: 그 층을 남겼을 때 `nasal_f3` 의 48 %가 60 Hz 위였다).
+            if self.w.shape[0] < self.n_frames:
+                self.w_coarse.append(self.w)
+            self.w = torch.zeros(tc, self.w.shape[1], dtype=self.w.dtype,
+                                 device=self.w.device).requires_grad_(True)
+            self.stride = stride
+            return tc
         with torch.no_grad():
             old = self.w.detach()
             new = torch.nn.functional.interpolate(
@@ -1454,9 +1555,13 @@ class CopySynthFitter:
             d = self.w * self.scale
             dl = 0.1 * self.scale
             l = l + self.lam_l1 * (torch.sqrt(d * d + dl * dl) - dl).mean()
-        if self.lam_smooth > 0 and self.w.shape[0] > 1:
-            d = self.w[1:] - self.w[:-1]
-            l = l + self.lam_smooth * (d * d).mean()
+        if self.lam_smooth > 0:
+            # **층마다 건다.** 층을 쌓는 동안 거친 층에도 계속 기울기가 가므로,
+            # 고운 층만 매끄럽게 해서는 난동을 거친 층으로 밀어낼 수 있다.
+            for q in ([self.w] + list(self.w_coarse)):
+                if q.shape[0] > 1:
+                    d = q[1:] - q[:-1]
+                    l = l + self.lam_smooth * (d * d).mean()
         if self.lam_prior > 0:
             d = (self._u() - self.u0) * self.prior_w
             l = l + self.lam_prior * (d * d).mean()
@@ -1479,8 +1584,7 @@ class CopySynthFitter:
         """
         if sizes is not None:
             self.sizes = list(sizes)
-        opt = torch.optim.Adam(params or [self.w, self.d, self.log_gain,
-                                          self.pulse_phi0], lr=lr)
+        opt = torch.optim.Adam(params or self.opt_params(), lr=lr)
         sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, max(iters, 1), eta_min=lr * 0.05)
         best = (-1e18, None, None, None)
         hist: list[tuple[float, float]] = []
@@ -1503,8 +1607,7 @@ class CopySynthFitter:
             # 스냅샷은 조금이라도 나아지면 뜬다. 멈춤 판정만 **의미 있는** 개선을 센다.
             gain = score - best[0]
             if score > best[0]:
-                best = (score, (self.w.detach().clone(), self.d.detach().clone()),
-                        self.log_gain.detach().clone(),
+                best = (score, self._snapshot(), None,
                         (env, fine, self._last_db, float(l.detach()), per))
             stall_before = stall          # 증가 **전** 값 — 건너뛴 회차에 되돌린다
             if patience > 0:
@@ -1514,14 +1617,15 @@ class CopySynthFitter:
                         print(f"    [{it}] 수렴 ({patience} 회 정체) — 조기 종료")
                     break
             l.backward()
-            ps = [self.w, self.d, self.log_gain, self.pulse_phi0]
+            ps = self.opt_params()
             # **비유한 기울기로 걸음을 딛으면 안 된다.** Adam 의 모멘트가 NaN 으로
             # 오염되면 그 뒤 모든 파라미터가 NaN 이 되고, 손실을 보기 전에 엔진 안에서
             # 터진다(실측: 탄음 구간에서 int(NaN)).
             if any(p.grad is not None and not torch.isfinite(p.grad).all() for p in ps):
                 bad_grads += 1
                 if DEBUG_NONFINITE:
-                    self._report_nonfinite(it, ps, ["w", "d", "log_gain", "pulse_phi0"])
+                    self._report_nonfinite(it, ps, ["w", "d", "log_gain", "pulse_phi0"]
+                                           + ["hf%d" % i for i in range(len(self.hf))])
                 # **건너뛰지 말고 성분만 지운다.** 예전에는 회차 전체를 버렸는데,
                 # 그러면 파라미터가 안 변하므로 **다음 회차도 똑같이 비유한**이다.
                 # 결정적으로 갇힌다 — 실측(out/sw/r000, yang_00000040 전체):
@@ -1547,22 +1651,26 @@ class CopySynthFitter:
         if verbose and bad_grads:
             print(f"    (기울기 비유한 {bad_grads} 회 건너뜀)")
         if best[1] is not None:
-            with torch.no_grad():
-                self.w.copy_(best[1][0]); self.d.copy_(best[1][1])
-                self.log_gain.copy_(best[2])
+            self._restore(best[1])
             env, fine, db, lv, per = best[3]
         else:
             env = fine = db = lv = float("nan"); per = {}
         return FitReport(env, fine, db, per, lv, len(hist), hist)
 
+    def opt_params(self) -> list:
+        """최적화 대상 전부. **한 군데서만 정의한다** — 예전에는 이 목록이 네 곳에
+        따로 적혀 있었고(옵티마이저·기울기 가드·스냅샷·최선 복원) 그래서 고역
+        파라미터를 어디에도 못 넣은 채로 남았다."""
+        return ([self.w] + list(self.w_coarse)
+                + [self.d, self.log_gain, self.pulse_phi0] + self.hf)
+
     def _snapshot(self):
-        return (self.w.detach().clone(), self.d.detach().clone(),
-                self.log_gain.detach().clone(), self.pulse_phi0.detach().clone())
+        return tuple(q.detach().clone() for q in self.opt_params())
 
     def _restore(self, snap) -> None:
         with torch.no_grad():
-            self.w.copy_(snap[0]); self.d.copy_(snap[1])
-            self.log_gain.copy_(snap[2]); self.pulse_phi0.copy_(snap[3])
+            for q, v in zip(self.opt_params(), snap):
+                q.copy_(v)
 
     def pick_lr_global(self, candidates, iters: int, verbose: bool = True) -> float:
         """짧은 탐침으로 전역 단계의 lr 을 고른다.
@@ -1577,7 +1685,8 @@ class CopySynthFitter:
         for lr in candidates:
             self._restore(start)
             rep = self.fit(iters, float(lr), 10 ** 9, False,
-                           params=[self.d, self.log_gain, self.pulse_phi0], sizes=STAGES[0])
+                           params=[self.d, self.log_gain, self.pulse_phi0] + self.hf,
+                           sizes=STAGES[0])
             if np.isfinite(rep.loss) and rep.loss < best[0]:
                 best = (rep.loss, float(lr))
             if verbose:
@@ -1626,8 +1735,8 @@ class CopySynthFitter:
         else:
             lr_g = float(lr_global[0])
         rep = self.fit(global_iters, lr_g, log_every, verbose,
-                       params=[self.d, self.log_gain, self.pulse_phi0], sizes=STAGES[0],
-                       patience=patience)
+                       params=[self.d, self.log_gain, self.pulse_phi0] + self.hf,
+                       sizes=STAGES[0], patience=patience)
         for si, (grid, sizes) in enumerate(zip(GRID_MS, STAGES)):
             tc = self.set_grid(grid)
             if verbose:
