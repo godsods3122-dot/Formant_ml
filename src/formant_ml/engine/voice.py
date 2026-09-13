@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 
 import numpy as np
 import torch
@@ -30,6 +31,8 @@ from .profile import SpeakerProfile
 from .residual import ResidualCorrector
 from .rng import NoiseBank
 from .tract import VocalTract
+
+LOADED_SOURCE_VERSION = 1
 
 
 def _dilate(x: torch.Tensor, k: int) -> torch.Tensor:
@@ -51,6 +54,18 @@ class EngineConfig:
     # Experimental A/B only; keep legacy until held-out pronunciation evidence.
     # Internal noise parameters are not fitted by the default control fitter.
     noise_modulation: str = "legacy"    # "lf": shared Rd-linked flow AM
+    glottal_source: str = "lf"          # "loaded": prescribed-flow impedance proxy
+    load_coupling: float = 1.0         # zero is an exact legacy bypass
+
+    def __post_init__(self):
+        if self.glottal_source not in ("lf", "loaded"):
+            raise ValueError("glottal_source must be 'lf' or 'loaded'")
+        if not math.isfinite(self.load_coupling) or not 0.0 <= self.load_coupling <= 1.0:
+            raise ValueError("load_coupling must be finite and in [0, 1]")
+
+    @property
+    def loaded_source_enabled(self) -> bool:
+        return self.glottal_source == "loaded" and self.load_coupling > 0.0
 
     @property
     def hop(self) -> int:
@@ -80,8 +95,15 @@ class VoiceEngine(nn.Module):
         f0r = (profile.f0_lo, profile.f0_hi, profile.f0_nominal) if profile else None
         if profile:
             self.cfg.tract_length_cm = profile.tract_length_cm
+        self.loaded_source = None
+        if self.cfg.loaded_source_enabled:
+            from .loaded_source import ImpedanceLoadedSource
+            self._check_source_options()
+            self.loaded_source = ImpedanceLoadedSource(
+                fs, self.cfg.tract_length_cm, self.cfg.load_coupling)
         self.glottis = GlottalSource(fs, hop, speaker=self.cfg.speaker, f0_range=f0r,
-                                     noise_modulation=self.cfg.noise_modulation)
+                                     noise_modulation=self.cfg.noise_modulation,
+                                     flow_reference=self.cfg.loaded_source_enabled)
         self.frication = FricationNoise(fs, hop)
         self.aspiration = AspirationNoise(fs, hop)
         self.transients = TransientTemplateBank(fs)
@@ -94,6 +116,14 @@ class VoiceEngine(nn.Module):
 
 
     # ------------------------------------------------------------ 상태
+    @staticmethod
+    def _check_source_options():
+        from . import glottis, tract
+        if tract.OPEN_DAMP:
+            raise ValueError("Loaded source and OPEN_DAMP cannot be combined")
+        if glottis.HJIT_CYCLE and glottis.HARM_PHASE_JIT > 0:
+            raise ValueError("Loaded source does not support non-streaming HJIT_CYCLE")
+
     def reset(self) -> None:
         self.state = dict(phase=None, amp=None, tract={}, residual={}, glottis={},
                           fric={}, asp={}, frame=0)
@@ -120,6 +150,17 @@ class VoiceEngine(nn.Module):
         g = self.glottis(c, phase0=st["phase"], noise=self.noise, frame0=f0i,
                          dispersion=GLOTTAL_DISPERSION,
                          amp0=st["amp"], state=st["glottis"], emit=t, pulse_phase=pp)
+        prepared_tracks = None
+        loaded = None
+        if self.loaded_source is not None:
+            self._check_source_options()
+            prepared_tracks = self.tract.prepare_tracks(c, n, st["tract"])
+            ps = frames_to_samples(c["p_sub"].unsqueeze(-1), hop)[:, :n, 0]
+            loaded = self.loaded_source(
+                g["reference_flow"], g["flow_scale"], g["f0"], g["ag_dc"],
+                ps, prepared_tracks, st.get("loaded", {}))
+            g["du"] = loaded["du"]
+            st["loaded"] = loaded["state"]
         fr = self.frication(c, g["ag_dc_frames"], g["phase"], g["voiced"], noise=self.noise,
                             frame0=f0i, state=st["fric"], emit=t, noise_am=g["noise_am"])
         asp = self.aspiration(g["asp_env"], noise=self.noise, sample0=s0, state=st["asp"],
@@ -129,7 +170,8 @@ class VoiceEngine(nn.Module):
         tr = self.transients.render(ev, n, b, noise=self.noise, device=ctrl.device, sample0=s0) \
             if ev else torch.zeros(b, n, device=ctrl.device)
         out = self.tract(g["du"], fr["source"], asp.get("source_v", asp["source"]), tr, c,
-                         state=st["tract"], asp_u=asp.get("source_u"), g_open=g.get("open_phase"))
+                         state=st["tract"], asp_u=asp.get("source_u"), g_open=g.get("open_phase"),
+                         prepared_tracks=prepared_tracks)
         y = out["audio"]
         if self.residual is not None:
             heads = self.residual(ctrl, state=st["residual"], emit=t)
@@ -150,10 +192,15 @@ class VoiceEngine(nn.Module):
         st["glottis"], st["fric"], st["asp"] = g["state"], fr["state"], asp["state"]
         st["tract"] = out["state"]
         st["frame"] += t
-        return dict(audio=y, du=g["du"], fric=fr["source"], asp=asp["source"], transient=tr,
+        result = dict(audio=y, du=g["du"], fric=fr["source"], asp=asp["source"], transient=tr,
                     glottal_path=out["glottal_path"], front_path=out["front_path"],
                     f0=g["f0"], amp=g["amp"], phase=g["phase"], reynolds=fr["reynolds"],
                     state=st)
+        if loaded is not None:
+            result.update(flow=loaded["flow"], load_pressure=loaded["load_pressure"],
+                          glottal_flow=loaded["glottal_flow"],
+                          reference_flow=g["reference_flow"])
+        return result
 
     # ------------------------------------------------------------ 편의 API
     @torch.no_grad()

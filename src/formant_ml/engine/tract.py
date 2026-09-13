@@ -445,6 +445,16 @@ class VocalTract(nn.Module):
         return out
 
     # ------------------------------------------------------------ 단계
+    def prepare_tracks(self, c: dict, n_emit: int, state: dict):
+        """Prepare once: the input-impedance proxy and audio share these tracks."""
+        self._n_emit = n_emit
+        tracks = self._formant_tracks({k: v.double() for k, v in c.items()})
+        if TRACK_SMOOTH_MS > 0.0:
+            tracks = [(self._smooth_track(f, f"sf{i}", state),
+                       self._smooth_track(bw, f"sb{i}", state))
+                      for i, (f, bw) in enumerate(tracks)]
+        return tracks
+
     def _smooth_track(self, x, key, state):
         """샘플률 궤적 (B, N) 에 2 단 1 차 저역 (`TRACK_SMOOTH_MS`). 상태는 `state[key_p]`."""
         a = 1.0 - math.exp(-1000.0 / (TRACK_SMOOTH_MS * self.fs))
@@ -872,7 +882,8 @@ class VocalTract(nn.Module):
     # ------------------------------------------------------------ 전체
     def forward(self, du: torch.Tensor, fric: torch.Tensor, asp: torch.Tensor,
                 transient: torch.Tensor, c: dict, state: dict | None = None,
-                asp_u: torch.Tensor | None = None, g_open: torch.Tensor | None = None) -> dict:
+                asp_u: torch.Tensor | None = None, g_open: torch.Tensor | None = None,
+                prepared_tracks: list | None = None) -> dict:
         """소스 (B,N) 들과 프레임률 제어 c (B,T_all). N ≤ T_all·hop 이면 선행 프레임이 있는 것이다.
 
         g_open: 성문 개방 곡선 (B,N) 0~1 — `OPEN_DAMP` 일 때 성문 경로 F1 을 주기마다 감쇠한다."""
@@ -907,10 +918,8 @@ class VocalTract(nn.Module):
         opn = up(c["oral_open"]).clamp(0.0, 1.0)
         tot = (vel + opn).clamp_min(1e-3)
         oral, nas = opn / tot, vel / tot
-        tracks = self._formant_tracks(c)
-        if TRACK_SMOOTH_MS > 0.0:
-            tracks = [(self._smooth_track(f, f"sf{i}", state), self._smooth_track(bw, f"sb{i}", state))
-                      for i, (f, bw) in enumerate(tracks)]
+        tracks = (self.prepare_tracks(c, self._n_emit, state)
+                  if prepared_tracks is None else prepared_tracks)
         tr_g = tracks
         if OPEN_DAMP and g_open is not None:
             o = g_open.to(tracks[0][0].dtype)[:, :tracks[0][0].shape[1]]

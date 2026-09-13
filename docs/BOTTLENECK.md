@@ -353,3 +353,14 @@ python scripts\copyfit.py data\voices\yang_00000101.wav --profile profiles\yang_
 별도의 `--hf-stage`를 지정했다면 그것은 추가 적합 예산이다. 제어를 완전히 유지할 때는 켜지 않는다.
 고역 단계만 명시한 경우에도 펄스 위상 탐색이나 제어 격자 교체는 실행하지 않는다.
 예전 `q_band`는 메타데이터로 보존하지만 화자 잠금만으로 Q 제약을 활성화하지 않는다.
+
+## 12. Optional impedance-loaded source
+
+`--glottal-source loaded --load-coupling 0.7` selects a prescribed-LF flow
+source with nonlinear resistance/inertance and stateful passive input-load
+feedback. The default remains LF; zero coupling is an exact legacy bypass.
+There are no new fitted controls/scalars. See [IMPEDANCE_SOURCE.md](IMPEDANCE_SOURCE.md)
+for units, the implicit solve/adjoint, saved-mode A/B semantics, fixed
+reference-flow assumptions, differentiation effects, and limitations.
+This is not a self-oscillating fold model or evidence of improved envelope/
+harmonic accuracy. Existing evaluation windows and objectives are unchanged.

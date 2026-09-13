@@ -35,7 +35,7 @@ import torch
 
 from formant_ml.engine.analyze import analyze
 from formant_ml.engine.calibration import (apply_calibration, legacy_fields,
-                                           load_calibration)
+                                           load_calibration, source_config)
 from formant_ml.engine.control import INDEX, PARAM_NAMES
 from formant_ml.engine.denoise import denoise, noise_profile, snr_report
 from formant_ml.engine.fit import CopySynthFitter
@@ -218,6 +218,12 @@ def main() -> None:
     ap.add_argument("--init", default=None, metavar="STEM",
                     help="앞선 적합(STEM_track.npz)의 제어열·전역 엔진값에서 출발한다 (두 번째 패스 — 다듬기). "
                          "펄스·유성·마찰 표시와 사건은 이번 분석의 것을 쓴다")
+    ap.add_argument("--glottal-source", choices=("lf", "loaded"), default=None,
+                    help="Source model (default LF, or restored from --init/constants). "
+                         "An explicit choice permits controlled source A/B.")
+    ap.add_argument("--load-coupling", type=float, default=None,
+                    help="Loaded-source pressure coupling in [0,1] (default/restored 1); "
+                         "zero bypasses the new source exactly. Not a fitted parameter.")
     ap.add_argument("--grids", default=None, metavar="MS,MS,...",
                     help="2.x 단계들의 격자 [ms] (fit.GRID_MS, 기본 20,10,5,1). 창은 단계 순서대로 늘어난다. "
                          "같은 값을 되풀이하면 층을 더하지 않고 그 격자에서 창만 늘려 이어 적합한다")
@@ -555,11 +561,9 @@ def main() -> None:
     print(f"구간 {a.t0:.3f}~{t1:.3f} s, {track.n_frames} 프레임 × {track.frame_ms} ms",
           flush=True)
 
-    eng = VoiceEngine(EngineConfig(sample_rate=48000, frame_ms=a.frame_ms,
-                                   speaker="female" if prof.f0_nominal > 165 else "male",
-                                   residual=False), prof)
     initial_constants = None
     recording_constants = load_calibration(a.recording_lock) if a.recording_lock else None
+    speaker_constants = load_calibration(a.speaker_lock) if a.speaker_lock else None
     if a.init:
         # 두 번째 패스: 앞선 적합의 제어열을 출발점으로, 전역 엔진값도 되살린다.
         with np.load(a.init + "_track.npz", allow_pickle=False) as _z:
@@ -578,6 +582,19 @@ def main() -> None:
         n_ = min(len(_v), track.n_frames)
         track.values[:n_] = _v[:n_, :track.values.shape[1]]
         print(f"출발점: {a.init} (제어열 {n_} 프레임, 공통·발화 상수 읽음)", flush=True)
+    source_options = source_config(
+        (initial_constants, speaker_constants, recording_constants),
+        glottal_source=a.glottal_source, load_coupling=a.load_coupling)
+    source_override = a.glottal_source is not None or a.load_coupling is not None
+    config = EngineConfig(sample_rate=48000, frame_ms=a.frame_ms,
+                          speaker="female" if prof.f0_nominal > 165 else "male",
+                          residual=False, **source_options)
+    if config.loaded_source_enabled and (a.open_damp or a.device != "cpu"):
+        ap.error("Loaded source requires CPU and cannot be combined with --open-damp")
+    eng = VoiceEngine(config, prof)
+    print(f"Source: {config.glottal_source}, load coupling {config.load_coupling:g}"
+          f"{' (explicit A/B override)' if source_override else ''}; "
+          "new frame controls 0, fitted scalars 0", flush=True)
     room_ir = (initial_constants["recording"].get("room_ir")
                if initial_constants is not None else None)
     if recording_constants is not None:
@@ -743,15 +760,16 @@ def main() -> None:
         print("포먼트 구역: " + ", ".join(f"{k} {v[0]:.0f}~{v[1]:.0f}"
                                         for k, v in sorted(_fit.FORMANT_BAND.items())), flush=True)
     if initial_constants is not None:
-        apply_calibration(eng, initial_constants)
+        apply_calibration(eng, initial_constants, allow_source_override=source_override)
     if a.hf_eq:
         eng.tract.recording_eq_enabled = True
     locked_constants = ()
     if a.speaker_lock:
-        _sp = load_calibration(a.speaker_lock)
+        _sp = speaker_constants
         if not _sp["speaker"]:
             raise ValueError("--speaker-lock requires speaker-scope constants")
-        locked_constants += apply_calibration(eng, _sp, ("speaker",))
+        locked_constants += apply_calibration(eng, _sp, ("speaker",),
+                                              allow_source_override=source_override)
         if "formant_band" in _sp:
             _fit.FORMANT_BAND = {k: (float(v[0]), float(v[1])) for k, v in _sp["formant_band"].items()}
             print("  포먼트 구역: " + ", ".join(f"{k} {v[0]:.0f}~{v[1]:.0f}"
@@ -761,7 +779,8 @@ def main() -> None:
             print("  화자 잠금에서 제외: " + ", ".join(excluded), flush=True)
         print(f"화자 상수 잠금: {a.speaker_lock} 에서 {len(locked_constants)} 항목", flush=True)
     if recording_constants is not None:
-        locked_constants += apply_calibration(eng, recording_constants, ("recording",))
+        locked_constants += apply_calibration(eng, recording_constants, ("recording",),
+                                              allow_source_override=source_override)
         print(f"녹음 경로 잠금: {a.recording_lock} (발화별 레벨 정규화는 유지)", flush=True)
     initial_utterance = initial_constants["utterance"] if initial_constants is not None else {}
     fit = CopySynthFitter(eng, seg, sr, track, phase_weight=a.phase, room_ir=room_ir,

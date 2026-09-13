@@ -264,11 +264,12 @@ class GlottalSource(nn.Module):
                  n_rd: int = 24, n_harm: int | None = None, k_growth: float = 0.25,
                  cycles_decay: float = 3.0, f0_min: float = 50.0,
                  f0_range: tuple[float, float, float] | None = None,
-                 noise_modulation: str = "legacy"):
+                 noise_modulation: str = "legacy", flow_reference: bool = False):
         super().__init__()
         if noise_modulation not in ("legacy", "lf"):
             raise ValueError("noise_modulation must be 'legacy' or 'lf'")
         self.noise_modulation = noise_modulation
+        self.flow_reference = flow_reference
         self.fs, self.hop = float(fs), int(hop)
         self.k_growth, self.cycles_decay = k_growth, cycles_decay
         if f0_range is not None:
@@ -284,17 +285,21 @@ class GlottalSource(nn.Module):
         self.register_buffer("k_idx", torch.arange(1, n_harm + 1, dtype=torch.float32))
         self.hjit_log = nn.Parameter(torch.tensor(0.0))       # 배음 위상 분산 배율 (HJIT_FIT)
         self.src_eq_db = nn.Parameter(torch.zeros(len(SRC_EQ_F)))   # 화자 음원 EQ (SRC_EQ)
-        if noise_modulation == "lf":
+        if noise_modulation == "lf" or flow_reference:
             # Integrate the SAME LF derivative used for the harmonic source, from
             # opening (phase zero) to closure. No independent open-quotient fit.
             flows = []
+            peaks = []
             for r in rds:
                 e = lf_pulse(float(r))
                 flow = np.concatenate(([0.0], np.cumsum(e)[:-1]))
+                peaks.append(flow.max() / len(e))
                 flow /= flow.max()
                 flows.append(flow - flow.mean())
             # Derived table, not checkpoint state: legacy checkpoints still load.
             self.register_buffer("lf_flow", torch.tensor(np.stack(flows), dtype=torch.float32),
+                                 persistent=False)
+            self.register_buffer("lf_flow_peak", torch.tensor(peaks, dtype=torch.float32),
                                  persistent=False)
 
     def _src_eq(self, x, state):
@@ -410,7 +415,8 @@ class GlottalSource(nn.Module):
 
     # ---------------------------------------------------------- 파형
     def _harmonics_blocked(self, phase, f0, tilt, log2f0, i0, wrd, rps, dispersion, fs,
-                           f_nyq, width, f_cut, k_max, blk, psi_fr=None, n=None):
+                           f_nyq, width, f_cut, k_max, blk, psi_fr=None, n=None,
+                           flow_reference=False):
         """하모닉 가산합성의 묶음판. 아래 순차 루프와 **같은 식**을 (B, N, blk) 로 푼다.
 
         `HARM_BLOCK` 주석이 근거다. 하모닉 차수는 커지기만 하므로, 한 묶음에 살아 있는
@@ -418,6 +424,7 @@ class GlottalSource(nn.Module):
         """
         k = self.k_idx
         acc = torch.zeros(phase.shape, dtype=torch.float64, device=phase.device)
+        flow = torch.zeros_like(acc) if flow_reference else None
         ph = phase.unsqueeze(-1)
         f0e = f0.unsqueeze(-1)
         tl = tilt.unsqueeze(-1)
@@ -457,7 +464,11 @@ class GlottalSource(nn.Module):
                     -0.5 * (2.0 * math.pi * fk * GLOTTAL_CLOSURE_SPREAD_S) ** 2)
             term = 2.0 * w_k * (cj.real * torch.cos(th) - cj.imag * torch.sin(th))
             acc = acc + term.double().sum(-1)
-        return acc
+            if flow_reference:
+                primitive = (2.0 * w_k * (cj.real * torch.sin(th) + cj.imag * torch.cos(th))
+                             / (2.0 * math.pi * kk))
+                flow = flow + primitive.double().sum(-1)
+        return (acc, flow) if flow_reference else acc
 
     def _lf_index(self, rd: torch.Tensor):
         """(B,N) Rd -> (i0, w). 하모닉 계수는 **차수별로** 표에서 뽑는다.
@@ -556,6 +567,7 @@ class GlottalSource(nn.Module):
         f_cut = f_nyq + 6.0 * width                    # 이 위는 마스크를 정확히 0 으로 (청크 무관 상한)
         log2f0 = torch.log2(f0.clamp_min(1.0) / 1000.0)
         du = torch.zeros_like(phase)
+        flow = torch.zeros_like(phase) if self.flow_reference else None
         # NaN 안전. f0 에 NaN 이 들어오면 ceil(NaN) 이 그대로 통과해 int(NaN) 에서
         # **예외로 터진다** — 적합기의 "손실이 비유한이면 중단" 가드가 손실을 보기도 전이라
         # 원인을 못 찾는다. 하모닉 상한만 정하는 값이므로 NaN 은 상한으로 접고, 잘못된
@@ -590,9 +602,16 @@ class GlottalSource(nn.Module):
             psi_fr = noise.white("hphase", frame0 * kw, t_all * kw, b, f0.dtype,
                                  f0.device).reshape(b, t_all, kw)
         if HARM_BLOCK > 0:
-            du = du + self._harmonics_blocked(
+            harmonics = self._harmonics_blocked(
                 phase, f0, tilt, log2f0, i0, wrd, rps, dispersion, fs,
-                f_nyq, width, f_cut, k_max, int(HARM_BLOCK), psi_fr, n).to(du.dtype)
+                f_nyq, width, f_cut, k_max, int(HARM_BLOCK), psi_fr, n,
+                flow_reference=self.flow_reference)
+            if self.flow_reference:
+                harmonic_du, harmonic_flow = harmonics
+                du = du + harmonic_du.to(du.dtype)
+                flow = flow + harmonic_flow.to(du.dtype)
+            else:
+                du = du + harmonics.to(du.dtype)
             k_max = 0                      # 아래 순차 루프를 건너뛴다
         for j in range(k_max):
             kk = k[j]
@@ -650,12 +669,21 @@ class GlottalSource(nn.Module):
                 w_k = w_k * torch.exp(
                     -0.5 * (2.0 * math.pi * fk * GLOTTAL_CLOSURE_SPREAD_S) ** 2)
             du = du + 2.0 * w_k * (cj.real * torch.cos(th) - cj.imag * torch.sin(th))
+            if self.flow_reference:
+                flow = flow + (2.0 * w_k * (cj.real * torch.sin(th) + cj.imag * torch.cos(th))
+                               / (2.0 * math.pi * kk))
         if SRC_EQ:
             du = self._src_eq(du, state)
+            if self.flow_reference:
+                flow = self._src_eq(flow, state.setdefault("flow_eq", {}))
         du = du * amp
+        if self.flow_reference:
+            flow = flow * amp
         if "voice_gain" in c:
             # 성문 배음에만 거는 빠른 이득 (control.py 의 voice_gain). 기식 포락(asp_env)은 건드리지 않는다.
             du = du * up(torch.pow(10.0, c["voice_gain"] / 20.0))
+            if self.flow_reference:
+                flow = flow * up(torch.pow(10.0, c["voice_gain"] / 20.0))
         # 성문 개방기 (LF: 0 ~ te 가 열림) -> 기식 AM 마스크
         frac = phase / (2 * math.pi)
         open_phase = torch.sin(math.pi * frac.clamp(0, 1) / 0.65).clamp_min(0.0) ** 2
@@ -673,8 +701,14 @@ class GlottalSource(nn.Module):
             asp_env = asp * (1.0 + ASP_AM_DEPTH * voiced * (0.325 - 0.5)) * noise_am
         else:
             asp_env = asp * (1.0 + ASP_AM_DEPTH * voiced * (open_phase - 0.5))
-        return dict(du=du, phase=phase, asp_env=asp_env.clamp_min(0.0),
+        result = dict(du=du, phase=phase, asp_env=asp_env.clamp_min(0.0),
                     noise_am=noise_am, open_phase=open_phase * voiced,
                     amp=amp, f0=f0, ag_dc=up(st["ag_dc"]), ag_dc_frames=st["ag_dc"], voiced=voiced,
                     physiology=st, amp_last=st["amp_raw"][:, t - 1], state=state,
                     phase_last=phase64[:, -1:])
+        if self.flow_reference:
+            from .loaded_source import PULSE_FLOW_CM3_S
+            peak = self.lf_flow_peak[i0] * (1 - wrd) + self.lf_flow_peak[i0 + 1] * wrd
+            result["flow_scale"] = PULSE_FLOW_CM3_S / peak
+            result["reference_flow"] = flow * result["flow_scale"]
+        return result

@@ -46,7 +46,7 @@ import torch
 from formant_ml.engine import turbulence as tb
 from formant_ml.engine import segment
 from formant_ml.engine.analyze import analyze, glottal_pulses
-from formant_ml.engine.calibration import apply_calibration, load_calibration
+from formant_ml.engine.calibration import apply_calibration, load_calibration, source_config
 from formant_ml.engine.control import PARAM_NAMES
 from formant_ml.engine.denoise import denoise, noise_profile
 from formant_ml.engine.fit import CopySynthFitter
@@ -85,7 +85,8 @@ def fit_one(path: str, t0: float, t1: float, kind: str, prof: SpeakerProfile,
             frame_ms: float = 1.0, clean: tuple[np.ndarray, int] | None = None,
             pulses: np.ndarray | None = None,
             speaker_constants: dict | None = None,
-            recording_constants: dict | None = None) -> dict:
+            recording_constants: dict | None = None,
+            glottal_source: str | None = None, load_coupling: float | None = None) -> dict:
     """구간 하나를 적합해 npz 로 남기고 요약 한 줄을 돌려준다.
 
     `clean` 과 `pulses` 는 같은 파일의 다른 구간과 **나눠 쓰라고** 있는 인자다. 둘 다
@@ -108,16 +109,22 @@ def fit_one(path: str, t0: float, t1: float, kind: str, prof: SpeakerProfile,
     track = analyze(seg, sr, prof, hop, t0=t0, full=y, pulses=pulses)
     eng = VoiceEngine(EngineConfig(sample_rate=48000, frame_ms=frame_ms,
                                    speaker="female" if prof.f0_nominal > 165 else "male",
-                                   residual=False), prof)
+                                   residual=False, **source_config(
+                                       (speaker_constants, recording_constants),
+                                       glottal_source=glottal_source,
+                                       load_coupling=load_coupling)), prof)
+    source_override = glottal_source is not None or load_coupling is not None
     locked = ()
     if speaker_constants is not None:
         if not speaker_constants["speaker"]:
             raise ValueError("No speaker-scope constants to lock")
-        locked += apply_calibration(eng, speaker_constants, ("speaker",))
+        locked += apply_calibration(eng, speaker_constants, ("speaker",),
+                                    allow_source_override=source_override)
     if recording_constants is not None:
         if not recording_constants["recording"]:
             raise ValueError("No recording-scope constants to lock")
-        locked += apply_calibration(eng, recording_constants, ("recording",))
+        locked += apply_calibration(eng, recording_constants, ("recording",),
+                                    allow_source_override=source_override)
     room_ir = (recording_constants["recording"].get("room_ir")
                if recording_constants is not None else None)
     fit = CopySynthFitter(eng, seg, sr, track, locked_constants=locked, room_ir=room_ir,
@@ -176,7 +183,7 @@ def _worker(args, on_row=None):
     None 이고, 진행은 파일 단위로 보인다).
     """
     (path, segs, prof_path, out_dir, budget, patience, threads,
-     speaker_constants, recording_constants) = args
+     speaker_constants, recording_constants, glottal_source, load_coupling) = args
     torch.set_num_threads(threads)
     rows = []
     try:
@@ -193,7 +200,8 @@ def _worker(args, on_row=None):
         try:
             row = fit_one(path, t0, t1, kind, prof, out_dir, budget, patience,
                           clean=clean, pulses=pulses, speaker_constants=speaker_constants,
-                          recording_constants=recording_constants)
+                          recording_constants=recording_constants,
+                          glottal_source=glottal_source, load_coupling=load_coupling)
             row["seconds"] = round(time.time() - t, 1)
         except Exception as e:                  # 한 구간이 죽어도 코퍼스는 계속 돈다
             row = dict(stem=_name(path, t0, t1), file=os.path.basename(path),
@@ -215,6 +223,10 @@ def main() -> None:
                     help="모든 구간이 공유하는 화자 공통 보정값")
     ap.add_argument("--recording-lock", metavar="JSON",
                     help="같은 녹음 환경의 출력 EQ·IR (화자 보정과 별개)")
+    ap.add_argument("--glottal-source", choices=("lf", "loaded"), default=None,
+                    help="Default LF or saved source; an explicit choice permits source A/B")
+    ap.add_argument("--load-coupling", type=float, default=None,
+                    help="Fixed loaded-source coupling [0,1]; zero is the exact legacy bypass")
     ap.add_argument("--kinds", default="fricative,vowel")
     ap.add_argument("--limit", type=int, default=0, help="구간 수 상한 (0 = 전부)")
     ap.add_argument("--files", type=int, default=0, help="파일 수 상한 (0 = 전부)")
@@ -228,6 +240,15 @@ def main() -> None:
     a = ap.parse_args()
     speaker_constants = load_calibration(a.speaker_lock) if a.speaker_lock else None
     recording_constants = load_calibration(a.recording_lock) if a.recording_lock else None
+    source_options = source_config(
+        (speaker_constants, recording_constants),
+        glottal_source=a.glottal_source, load_coupling=a.load_coupling)
+    config = EngineConfig(**source_options)
+    if config.loaded_source_enabled:
+        from formant_ml.engine.loaded_source import require_backend
+        require_backend()
+    print(f"Source: {config.glottal_source}, load coupling {config.load_coupling:g}; "
+          "new frame controls 0, fitted scalars 0", flush=True)
 
     budget = tuple(int(x) for x in a.budget.split(","))
     kinds = set(a.kinds.split(","))
@@ -266,7 +287,8 @@ def main() -> None:
             n_fric += s.kind == "fricative"
         if keep:
             jobs.append((p, keep, a.profile, a.out, budget, a.patience, a.threads,
-                         speaker_constants, recording_constants))
+                         speaker_constants, recording_constants,
+                         a.glottal_source, a.load_coupling))
         if a.limit and n_seg >= a.limit:
             break
     print(f"구간 {n_seg} 개 (마찰 {n_fric}, 모음 {n_seg - n_fric}) / 파일 {len(jobs)} 개, "

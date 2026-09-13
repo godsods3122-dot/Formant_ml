@@ -12,7 +12,7 @@ from formant_ml.engine import fit as fit_module
 from formant_ml.engine import tract as tract_module
 from formant_ml.engine.calibration import (
     apply_calibration, capture_calibration, combine_calibrations, engine_parameters,
-    legacy_fields, load_calibration, normalize_calibration,
+    legacy_fields, load_calibration, normalize_calibration, source_config,
 )
 from formant_ml.engine.control import ControlTrack, default_vector
 from formant_ml.engine.fit import CopySynthFitter
@@ -137,6 +137,33 @@ def test_wrong_engine_or_mixed_shapes_cannot_be_combined():
     del b["speaker"]["log_front_bw"]
     with pytest.raises(ValueError, match="incomplete"):
         combine_calibrations([a, b])
+
+
+def test_source_configuration_restore_override_and_parameter_budget():
+    # Zero coupling also exercises saved configuration without requiring numba.
+    legacy = _engine()
+    loaded = VoiceEngine(EngineConfig(residual=False, glottal_source="loaded", load_coupling=0))
+    data = capture_calibration(loaded)
+    settings = source_config((data,))
+    assert settings == {"glottal_source": "loaded", "load_coupling": 0}
+    restored = VoiceEngine(EngineConfig(residual=False, **settings))
+    apply_calibration(restored, data)
+    with pytest.raises(ValueError, match="model mismatch"):
+        apply_calibration(legacy, data)
+    apply_calibration(legacy, data, allow_source_override=True)
+    assert legacy.cfg.glottal_source == "lf"
+    assert source_config((data,), glottal_source="lf", load_coupling=1) == {
+        "glottal_source": "lf", "load_coupling": 1}
+    with pytest.raises(ValueError, match="Conflicting saved"):
+        source_config((data, capture_calibration(legacy)))
+    mismatch = copy.deepcopy(data)
+    mismatch["model"]["tract_length_cm"] = 12
+    with pytest.raises(ValueError, match="tract_length_cm"):
+        apply_calibration(legacy, mismatch, allow_source_override=True)
+    assert {k: p.numel() for k, p in engine_parameters(legacy).items()} == {
+        k: p.numel() for k, p in engine_parameters(loaded).items()}
+    assert source_config((normalize_calibration({"log_front_bw": 0.2}),)) == {
+        "glottal_source": "lf", "load_coupling": 1}
 
 
 def test_different_room_responses_are_not_averaged():
@@ -300,8 +327,11 @@ def test_sparse_events_reach_only_observed_controls_with_finite_gradients(monkey
     assert torch.isfinite(f.event_loss())
 
 
-def test_copyfit_render_only_round_trip_preserves_recording_chain(tmp_path, monkeypatch):
+@pytest.mark.parametrize("source", ["lf", "loaded"])
+def test_copyfit_render_only_round_trip_preserves_recording_chain(tmp_path, monkeypatch, source):
     import soundfile as sf
+    if source == "loaded":
+        pytest.importorskip("numba")
 
     path = Path(__file__).resolve().parents[2] / "scripts" / "copyfit.py"
     spec = importlib.util.spec_from_file_location("copyfit_calibration_cli", path)
@@ -320,6 +350,7 @@ def test_copyfit_render_only_round_trip_preserves_recording_chain(tmp_path, monk
               "--global-iters", "0", "--stage-iters", "0", "--phase-iters", "0"]
     first, second = tmp_path / "first", tmp_path / "second"
     monkeypatch.setattr(cli.sys, "argv", common + [
+        "--glottal-source", source, "--load-coupling", "0.7",
         "--recording-lock", str(channel), "--out", str(first)])
     cli.main()
     monkeypatch.setattr(cli.sys, "argv", common + [
@@ -332,4 +363,14 @@ def test_copyfit_render_only_round_trip_preserves_recording_chain(tmp_path, monk
         constants = load_calibration(str(stem) + "_track.npz")
         assert constants["recording"]["hf_eq_enabled"]
         assert constants["recording"]["room_ir"] == pytest.approx([1, 0.02])
+        assert constants["model"]["glottal_source"] == source
+        assert constants["model"]["load_coupling"] == 0.7
         assert Path(str(stem) + "_constants.json").exists()
+    if source == "loaded":
+        third = tmp_path / "override"
+        monkeypatch.setattr(cli.sys, "argv", common + [
+            "--init", str(first), "--glottal-source", "lf", "--out", str(third)])
+        cli.main()
+        assert load_calibration(str(third) + "_track.npz")["model"]["glottal_source"] == "lf"
+        with np.load(str(first) + "_track.npz") as a, np.load(str(third) + "_track.npz") as b:
+            np.testing.assert_array_equal(a["values"], b["values"])

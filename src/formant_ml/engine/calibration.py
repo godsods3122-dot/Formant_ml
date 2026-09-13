@@ -31,6 +31,36 @@ FIELDS = {
 }
 EXTRA_FIELDS = {"room_ir": "recording", "hf_eq_enabled": "recording", "gain_db": "utterance",
                 "pulse_phi0": "utterance"}
+SOURCE_MODEL_FIELDS = ("glottal_source", "load_coupling", "loaded_source_version")
+
+
+def source_config(calibrations=(), *, glottal_source=None, load_coupling=None) -> dict:
+    """Resolve saved source settings before engine creation, or explicit A/B choices.
+
+    Missing legacy fields mean the legacy source. Explicit options override only
+    their own values; conflicting saved values otherwise require a decision.
+    """
+    from .voice import EngineConfig, LOADED_SOURCE_VERSION
+
+    models = [normalize_calibration(item)["model"] for item in calibrations if item is not None]
+    result = {}
+    for name, explicit, default in (("glottal_source", glottal_source, "lf"),
+                                    ("load_coupling", load_coupling, 1.0)):
+        saved = [m[name] for m in models if name in m]
+        if explicit is not None:
+            result[name] = explicit
+        elif saved:
+            if any(value != saved[0] for value in saved):
+                raise ValueError(f"Conflicting saved {name}; select it explicitly for A/B")
+            result[name] = saved[0]
+        else:
+            result[name] = default
+    if glottal_source is None:
+        for model in models:
+            if model.get("loaded_source_version", LOADED_SOURCE_VERSION) != LOADED_SOURCE_VERSION:
+                raise ValueError("Unsupported loaded source version; select a source explicitly")
+    EngineConfig(**result)  # Validate even when a caller is only inspecting settings.
+    return result
 
 
 def parameter_scope(name: str) -> str:
@@ -43,6 +73,7 @@ def engine_parameters(engine) -> dict[str, torch.nn.Parameter]:
 
 
 def model_signature(engine) -> dict:
+    from .voice import LOADED_SOURCE_VERSION
     profile = engine.profile
     return dict(sample_rate=engine.cfg.sample_rate,
                 tract_length_cm=float(engine.tract.length_cm),
@@ -50,7 +81,10 @@ def model_signature(engine) -> dict:
                 speaker=engine.cfg.speaker,
                 f0_range=None if profile is None else
                 [profile.f0_lo, profile.f0_hi, profile.f0_nominal],
-                noise_modulation=engine.cfg.noise_modulation)
+                noise_modulation=engine.cfg.noise_modulation,
+                glottal_source=engine.cfg.glottal_source,
+                load_coupling=engine.cfg.load_coupling,
+                loaded_source_version=LOADED_SOURCE_VERSION)
 
 
 def normalize_calibration(data: Mapping) -> dict:
@@ -136,13 +170,16 @@ def capture_calibration(engine, *, gain_db: float | None = None,
 
 
 def apply_calibration(engine, data: Mapping,
-                      scopes: Sequence[str] = SCOPES) -> tuple[str, ...]:
+                      scopes: Sequence[str] = SCOPES, *,
+                      allow_source_override: bool = False) -> tuple[str, ...]:
     """Validate all selected shapes before copying anything; never truncate."""
     data = normalize_calibration(data)
     if set(scopes) - set(SCOPES):
         raise ValueError(f"Unknown calibration scopes: {scopes}")
     actual = model_signature(engine)
     for name, expected in data["model"].items():
+        if allow_source_override and name in SOURCE_MODEL_FIELDS:
+            continue
         if name not in actual or actual[name] != expected:
             raise ValueError(f"Calibration model mismatch for {name}: "
                              f"saved {expected!r}, engine {actual.get(name)!r}")
