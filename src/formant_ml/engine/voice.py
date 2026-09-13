@@ -124,6 +124,27 @@ class VoiceEngine(nn.Module):
         if glottis.HJIT_CYCLE and glottis.HARM_PHASE_JIT > 0:
             raise ValueError("Loaded source does not support non-streaming HJIT_CYCLE")
 
+    def _pulse_rate(self, phase, sample0: int, n: int, batch: int):
+        """Rate of the full, unwrapped external phase; never modulo differences.
+
+        The very first sample has no predecessor, so use the first available
+        interval there. Later chunks use the preceding sample of the same
+        caller-supplied absolute phase trajectory.
+        """
+        if (phase.ndim != 2 or phase.shape[0] != batch
+                or phase.shape[1] < max(2, sample0 + n)):
+            raise ValueError("Loaded pulse_phase must supply the full phase trajectory "
+                             "through emitted samples, with at least two samples")
+        phase = phase.double()
+        if sample0:
+            previous = phase[:, sample0 - 1:sample0 + n - 1]
+        else:
+            previous = torch.cat((2 * phase[:, :1] - phase[:, 1:2], phase[:, :n - 1]), -1)
+        rate = (phase[:, sample0:sample0 + n] - previous) * (self.cfg.sample_rate / (2 * math.pi))
+        if not bool(torch.isfinite(rate).all()) or bool((rate <= 0).any()):
+            raise ValueError("Loaded pulse_phase must be finite, unwrapped and strictly increasing")
+        return rate
+
     def reset(self) -> None:
         self.state = dict(phase=None, amp=None, tract={}, residual={}, glottis={},
                           fric={}, asp={}, frame=0)
@@ -146,6 +167,13 @@ class VoiceEngine(nn.Module):
         n = t * hop
         c = {name: ctrl[..., INDEX[name]] for name in PARAM_NAMES}
         f0i, s0 = st["frame"], st["frame"] * hop
+        source_rate = None
+        if self.loaded_source is not None:
+            self._check_source_options()
+            if ctrl.device.type != "cpu":
+                raise ValueError("The loaded glottal source currently supports CPU only")
+            if pulse_phase is not None:
+                source_rate = self._pulse_rate(pulse_phase, s0, n, b)
         pp = None if pulse_phase is None else pulse_phase[:, s0:s0 + n]
         g = self.glottis(c, phase0=st["phase"], noise=self.noise, frame0=f0i,
                          dispersion=GLOTTAL_DISPERSION,
@@ -153,12 +181,13 @@ class VoiceEngine(nn.Module):
         prepared_tracks = None
         loaded = None
         if self.loaded_source is not None:
-            self._check_source_options()
+            if source_rate is None:
+                source_rate = g["f0"]
             prepared_tracks = self.tract.prepare_tracks(c, n, st["tract"])
             ps = frames_to_samples(c["p_sub"].unsqueeze(-1), hop)[:, :n, 0]
             loaded = self.loaded_source(
-                g["reference_flow"], g["flow_scale"], g["f0"], g["ag_dc"],
-                ps, prepared_tracks, st.get("loaded", {}))
+                g["reference_flow"], g["flow_scale"], source_rate, g["ag_dc"],
+                ps, prepared_tracks, st.get("loaded", {}), legacy_du=g["du"])
             g["du"] = loaded["du"]
             st["loaded"] = loaded["state"]
         fr = self.frication(c, g["ag_dc_frames"], g["phase"], g["voiced"], noise=self.noise,
@@ -199,6 +228,7 @@ class VoiceEngine(nn.Module):
         if loaded is not None:
             result.update(flow=loaded["flow"], load_pressure=loaded["load_pressure"],
                           glottal_flow=loaded["glottal_flow"],
+                          source_rate=source_rate,
                           reference_flow=g["reference_flow"])
         return result
 

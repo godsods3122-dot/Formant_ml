@@ -55,8 +55,9 @@ periodic Fourier primitive using the same harmonic coefficients, tilt,
 masking, phase, amplitude, and optional source EQ. The Rd table's uncentered
 integrated pulse maximum normalizes that primitive. A fixed nominal pulse
 excursion of **100 cm^3/s** supplies a dimensional reference scale. This is an
-explicit reference-flow assumption, not measured anatomy and not an added
-output gain; the same scale is divided out when returning to engine units.
+empirical operating-regime calibration, not identified anatomical flow and
+not an added output gain; the same scale is divided out of the load-induced
+flow correction when returning to engine units.
 The integrated LF waveform is never used as glottal area.
 
 The actual state `q` is AC flow [cm^3/s] about the existing quasi-static
@@ -88,7 +89,8 @@ Diagnostics returned in `parts`:
 | `glottal_flow` | Udc + q, cm^3/s |
 | `reference_flow` | Prescribed zero-mean LF reference flow, cm^3/s |
 | `load_pressure` | Coupling-scaled midpoint pressure actually fed back, dyn/cm^2 |
-| `du` | Normalized differentiated solved flow sent to the tract |
+| `source_rate` | Actual pulse-phase rate used for correction normalization, cycles/s |
+| `du` | Analytic legacy LF derivative plus differentiated load-flow deviation |
 
 ## Load impedance and feedback
 
@@ -116,8 +118,8 @@ modes, and use of transfer-formant frequencies as impedance-pole proxies
 are modeling approximations.
 
 These states are **not** the audio biquad states: the normalized output
-formant cascade does not expose a physical input-pressure port. Solved flow
-feeds the existing forward tract once. Modal pressure is returned to the
+formant cascade does not expose a physical input-pressure port. The loaded
+source feeds the existing forward tract once. Modal pressure is returned to the
 source solve, not cascaded or added onto output audio. There are no duplicate
 audio poles, arbitrary feedback delay, or restored constriction multiplier.
 Aspiration/frication and their mean-flow physiology remain unchanged. Nasal,
@@ -172,12 +174,36 @@ remains ordinary Torch; source/load coupling is fixed configuration.
 
 Default LF and **literal zero coupling** bypass new source synthesis and
 load state entirely, including when the backend is absent. They reproduce
-the legacy renderer exactly. Nonzero coupling uses a causal first difference
-of physical flow, normalized by its LF flow scale and F0. Unlike the legacy
-analytic derivative, it includes the expected half-sample differentiation
-phase and high-frequency sinc factor, plus derivatives from changing
-reference controls. Therefore arbitrarily small nonzero coupling is **not**
-bit-identical to LF. No corrective EQ or noncausal phase shift hides this.
+the legacy renderer exactly. Active output preserves the existing analytic
+LF component and differentiates **only the load-induced flow deviation**:
+
+```text
+delta[n] = q_actual[n] - q_reference[n]
+du_out[n] = du_legacy[n]
+            + fs*(delta[n]-delta[n-1]) / (flow_scale[n]*source_rate[n])
+```
+
+This is a residual/defect correction atop the baseline's prescribed,
+time-varying LF approximation, **not the exact full waveform derivative of
+physical glottal flow**. It keeps control-modulation and numerical
+differentiation artifacts of the reference out of the no-load limit.
+The internal actual-flow/nonlinear-pressure equations and their power balance
+remain as stated. There is no fitted EQ, compensating gain, or phase shift.
+Tiny positive coupling converges to legacy output to numerical precision;
+even with changing reference controls the no-load recurrence reproduces the
+reference, so its output correction is zero.
+
+For internally accumulated phase, `source_rate` is the actual F0 including
+jitter. With external `pulse_phase` (including fitter `--pulse-lock`), it is
+the sample difference of the **supplied unwrapped phase**, in cycles/s, not
+`f0_target`. The full absolute phase trajectory is required on every forward
+call, matching the engine's existing slicing contract. At chunk boundaries,
+the preceding sample of that trajectory supplies the left endpoint. At the
+very first sample only, where no prior phase exists, the first available
+interval supplies the rate. This is consistent between streaming and
+monolithic output, introduces no modulo-induced rate jumps, and requires no
+lookahead beyond the existing interpolation frame. Nonfinite,
+non-increasing, wrapped, or undersized trajectories fail explicitly.
 
 Recurrent state per channel: actual q, previous reference q, and six modal
 pressure/quadrature values (**eight scalars**). Existing tract smoothing
@@ -199,17 +225,17 @@ recurrence graph. First use includes numba compilation.
 A short warmed CPU probe (200 ms synthetic vowel, 48 kHz, two Torch threads,
 three repetitions, default forward tract, no residual) measured:
 
-| Harmonic block | Source | Render | Forward + backward |
-|---|---|---|---|
-| 0 (default) | LF | 53.7 ms | 190.0 ms |
-| 0 | loaded | 77.4 ms | 237.5 ms |
-| 16 | LF | 59.9 ms | 195.2 ms |
-| 16 | loaded | 65.3 ms | 206.9 ms |
+| Source (default harmonic path) | Render | Forward + backward |
+|---|---|---|
+| LF | 61.8 ms | 234.5 ms |
+| loaded | 82.4 ms | 285.5 ms |
 
 This is not a corpus fit, quality result, or small-buffer realtime guarantee.
 Parent A/B must choose adoption; the default remains off.
 
-Focused tests cover analytic/first-difference gradients including terminal
+Focused tests cover analytic/finite-difference gradients including terminal
 state, positive-real discrete frequency response, unforced static energy
-decay, exact bypass, changing-controls streaming, and saved-mode replay/
-intentional source override with unchanged initial controls.
+decay, exact bypass and tiny-coupling convergence, dynamic-reference no-load
+identity, externally pulse-locked phase-rate normalization/gradients/
+streaming, and saved-mode replay/intentional source override with unchanged
+initial controls.

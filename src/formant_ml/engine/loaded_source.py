@@ -199,7 +199,8 @@ class ImpedanceLoadedSource:
         self.fs, self.length_cm, self.coupling = sample_rate, length_cm, coupling
         self.r0 = 0.02 * RHO * C_SOUND / TRACT_AREA_CM2
 
-    def __call__(self, reference, flow_scale, f0, area, p_sub, tracks, state):
+    def __call__(self, reference, flow_scale, source_rate, area, p_sub, tracks, state,
+                 *, legacy_du):
         if reference.device.type != "cpu":
             raise ValueError("The loaded glottal source currently supports CPU only")
         ref, area, p_sub = reference.double(), area.double(), p_sub.double()
@@ -214,8 +215,12 @@ class ImpedanceLoadedSource:
             ref, mass, resistance, quadratic, mean,
             load_coefficients(tracks, self.fs, self.length_cm),
             initial, self.coupling, self.r0)
-        previous = torch.cat((initial[:, :1], flow[:, :-1]), -1)
-        du = (flow - previous) * self.fs / (flow_scale.double() * f0.double().clamp_min(1.0))
-        return dict(du=du.to(reference.dtype), flow=flow, load_pressure=pressure,
+        defect = flow - ref
+        previous = torch.cat((initial[:, :1] - initial[:, 1:2], defect[:, :-1]), -1)
+        # Preserve the analytic LF component; differentiate only the load-induced
+        # flow deviation, not control-modulation/discretization error in LF.
+        correction = (defect - previous) * self.fs / (flow_scale.double() * source_rate.double())
+        du = legacy_du.double() + correction
+        return dict(du=du.to(legacy_du.dtype), flow=flow, load_pressure=pressure,
                     glottal_flow=flow + mean,
                     state={"flow": final})

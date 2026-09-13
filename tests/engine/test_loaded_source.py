@@ -6,7 +6,7 @@ import torch
 from formant_ml.engine import glottis, tract
 from formant_ml.engine.control import ControlTrack, default_vector
 from formant_ml.engine.loaded_source import (
-    RHO, C_SOUND, TRACT_AREA_CM2,
+    RHO, C_SOUND, TRACT_AREA_CM2, ImpedanceLoadedSource,
     load_coefficients, loaded_flow, njit,
 )
 from formant_ml.engine.voice import EngineConfig, VoiceEngine
@@ -184,3 +184,88 @@ def test_blocked_flow_reference_matches_sequential(monkeypatch):
     _, b = eng.render(_track(), return_parts=True)
     np.testing.assert_allclose(a["reference_flow"], b["reference_flow"], atol=8e-5, rtol=1e-5)
     np.testing.assert_allclose(a["du"], b["du"], atol=3e-5, rtol=1e-4)
+
+
+@backend
+def test_dynamic_reference_no_load_preserves_legacy_component():
+    n = 79
+    t = torch.linspace(0, 1, n, dtype=torch.float64)[None]
+    ref = 20 * (1 + t) * torch.sin(17 * t)
+    legacy = torch.cos(31 * t)  # Does not need to equal a discrete reference derivative.
+    scale, rate, area, ps = 100 + 40*t, 180 + 90*t, 0.03 + 0.1*t, 4 + 5*t
+    tracks = [(500 + 80*t, 35 + 40*t), (1500 + 50*t, 60 + 50*t),
+              (2600 - 100*t, 80 + 60*t)]
+    source = ImpedanceLoadedSource(FS, 14.6, 0.0)
+    args = (ref, scale, rate, area, ps)
+    full = source(*args, tracks, {}, legacy_du=legacy)
+    torch.testing.assert_close(full["flow"], ref, atol=2e-12, rtol=1e-12)
+    torch.testing.assert_close(full["du"], legacy, atol=2e-12, rtol=1e-12)
+    first = source(*[x[:, :31] for x in args],
+                   [(f[:, :31], bw[:, :31]) for f, bw in tracks], {}, legacy_du=legacy[:, :31])
+    last = source(*[x[:, 31:] for x in args],
+                  [(f[:, 31:], bw[:, 31:]) for f, bw in tracks],
+                  first["state"], legacy_du=legacy[:, 31:])
+    torch.testing.assert_close(torch.cat((first["du"], last["du"]), 1), legacy,
+                               atol=2e-12, rtol=1e-12)
+
+
+@backend
+def test_tiny_positive_coupling_converges_to_legacy(monkeypatch):
+    monkeypatch.setattr(glottis, "HARM_BLOCK", 0)
+    tr = _track()
+    legacy = VoiceEngine(EngineConfig(residual=False, n_extra_formants=0))
+    base, base_parts = legacy.render(tr, return_parts=True)
+    errors = []
+    for coupling in (1e-3, 1e-6, 1e-9):
+        eng = VoiceEngine(EngineConfig(residual=False, n_extra_formants=0,
+                                       glottal_source="loaded", load_coupling=coupling))
+        y, parts = eng.render(tr, return_parts=True)
+        errors.append(np.linalg.norm(y - base))
+        if coupling == 1e-9:
+            np.testing.assert_allclose(parts["du"], base_parts["du"], atol=2e-7, rtol=1e-6)
+    assert errors[1] < errors[0] * 0.01
+    assert errors[2] < errors[1] * 0.1
+
+
+@backend
+def test_external_pulse_rate_defect_scaling_streaming_and_gradient(monkeypatch):
+    tr = _track()
+    ctrl = tr.to_tensor()[:, :25]
+    n = ctrl.shape[1] * 48
+    rates = torch.linspace(260, 340, n, dtype=torch.float64)[None]
+    phase = torch.cumsum(rates * (2 * np.pi / FS), 1) + 31 * 2 * np.pi
+    phase = phase.requires_grad_()
+    eng = VoiceEngine(EngineConfig(residual=False, n_extra_formants=0,
+                                   glottal_source="loaded", load_coupling=0.7))
+    captured = {}
+    original = ImpedanceLoadedSource.__call__
+
+    def inspect(self, reference, scale, rate, *args, **kwargs):
+        captured.update(scale=scale, legacy=kwargs["legacy_du"])
+        return original(self, reference, scale, rate, *args, **kwargs)
+
+    monkeypatch.setattr(ImpedanceLoadedSource, "__call__", inspect)
+    full = eng(ctrl, pulse_phase=phase)
+    expected_rate = torch.cat((rates[:, 1:2], rates[:, 1:]), 1)
+    torch.testing.assert_close(full["source_rate"], expected_rate, atol=2e-9, rtol=1e-11)
+    defect = full["flow"] - full["reference_flow"].double()
+    prev = torch.cat((torch.zeros_like(defect[:, :1]), defect[:, :-1]), 1)
+    expected_du = captured["legacy"].double() + (defect - prev) * FS / (
+        captured["scale"].double() * expected_rate)
+    torch.testing.assert_close(full["du"], expected_du.float(), atol=1e-7, rtol=1e-6)
+    full["du"].square().mean().backward()
+    assert phase.grad is not None and torch.isfinite(phase.grad).all()
+    assert phase.grad.abs().max() > 0
+    eng.reset()
+    chunks = []
+    with torch.no_grad():
+        for start in range(0, ctrl.shape[1], 7):
+            end = min(ctrl.shape[1], start + 7)
+            out = eng(ctrl[:, start:min(ctrl.shape[1], end + 1)],
+                      pulse_phase=phase.detach(), emit=end - start)
+            chunks.append(out["audio"])
+    torch.testing.assert_close(torch.cat(chunks, 1), full["audio"].detach(),
+                               atol=2e-6, rtol=1e-5)
+    eng.reset()
+    with pytest.raises(ValueError, match="unwrapped"):
+        eng(ctrl, pulse_phase=torch.remainder(phase.detach(), 2*np.pi))
