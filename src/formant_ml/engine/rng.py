@@ -7,6 +7,8 @@
 """
 from __future__ import annotations
 
+import zlib
+
 import torch
 
 BLOCK = 8192
@@ -24,7 +26,12 @@ class NoiseBank:
         key = (channel, idx)
         b = self._cache.get(key)
         if b is None:
-            ch = self.CHANNELS.index(channel) if channel in self.CHANNELS else hash(channel) % 997
+            # **이름에서 번호를 뽑을 때 `hash()` 를 쓰면 안 된다.** 문자열 해시는 프로세스마다
+            # 무작위화되어(PYTHONHASHSEED) 같은 씨앗으로도 프로세스마다 다른 난수가 나온다.
+            # 실측: 배음 위상 채널("hphase")이 그래서, 같은 제어열을 다시 렌더한 치찰음 고역
+            # 변조가 프로세스마다 +9.1 / +6.6 dB 로 달랐다(MEASUREMENTS §50). crc32 는 고정이다.
+            ch = (self.CHANNELS.index(channel) if channel in self.CHANNELS
+                  else 100 + zlib.crc32(channel.encode("utf-8")) % 997)
             g = torch.Generator().manual_seed((self.seed * 1000003 + ch * 7919 + idx) % (2 ** 31))
             b = torch.randn(BLOCK, generator=g, dtype=torch.float32)
             if len(self._cache) > self.cache_blocks:

@@ -17,7 +17,10 @@ dependencies = ["torch>=2.0", "numpy>=1.24", "scipy>=1.10", "soundfile>=0.12"]
 # 있으므로 하드 의존이 아니라 extra 로 둔다 (score.py::load_score 참조).
 [project.optional-dependencies]
 yaml = ["pyyaml>=6.0"]
-dev = ["pyyaml>=6.0", "pytest>=7.0", "numba>=0.59", "praat-parselmouth>=0.4"]
+dev = ["pyyaml>=6.0", "pytest>=7.0", "numba>=0.59", "praat-parselmouth>=0.4",
+       # scripts/plot_breakup.py·plot_noise.py 가 쓴다. RUN_LOCAL 이 그 둘의
+       # 통과를 필수 규칙으로 걸고 있는데 선언이 빠져 있었다.
+       "matplotlib>=3.7"]
 realtime = ["numba>=0.59"]
 measure = ["praat-parselmouth>=0.4"]
 

@@ -26,7 +26,20 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib import rcParams
 
-rcParams["font.family"] = "NanumGothic"
+# **설치된 한글 폰트를 골라 쓴다.** 한 이름으로 못박으면 그 폰트가 없는 기계에서
+# 라벨이 전부 두부(□)가 되고, 그림이 유일한 산출물인 이 스크립트는 쓸모가 없어진다
+# (윈도우에는 NanumGothic 이 없고 Malgun Gothic 이 있다).
+def _pick_korean_font() -> str:
+    from matplotlib import font_manager as fm
+    have = {f.name for f in fm.fontManager.ttflist}
+    for name in ("NanumGothic", "Malgun Gothic", "AppleGothic", "Noto Sans CJK KR",
+                 "Noto Sans KR", "Gulim", "Batang"):
+        if name in have:
+            return name
+    return rcParams["font.family"][0]
+
+
+rcParams["font.family"] = _pick_korean_font()
 rcParams["axes.unicode_minus"] = False
 
 

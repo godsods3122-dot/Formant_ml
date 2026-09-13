@@ -90,6 +90,51 @@ _P: list[ParamSpec] = [
     ParamSpec("transient", "0-1", 0.0, 1.0, 0.0, False, "과도음 템플릿 트리거 세기(임펄스로 쓴다)"),
     ParamSpec("transient_id", "index", 0.0, 63.0, 0.0, False, "템플릿 번호"),
     ParamSpec("residual_mix", "0-1", 0.0, 1.0, 1.0, False, "잔차 보정 적용 비율"),
+    # --- 성문 배음 이득 (0.4 기반, docs/FOUNDATION.md) --------------------------------------
+    # **성문 배음에만** 거는 빠른 이득 [dB]. 목표의 성문 펄스는 주기마다 진폭이 흔들린다(시머 ≈ 9 %,
+    # 목표 실측) — 펄스 하나하나의 진폭은 잡음과 달리 **관측 가능한 결정적 정보**라 복사합성이 따라가도
+    # 된다. 예전에는 그것을 폐압·성도 이득 같은 잡음까지 함께 써는 손잡이로 따라가, 제어 대역을 묶자
+    # 포락 점수의 오차가 모음 0~1 kHz 에서 두 배가 됐다(MEASUREMENTS §51). 기식·마찰은 건드리지
+    # 않는다 — 거칠기(20~150 Hz 로 잡음을 써는 것) 원칙과 부딪히지 않는다. **목록 끝에 둔다**(옛 트랙의
+    # 열 번호를 그대로 둔다).
+    ParamSpec("voice_gain", "dB", -24.0, 24.0, 0.0, False, "성문 배음 이득 (주기별 진폭, 잡음 제외)"),
+    ParamSpec("front_q", "Q", 1.0, 8.0, 3.0, True, "앞공동 공진 Q (tract.FRONT_Q_CTRL 일 때만 쓴다)"),
+    # **보조 공진의 깊이는 목록 끝에 둔다.** 중간에 끼우면 예전에 저장한 `*_track.npz` 의
+    # 열이 통째로 한 칸씩 밀려 못 읽는다 — 실제로 겪었다 (56 열 짜리가 63 열 이름표와 어긋났다).
+    ParamSpec("aux1_mix", "0-1", -0.3, 1.0, 0.0, False,
+              "보조 공진 1 의 깊이. 쓸 때는 0~1 로 자르고, **범위 하한은 −0.3 이다** — 0 을 범위의 "
+              "끝에 두면 시그모이드가 포화해 기울기가 1.0e−4 로 죽어 옵티마이저가 영원히 못 켠다"
+              " (실측: `M3` 에서 보조 공진 셋이 전부 0.00 인 채 끝났다, MEASUREMENTS §51.40)."),
+    ParamSpec("aux2_mix", "0-1", -0.3, 1.0, 0.0, False, "보조 공진 2 (F2~F3 사이)의 깊이 0~1."),
+    ParamSpec("aux3_mix", "0-1", -0.3, 1.0, 0.0, False, "보조 공진 3 의 깊이 0~1."),
+    ParamSpec("aux4_mix", "0-1", -0.3, 1.0, 0.0, False, "보조 공진 4 의 깊이 0~1."),
+    ParamSpec("aux5_mix", "0-1", -0.3, 1.0, 0.0, False, "보조 공진 5 의 깊이 0~1."),
+    ParamSpec("aux6_mix", "0-1", -0.3, 1.0, 0.0, False, "보조 공진 6 의 깊이 0~1."),
+    ParamSpec("aux7_mix", "0-1", -0.3, 1.0, 0.0, False, "보조 공진 7 의 깊이 0~1."),
+    # **보조 영점** — 소리를 죽이는 극. 틈마다 하나 (F1–F2, F2–F3, F3–F4).
+    ParamSpec("azr1_mix", "0-1", -0.3, 1.0, 0.0, False,
+              "보조 영점 1 (F1~F2 사이)의 깊이. 0 이면 정확히 항등 (MEASUREMENTS §51.46)."),
+    ParamSpec("azr2_mix", "0-1", -0.3, 1.0, 0.0, False, "보조 영점 2 (F2~F3 사이)의 깊이."),
+    ParamSpec("azr3_mix", "0-1", -0.3, 1.0, 0.0, False, "보조 영점 3 (F3~F4 사이)의 깊이."),
+    # 자리는 **틈의 기하평균 대비 배율**이다. 절대 Hz + "0 이면 기하평균" 으로 두었더니 그 0 이
+    # `if > 0` 이라는 **벽**이 되어 기울기가 아예 안 흘렀다 (기본값에서 ∂손실/∂값 = 0).
+    ParamSpec("azr1_f", "ratio", 0.5, 2.0, 1.0, True, "보조 영점 1 의 자리 (틈의 기하평균 × 이 값)."),
+    ParamSpec("azr2_f", "ratio", 0.5, 2.0, 1.0, True, "보조 영점 2 의 자리."),
+    ParamSpec("azr3_f", "ratio", 0.5, 2.0, 1.0, True, "보조 영점 3 의 자리."),
+    # --- 고역 영점 (tract.HF_ZEROS, §51.50) — F4 위의 좁고 깊은 골. 자리는 제 띠 안에서 자유다.
+    ParamSpec("hzr1_mix", "0-1", -0.3, 1.0, 0.0, False, "고역 영점 1 (4~8 kHz)의 깊이."),
+    ParamSpec("hzr2_mix", "0-1", -0.3, 1.0, 0.0, False, "고역 영점 2 (7~12 kHz)의 깊이."),
+    ParamSpec("hzr3_mix", "0-1", -0.3, 1.0, 0.0, False, "고역 영점 3 (11~16 kHz)의 깊이."),
+    ParamSpec("hzr1_f", "Hz", 4000.0, 8000.0, 7000.0, True, "고역 영점 1 의 자리."),
+    ParamSpec("hzr2_f", "Hz", 7000.0, 12000.0, 11000.0, True, "고역 영점 2 의 자리."),
+    ParamSpec("hzr3_f", "Hz", 11000.0, 16000.0, 15000.0, True, "고역 영점 3 의 자리."),
+    # --- 고역의 뾰족한 마루 (tract.HF_POLES, §51.51) — 영점과 대칭인 짝.
+    ParamSpec("hzp1_mix", "0-1", -0.3, 1.0, 0.0, False, "고역 마루 1 (4~8 kHz)의 높이."),
+    ParamSpec("hzp2_mix", "0-1", -0.3, 1.0, 0.0, False, "고역 마루 2 (7~12 kHz)의 높이."),
+    ParamSpec("hzp3_mix", "0-1", -0.3, 1.0, 0.0, False, "고역 마루 3 (11~16 kHz)의 높이."),
+    ParamSpec("hzp1_f", "Hz", 4000.0, 8000.0, 5656.9, True, "고역 마루 1 의 자리."),
+    ParamSpec("hzp2_f", "Hz", 7000.0, 12000.0, 9165.2, True, "고역 마루 2 의 자리."),
+    ParamSpec("hzp3_f", "Hz", 11000.0, 16000.0, 13266.5, True, "고역 마루 3 의 자리."),
 ]
 PARAMS: dict[str, ParamSpec] = {p.name: p for p in _P}
 PARAM_NAMES: list[str] = [p.name for p in _P]
@@ -112,6 +157,9 @@ class ControlTrack:
     voiced: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=bool))
     # 프레임별 마찰 여부(무성 + 고역 우세). 폐쇄와 마찰은 다르게 다뤄야 한다.
     fricative: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=bool))
+    # 파열(스톱 버스트)이 서는 프레임 색인. 분석이 채운다 — 적합이 그 자리에서만
+    # 제어의 해상도를 풀고(fit.BURST_FINE), 어택 항이 그 자리를 본다(fit.ATTACK_W).
+    bursts: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=int))
 
     @property
     def n_frames(self) -> int:

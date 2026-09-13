@@ -102,7 +102,8 @@ class VoiceEngine(nn.Module):
     # ------------------------------------------------------------ 핵심
     def forward(self, ctrl: torch.Tensor, events: list[dict] | None = None,
                 t_offset_s: float = 0.0, state: dict | None = None,
-                emit: int | None = None) -> dict:
+                emit: int | None = None,
+                pulse_phase: torch.Tensor | None = None) -> dict:
         """ctrl: (B, T, P) 프레임률 제어 텐서. events: 과도음 이벤트(절대 시각).
 
         emit: 내보낼 프레임 수. 스트리밍은 T+1 프레임을 주고 emit=T 로 불러 마지막
@@ -115,17 +116,20 @@ class VoiceEngine(nn.Module):
         n = t * hop
         c = {name: ctrl[..., INDEX[name]] for name in PARAM_NAMES}
         f0i, s0 = st["frame"], st["frame"] * hop
+        pp = None if pulse_phase is None else pulse_phase[:, s0:s0 + n]
         g = self.glottis(c, phase0=st["phase"], noise=self.noise, frame0=f0i,
                          dispersion=GLOTTAL_DISPERSION,
-                         amp0=st["amp"], state=st["glottis"], emit=t)
+                         amp0=st["amp"], state=st["glottis"], emit=t, pulse_phase=pp)
         fr = self.frication(c, g["ag_dc_frames"], g["phase"], g["voiced"], noise=self.noise,
                             frame0=f0i, state=st["fric"], emit=t, noise_am=g["noise_am"])
-        asp = self.aspiration(g["asp_env"], noise=self.noise, sample0=s0, state=st["asp"])
+        asp = self.aspiration(g["asp_env"], noise=self.noise, sample0=s0, state=st["asp"],
+                              voiced=g["voiced"])
         ev = [dict(e, t=e["t"] - t_offset_s) for e in (events or [])
               if -0.1 <= e["t"] - t_offset_s < n / self.cfg.sample_rate]
         tr = self.transients.render(ev, n, b, noise=self.noise, device=ctrl.device, sample0=s0) \
             if ev else torch.zeros(b, n, device=ctrl.device)
-        out = self.tract(g["du"], fr["source"], asp["source"], tr, c, state=st["tract"])
+        out = self.tract(g["du"], fr["source"], asp.get("source_v", asp["source"]), tr, c,
+                         state=st["tract"], asp_u=asp.get("source_u"), g_open=g.get("open_phase"))
         y = out["audio"]
         if self.residual is not None:
             heads = self.residual(ctrl, state=st["residual"], emit=t)
