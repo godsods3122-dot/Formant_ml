@@ -47,12 +47,16 @@ import torch
 
 from . import room
 from . import tract as _tract_mod
+from .calibration import capture_calibration, engine_parameters, parameter_scope
+from .events import build_control_events
 from . import glottis as _glottis_mod
 from .control import INDEX, PARAMS, ControlTrack
 
 FFT_SIZES = (256, 512, 1024, 2048, 4096)
 MEL_FFT = 256              # 포락용 창 (5.3 ms @48 kHz) — 하모닉이 분해되지 않는다
 HARM_FFT = 2048            # 하모닉용 창 (43 ms, 분해능 23 Hz) — F0 빗살이 보인다
+# Target-synchronous relative amplitude errors; no new synthesis controls.
+HARMONIC_W = 1.0
 DB_RANGE = 70.0            # 정점 아래 이만큼까지만 본다 (전역 바닥)
 #: **밴드별 바닥.** 전역 바닥 하나(정점 −70 dB)는 조용하지만 실재하는 고역을 통째로
 #: 가린다 — 실측(`yang_00000040`)에서 멜 48 밴드 중 9 개가 바닥 아래였고 그중 7 개가
@@ -557,9 +561,8 @@ PHASE_FMAX = 0.0
 #: 기식 MVF 를 적합하지 않는다(`copyfit --mvf` 가 값을 박는다). v2.1 의 모든 판에서 적합 MVF 가 하한 2 kHz 로
 #: 갔다 — 목표 s040 의 MVF 는 ≈ 6 kHz 이고(§50.17) 감사의 모음 주기성은 s101 에서 1.5 kHz 위가 목표보다 잡음이
 #: 많다(0.23/0.08/0.03 대 0.41/0.21/0.17). 적합기가 기식을 2~5 kHz 의 포락 채움재로 쓰고 있다.
-#: **화자 상수를 얼린다** (MEASUREMENTS §51.35). 켜면 `self.hf` (고역 극 구조·이상와 영점·앞공동
-#: 대역폭·MVF·음원 EQ·성문 개방 감쇠)가 옵티마이저 목록에서 빠진다. 값은 `copyfit --speaker-lock`
-#: 이 미리 넣는다.
+#: Legacy API switch: freeze speaker-scope constants only. CLI locks explicitly
+#: supplied names; source aperiodicity and recording calibration are separate.
 #:
 #: 왜: 성도 길이와 후두 구조는 한 사람의 것이지 문장의 것이 아니다. 그런데 발화마다 따로 적합하면
 #: 그 자유도가 발화별 실현 오차를 빨아들인다 — 실측(`out/L86`, 같은 화자 두 문장): 고역 극 대역폭
@@ -805,6 +808,7 @@ BALANCE = False
 #: `corr` 는 포락과 같은 몫이다 — 0.5 로 두었더니 끊김이 21 → 47 로 돌아왔다 (`out/L16`).
 BAL_W: dict[str, float] = {
     "pulse": 0.3, "phase": 1.0, "corr": 1.0, "hnr": 0.5,
+    "harmonic": 1.0,
     "sharp": 0.3, "subf0": 0.3, "flux": 0.3, "cont": 0.3,
     "prior": 0.3, "smooth": 0.2, "unvoiced": 0.5, "quiet": 0.3, "move": 1.0, "relead": 1.0,
     "gesture": 0.5, "delta": 1.0, "formant": 1.0, "ripple": 1.0,
@@ -972,7 +976,8 @@ PHASE_PATIENCE = 0
 #: (격자 16 + τ 11 + 출발점 평활 24, 제곱합) 목표의 F2 는 가장 빠른 1 % 에서 **4~5 ms** 만에 20 %
 #: 를 움직인다. 4 ms 도약은 자음 경계로 지나가지만 31 ms 글라이드는 미끄러짐으로 들린다.
 #:
-#: 열은 **이벤트 수 × `EVENT_PARAMS`** 로, 20 ms 격자(71 점 × 33 열)에 비하면 작다.
+#: Each observed control/event pair gets one coefficient, not an event-by-control
+#: matrix. Unchanged controls receive no event freedom.
 EVENT_W = 0.0
 #: **`front_len` 과 `obstacle` 이 빠져 있었다** (§51.54). 치찰음의 공명은 포먼트가 아니라 **앞공동**이
 #: 만든다 (`_front_cavity`: f_p = c/4L_front). 그런데 `front_len` 은 `--slow front_len=20` 으로 σ 20 ms
@@ -987,7 +992,7 @@ EVENT_PARAMS = ("f1", "f2", "f3", "f4", "a_c", "tract_gain", "front_len", "obsta
 #: 그 뒤 *"이벤트 파라미터를 더 강화해야 할 거 같고(더 세고 빠른 펄스)"* 라 해서 1.0 으로 줄인다 —
 #: 1 ms 프레임에서 계단이 두 프레임에 다 오르는 값이고, 그보다 빠르면 격자에서 그냥 불연속이다.
 EVENT_FADE_MS = 1.0
-#: 이벤트 자리는 `MOVE_FINE_PCT` 가 찾은 빠른 프레임의 **연속 덩어리마다 하나**다.
+#: Nearby changes merge within each control, without merging reversals.
 EVENT_MIN_GAP_MS = 12.0
 #: 덩어리의 **총 도약**(로그 비)이 이보다 작으면 이벤트를 두지 않는다 — 진짜 분기만 잡는다.
 #: 0.12 -> 0.08 ("더 세고 빠른 펄스"): 12 % 도약은 한 반음 반이라 자음 경계의 작은 것들을 놓쳤다.
@@ -1272,7 +1277,12 @@ class CopySynthFitter:
                  lam_l1: float = 0.0,
                  phase_weight: float = 0.0, pulse_weight: float = 1.0,
                  n_mels: int = 48, device: str = "cpu",
-                 room_ir: np.ndarray | None = None):
+                 room_ir: np.ndarray | None = None,
+                 harmonic_weight: float | None = None,
+                 locked_constants: tuple[str, ...] = (),
+                 initial_gain_db: float | None = None,
+                 initial_pulse_phi0: float = 0.0,
+                 formant_band: dict[str, tuple[float, float]] | None = None):
         self.eng = engine
         self.hop = engine.cfg.hop
         self.fs = engine.cfg.sample_rate
@@ -1281,6 +1291,19 @@ class CopySynthFitter:
         self.lam_l1 = float(lam_l1)
         self.phase_weight = phase_weight
         self.pulse_weight = pulse_weight
+        self.harmonic_weight = float(HARMONIC_W if harmonic_weight is None else harmonic_weight)
+        if not math.isfinite(self.harmonic_weight) or self.harmonic_weight < 0:
+            raise ValueError("harmonic_weight must be finite and nonnegative")
+        if initial_gain_db is not None and not math.isfinite(initial_gain_db):
+            raise ValueError("initial_gain_db must be finite")
+        if not math.isfinite(initial_pulse_phi0):
+            raise ValueError("initial_pulse_phi0 must be finite")
+        constants = engine_parameters(engine)
+        self.locked_constants = frozenset(locked_constants)
+        unknown = self.locked_constants - constants.keys()
+        if unknown:
+            raise ValueError(f"Unknown locked constants: {sorted(unknown)}")
+        self.harmonic = None
         self._bal: dict = {}          # 균형 모드의 유효 가중 (비면 원래 가중)
         self._collect = False         # True 면 loss() 가 항을 self._terms 에 모은다
         self._terms: dict = {}
@@ -1334,14 +1357,18 @@ class CopySynthFitter:
                       if not (PARAMS[p].log and float(base[:, INDEX[p]].abs().min()) == 0.0)]
         self.cols = torch.tensor([INDEX[p] for p in self.names], device=device)
         self.specs = [PARAMS[p] for p in self.names]
-        if FORMANT_BAND:
+        bands = FORMANT_BAND if formant_band is None else formant_band
+        if bands:
             # **포먼트마다 제 구역을 준다** (MEASUREMENTS §51.38).
             import dataclasses as _dc
-            self.specs = [(_dc.replace(sp, lo=max(sp.lo, FORMANT_BAND[nm][0]),
-                                       hi=min(sp.hi, FORMANT_BAND[nm][1]))
-                           if nm in FORMANT_BAND else sp)
+            self.specs = [(_dc.replace(sp, lo=max(sp.lo, bands[nm][0]),
+                                       hi=min(sp.hi, bands[nm][1]))
+                           if nm in bands else sp)
                           for nm, sp in zip(self.names, self.specs)]
-        u0 = torch.stack([self._to_raw(base[:, INDEX[p]], PARAMS[p]) for p in self.names], 1)
+            if any(sp.lo >= sp.hi for sp in self.specs):
+                raise ValueError("Formant bands must overlap the control bounds")
+        u0 = torch.stack([self._to_raw(base[:, INDEX[p]], sp)
+                          for p, sp in zip(self.names, self.specs)], 1)
         if MOTION and BASE_SMOOTH > 0.0 and MOTION_SLOW:
             u0 = self._smooth_base(u0)
         self.u0 = u0.detach()
@@ -1367,13 +1394,16 @@ class CopySynthFitter:
                       if len(n) == 2 and n[0] == "f" and n[1].isdigit()]
         self.log_gain = torch.zeros(1, dtype=torch.float64, device=device,
                                     requires_grad=True)
+        if initial_gain_db is not None:
+            with torch.no_grad():
+                self.log_gain.fill_(initial_gain_db * math.log(10.0) / 20.0)
 
         # 목표의 성문 폐쇄 시각 -> 샘플 색인 (있으면 위상 고정에 쓴다)
         pl = np.asarray(getattr(init, "pulses", np.zeros(0)), dtype=np.float64)
         pl = pl[(pl >= 0.0) & (pl * self.fs < n - 1)]
         self.pulse_idx = torch.as_tensor((pl * self.fs).astype(np.int64), device=device)
-        self.pulse_phi0 = torch.zeros(1, dtype=torch.float64, device=device,
-                                      requires_grad=True)
+        self.pulse_phi0 = torch.full((1,), initial_pulse_phi0, dtype=torch.float64,
+                                     device=device, requires_grad=True)
         self._pulse_phase = self._build_pulse_phase() if PULSE_LOCK else None
         self.wins = {k: torch.hann_window(k, device=device) for k in FFT_SIZES}
         # 포락은 **짧은 창**에서 잰다. 1024 (21 ms) 는 F0 240 Hz 의 하모닉을 분해하므로
@@ -1415,31 +1445,60 @@ class CopySynthFitter:
                                                             make_mask=True)
             self._prepare_voice_stats(raw)
         self._prepare_corr()
+        self.prior_mask = torch.ones_like(self.u0)
+        if self.harmonic_weight > 0:
+            from .harmonic import HarmonicMagnitudeLoss
+            f0 = np.asarray(self.track["f0_target"], dtype=np.float64)
+            voiced = self.track.voiced if self.track.voiced.size else f0 > 0
+            fricative = (self.track.fricative if self.track.fricative.size
+                         else np.zeros_like(f0, dtype=bool))
+            self.harmonic = HarmonicMagnitudeLoss(
+                self.target[0].cpu().numpy(), self.fs, self.hop, f0, voiced, fricative,
+                fmax=min(3000.0, self.f_max), device=device, pulses=self.track.pulses)
+            covered = torch.as_tensor(self.harmonic.coverage, device=device)
+            for i, name in enumerate(self.names):
+                if name in ("bw1", "bw2", "bw3", "bw4"):
+                    # Smoothed-envelope BW is an initializer, not an observation.
+                    # Keep the temporal/physical constraints, not this biased anchor.
+                    center = self.base[:, INDEX[f"f{name[2:]}"]]
+                    in_band = (center > 0) & (center <= self.harmonic.fmax)
+                    self.prior_mask[:, i] = (~(covered & in_band)).to(self.prior_mask.dtype)
         # **화자의 고역 손실은 적합 대상이다.** `log_extra_bw`(고차 극 보정의 대역폭
         # 배율)와 `log_front_bw`(앞공동 대역폭 배율)는 `nn.Parameter` 인데 어느
         # 옵티마이저 목록에도 없어서 영원히 0(= 배율 1)에 머물렀다 (§37.3 이 지적).
         # 고차 극이 고정 위치라 화자의 고역을 맞출 수단이 사실상 이 둘뿐인데 그마저
         # 잠겨 있었다 — 실측으로 8.9 kHz 가 −5.5 dB, 15.9 kHz 가 −4.7 dB 모자란다.
-        self.hf = [q for q in (getattr(self.eng.tract, "log_extra_bw", None),
-                               getattr(self.eng.tract, "log_front_bw", None),
-                               None if MVF_FROZEN else getattr(getattr(self.eng, "aspiration", None), "log_mvf", None),
-                               getattr(self.eng.tract, "hf_log_df", None),
-                               getattr(self.eng.tract, "hf_log_bw", None),
-                               getattr(self.eng.tract, "hf_eq_db", None)
-                               if _tract_mod.HF_EQ else None,
-                               getattr(self.eng.tract, "pir_log_f", None),
-                               getattr(self.eng.tract, "pir_depth", None),
-                               getattr(getattr(self.eng, "frication", None), "log_lp_ratio", None)
-                               if FRIC_LP_FIT else None,
-                               getattr(self.eng.tract, "open_damp", None) if _tract_mod.OPEN_DAMP else None,
-                               getattr(self.eng.glottis, "hjit_log", None) if _glottis_mod.HJIT_FIT else None,
-                               getattr(self.eng.glottis, "src_eq_db", None) if _glottis_mod.SRC_EQ else None,
-                               getattr(self.eng.tract, "open_f1", None) if _tract_mod.OPEN_DAMP else None)
-                   if isinstance(q, torch.nn.Parameter)]
+        enabled = dict(log_extra_bw=True, log_front_bw=True, log_mvf=not MVF_FROZEN,
+                       hf_log_df=_tract_mod.HF_FIXED, hf_log_bw=_tract_mod.HF_FIXED,
+                       hf_eq_db=self.eng.tract.output_eq_enabled,
+                       pir_log_f=_tract_mod.HF_FIXED,
+                       pir_depth=_tract_mod.HF_FIXED, fric_log_lp_ratio=FRIC_LP_FIT,
+                       open_damp=_tract_mod.OPEN_DAMP, open_f1=_tract_mod.OPEN_DAMP,
+                       glottis_hjit_log=_glottis_mod.HJIT_FIT,
+                       glottis_src_eq_db=_glottis_mod.SRC_EQ)
+        self.constant_parameters = {name: constants[name] for name, on in enabled.items() if on}
         if SPEAKER_LOCK:
-            # **화자 상수는 발화마다 다시 적합하지 않는다** (MEASUREMENTS §51.35).
-            self.hf = []
-        self.calibrate_gain()
+            self.locked_constants |= {name for name in constants
+                                      if parameter_scope(name) == "speaker"}
+        self.hf = [p for name, p in self.constant_parameters.items()
+                   if name not in self.locked_constants]
+        if initial_gain_db is None:
+            self.calibrate_gain()
+
+    def acoustic_constants(self) -> dict:
+        return capture_calibration(
+            self.eng, gain_db=self.gain_db(),
+            pulse_phi0=float(self.pulse_phi0.detach().item()),
+            room_ir=None if self.room_ir is None else self.room_ir.detach().cpu().numpy())
+
+    def constant_budget(self) -> dict:
+        all_params = engine_parameters(self.eng)
+        return {scope: {
+            "fitted": {name: p.numel() for name, p in self.constant_parameters.items()
+                       if parameter_scope(name) == scope and name not in self.locked_constants},
+            "locked": {name: all_params[name].numel() for name in sorted(self.locked_constants)
+                       if parameter_scope(name) == scope}}
+            for scope in ("speaker", "recording", "utterance")}
 
     # ------------------------------------------------------- 재매개화
     @staticmethod
@@ -1462,8 +1521,7 @@ class CopySynthFitter:
     def _delta(self) -> torch.Tensor:
         """격자 위 증분 -> 프레임별 raw 증분.
 
-        `MOTION` 이 꺼져 있으면 예전대로 격자 값의 선형 보간이다. 켜면 `w` 를
-        **가속도**로 읽고 두 번 적분한다 (윗쪽 `MOTION` 주석이 근거다).
+        `MOTION` 이 꺼져 있으면 선형 보간, 켜면 선택한 B-스플라인/목표 근사다.
         """
         w = self._expand(self._mask_slow(self.w))
         for c in self.w_coarse:
@@ -1474,7 +1532,8 @@ class CopySynthFitter:
         self._w_smooth = w
         if EVENT_W > 0.0 and getattr(self, "w_ev", None) is not None:
             # **계단은 평활 뒤에 더한다** — τ·열 평활을 안 받아야 4 ms 안에 오른다.
-            w = w.index_add(1, self._ev_cols, (self._ev_basis @ self.w_ev) * EVENT_W)
+            w = w.index_add(1, self._ev_cols,
+                            self._ev_basis * self.w_ev.unsqueeze(0) * EVENT_W)
         return w
 
     def _smooth_base(self, u0: torch.Tensor) -> torch.Tensor:
@@ -1498,51 +1557,22 @@ class CopySynthFitter:
         return out
 
     def _build_events(self, device) -> None:
-        """관측이 급히 움직이는 자리마다 계단 하나. 기저 (T, n_ev) 와 계수 (n_ev, P_ev)."""
-        T = int(self.base.shape[0])
-        cols = [i for i, n in enumerate(self.names) if n in EVENT_PARAMS]
-        fo = self._fast_obs_frames()
-        if not cols or fo.size == 0:
+        """Allocate one scalar per observed control/event, in raw fitting units."""
+        observed = torch.stack([self._to_raw(self.base[:, INDEX[name]], spec)
+                                for name, spec in zip(self.names, self.specs)], 1)
+        ev = build_control_events(
+            self.track, self.names, observed.detach().cpu().numpy(), params=EVENT_PARAMS,
+            rate_pct=MOVE_FINE_PCT, min_gap_ms=EVENT_MIN_GAP_MS,
+            min_jump=EVENT_MIN_JUMP, fade_ms=EVENT_FADE_MS)
+        if ev.columns.size == 0:
             return
-        # **덩어리마다 하나, 그 덩어리의 봉우리에.** 첫 프레임에 놓으면 전이의 시작이라 계단이
-        # 목표보다 이르게 선다. 덩어리의 **총 도약**을 같이 기록해 벌점의 기준으로 쓴다.
-        gap = max(1, int(round(EVENT_MIN_GAP_MS / float(self.track.frame_ms))))
-        runs, cur = [], [int(fo[0])]
-        for i in fo[1:]:
-            if int(i) - cur[-1] <= gap:
-                cur.append(int(i))
-            else:
-                runs.append(cur); cur = [int(i)]
-        runs.append(cur)
-        spd = self._fast_obs_speed()
-        ev, jump = [], []
-        for r in runs:
-            # **덩어리의 속도 중앙값** 자리에 세운다. 봉우리에 세우면 목표보다 늦다 — 전이는 앞이
-            # 가파르고 뒤가 길어서 봉우리가 움직임의 한가운데보다 뒤에 있다 (사용자: *"치찰음
-            # 포먼트가 실제 음원보다 늦게 적용되고"*). 누적 속도가 절반을 넘는 자리가 계단의
-            # 50 % 지점과 맞는 자리다. 첫 프레임은 전이의 시작이라 반대로 이르다.
-            cs = np.cumsum(spd[r])
-            j = int(r[int(np.searchsorted(cs, 0.5 * cs[-1]))]) if cs[-1] > 0 else int(r[0])
-            tot = float(np.sum(spd[r[0]:r[-1] + 1])) * float(self.track.frame_ms) / 100.0
-            if tot < EVENT_MIN_JUMP:
-                continue
-            ev.append(j); jump.append(tot)
-        if not ev:
-            return
-        # 부드러운 계단 — 10 % 에서 90 % 까지 `EVENT_FADE_MS` 에 오른다 (로지스틱).
-        # 척도는 0.25 프레임 밑으로 안 내린다: 그 밑은 프레임 격자에서 그냥 불연속이라 클릭이 된다.
-        sc = max(EVENT_FADE_MS / (2.0 * math.log(9.0) * float(self.track.frame_ms)), 0.25)
-        t = np.arange(T)[:, None]
-        # 지수를 ±60 으로 자른다 — 그 바깥은 배정도에서 정확히 0 / 1 이고, 안 자르면 exp 가 넘친다.
-        z = np.clip((t - np.asarray(ev)[None, :]) / sc, -60.0, 60.0)
-        B = 1.0 / (1.0 + np.exp(-z))
-        self._ev_basis = torch.as_tensor(B, dtype=torch.float64, device=device)
-        self._ev_cols = torch.as_tensor(cols, dtype=torch.long, device=device)
-        self.w_ev = torch.zeros(len(ev), len(cols), dtype=torch.float64,
-                                device=device, requires_grad=True)
-        self._ev_n = len(ev)
-        self._ev_jump = torch.as_tensor(jump, dtype=torch.float64, device=device)
-        self._ev_idx = torch.as_tensor(ev, dtype=torch.long, device=device)
+        self._ev_basis = torch.as_tensor(ev.basis, dtype=torch.float64, device=device)
+        self._ev_cols = torch.as_tensor(ev.columns, dtype=torch.long, device=device)
+        self.w_ev = torch.zeros(ev.columns.size, dtype=torch.float64, device=device,
+                                requires_grad=True)
+        self._ev_n = ev.columns.size
+        self._ev_jump = torch.as_tensor(ev.jumps, dtype=torch.float64, device=device)
+        self._ev_idx = torch.as_tensor(ev.indices, dtype=torch.long, device=device)
 
     def _fast_obs_mask(self, T: int, dtype, device) -> torch.Tensor:
         """**관측이 빠르게 움직이는 프레임은 출발점을 안 뭉갠다** (MEASUREMENTS §51.44).
@@ -2623,7 +2653,7 @@ class CopySynthFitter:
         if getattr(self, "w_ev", None) is None:
             return torch.zeros((), device=self.target.device)
         a = self.w_ev * EVENT_W
-        cap = (EVENT_CAP_REL * self._ev_jump).unsqueeze(1).to(a.dtype).clamp_min(1e-3)
+        cap = (EVENT_CAP_REL * self._ev_jump).to(a.dtype).clamp_min(1e-3)
         over = self._soft_over(a.abs() - cap, 0.05 * cap)
         pen = (over / cap).pow(2).mean() + EVENT_L1 * a.abs().mean()
         # (나) **이벤트 자리에서 부드러운 층이 움직이면 벌한다** — 도약은 계단이 져야 한다.
@@ -2633,8 +2663,8 @@ class CopySynthFitter:
             T = ws.shape[0]
             lo = torch.clamp(self._ev_idx - h, 0, T - 1)
             hi = torch.clamp(self._ev_idx + h, 0, T - 1)
-            d = (ws.index_select(0, hi) - ws.index_select(0, lo)).index_select(1, self._ev_cols)
-            cap2 = (EVENT_RAMP_FREE * self._ev_jump).unsqueeze(1).to(d.dtype).clamp_min(1e-3)
+            d = ws[hi, self._ev_cols] - ws[lo, self._ev_cols]
+            cap2 = (EVENT_RAMP_FREE * self._ev_jump).to(d.dtype).clamp_min(1e-3)
             ramp = self._soft_over(d.abs() - cap2, 0.05 * cap2)
             pen = pen + EVENT_RAMP_W * (ramp / cap2).pow(2).mean()
         return pen
@@ -3110,6 +3140,8 @@ class CopySynthFitter:
                 T[name] = term
             l = l + self._bal.get(name, base) * term
 
+        if self.harmonic is not None:
+            add("harmonic", self.harmonic_weight, self.harmonic(y[0]))
         if want:
             pl = self.pulse_loss(phase)
             self._last_pulse = float(pl.detach())
@@ -3194,7 +3226,7 @@ class CopySynthFitter:
             if torch.is_tensor(sm):
                 add("smooth", self.lam_smooth, sm)
         if self.lam_prior > 0:
-            d = (self._u() - self.u0) * self.prior_w
+            d = (self._u() - self.u0) * self.prior_w * self.prior_mask
             add("prior", self.lam_prior, (d * d).mean())
         if T is not None:
             self._terms = T
@@ -3272,6 +3304,13 @@ class CopySynthFitter:
         """
         if sizes is not None:
             self.sizes = list(sizes)
+        if iters < 0:
+            raise ValueError("iters must be nonnegative")
+        if iters == 0:
+            with torch.no_grad():
+                loss, sc, env_sc, per = self.loss()
+            return FitReport(float(100.0 * (1.0 - env_sc)), float(100.0 * (1.0 - sc)),
+                             self._last_db, per, float(loss), 0, [])
         # **목적함수를 계단으로 바꾸지 않는다** (연속변형 / graduated non-convexity).
         # 위상 단계는 `phase_weight` 를 0 에서 3.0 으로 한 번에 올려 왔고, 그래서 §27 이
         # 적은 대로 **항상 한 번 꺾였다가 회복**한다 — 200 회로는 회복을 못 끝내
@@ -3467,7 +3506,13 @@ class CopySynthFitter:
         `patience` 는 각 단계의 수렴 판정에 그대로 넘어간다. 코퍼스를 통째로 돌릴 때
         쓴다 (`scripts/parametrize_corpus.py`). 기본 0 = 예전 거동.
         """
-        if PULSE_LOCK and getattr(self, "_pulse_phase", None) is not None:
+        if min(global_iters, stage_iters, phase_iters) < 0:
+            raise ValueError("Iteration budgets must be nonnegative")
+        if global_iters == stage_iters == phase_iters == 0 and HF_STAGE_ITERS == 0:
+            # Render-only means no LR probes, phase sweep, or grid replacement.
+            return self.fit(0, verbose=verbose, sizes=FFT_SIZES)
+        if (global_iters + stage_iters + phase_iters > 0
+                and PULSE_LOCK and getattr(self, "_pulse_phase", None) is not None):
             # **위상 오프셋을 먼저 훑는다.** 잠금을 켜면 `pulse_loss` 가 항등적으로 0 이라 `pulse_phi0` 를
             # 끌어 줄 항이 스펙트럼 손실뿐인데, 그 손실은 위상에 대해 다봉이다 — 실측(`L53/s040`)에서
             # 최적 오프셋이 −2.62 rad 로 초기값에서 멀었다. 12 등분해 한 번 재고 가장 나은 자리에서 시작한다.
@@ -3487,7 +3532,7 @@ class CopySynthFitter:
             print(f"  1 단계 전역 {len(self.names)} 스칼라 (이득 {self.gain_db():+.1f} dB)")
         if isinstance(lr_global, (int, float)):
             lr_global = (float(lr_global),)
-        if len(lr_global) > 1:
+        if global_iters > 0 and len(lr_global) > 1:
             probe = max(20, global_iters // 4)
             lr_g = self.pick_lr_global(lr_global, probe, verbose)
             if verbose:
@@ -3497,12 +3542,13 @@ class CopySynthFitter:
         rep = self.fit(global_iters, lr_g, log_every, verbose,
                        params=[self.d, self.log_gain, self.pulse_phi0] + self.hf,
                        sizes=STAGES[0], patience=patience)
-        for si, (grid, sizes) in enumerate(zip(GRID_MS, STAGES)):
-            tc = self.set_grid(grid)
-            if verbose:
-                print(f"  2.{si + 1} 단계  격자 {grid:g} ms ({tc} 점)  창 {sizes}", flush=True)
-            rep = self.fit(stage_iters, lr_frame * (0.75 ** si), log_every, verbose,
-                           sizes=sizes, patience=patience)
+        if stage_iters > 0:
+            for si, (grid, sizes) in enumerate(zip(GRID_MS, STAGES)):
+                tc = self.set_grid(grid)
+                if verbose:
+                    print(f"  2.{si + 1} 단계  격자 {grid:g} ms ({tc} 점)  창 {sizes}", flush=True)
+                rep = self.fit(stage_iters, lr_frame * (0.75 ** si), log_every, verbose,
+                               sizes=sizes, patience=patience)
         # **위상 단계는 기본이다.** 크기만 맞추면 위상은 물리가 강제하는 곳에서만 맞는다.
         # 실측(코퍼스 150 ms 창 4 개): 조화 SNR +3.3/+1.0/+3.5/−2.6 -> +24.7/+16.5/+12.9/+16.2,
         # 위상 모양 오차 7.6/29.9/65.5/25.4° -> 3.4/17.8/32.6/16.4°. 포락은 안 나빠졌다.

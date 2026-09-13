@@ -333,6 +333,7 @@ class VocalTract(nn.Module):
         self.hf_log_df = nn.Parameter(torch.zeros(n_hf))
         self.hf_log_bw = nn.Parameter(torch.zeros(n_hf))
         self.hf_eq_db = nn.Parameter(torch.zeros(HF_EQ_N))     # 고역 포락 EQ (HF_EQ)
+        self.recording_eq_enabled: bool | None = None
         self.pir_log_f = nn.Parameter(torch.tensor(0.0))
         self.pir_depth = nn.Parameter(torch.tensor(-2.0))     # 시그모이드 — 처음엔 얕게
         # 성문 개방기 감쇠 (OPEN_DAMP): k_b = 4·sigmoid(x) (x = −ln 3 → 1 배), k_f = 0.15·tanh(y) + 0.05
@@ -667,7 +668,10 @@ class VocalTract(nn.Module):
         모음의 **비음화**는 따로 만들지 않는다. 연구개가 열린 채 구강도 열려 있으면 두
         분기가 그냥 더해지고, 그 간섭이 F1 부근의 극-영점 쌍으로 나타난다.
         """
-        if float(c["velum"].detach().max()) <= 1e-4:
+        # 입력이 닫혀도 저장된 에너지는 제 대역폭으로 감쇠해야 한다. 상태가 없고
+        # 게이트가 정확히 0 이며 열림 기울기도 필요 없을 때만 분기를 건너뛴다.
+        if not _live(c["velum"], thr=0.0) and not any(
+                key.startswith(("nb", "nx")) for key in state):
             return torch.zeros_like(x)
         d = self._up(c["nasal_damp"])
         y = x
@@ -730,9 +734,13 @@ class VocalTract(nn.Module):
             y = y + mix * (w - y)
         return y
 
+    @property
+    def output_eq_enabled(self) -> bool:
+        return HF_EQ if self.recording_eq_enabled is None else self.recording_eq_enabled
+
     def _hf_eq(self, x, state):
         """고역 포락 EQ — 로그 등간격 피킹 필터 `HF_EQ_N` 개. `HF_EQ` 참조."""
-        if not HF_EQ or not hasattr(self, "hf_eq_db"):
+        if not self.output_eq_enabled:
             return x
         g = HF_EQ_LIM * torch.tanh(self.hf_eq_db / HF_EQ_LIM)
         if float(g.detach().abs().max()) < 1e-4:
@@ -927,8 +935,9 @@ class VocalTract(nn.Module):
             xn_in = x_n * oral
             if HPC_TAIL and HPC_AT_INPUT:
                 xn_in = self._hpc(xn_in, "n", state)
+            # 비강 여분 극(nx*)과 잡음 사본은 독립된 상태를 쓴다.
             y_nc = self._extra_cascade(self._cascade(xn_in, tr_n, state, "n"), tr_n,
-                                       state, prefix="nx", bw_extra=NOISE_EXTRA_BW)
+                                       state, prefix="noise_x", bw_extra=NOISE_EXTRA_BW)
             if HPC_TAIL and not HPC_AT_INPUT:
                 y_nc = self._hpc(y_nc, "n", state)
             y_g = y_g + y_nc

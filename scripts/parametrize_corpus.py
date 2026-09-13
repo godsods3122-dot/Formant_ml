@@ -46,6 +46,7 @@ import torch
 from formant_ml.engine import turbulence as tb
 from formant_ml.engine import segment
 from formant_ml.engine.analyze import analyze, glottal_pulses
+from formant_ml.engine.calibration import apply_calibration, load_calibration
 from formant_ml.engine.control import PARAM_NAMES
 from formant_ml.engine.denoise import denoise, noise_profile
 from formant_ml.engine.fit import CopySynthFitter
@@ -82,7 +83,9 @@ def load_clean(path: str) -> tuple[np.ndarray, int]:
 def fit_one(path: str, t0: float, t1: float, kind: str, prof: SpeakerProfile,
             out_dir: str, budget: tuple[int, int, int], patience: int,
             frame_ms: float = 1.0, clean: tuple[np.ndarray, int] | None = None,
-            pulses: np.ndarray | None = None) -> dict:
+            pulses: np.ndarray | None = None,
+            speaker_constants: dict | None = None,
+            recording_constants: dict | None = None) -> dict:
     """구간 하나를 적합해 npz 로 남기고 요약 한 줄을 돌려준다.
 
     `clean` 과 `pulses` 는 같은 파일의 다른 구간과 **나눠 쓰라고** 있는 인자다. 둘 다
@@ -106,7 +109,20 @@ def fit_one(path: str, t0: float, t1: float, kind: str, prof: SpeakerProfile,
     eng = VoiceEngine(EngineConfig(sample_rate=48000, frame_ms=frame_ms,
                                    speaker="female" if prof.f0_nominal > 165 else "male",
                                    residual=False), prof)
-    fit = CopySynthFitter(eng, seg, sr, track)
+    locked = ()
+    if speaker_constants is not None:
+        if not speaker_constants["speaker"]:
+            raise ValueError("No speaker-scope constants to lock")
+        locked += apply_calibration(eng, speaker_constants, ("speaker",))
+    if recording_constants is not None:
+        if not recording_constants["recording"]:
+            raise ValueError("No recording-scope constants to lock")
+        locked += apply_calibration(eng, recording_constants, ("recording",))
+    room_ir = (recording_constants["recording"].get("room_ir")
+               if recording_constants is not None else None)
+    fit = CopySynthFitter(eng, seg, sr, track, locked_constants=locked, room_ir=room_ir,
+                         formant_band=None if speaker_constants is None else
+                         speaker_constants.get("formant_band"))
     rep = fit.fit_staged(global_iters=budget[0], stage_iters=budget[1],
                          phase_iters=budget[2], verbose=False, log_every=10 ** 9,
                          patience=patience)
@@ -121,6 +137,7 @@ def fit_one(path: str, t0: float, t1: float, kind: str, prof: SpeakerProfile,
         npz, values=res.values.astype(np.float32), frame_ms=res.frame_ms,
         names=np.array(PARAM_NAMES), target=tgt.astype(np.float32),
         synth=out.astype(np.float32), sample_rate=48000,
+        acoustic_constants=np.array(json.dumps(fit.acoustic_constants(), allow_nan=False)),
         voiced=np.asarray(track.voiced), fricative=np.asarray(track.fricative),
         pulses=np.asarray(track.pulses))
     row = dict(stem=stem, file=os.path.basename(path), t0=t0, t1=t1, kind=kind,
@@ -130,6 +147,7 @@ def fit_one(path: str, t0: float, t1: float, kind: str, prof: SpeakerProfile,
                trust=fid["trust"], resolved=fid["resolved"],
                noise_ratio=fid["noise_ratio"],
                spectrum_match=fid["spectrum_match"], gain_db=fit.gain_db(),
+               constant_budget=fit.constant_budget(),
                correction_status=fid.get("correction_status",
                                          "resolved" if fid["resolved"] else "unresolved"),
                score_note="clipped heuristic estimate, not a bound; trust is not confidence; "
@@ -157,7 +175,8 @@ def _worker(args, on_row=None):
     아무것도 안 찍히면 멈춘 것과 구별이 안 된다 (다중 프로세스에서는 피클이 안 되므로
     None 이고, 진행은 파일 단위로 보인다).
     """
-    (path, segs, prof_path, out_dir, budget, patience, threads) = args
+    (path, segs, prof_path, out_dir, budget, patience, threads,
+     speaker_constants, recording_constants) = args
     torch.set_num_threads(threads)
     rows = []
     try:
@@ -173,7 +192,8 @@ def _worker(args, on_row=None):
         t = time.time()
         try:
             row = fit_one(path, t0, t1, kind, prof, out_dir, budget, patience,
-                          clean=clean, pulses=pulses)
+                          clean=clean, pulses=pulses, speaker_constants=speaker_constants,
+                          recording_constants=recording_constants)
             row["seconds"] = round(time.time() - t, 1)
         except Exception as e:                  # 한 구간이 죽어도 코퍼스는 계속 돈다
             row = dict(stem=_name(path, t0, t1), file=os.path.basename(path),
@@ -191,6 +211,10 @@ def main() -> None:
     ap.add_argument("--wavs", default="data/voices/*.wav")
     ap.add_argument("--out", default="out/corpus")
     ap.add_argument("--profile", default="profiles/yang_female.json")
+    ap.add_argument("--speaker-lock", metavar="JSON",
+                    help="모든 구간이 공유하는 화자 공통 보정값")
+    ap.add_argument("--recording-lock", metavar="JSON",
+                    help="같은 녹음 환경의 출력 EQ·IR (화자 보정과 별개)")
     ap.add_argument("--kinds", default="fricative,vowel")
     ap.add_argument("--limit", type=int, default=0, help="구간 수 상한 (0 = 전부)")
     ap.add_argument("--files", type=int, default=0, help="파일 수 상한 (0 = 전부)")
@@ -202,6 +226,8 @@ def main() -> None:
                     help="이 회차 동안 손실이 안 줄면 그 단계를 끝낸다 (0 = 끔)")
     ap.add_argument("--resume", action="store_true", help="이미 있는 npz 는 건너뛴다")
     a = ap.parse_args()
+    speaker_constants = load_calibration(a.speaker_lock) if a.speaker_lock else None
+    recording_constants = load_calibration(a.recording_lock) if a.recording_lock else None
 
     budget = tuple(int(x) for x in a.budget.split(","))
     kinds = set(a.kinds.split(","))
@@ -239,7 +265,8 @@ def main() -> None:
             n_seg += 1
             n_fric += s.kind == "fricative"
         if keep:
-            jobs.append((p, keep, a.profile, a.out, budget, a.patience, a.threads))
+            jobs.append((p, keep, a.profile, a.out, budget, a.patience, a.threads,
+                         speaker_constants, recording_constants))
         if a.limit and n_seg >= a.limit:
             break
     print(f"구간 {n_seg} 개 (마찰 {n_fric}, 모음 {n_seg - n_fric}) / 파일 {len(jobs)} 개, "

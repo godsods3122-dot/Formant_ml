@@ -30,11 +30,15 @@ from __future__ import annotations
 import numpy as np
 
 
-def harmonic_basis(n: int, f0: float, fs: float, k_max: int) -> np.ndarray:
+def harmonic_basis(n: int, f0: float, fs: float, k_max: int,
+                   phase: np.ndarray | None = None) -> np.ndarray:
     """(n, 2K) 최소제곱 기저 [cos k, sin k]."""
-    t = (np.arange(n) - n / 2.0) / fs
+    if phase is None:
+        phase = 2 * np.pi * f0 * (np.arange(n) - n / 2.0) / fs
+    elif np.shape(phase) != (n,):
+        raise ValueError("harmonic phase must have one value per sample")
     k = np.arange(1, k_max + 1)[:, None]
-    w = 2 * np.pi * f0 * k * t[None, :]
+    w = k * np.asarray(phase)[None, :]
     return np.concatenate([np.cos(w), np.sin(w)], axis=0).T
 
 

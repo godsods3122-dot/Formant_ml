@@ -146,6 +146,36 @@ def test_fitter_gradients_are_finite(_engine):
         assert t.grad is not None and torch.isfinite(t.grad).all(), name
 
 
+def test_harmonic_loss_releases_only_supported_bandwidth_anchors(_engine):
+    tr = _track(160)
+    tr["f0_target"] = 295.0
+    tr.voiced = np.ones(160, bool)
+    tr.fricative = np.zeros(160, bool)
+    tr.fricative[65:95] = True
+    target = _synthetic_vowel(fs=48000, f0=295.0, dur=0.16)
+    new = CopySynthFitter(_engine, target, 48000, tr, harmonic_weight=1.0)
+    old = CopySynthFitter(_engine, target, 48000, tr, harmonic_weight=0.0)
+    assert new.names == old.names
+    assert old.harmonic is None and torch.all(old.prior_mask == 1)
+    covered = new.harmonic.coverage
+    assert covered.any() and not covered[65:95].any()
+    for name in ("bw1", "bw2", "bw3"):
+        mask = new.prior_mask[:, new.names.index(name)].numpy()
+        assert np.all(mask[covered] == 0)
+        assert np.all(mask[~covered] == 1)
+    assert torch.all(new.prior_mask[:, new.names.index("f1")] == 1)
+    assert torch.all(new.prior_mask[:, new.names.index("bw4")] == 1)
+    new._collect = True
+    new.loss()
+    assert "harmonic" in new._terms
+
+
+@pytest.mark.parametrize("weight", [-1.0, float("nan"), float("inf")])
+def test_harmonic_loss_rejects_invalid_weights(_engine, weight):
+    with pytest.raises(ValueError, match="harmonic_weight"):
+        CopySynthFitter(_engine, np.zeros(2880), 48000, _track(), harmonic_weight=weight)
+
+
 def test_fitter_recovers_a_detuned_tilt(_engine):
     """소스 기울기가 7 dB/oct 틀린 출발점에서 전역 단계가 원래 값을 되찾는다.
 

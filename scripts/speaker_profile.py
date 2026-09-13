@@ -1,46 +1,30 @@
-"""여러 발화의 적합 결과에서 **화자 상수**만 뽑아 하나로 합친다 (MEASUREMENTS §51.35).
+"""여러 발화에서 화자 공통 보정값만 합친다. 녹음 경로는 별도 scope 로 저장한다.
 
-성도 길이·고역 극 구조·이상와 영점·앞공동 대역폭·MVF·음원 EQ 는 한 사람의 것이지 문장의 것이
-아니다. 그런데 지금은 발화마다 따로 적합되어 서로 어긋난다 — 실측(`out/L86`): 이상와 영점
-`pir_log_f` 0.42 대 2.72, `pir_depth` −0.09 대 −1.96, 고역 극 대역폭 `hf_log_bw` |차| 중앙 0.48.
-그 자유도는 발화별 실현 오차를 빨아들이는 데 쓰이고 있다.
+MVF·성문 위상 분산·음원 EQ·레벨 정규화는 발화에 남긴다.
+이 보정값은 모델의 경험적 눈금이지 해부학의 직접 측정값은 아니다.
 
     python scripts/speaker_profile.py out/L86/s040 out/L86/s101 -o profiles/yang_female_speaker.json
 
 쓸 때는 `copyfit --speaker-lock <파일>` — 값을 넣고 **옵티마이저에서 뺀다**.
 """
 from __future__ import annotations
-import argparse, json
+import argparse
+import json
+import os
+import sys
 import numpy as np
 
-#: 화자 상수로 볼 항목 (`fit.CopySynthFitter.hf` 와 같은 목록).
-KEYS = ("hf_log_df", "hf_log_bw", "pir_log_f", "pir_depth",
-        "fric_log_lp_ratio", "glottis_hjit_log", "glottis_src_eq_db",
-        "open_damp", "open_f1")
-ENGINE_KEYS = ("log_extra_bw", "log_front_bw")
-ASP_KEYS = ("log_mvf",)
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+from formant_ml.engine.calibration import combine_calibrations, load_calibration
 
 
 def _load(stem: str) -> dict:
-    z = np.load(stem + "_track.npz", allow_pickle=True)
-    out = {}
-    for blob, keys in ((z["hf_params"], KEYS), (z["engine_params"], ENGINE_KEYS),
-                       (z["asp_params"], ASP_KEYS)):
-        d = json.loads(str(blob))
-        for k in keys:
-            if k in d:
-                out[k] = np.atleast_1d(np.asarray(d[k], float))
-    return out
+    return load_calibration(stem if stem.endswith((".npz", ".json")) else stem + "_track.npz")
 
 
-def combine(stems: list[str]) -> dict:
-    """발화별 값의 **중앙값**. 전부 로그·무한정 좌표라 중앙값이 곧 기하평균 쪽이다."""
-    per = [_load(s) for s in stems]
-    out = {}
-    for k in set().union(*[set(p) for p in per]):
-        vs = [p[k] for p in per if k in p]
-        n = min(len(v) for v in vs)
-        out[k] = np.median(np.stack([v[:n] for v in vs]), 0).tolist()
+def combine(stems: list[str], scope: str = "speaker") -> dict:
+    out = combine_calibrations([_load(s) for s in stems], scope)
+    out["sources"] = list(stems)
     return out
 
 
@@ -125,11 +109,15 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("stems", nargs="+", help="out/<태그>/<파일> (…_track.npz 를 읽는다)")
     ap.add_argument("-o", "--out", required=True)
+    ap.add_argument("--scope", choices=("speaker", "recording"), default="speaker",
+                    help="화자 보정 또는 동일 녹음 환경의 출력 EQ·IR. 발화값은 합치지 않는다")
     ap.add_argument("--bands", action="store_true",
                     help="포먼트마다의 제 구역(F1~F4 는 목표 관측, F5~F8 은 균일관 추정)을 같이 넣는다")
     ap.add_argument("--profile", default="profiles/yang_female.json")
     a = ap.parse_args()
-    prof = combine(a.stems)
+    if a.bands and a.scope != "speaker":
+        ap.error("--bands belongs to speaker calibration")
+    prof = combine(a.stems, a.scope)
     if a.bands:
         fb = formant_bands(a.stems, a.profile)
         # **Q 구역은 넣지 않는다** (§51.39 의 반증). 모음 프레임에서 낸 Q 를 전 구간에 걸면
@@ -138,18 +126,14 @@ def main() -> int:
         # 딱딱한 상자 대신 벌점으로 다시 만들어야 한다.
         fb.pop("_q", None)
         prof["formant_band"] = fb
-    json.dump(prof, open(a.out, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
-    print(f"화자 상수 {len(prof)} 항목을 {len(a.stems)} 발화에서 합쳐 {a.out} 에 썼다")
-    for k, v in sorted(prof.items()):
-        if k in ("formant_band", "q_band"):
-            for nm, (lo, hi) in v.items():
-                u = "Hz" if k == "formant_band" else "Q "
-                print(f"  {'구역' if k=='formant_band' else 'Q구역'} {nm:<16} {lo:7.1f} ~ {hi:7.1f} {u}")
-            continue
-        v = np.asarray(v, float)
-        spread = [np.asarray(_load(s).get(k, [np.nan]), float) for s in a.stems]
-        n = min(len(x) for x in spread)
-        rng = np.ptp(np.stack([x[:n] for x in spread]), 0) if len(spread) > 1 else np.zeros(n)
+    with open(a.out, "w", encoding="utf-8") as f:
+        json.dump(prof, f, ensure_ascii=False, indent=1, allow_nan=False)
+    print(f"{a.scope} 상수 {len(prof[a.scope])} 항목을 {len(a.stems)} 발화에서 합쳐 {a.out} 에 썼다")
+    per = [_load(s)[a.scope] for s in a.stems]
+    for k, v in sorted(prof[a.scope].items()):
+        v = np.atleast_1d(np.asarray(v, float))
+        spread = [np.atleast_1d(np.asarray(p[k], float)) for p in per]
+        rng = np.ptp(np.stack(spread), 0)
         print(f"  {k:<22} 중앙 {np.round(v[:4], 3)}  발화 간 폭 최대 {np.max(rng):.3f}")
     return 0
 

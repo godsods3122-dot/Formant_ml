@@ -40,13 +40,20 @@ done
 # 복사합성 — 녹음을 정답으로 두고 물리 파라미터를 역추정한다 (0.3.x 의 주 작업 방식)
 python scripts/copyfit.py data/voices/yang_00000034.wav \
     --profile profiles/yang_female.json --from 0.510 --to 0.665 --out out/fit
-# -> out/fit_target.wav / out/fit_fit.wav / out/fit_track.npz / out/fit_report.json
+# -> out/fit_target.wav / out/fit_fit.wav / out/fit_track.npz / out/fit_report.json / out/fit_constants.json
 
 python scripts/bench_corpus.py --quick            # 고정 구간 4 개 회귀 벤치
 python scripts/parametrize_corpus.py --out out/corpus --jobs 3 --resume
                                                   # 코퍼스 전체 -> 물리 factor 학습 데이터
 python scripts/calibrate_levels.py --write        # 제스처 세기를 프로파일 실측 목표에 맞춘다
 ```
+
+적합 상수는 이제 **화자 공통 / 녹음 경로 / 발화별**로 나누어 저장한다.
+`scripts\speaker_profile.py`로 기존 결과의 화자 보정값을 모으고 `copyfit --speaker-lock`으로
+재사용한다. 녹음 EQ·방 IR은 `--recording-lock`으로 별도 선택하며 MVF·음원 EQ·레벨 정규화는
+발화에 남긴다. 코퍼스 적합에도 같은 옵션을 쓸 수 있다. 형식·명령·자유도와 렌더 전용 실행은
+[`docs/BOTTLENECK.md` §11](docs/BOTTLENECK.md#11-공통-상수-분리와-기존-배선-수정)에 설명했다.
+공통값 분리가 곧 해부학적 식별이나 목표 포락 점수 달성을 뜻하지는 않는다.
 
 발음 진단은 `scripts/bench_corpus.py --denoise all --seeds 0,991,2027
 --budget 2,1,0 --no-probe --json out/diagnostics.json` 으로 시작할 수 있다.

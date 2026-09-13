@@ -34,6 +34,8 @@ import soundfile as sf
 import torch
 
 from formant_ml.engine.analyze import analyze
+from formant_ml.engine.calibration import (apply_calibration, legacy_fields,
+                                           load_calibration)
 from formant_ml.engine.control import INDEX, PARAM_NAMES
 from formant_ml.engine.denoise import denoise, noise_profile, snr_report
 from formant_ml.engine.fit import CopySynthFitter
@@ -305,9 +307,11 @@ def main() -> None:
                     help="비강 분기를 켜지 않는다 (analyze.NASAL_VELUM = False). 머머 검출과 구강 포먼트 보간은 그대로 — "
                          "연구개를 여는 것만 끈다. A/B 용이다")
     ap.add_argument("--speaker-lock", default=None, metavar="JSON",
-                    help="화자 상수(고역 극 구조·이상와 영점·앞공동 대역폭·MVF·음원 EQ)를 이 파일에서 읽어 넣고 "
-                         "**적합 대상에서 뺀다** (fit.SPEAKER_LOCK, §51.35). "
-                         "파일은 scripts/speaker_profile.py 가 여러 발화에서 만든다")
+                    help="화자 공통 보정값만 읽고 잠근다. MVF·위상 분산·음원 EQ·녹음 경로는 "
+                         "잠그지 않는다. scripts/speaker_profile.py 의 JSON 또는 *_track.npz")
+    ap.add_argument("--recording-lock", default=None, metavar="JSON",
+                    help="같은 녹음 환경의 출력 EQ·방 IR을 읽고 고정한다. 발화별 레벨 정규화는 "
+                         "유지한다. *_constants.json 또는 *_track.npz; --room-from 과 함께 쓰지 않는다")
     ap.add_argument("--spec-ripple", type=float, default=None, metavar="W",
                     help="**고역 물결**이 목표보다 얕은 만큼을 문다 (fit.HFRIP_W, §51.53). 포락 손실은 "
                          "멜 띠(12 kHz 에서 516 Hz)가 목표 구조(281 Hz)보다 넓어서 고역의 마루·골을 "
@@ -385,6 +389,9 @@ def main() -> None:
                     help="주기성(조화 대 비조화)을 목표에 일치시킨다 (기본 0 = 끔). "
                          "없으면 적합기가 하모닉을 잡음으로 바꿔 같은 스펙트럼을 만든다 "
                          "— 실측 fric_gain +1022 %%. MEASUREMENTS §44")
+    ap.add_argument("--harmonic", type=float, default=None, metavar="W",
+                    help="유성 0~3 kHz 배음별 크기 오차 (기본 1). 목표 위상에 동기화한 최소제곱으로 "
+                         "비교한다. 새 제어열은 없다. 0이면 이전 손실과 BW 관측 사전으로 돌아간다")
     ap.add_argument("--cont", type=float, default=None,
                     help="창별 손실이 직전 창보다 나빠진 만큼을 문다 (기본 0 = 끔). "
                          "평균 손실은 국소 붕괴를 못 본다 — 50 ms 구간 상관이 1.00 인데 "
@@ -400,6 +407,10 @@ def main() -> None:
                          "위에서 트랙이 흔들리는 것만 문다 — 지지직과 저역 초과가 "
                          "둘 다 여기서 온다 (docs/MEASUREMENTS.md §13, §16)")
     a = ap.parse_args()
+    if a.recording_lock and a.room_from:
+        ap.error("--recording-lock and --room-from are mutually exclusive")
+    if a.harmonic is not None and (not np.isfinite(a.harmonic) or a.harmonic < 0):
+        ap.error("--harmonic must be finite and nonnegative")
     torch.set_num_threads(a.threads)
     # 손실 가중은 **모듈 전역**이고 CopySynthFitter 가 생성 시점에 읽는다. 그러므로
     # 적합기를 만들기 전에 여기서 덮어써야 한다.
@@ -547,32 +558,32 @@ def main() -> None:
     eng = VoiceEngine(EngineConfig(sample_rate=48000, frame_ms=a.frame_ms,
                                    speaker="female" if prof.f0_nominal > 165 else "male",
                                    residual=False), prof)
+    initial_constants = None
+    recording_constants = load_calibration(a.recording_lock) if a.recording_lock else None
     if a.init:
         # 두 번째 패스: 앞선 적합의 제어열을 출발점으로, 전역 엔진값도 되살린다.
-        _z = np.load(a.init + "_track.npz", allow_pickle=True)
-        _v = np.asarray(_z["values"], dtype=np.float64)
+        with np.load(a.init + "_track.npz", allow_pickle=False) as _z:
+            _v = np.asarray(_z["values"], dtype=np.float64)
+            if float(_z["frame_ms"]) != track.frame_ms:
+                raise ValueError("--init control frame spacing must match --frame-ms")
+            if _v.ndim != 2 or not np.isfinite(_v).all():
+                raise ValueError("--init controls must be a finite two-dimensional array")
+            if "names" in _z:
+                old_names = tuple(_z["names"].tolist())
+                if old_names != tuple(PARAM_NAMES[:len(old_names)]):
+                    raise ValueError("--init control names do not match the engine schema")
+        initial_constants = load_calibration(a.init + "_track.npz")
         if _v.shape[1] < track.values.shape[1]:          # 나중에 더한 제어값은 기본값으로
             _v = np.concatenate([_v, np.tile(track.values[:1, _v.shape[1]:], (len(_v), 1))], 1)
         n_ = min(len(_v), track.n_frames)
         track.values[:n_] = _v[:n_, :track.values.shape[1]]
-        with torch.no_grad():
-            for _k, _x in json.loads(str(_z["engine_params"])).items():
-                getattr(eng.tract, _k).fill_(_x)
-            if "asp_params" in _z.files:
-                _ap = json.loads(str(_z["asp_params"]))
-                if "log_mvf" in _ap and hasattr(eng.aspiration, "log_mvf"):
-                    eng.aspiration.log_mvf.fill_(_ap["log_mvf"])
-            if "hf_params" in _z.files:
-                for _k, _x in json.loads(str(_z["hf_params"])).items():
-                    if _k == "fric_log_lp_ratio":
-                        eng.frication.log_lp_ratio.fill_(_x)
-                    elif _k == "glottis_hjit_log":
-                        eng.glottis.hjit_log.fill_(_x)
-                    elif hasattr(eng.tract, _k):
-                        _t = getattr(eng.tract, _k)
-                        _t.copy_(torch.as_tensor(_x, dtype=_t.dtype).reshape(_t.shape))
-        print(f"출발점: {a.init} (제어열 {n_} 프레임, 전역 엔진값 복원)", flush=True)
-    room_ir = None
+        print(f"출발점: {a.init} (제어열 {n_} 프레임, 공통·발화 상수 읽음)", flush=True)
+    room_ir = (initial_constants["recording"].get("room_ir")
+               if initial_constants is not None else None)
+    if recording_constants is not None:
+        if not recording_constants["recording"]:
+            raise ValueError("--recording-lock requires recording-scope constants")
+        room_ir = recording_constants["recording"].get("room_ir")
     if a.room_from:
         from formant_ml.engine import room as _room
         # **마른 출력이 있으면 그쪽을 쓴다.** 이미 방을 넣고 적합한 결과라면
@@ -731,32 +742,41 @@ def main() -> None:
         _fit.Q_BAND = {k: (float(v[0]), float(v[1])) for k, v in _qb.items()}
         print("포먼트 구역: " + ", ".join(f"{k} {v[0]:.0f}~{v[1]:.0f}"
                                         for k, v in sorted(_fit.FORMANT_BAND.items())), flush=True)
+    if initial_constants is not None:
+        apply_calibration(eng, initial_constants)
+    if a.hf_eq:
+        eng.tract.recording_eq_enabled = True
+    locked_constants = ()
     if a.speaker_lock:
-        import json as _json
-        _sp = _json.load(open(a.speaker_lock, encoding="utf-8"))
-        _put = 0
-        with torch.no_grad():
-            for _k, _v in _sp.items():
-                _o = (eng.glottis if _k.startswith("glottis_") else
-                      eng.frication if _k.startswith("fric_") else
-                      eng.aspiration if _k == "log_mvf" else eng.tract)
-                _n = _k.split("_", 1)[1] if _k.startswith(("glottis_", "fric_")) else _k
-                _q = getattr(_o, _n, None)
-                if not isinstance(_q, torch.nn.Parameter):
-                    continue
-                _t = torch.as_tensor(_v, dtype=_q.dtype).reshape(-1)
-                _q.copy_(_t[:_q.numel()].reshape(_q.shape) if _q.numel() <= _t.numel()
-                         else _q)
-                _put += 1
+        _sp = load_calibration(a.speaker_lock)
+        if not _sp["speaker"]:
+            raise ValueError("--speaker-lock requires speaker-scope constants")
+        locked_constants += apply_calibration(eng, _sp, ("speaker",))
         if "formant_band" in _sp:
             _fit.FORMANT_BAND = {k: (float(v[0]), float(v[1])) for k, v in _sp["formant_band"].items()}
             print("  포먼트 구역: " + ", ".join(f"{k} {v[0]:.0f}~{v[1]:.0f}"
                                               for k, v in sorted(_fit.FORMANT_BAND.items())), flush=True)
-        _fit.SPEAKER_LOCK = True
-        print(f"화자 상수 잠금: {a.speaker_lock} 에서 {_put} 항목을 넣고 적합 대상에서 뺐다", flush=True)
+        excluded = sorted(set(_sp["recording"]) | set(_sp["utterance"]))
+        if excluded:
+            print("  화자 잠금에서 제외: " + ", ".join(excluded), flush=True)
+        print(f"화자 상수 잠금: {a.speaker_lock} 에서 {len(locked_constants)} 항목", flush=True)
+    if recording_constants is not None:
+        locked_constants += apply_calibration(eng, recording_constants, ("recording",))
+        print(f"녹음 경로 잠금: {a.recording_lock} (발화별 레벨 정규화는 유지)", flush=True)
+    initial_utterance = initial_constants["utterance"] if initial_constants is not None else {}
     fit = CopySynthFitter(eng, seg, sr, track, phase_weight=a.phase, room_ir=room_ir,
                           device=a.device, lam_l1=float(a.l1 or 0.0),
+                          harmonic_weight=a.harmonic,
+                          locked_constants=locked_constants,
+                          initial_gain_db=initial_utterance.get("gain_db"),
+                          initial_pulse_phi0=initial_utterance.get("pulse_phi0", 0.0),
                           params=tuple(p for p in _DP if p not in frozen))
+    inactive = sorted(set(locked_constants) - fit.constant_parameters.keys())
+    if inactive:
+        print("  현재 렌더 옵션에서 비활성인 저장 상수: " + ", ".join(inactive), flush=True)
+    if fit.harmonic is not None:
+        print(f"배음 크기: 가중 {fit.harmonic_weight:g}, "
+              f"목표 관측 {fit.harmonic.observations}개 (0~3 kHz)", flush=True)
     if a.smooth_w is not None:
         fit.lam_smooth = float(a.smooth_w)
     if a.prior_w is not None:
@@ -776,6 +796,15 @@ def main() -> None:
               "잡음비와 아래 치찰음 지문을 함께 읽을 것.")
 
     out = fit.render()
+    harmonic_report = None
+    if fit.harmonic is not None:
+        harmonic_report = fit.harmonic.report(torch.as_tensor(out, device=a.device))
+        if harmonic_report["observations"]:
+            print(f"배음 오차: {harmonic_report['mae_db']:.2f} dB, "
+                  f"95% {harmonic_report['p95_db']:.2f} dB, "
+                  f"최악 {harmonic_report['max_db']:.2f} dB", flush=True)
+        else:
+            print("배음 오차: 관측 가능한 유성 창 없음", flush=True)
     os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
     sf.write(a.out + "_target.wav", seg, sr)
     sf.write(a.out + "_fit.wav", out, 48000)
@@ -789,19 +818,10 @@ def main() -> None:
     # 아니라 성도 모듈의 파라미터라 `values` 에 없다. 빠뜨리면 재렌더가 그 둘을 0 으로 되돌려
     # 고역이 저장된 `_fit.wav` 와 달라진다 — 실측 `out/L22/s040` 의 10~15 kHz 포락 동기가
     # 저장본 0.994 대 재렌더 0.525 였다. 재렌더할 때는 `engine_params` 를 도로 넣어라.
-    eng_p = {n: float(p.detach().cpu()) for n, p in
-             (("log_extra_bw", getattr(eng.tract, "log_extra_bw", None)),
-              ("log_front_bw", getattr(eng.tract, "log_front_bw", None)))
-             if p is not None}
-    hf_p = {n: getattr(eng.tract, n).detach().cpu().numpy().ravel().tolist()
-            for n in ("hf_log_df", "hf_log_bw", "pir_log_f", "pir_depth", "open_damp", "open_f1")
-            if hasattr(eng.tract, n)}
-    if hasattr(eng, "frication"):
-        hf_p["fric_log_lp_ratio"] = float(eng.frication.log_lp_ratio.detach().cpu())
-    if hasattr(eng.glottis, "hjit_log"):
-        hf_p["glottis_hjit_log"] = float(eng.glottis.hjit_log.detach().cpu())
+    constants = fit.acoustic_constants()
+    old_fields = legacy_fields(constants)
+    eng_p, hf_p, asp_p = (old_fields[n] for n in ("engine_params", "hf_params", "asp_params"))
     if hasattr(eng.glottis, "src_eq_db"):
-        hf_p["glottis_src_eq_db"] = eng.glottis.src_eq_db.detach().cpu().numpy().tolist()
         from formant_ml.engine import glottis as _glp
         if _glp.SRC_EQ:
             _q = (_glp.SRC_EQ_MAX_DB * torch.tanh(eng.glottis.src_eq_db / _glp.SRC_EQ_MAX_DB)).tolist()
@@ -813,9 +833,7 @@ def main() -> None:
                   f"k_f {float(0.15 * torch.tanh(eng.tract.open_f1) + 0.05):+.3f}", flush=True)
     if _fit.FRIC_LP_FIT:
         print(f"  마찰 절벽 배율 {float(torch.exp(eng.frication.log_lp_ratio)):.2f} (가둠 전)", flush=True)
-    asp_p = {"log_mvf": float(eng.aspiration.log_mvf.detach().cpu()),
-             "mvf_hz": float(eng.aspiration.mvf().detach().cpu())} \
-        if hasattr(eng.aspiration, "log_mvf") else {}
+    asp_p["mvf_hz"] = float(eng.aspiration.mvf().detach().cpu())
     if asp_p:
         print(f"  기식 MVF {asp_p['mvf_hz']:.0f} Hz", flush=True)
     np.savez(a.out + "_track.npz", values=res.values, frame_ms=res.frame_ms,
@@ -823,13 +841,19 @@ def main() -> None:
              engine_params=np.array(json.dumps(eng_p)),
              asp_params=np.array(json.dumps(asp_p)),
              hf_params=np.array(json.dumps(hf_p)),
+             acoustic_constants=np.array(json.dumps(constants, allow_nan=False)),
              gain_db=np.array(fit.gain_db()))
+    with open(a.out + "_constants.json", "w", encoding="utf-8") as f:
+        json.dump(constants, f, ensure_ascii=False, indent=1, allow_nan=False)
     with open(a.out + "_report.json", "w", encoding="utf-8") as f:
         json.dump({"env": rep.env, "fine": rep.fine, "per_size": rep.per_size,
                    "fine_corr": fid["fine_corr"], "floor": fid["floor"],
                    "resolved": fid["resolved"], "trust": fid["trust"],
                    "noise_ratio": fid["noise_ratio"],
                    "score_kind": "diagnostic_not_perceptual_equivalence",
+                   "harmonic": harmonic_report, "harmonic_weight": fit.harmonic_weight,
+                   "constant_budget": fit.constant_budget(), "frame_controls": len(fit.names),
+                   "event_coefficients": 0 if fit.w_ev is None else fit.w_ev.numel(),
                    "spectrum_match": fid["spectrum_match"],
                    "loss": rep.loss, "gain_db": fit.gain_db(),
                    "moved": {n: [x, z] for n, x, z in fit.moved()}},
