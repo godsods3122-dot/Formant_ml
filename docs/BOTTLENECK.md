@@ -364,3 +364,20 @@ for units, the implicit solve/adjoint, saved-mode A/B semantics, fixed
 reference-flow assumptions, differentiation effects, and limitations.
 This is not a self-oscillating fold model or evidence of improved envelope/
 harmonic accuracy. Existing evaluation windows and objectives are unchanged.
+
+## 13. 제한된 성능 확인과 남은 계획 (2026-09-13)
+
+s040의 기존 1.42초 목표 음원에서 같은 시작 제어열, 목표 펄스 고정, 32개 적합 열,
+200회 갱신으로 비교했다. M1 재현이나 전체 코퍼스 검증은 아니다.
+
+| 배음 손실 가중 | 포락 | 정밀 | 실행 시간 |
+|---|---|---|---|
+| 0 | 89.810% | 84.430% | 384.1초 |
+| 1 | 89.788% | 84.462% | 382.2초 |
+
+포락 상승이나 91% 달성은 확인되지 않았다. 가중 1의 신뢰도 선별 배음 관측 272개에서는
+평균 0.362 dB, 95% 분위 2.354 dB였지만, 이것을 전체 배음 1 dB 달성으로 해석하지 않는다.
+비선형 소스의 실제 음원 품질 비교는 미완료이므로 기본 꺼짐을 유지한다.
+
+비용 제한으로 추가 실험을 중단했다. 다음 작업은 두 조건의 동일 관측 배음 재평가,
+비선형 소스 on/off의 동일 예산 비교, 이후 다른 발화 확인 순서다.
