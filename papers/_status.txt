@@ -1,0 +1,47 @@
+OK   200 352KB 2000_Narayanan_Alwan_noise_source_models_fricatives
+OK   200 280KB 2006_Birkholz_noise_sources_area_functions_fricatives
+OK   200 1172KB 2011_Birkholz_model_based_articulatory_trajectories
+OK   200 4020KB 2020_Birkholz_VocalTractLab_2.3_manual
+OK   200 2072KB 1980_Klatt_cascade_parallel_formant_synthesizer
+OK   200 1432KB Klatt_chapter3_cascade_parallel_description
+OK   200 312KB 2009_Weenink_KlattGrid
+OK   200 316KB 2000_Jackson_Shadle_frication_modulated_by_voicing
+OK   200 120KB 2005_Pincas_Jackson_AM_of_frication_by_voicing_saturates
+OK   200 144KB 2001_Stylianou_harmonic_plus_noise_model
+OK   200 352KB 2009_Drugman_deterministic_plus_stochastic_residual
+FAIL 403 2020_Engel_DDSP  https://openreview.net/pdf?id=B1x1ma4tDr
+OK   200 1652KB 2020_Wang_Yamagishi_cyclic_noise_NSF
+OK   200 756KB 2024_Yu_differentiable_allpole_timevarying
+OK   200 404KB 2020_maximum_voiced_frequency_estimation
+OK   200 7388KB 2021_high_quality_vocoding_design_signal_processing
+OK   200 1052KB 2023_review_differentiable_DSP_music_speech
+OK   200 1220KB 2022_review_articulatory_models_speech_production
+OK   200 2684KB 1990_Glasberg_Moore_auditory_filter_shapes_ERB
+FAIL 503 1994_Shackleton_Carlyon_resolved_unresolved_harmonics  http://audition.ens.fr/P2web/eval2007/DP_shackleton-1994-harmonic_resolution_pitch.pdf
+FAIL 404 1994_Hawks_difference_limens_formant_patterns  http://web.mit.edu/carrien/Public/speechlab/papers/hawks1994.pdf
+OK   200 72KB 1999_Karlsson_DL_formant_frequency_high_F0
+OK   200 504KB 2016_Garellek_voice_source_spectral_slopes
+FAIL 200 2021_Kreiman_validating_psychoacoustic_model_voice_quality  https://pmc.ncbi.nlm.nih.gov/articles/PMC7822631/pdf/
+OK   200 652KB 2014_Monson_perceptual_significance_HFE_voice
+OK   200 6240KB 2014_Delvaux_piriform_fossae_spectral_impact_PLOS
+OK   200 480KB 2005_Kitamura_hypopharyngeal_cavities_individual_variation
+FAIL 403 2011_McDermott_Simoncelli_sound_texture_perception  https://www.cell.com/neuron/pdf/S0896-6273(11)00562-9.pdf
+FAIL 200 2023_two_stage_spectral_model_sound_texture  https://pmc.ncbi.nlm.nih.gov/articles/PMC9950610/pdf/
+OK   200 160KB 2007_Li_spectral_measures_sibilants
+OK   200 1004KB 2024_Jongman_phonetics_of_fricatives
+OK   200 644KB 2011_Flynn_comparing_vowel_formant_normalisation
+FAIL 200 2010_Li_sibilants_speaker_centered_approach  https://pmc.ncbi.nlm.nih.gov/articles/PMC3027155/pdf/
+FAIL 202 1997_Fitch_vocal_tract_length_formant_dispersion  https://scispace.com/pdf/vocal-tract-length-and-formant-frequency-dispersion-2vtop2z15t.pdf
+OK   200 992KB 2021_human_perception_of_audio_deepfakes
+FAIL 200 2010_Mehta_Hillman_model_breathiness_aspiration_noise  https://pmc.ncbi.nlm.nih.gov/articles/PMC2891879/pdf/
+OK   200 24KB Shadle_aerodynamics_puzzle_voiced_fricatives
+OK   200 7948KB 2022_NeuralDPS_deterministic_stochastic_multiband
+OK   200 948KB 2021_UnivNet_multiresolution_spectrogram_discriminators
+OK   200 4348KB 2011_KARMA_formant_antiformant_tracking
+OK   200 7268KB 2020_Engel_DDSP
+FAIL 520 2021_Kreiman_validating_psychoacoustic_model_voice_quality
+FAIL 520 2023_two_stage_spectral_model_sound_texture
+FAIL 520 2010_Li_sibilants_speaker_centered_approach
+FAIL 520 2010_Mehta_Hillman_model_breathiness_aspiration_noise
+FAIL 520 2011_McDermott_Simoncelli_sound_texture_perception
+FAIL 520 2014_Monson_perceptual_significance_HFE_voice_PMC

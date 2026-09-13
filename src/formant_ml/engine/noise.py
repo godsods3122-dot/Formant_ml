@@ -33,6 +33,13 @@ NU = 0.15                # 공기 동점성 cm²/s
 RE_CRIT = 1800.0         # 난류 개시 레이놀즈 수 (Stevens 1998, 1700~1800)
 RE_REF = 8000.0          # /s/ 급 협착의 전형값 — 세기 정규화 기준
 C_SOUND = 35000.0        # cm/s
+#: **마찰 v2** — 구동의 문턱을 매끈하게(softplus, 폭 `FRIC_SOFT_W`*Re_c^2) 하고 샘플률 포락에 2 단 1 차
+#: 평활(`FRIC_ENV_MS`)을 건다. v1 의 `(Re^2 - Re_c^2).clamp_min(0)^1.5 / a_c` 는 문턱 근처에서 1 ms 마디로
+#: 이은 유량·협착의 작은 흔들림을 깊은 골로 증폭했다(§50.9, docs/NOISE_SOURCE_REVIEW.md §2).
+FRIC_V2 = False
+FRIC_SOFT_W = 0.2
+FRIC_ENV_MS = 2.0
+
 # **성문 주기에 동기한 마찰 AM 의 깊이.** 폐쇄기에 유량이 줄어 마찰도 준다.
 # 깊이 0.35 는 예전 사각파 게이트(`1 − 0.5·(frac < 0.35)`)의 주기 평균을 보존하도록
 # 고른 값이다. 기식 쪽 `glottis.ASP_AM_DEPTH` 와 함께 F0 동기 변조를 만든다 —
@@ -146,6 +153,11 @@ def slow_modulation(white_frames: torch.Tensor, fs_frame: float, knee_hz, zi=Non
     return y * gain, zf
 
 
+#: 마찰 소스 고역 절벽 배율의 중심(ln 3.2)과 가둠 폭(±ln 2 → 1.6~6.4 배).
+LOG_LP0 = math.log(3.2)
+LP_RATIO_LIM = math.log(2.0)
+
+
 class FricationNoise(nn.Module):
     """협착 공기역학 -> 마찰 소스 (샘플률). 색은 여기서 **소스 스펙트럼**까지만."""
 
@@ -226,10 +238,24 @@ class FricationNoise(nn.Module):
         re, v, d = reynolds(u, a_c)
         # Stevens: 소스 압력 ∝ ρ·v³·√A. Re = v·d/ν ∝ v·√A 이므로 같은 Re 에서 v³√A ∝ Re³/A —
         # 넓은 통로(모음 자세)는 같은 Re 라도 조용하다. (Re²−Re_c²)^1.5/(A/A_ref), A_ref=0.1 cm².
-        drive = (((re ** 2 - RE_CRIT ** 2).clamp_min(0.0) / RE_REF ** 2) ** 1.5
-                 * (0.1 / a_c.clamp_min(0.02)))
+        if FRIC_V2:
+            w = FRIC_SOFT_W * RE_CRIT ** 2
+            over = w * torch.nn.functional.softplus((re ** 2 - RE_CRIT ** 2) / w)
+            drive = (over / RE_REF ** 2) ** 1.5 * (0.1 / a_c.clamp_min(0.02))
+        else:
+            drive = (((re ** 2 - RE_CRIT ** 2).clamp_min(0.0) / RE_REF ** 2) ** 1.5
+                     * (0.1 / a_c.clamp_min(0.02)))
         drive = drive + burst_env ** 3 * (0.1 / a_c.clamp_min(0.02))   # 버스트: 방전 속도의 세제곱
         env = drive * torch.exp(self.log_amp) * up(c["fric_gain"])
+        if FRIC_V2 and FRIC_ENV_MS > 0.0:
+            a_s = 1.0 - math.exp(-1000.0 / (FRIC_ENV_MS * fs))
+            for p_ in (0, 1):
+                k_ = "env%d" % p_
+                zi = state.get(k_)
+                if zi is None:
+                    e0 = env[:, :1].to(torch.float64)
+                    zi = torch.cat([(1.0 - a_s) * e0, torch.zeros_like(e0)], -1)
+                env, state[k_] = tv_biquad(env, a_s, 0.0, 0.0, -(1.0 - a_s), 0.0, zi=zi)
         # 장애물(앞니) 소스의 혹은 자유 제트의 Strouhal 정점보다 높고 넓다(Shadle). 같은 화자 A/B 에서
         # St=0.2 그대로 두면 1~3 kHz 가 10~12 dB 과했다. 정점 ×2.5, Q 0.5.
         f_peak = (0.5 * v / d.clamp_min(1e-3)).clamp(800.0, 0.45 * fs)
@@ -315,7 +341,9 @@ class FricationNoise(nn.Module):
         # 그래서 소스가 나이퀴스트까지 평평했고, 실측 남성 /ㅅ/ 이 정점 대비 12~16 kHz 에서
         # −30 dB 인데 합성은 −13 dB 에서 멈췄다(측정). 정점의 lp_ratio 배에서 2 차씩
         # `lp_stages` 단 — 한 단(−12 dB/oct)으로는 실측 기울기에 못 미친다.
-        lpf = (f_peak * torch.exp(self.log_lp_ratio)).clamp(600.0, 0.45 * fs)
+        # 절벽 배율은 3.2 배 둘레 1.6~6.4 배로 가둔다(적합할 때 달아나지 않게). 기본값에서는 그대로 3.2 배다.
+        llr = LOG_LP0 + LP_RATIO_LIM * torch.tanh((self.log_lp_ratio - LOG_LP0) / LP_RATIO_LIM)
+        lpf = (f_peak * torch.exp(llr)).clamp(600.0, 0.45 * fs)
         for i, q in enumerate(butterworth_q(self.lp_stages)):
             src, state[f"lp{i}"] = tv_biquad(src, *lowpass_coeffs(lpf, q, fs),
                                              zi=state.get(f"lp{i}"))
@@ -323,8 +351,23 @@ class FricationNoise(nn.Module):
                     reynolds=re, flow=u, state=state)
 
 
+#: **기식 v2.1 — 유성 정도로 가른다** (docs/NOISE_SOURCE_REVIEW.md §4).
+#:
+#: v2.0 은 성대가 떨든 말든 기식을 MVF(5.5 kHz) 위로만 보냈다. 문헌과 목표가 둘 다 반박한다:
+#: MVF 는 시변이고 무성음에서 ~1 kHz 다(MVF 연구), Klatt 도 기식을 모음과 같은 포먼트에 통과시킨다.
+#: 목표 실측 — 무성·비마찰 기식 프레임의 0.3~5 kHz 봉우리 깊이가 모음의 80 %, 모음 포락과 상관
+#: +0.46 (s040) / +0.31 (s101): **무성 기식은 포먼트 구조를 가진 전대역 잡음**이다. 그래서
+#:   * 유성분(떨림 진폭 비례 v): MVF 위 2 차 고역, 바닥 `ASP_V_FLOOR` — 성도의 저 Q 사본으로
+#:   * 무성분(1 − v): 예전 셸프(3 kHz, 바닥 0.3) — **정상 종속 가지**(물리 포먼트)로
+#: MVF 는 파일 전역 적합값(`log_mvf`, 2~9 kHz, 초기 5.5 kHz). 목표도 파일마다 중역 주기성이 다르다.
+ASP_SPLIT = False
+ASP_V_FLOOR = 0.05
+
+
 class AspirationNoise(nn.Module):
     """성문 기식: 포락선은 glottis 가 물리로 준다. 여기서는 색(완만한 고역 셸프)만."""
+
+    order = 1           # 고역 셸프의 차수 (2 면 1 차 고역통과를 두 번 — 12 dB/oct)
 
     def __init__(self, fs: float, hop: int, corner_hz: float = 3000.0, floor: float = 0.3,
                  amp_ref: float = 0.3):      # 실측 남성 /아/ HNR 22 dB, 4~8 kHz 대역에 적합 (2026-09-06)
@@ -332,17 +375,45 @@ class AspirationNoise(nn.Module):
         self.fs, self.hop = float(fs), int(hop)
         self.corner, self.floor = corner_hz, floor
         self.log_amp = nn.Parameter(torch.tensor(math.log(amp_ref)))
+        # v2.1: 유성 기식의 MVF [Hz] — 파일 전역 적합값. 0 에서 5.5 kHz.
+        self.log_mvf = nn.Parameter(torch.tensor(0.0))
+
+    MVF_LO, MVF_HI, MVF_INIT = 2000.0, 9000.0, 5500.0
+
+    def mvf(self) -> torch.Tensor:
+        lo, hi = math.log(self.MVF_LO), math.log(self.MVF_HI)
+        x0 = (math.log(self.MVF_INIT) - lo) / (hi - lo)
+        b0 = math.log(x0 / (1.0 - x0))
+        return torch.exp(lo + (hi - lo) * torch.sigmoid(self.log_mvf + b0))
 
     def forward(self, asp_env: torch.Tensor, noise=None, sample0: int = 0,
-                state: dict | None = None) -> dict:
+                state: dict | None = None, voiced: torch.Tensor | None = None) -> dict:
         b, n = asp_env.shape
         noise = noise or NoiseBank()
         state = {} if state is None else state
         white = noise.white("asp", sample0, n, b, asp_env.dtype, asp_env.device)
+        if ASP_SPLIT and voiced is not None:
+            g = asp_env * torch.exp(self.log_amp)
+            v = voiced[:, :n].to(white.dtype).clamp(0.0, 1.0)
+            r_u = math.exp(-2 * math.pi * self.corner / self.fs)
+            hu, state["hu"] = tv_biquad(white, 0.5 * (1 + r_u), -0.5 * (1 + r_u), 0.0, -r_u, 0.0,
+                                        zi=state.get("hu"))
+            col_u = self.floor * white + (1.0 - self.floor) * hu
+            r_v = torch.exp(-2 * math.pi * self.mvf() / self.fs)
+            hv, state["hv1"] = tv_biquad(white, 0.5 * (1 + r_v), -0.5 * (1 + r_v), 0.0, -r_v, 0.0,
+                                         zi=state.get("hv1"))
+            hv, state["hv2"] = tv_biquad(hv, 0.5 * (1 + r_v), -0.5 * (1 + r_v), 0.0, -r_v, 0.0,
+                                         zi=state.get("hv2"))
+            col_v = ASP_V_FLOOR * white + (1.0 - ASP_V_FLOOR) * hv
+            src_v, src_u = col_v * g * v, col_u * g * (1.0 - v)
+            return dict(source=src_v + src_u, source_v=src_v, source_u=src_u, state=state)
         # 1 차 고역 셸프: floor + (1−floor)·HP(corner)
         r = math.exp(-2 * math.pi * self.corner / self.fs)
         hp, state["hp"] = tv_biquad(white, 0.5 * (1 + r), -0.5 * (1 + r), 0.0, -r, 0.0,
                                     zi=state.get("hp"))
+        if int(getattr(self, "order", 1)) >= 2:
+            hp, state["hp2"] = tv_biquad(hp, 0.5 * (1 + r), -0.5 * (1 + r), 0.0, -r, 0.0,
+                                         zi=state.get("hp2"))
         colored = self.floor * white + (1.0 - self.floor) * hp
         return dict(source=colored * asp_env * torch.exp(self.log_amp), state=state)
 

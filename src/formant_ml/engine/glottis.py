@@ -70,6 +70,97 @@ CMH2O = 980.665          # 1 cmH2O = 980.665 dyn/cm²
 #: **하모닉 기울기를 더 올릴 대상 자체가 없다** — 올려 봐야 펄스만 날카로워진다.
 TILT_MAX_HZ = 5000.0
 
+#: **하모닉을 묶음으로 합성한다** (0 = 예전처럼 하나씩). 적합 한 회차의 **68.2 %**가
+#: 아래 하모닉 루프였다 (`yang_00000040` 전체, 1374 ms 중 937 ms). 루프 상한이
+#: `ceil(f_cut / f0_min)` 이라 발화 어딘가에 f0 95.6 Hz 가 한 번만 있어도 **하모닉 269 개를
+#: 하나씩** 돌고, 회차마다 순방향·역전파로 수만 번의 작은 연산이 된다 — 시간이 계산이
+#: 아니라 연산을 띄우는 비용으로 간다 (프로파일: `aten::mul` 72522 회, 평균 4.2 µs).
+#:
+#: 순차 누적을 둔 이유(아래 루프 주석)는 **실시간 경로의 스트리밍 = 오프라인 일치**다
+#: — float32 축약 순서가 청크 길이에 따라 달라지면 고 Q 성도를 지나며 1e-3 로 커진다.
+#: 오프라인 적합에는 그 제약이 없으므로 적합기만 이것을 켠다. 묶음 안의 합은 float64 로
+#: 누적해 순서 민감도를 줄인다.
+HARM_BLOCK = 0
+
+#: **최대 유성 주파수(MVF)** — 조화+잡음 모형(Stylianou 1996; WORLD 의 비주기성과 같은
+#: 생각)의 경계. 0 이면 끈다(배음을 나이퀴스트까지 만든다 — 예전 동작).
+#:
+#: 왜: 사용자가 스펙트로그램에서 "대충 6200 Hz 까지는 지문 같은 무늬가 있는 반면에 그 위로는
+#: 필터 같은 경향만 있지 죄다 안개처럼 흩어져 있다" 고 보았다. 대역별 **파형** 주기성(F0 지연
+#: 자기상관)을 재면 정확히 그렇다 (`yang_00000040` 유성 프레임):
+#:
+#:     kHz     1     2     3     4     5     6     7    8~15
+#:     목표  0.67  0.42  0.28  0.16  0.11  0.02  0.01   ≈ 0
+#:     L22   0.85  0.53  0.38  0.32  0.21  0.11 −0.02   ≈ 0
+#:
+#: 목표의 배음은 6 kHz 에서 끝나고 그 위는 **포락만** 성문 주기에 물린 잡음이다. 우리는
+#: 배음을 끝까지 만들어 1~6 kHz 가 목표보다 20~100 % 날카롭다 ("하모닉을 너무 날카롭게
+#: 깎았다"). 그래서 배음에 MVF 부드러운 저역통과를 걸고, 그 위는 성문 주기로 변조된
+#: 기식 잡음이 **같은 성도**를 지나게 한다 — 여기원은 나누고 필터는 공유한다.
+MVF_HZ = 0.0
+MVF_WIDTH = 800.0
+
+#: **배음별 위상 분산** [rad/kHz] — 고역 배음이 "지워지는" 게 아니라 **번져서** 안개가 되게
+#: 한다. 0 이면 끈다.
+#:
+#: 사용자의 물리: *"고역에서는 임계 이상의 진동은 분산이 커져서 유사 노이즈로 붕괴되지만,
+#: 포먼트는 살아있다."* 연화(점액·조직 감쇠)는 고역 배음의 **진폭**을 줄일 뿐 선은 남긴다.
+#: 안개인데 포먼트가 사는 결은 **배음 위상이 차수에 따라 더 흔들려 선폭이 넓어지는** 쪽이다
+#: — 선들이 겹쳐 연속체가 되고, 같은 필터를 지나니 포락은 그대로다.
+#:
+#: 목표에서 형태가 나온다. 대역별 파형 주기성의 1 kHz 대비 비가 2/3/4/5/6 kHz 에서
+#: 0.63/0.42/0.24/0.16/0.03 이고, 가우시안 위상 흔들림이면 주기성이 exp(−σ²/2) 로 준다.
+#: 역산하면 σ = 0.96/1.32/1.69/1.91/2.65 rad — **주파수에 거의 비례**한다 (≈0.4 rad/kHz).
+#: 차수에 비례하는 분산, 즉 사용자가 말한 "임계 이상의 분산 증가" 다.
+#:
+#: 앞서 넣은 조화+잡음 분리(`MVF_HZ`)는 방향이 틀렸다 — MVF 위 배음을 **지우고** 따로 게이트한
+#: 잡음을 얹으니 배음이 붕괴하는 게 아니라 갈아 끼워지고, 게이트가 세로 블록을 만든다.
+#: 이것은 배음을 지우지 않는다. 위상만 흔드므로 **각 배음의 에너지가 보존**된다.
+#:
+#: `jitter`(공통 F0 흔들림)로는 안 된다 — 선폭이 k·f0·jitter 로만 넓어져 6 kHz(k≈20)에서 선을
+#: 겹치게 하려면 지터가 5 %여야 하는데 상한이 1 %이고 적합값이 **이미 상한에 붙어 있다**
+#: (0.0098) — 적합기가 더 흩뜨리고 싶어 하는데 수단이 없었다는 신호다. 여기서는 배음마다
+#: **독립인** 흔들림을 쓴다.
+#:
+#: ψ_k 는 프레임률(1 kHz) 위치 기반 백색 난수를 선형 보간한 것 — 대역폭 ~500 Hz 라 선을
+#: 이웃(f0 ≈ 300 Hz)과 겹칠 만큼 번지게 한다. **상태가 없으므로** 청크를 나눠도(실시간
+#: 경로) 같은 값이 나온다. 세기 σ(f) = HARM_PHASE_JIT·max(0, f − HARM_PHASE_ONSET)/1000.
+#: 화자의 성대 조직(점막파의 불규칙성)이 정하는 값이라 프로파일로 옮길 자리다.
+HARM_PHASE_JIT = 0.0
+HARM_PHASE_ONSET = 500.0
+#: 난수 배치의 고정 폭 — 위치(프레임·배음)가 청크와 무관하게 정해진다. 배음 수가 이보다 많으면
+#: 배음 번호를 이 폭으로 **감아** 쓴다(k % KMAX). 400 이던 때 적합이 F0 를 한 유성 프레임에서
+#: 하한 가까이 내리자 배음 수가 400 을 넘어 위상 단계에서 IndexError 로 죽었다(out/L34/s101).
+#: 512 면 F0 하한 50 Hz 에서도 24 kHz 까지 480 개라 감기지 않는다.
+HARM_PHASE_KMAX = 512
+#: 배음 위상 분산 세기의 **화자 전역 배율**을 적합한다 (MEASUREMENTS §51.12). 켜면 σ(f) 에
+#: exp(0.9·tanh(x/0.9)) (0.4~2.5 배, 처음 1 배)를 곱하고, x 는 적합기의 전역 목록에 들어간다.
+#: 목표의 대역별 주기성은 화자·녹음마다 다르다(s040 0.90/0.55/0.31/0.31/0.11, s101 0.84/0.41/0.21/0.17/0.13,
+#: 1~5 kHz) — 고정 상수 0.25 rad/kHz 로는 s040 의 3.5~5.5 kHz 가 목표보다 덜 주기적이었다(0.11/0.04).
+HJIT_FIT = False
+#: **주기 동기 배음 위상 분산** (FOUNDATION §3.2, MEASUREMENTS §51.13). 켜면 ψ_k 를 1 ms 프레임 난수가 아니라
+#: **성문 주기마다** 새로 뽑고(닫힌 구간 한가운데 — LF 위상 `HJIT_CYCLE_ANCHOR` — 를 주기 경계로), 주기 안에서는
+#: 이웃 두 주기의 값을 선형으로 잇는다. 1 ms 난수는 한 주기 안을 네다섯 번 뒤섞어 고역 포락의 성문 주기 동기를
+#: 지웠다: 적합기 로그의 "지글거림(유성)" F0 대역 변조가 목표의 0.53~0.59 배(`L52`) — 목표 고역 포락의 F0 동기는
+#: 0.83~0.84 다. 주기마다 뽑으면 한 주기 안의 펄스 모양이 살아 있고 주기 사이만 흩어진다 — Hermes(1991)·
+#: Mehta & Quatieri(2005)의 "펄스 동기 잡음이라야 목소리에 녹는다". 위상 난수의 주기 좌표는 기울기를 끊는다
+#: (f0 로 잘못된 난수 기울기가 흐르지 않게). 오프라인 적합 전용이다 — 스트리밍에서는 주기 번호가 청크마다 새로 시작한다.
+#: **화자 음원 EQ** (MEASUREMENTS §51.17). 켜면 성문 배음 소스에 고정 주파수의 봉우리 여섯을 곱한다 —
+#: 이득만 화자 전역 적합값(±`SRC_EQ_MAX_DB`), 위치·폭은 고정. DC 이득은 1 이라 전체 수준은 안 건드린다.
+#:
+#: 왜: 지금 음원의 모양 자유도는 Rd(LF 한 모수)와 기울기 하나뿐이다. 문헌(A 층)은 음원을 기울기 **넷**
+#: (H1–H2, H2–H4, H4–2 kHz, 2–5 kHz)으로 기술하고 그것이 화자 정체의 큰 몫이라고 한다(Kreiman·Garellek 2016).
+#: 실측: 포락 오차의 85~93 %가 모음 0~1 kHz 인데(§51.2), 그 대역은 5.3 ms 창에서 배음 두셋만 들어가므로
+#: **성문 펄스 모양 그 자체**다. 프레임별·대역별 최적 이득(89 %)과 프레임별 최적 정렬(+3.5 점)을 다 줘도
+#: 남는 몫이 여기다. 시간에 따라 움직이지 않으므로 성도(시변)의 오차를 대신 흡수하지 못한다.
+SRC_EQ = False
+SRC_EQ_F = (150.0, 300.0, 600.0, 1200.0, 2400.0, 4800.0)
+SRC_EQ_BW_REL = 0.7
+SRC_EQ_MAX_DB = 9.0
+
+HJIT_CYCLE = False
+HJIT_CYCLE_ANCHOR = 0.9
+
 #: **성문 폐쇄 시각의 흩어짐** [s]. 성대는 부드러운 물질이라 성문 길이를 따라
 #: **동시에 닫히지 않는다** — 앞뒤로 지퍼처럼 닫힌다. 길이 방향의 면적 요소들은
 #: 병렬이므로 총 유량은 그 합이고, 따라서 유량미분은 이상적인 펄스를 **국소 폐쇄
@@ -144,6 +235,17 @@ def lf_pulse(rd: float, n: int = 4096) -> np.ndarray:
 # 값은 실측으로 정해야 하므로 상수로 빼 둔다. 하드코딩된 채로는 A/B 를 못 돌린다.
 ASP_AM_DEPTH = 0.7
 
+#: **유성 마스크를 떨림 진폭에 비례시킨다** [기준 진폭]. 0 이면 예전 이진 마스크
+#: `amp > 1e-3` 그대로다.
+#:
+#: 이진 마스크는 성대가 조금이라도 떨면 성문 주기 AM(기식 `ASP_AM_DEPTH`, 마찰
+#: `noise.FRIC_AM_DEPTH`)을 **전 깊이로** 건다. 실측(out/L25/s040, ㅊ 0.71~0.82 s): 떨림
+#: 진폭 중앙 0.37 (모음 0.86), 최소 0.15 인데 마스크는 100 % 켜져 있었다 — 무성 치찰음의
+#: 난류가 F0 로 전 깊이 썰렸다(MEASUREMENTS §50.4). 또 이진이라 "덜 떨면 덜 썰린다" 는
+#: 기울기가 없다. >0 이면 `clamp(amp / VOICED_SOFT, 0, 1)` — 모음 떨림(≈0.8)에서 1,
+#: 반쯤 떨면 절반 깊이다.
+VOICED_SOFT = 0.0
+
 
 def lf_table(n_rd: int = 24, rd_min: float = 0.3, rd_max: float = 2.7,
              n_harm: int = 400, n: int = 4096) -> tuple[torch.Tensor, torch.Tensor]:
@@ -180,6 +282,8 @@ class GlottalSource(nn.Module):
         self.register_buffer("rd_grid", rds)
         self.register_buffer("lf_coef", coef)                      # (n_rd, K)
         self.register_buffer("k_idx", torch.arange(1, n_harm + 1, dtype=torch.float32))
+        self.hjit_log = nn.Parameter(torch.tensor(0.0))       # 배음 위상 분산 배율 (HJIT_FIT)
+        self.src_eq_db = nn.Parameter(torch.zeros(len(SRC_EQ_F)))   # 화자 음원 EQ (SRC_EQ)
         if noise_modulation == "lf":
             # Integrate the SAME LF derivative used for the harmonic source, from
             # opening (phase zero) to closure. No independent open-quotient fit.
@@ -192,6 +296,24 @@ class GlottalSource(nn.Module):
             # Derived table, not checkpoint state: legacy checkpoints still load.
             self.register_buffer("lf_flow", torch.tensor(np.stack(flows), dtype=torch.float32),
                                  persistent=False)
+
+    def _src_eq(self, x, state):
+        """성문 배음 소스에 거는 화자 전역 EQ (고정 주파수 봉우리 여섯, 이득만 적합). `SRC_EQ` 참조."""
+        from .tviir import peak_coeffs
+        for i, f in enumerate(SRC_EQ_F):
+            gdb = SRC_EQ_MAX_DB * torch.tanh(self.src_eq_db[i] / SRC_EQ_MAX_DB)
+            zr = torch.pow(10.0, gdb / 20.0).to(x.dtype)
+            fq = torch.full_like(x, float(f))
+            bw = torch.full_like(x, float(f) * SRC_EQ_BW_REL)
+            key = f"seq{i}"
+            x, state[key] = tv_biquad(x, *peak_coeffs(fq, bw, self.fs, zr), zi=state.get(key))
+        return x
+
+    def _hjit(self):
+        """배음 위상 분산 기울기 [rad/kHz]. HJIT_FIT 이면 전역 배율(0.4~2.5)을 곱한다."""
+        if HJIT_FIT:
+            return HARM_PHASE_JIT * torch.exp(0.9 * torch.tanh(self.hjit_log / 0.9))
+        return HARM_PHASE_JIT
 
     # ---------------------------------------------------------- 생리 상태
     def threshold(self, f0, adduction):
@@ -287,6 +409,56 @@ class GlottalSource(nn.Module):
         return dict(f0=f0, amp=amp, amp_raw=amp_raw, rd=rd, ag_dc=ag_dc, asp=asp, pth=pth)
 
     # ---------------------------------------------------------- 파형
+    def _harmonics_blocked(self, phase, f0, tilt, log2f0, i0, wrd, rps, dispersion, fs,
+                           f_nyq, width, f_cut, k_max, blk, psi_fr=None, n=None):
+        """하모닉 가산합성의 묶음판. 아래 순차 루프와 **같은 식**을 (B, N, blk) 로 푼다.
+
+        `HARM_BLOCK` 주석이 근거다. 하모닉 차수는 커지기만 하므로, 한 묶음에 살아 있는
+        하모닉이 하나도 없으면 그 뒤 묶음도 없다 — 거기서 멈춘다.
+        """
+        k = self.k_idx
+        acc = torch.zeros(phase.shape, dtype=torch.float64, device=phase.device)
+        ph = phase.unsqueeze(-1)
+        f0e = f0.unsqueeze(-1)
+        tl = tilt.unsqueeze(-1)
+        w0 = (1 - wrd).unsqueeze(-1)
+        w1 = wrd.unsqueeze(-1)
+        for j0 in range(0, k_max, blk):
+            j1 = min(j0 + blk, k_max)
+            kk = k[j0:j1].to(phase.dtype)                          # (Kb,)
+            fk = f0e * kk                                          # (B,N,Kb)
+            live = fk <= f_cut
+            if not bool(live.any()):
+                break
+            tab = self.lf_coef[:, j0:j1]                           # (n_rd, Kb)
+            cj = tab[i0] * w0 + tab[i0 + 1] * w1                   # (B,N,Kb)
+            mask = torch.sigmoid((f_nyq - fk) / width) * live
+            if MVF_HZ > 0.0:
+                mask = mask * torch.sigmoid((MVF_HZ - fk) / MVF_WIDTH)
+            if TILT_MAX_HZ > 0.0:
+                oct_ = torch.log2(fk.clamp(20.0, TILT_MAX_HZ) / 1000.0)
+                gain = 10.0 ** (tl * oct_ / 20.0)
+            else:
+                gain = 10.0 ** (tl * (log2f0.unsqueeze(-1) + torch.log2(kk)) / 20.0)
+            th = ph * kk
+            if rps is not None:
+                th = th + rps[..., j0:j1]
+            if dispersion != 0.0:
+                xn = (fk / (0.5 * fs)).clamp(0.0, 1.0)
+                th = th - dispersion * xn * xn
+            if psi_fr is not None:
+                jj = torch.arange(j0, j1, device=psi_fr.device) % psi_fr.shape[-1]
+                psi = frames_to_samples(psi_fr.index_select(2, jj), self.hop)[:, :n]
+                th = th + (self._hjit() * (fk - HARM_PHASE_ONSET).clamp_min(0.0)
+                           / 1000.0) * psi
+            w_k = mask * gain
+            if GLOTTAL_CLOSURE_SPREAD_S > 0.0:
+                w_k = w_k * torch.exp(
+                    -0.5 * (2.0 * math.pi * fk * GLOTTAL_CLOSURE_SPREAD_S) ** 2)
+            term = 2.0 * w_k * (cj.real * torch.cos(th) - cj.imag * torch.sin(th))
+            acc = acc + term.double().sum(-1)
+        return acc
+
     def _lf_index(self, rd: torch.Tensor):
         """(B,N) Rd -> (i0, w). 하모닉 계수는 **차수별로** 표에서 뽑는다.
 
@@ -327,7 +499,8 @@ class GlottalSource(nn.Module):
                 rps: torch.Tensor | None = None, dispersion: float = 0.0,
                 noise=None, frame0: int = 0,
                 amp0: torch.Tensor | None = None, state: dict | None = None,
-                emit: int | None = None) -> dict:
+                emit: int | None = None,
+                pulse_phase: torch.Tensor | None = None) -> dict:
         """c: 프레임률 (B,T) dict. 반환 샘플률 텐서들 (B,N).
 
         noise : NoiseBank (위치 기반 난수). frame0 : 이 청크의 첫 프레임 번호.
@@ -362,9 +535,15 @@ class GlottalSource(nn.Module):
         f0 = f0 * (1.0 + jit * zs[..., 0])
         amp = amp * (1.0 + shm * zs[..., 1]).clamp_min(0.0)
         # 위상 누적은 float64 로 (float32 cumsum 오차 × 하모닉 차수가 청크 경계에서 보인다)
-        phase64 = torch.cumsum(2 * math.pi * f0.double() / fs, dim=-1)
-        if phase0 is not None:
-            phase64 = phase64 + phase0.double()
+        if pulse_phase is not None:
+            # **펄스 잠금**: 위상을 f0 적분이 아니라 목표 녹음의 성문 폐쇄 시각에서 만든다
+            # (MEASUREMENTS §51.16). 지터·시머의 실현이 아니라 **관측된 주기 경계**다.
+            phase64 = pulse_phase.double()[:, :n]
+        else:
+            phase64 = torch.cumsum(2 * math.pi * f0.double() / fs, dim=-1)
+            if phase0 is not None:
+                phase64 = phase64 + phase0.double()
+        ph_unw = phase64.detach()                 # 주기 동기 위상 분산의 주기 좌표 (HJIT_CYCLE)
         phase64 = torch.remainder(phase64, 2 * math.pi)
         phase = phase64.to(f0.dtype)                  # 상태(phase_last)는 float64 로 넘긴다:
         #                                               float32 위상 2e-7 rad × 하모닉 100 = 2e-5 rad 가 청크 경계에서 보였다
@@ -381,8 +560,40 @@ class GlottalSource(nn.Module):
         # **예외로 터진다** — 적합기의 "손실이 비유한이면 중단" 가드가 손실을 보기도 전이라
         # 원인을 못 찾는다. 하모닉 상한만 정하는 값이므로 NaN 은 상한으로 접고, 잘못된
         # 값은 아래 du 계산에서 NaN 으로 **전파**시켜 가드가 잡게 둔다.
-        f0_min = torch.nan_to_num(f0.detach(), nan=1.0, posinf=1.0).min().clamp_min(1.0)
+        f0_all = torch.nan_to_num(f0.detach(), nan=1.0, posinf=1.0)
+        # **하모닉 상한은 소리 나는 샘플의 f0 로 잡는다.** 무성 샘플은 진폭이 0 이라
+        # (`du = du * amp`) 그 하모닉은 어차피 버려진다. 그런데 무성 구간의 f0_target 은
+        # 적합기가 아무 데나 두는 값이라 낮게 떨어진다 — 실측(`yang_00000040`)에서 전체
+        # 최소 95.6 Hz 는 무성 프레임이었고 유성 최소는 147.5 Hz 였다. 전체로 잡으면
+        # 하모닉 269 개, 유성으로 잡으면 175 개다. 적합 한 회차의 68 %가 이 루프다.
+        # 소리 나는 샘플이 하나도 없으면(무성 청크) 예전처럼 전체로 잡는다.
+        on = amp.detach() > 1e-3
+        f0_min = (f0_all[on] if bool(on.any()) else f0_all).min().clamp_min(1.0)
         k_max = int(torch.clamp(torch.ceil(f_cut / f0_min), 1, len(k)).item())
+        psi_fr = None
+        psi_cyc = None
+        if HARM_PHASE_JIT > 0.0 and HJIT_CYCLE:
+            # (B, n_c, KMAX) 주기 난수 + 샘플마다 (주기 번호, 주기 안 위치)
+            kw = HARM_PHASE_KMAX
+            u = ph_unw / (2.0 * math.pi) - HJIT_CYCLE_ANCHOR
+            cyc = torch.floor(u)
+            c0 = int(cyc.min().item())
+            n_c = int(cyc.max().item()) - c0 + 2
+            tab = noise.white("hphase_c", (c0 + 10) * kw, n_c * kw, b, f0.dtype,
+                              f0.device).reshape(b, n_c, kw)
+            ci = (cyc - c0).long()
+            al = (u - cyc).to(f0.dtype)
+            psi_cyc = (tab, ci, al)
+        elif HARM_PHASE_JIT > 0.0:
+            # (B, T, KMAX) 프레임률 난수. 위치 = 프레임·KMAX + 배음 — 청크와 무관하다.
+            kw = HARM_PHASE_KMAX
+            psi_fr = noise.white("hphase", frame0 * kw, t_all * kw, b, f0.dtype,
+                                 f0.device).reshape(b, t_all, kw)
+        if HARM_BLOCK > 0:
+            du = du + self._harmonics_blocked(
+                phase, f0, tilt, log2f0, i0, wrd, rps, dispersion, fs,
+                f_nyq, width, f_cut, k_max, int(HARM_BLOCK), psi_fr, n).to(du.dtype)
+            k_max = 0                      # 아래 순차 루프를 건너뛴다
         for j in range(k_max):
             kk = k[j]
             fk = f0 * kk
@@ -391,6 +602,8 @@ class GlottalSource(nn.Module):
                 continue
             cj = self.lf_coef[i0, j] * (1 - wrd) + self.lf_coef[i0 + 1, j] * wrd   # (B,N)
             mask = torch.sigmoid((f_nyq - fk) / width) * live
+            if MVF_HZ > 0.0:
+                mask = mask * torch.sigmoid((MVF_HZ - fk) / MVF_WIDTH)
             if TILT_MAX_HZ > 0.0:
                 # 셸프: 상한 위에서는 기울기가 더 안 오른다 (TILT_MAX_HZ 주석 참조).
                 oct_ = torch.log2(fk.clamp(20.0, TILT_MAX_HZ) / 1000.0)
@@ -421,19 +634,37 @@ class GlottalSource(nn.Module):
                 # 만들지 않는다 — K=240 이면 그것만 65 MB 다.
                 xn = (fk / (0.5 * fs)).clamp(0.0, 1.0)
                 th = th - dispersion * xn * xn
+            if psi_fr is not None:
+                th = th + (self._hjit() * (fk - HARM_PHASE_ONSET).clamp_min(0.0)
+                           / 1000.0) * up(psi_fr[:, :, j % psi_fr.shape[-1]])
+            elif psi_cyc is not None:
+                tab, ci, al = psi_cyc
+                col = tab[:, :, j % tab.shape[-1]]                       # (B, n_c)
+                p0 = torch.gather(col, 1, ci)
+                p1 = torch.gather(col, 1, (ci + 1).clamp(max=col.shape[1] - 1))
+                th = th + (self._hjit() * (fk - HARM_PHASE_ONSET).clamp_min(0.0)
+                           / 1000.0) * (p0 + al * (p1 - p0))
             w_k = mask * gain
             if GLOTTAL_CLOSURE_SPREAD_S > 0.0:
                 # 폐쇄 시각의 흩어짐 -> **영위상** 크기 테이퍼 (위 상수 참조).
                 w_k = w_k * torch.exp(
                     -0.5 * (2.0 * math.pi * fk * GLOTTAL_CLOSURE_SPREAD_S) ** 2)
             du = du + 2.0 * w_k * (cj.real * torch.cos(th) - cj.imag * torch.sin(th))
+        if SRC_EQ:
+            du = self._src_eq(du, state)
         du = du * amp
+        if "voice_gain" in c:
+            # 성문 배음에만 거는 빠른 이득 (control.py 의 voice_gain). 기식 포락(asp_env)은 건드리지 않는다.
+            du = du * up(torch.pow(10.0, c["voice_gain"] / 20.0))
         # 성문 개방기 (LF: 0 ~ te 가 열림) -> 기식 AM 마스크
         frac = phase / (2 * math.pi)
         open_phase = torch.sin(math.pi * frac.clamp(0, 1) / 0.65).clamp_min(0.0) ** 2
         open_phase = torch.where(frac < 0.65, open_phase, torch.zeros_like(open_phase))
         asp = up(st["asp"])
-        voiced = (amp > 1e-3).float()
+        if VOICED_SOFT > 0.0:
+            voiced = (amp / VOICED_SOFT).clamp(0.0, 1.0)
+        else:
+            voiced = (amp > 1e-3).float()
         noise_am = None
         if self.noise_modulation == "lf":
             noise_am = self.lf_noise_envelope(phase, rd, voiced)
@@ -443,7 +674,7 @@ class GlottalSource(nn.Module):
         else:
             asp_env = asp * (1.0 + ASP_AM_DEPTH * voiced * (open_phase - 0.5))
         return dict(du=du, phase=phase, asp_env=asp_env.clamp_min(0.0),
-                    noise_am=noise_am,
+                    noise_am=noise_am, open_phase=open_phase * voiced,
                     amp=amp, f0=f0, ag_dc=up(st["ag_dc"]), ag_dc_frames=st["ag_dc"], voiced=voiced,
                     physiology=st, amp_last=st["amp_raw"][:, t - 1], state=state,
                     phase_last=phase64[:, -1:])

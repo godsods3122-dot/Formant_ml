@@ -1,6 +1,7 @@
 __pycache__/
 *.py[cod]
 .venv/
+.venv-cuda/
 venv/
 *.egg-info/
 out/
@@ -11,3 +12,6 @@ runs/
 # 기준 자료는 레포에 둔다 — 계정을 옮겨가며 작업할 때 매번 다시 올리지 않도록.
 !reference/**
 .DS_Store
+
+# 논문 원문 PDF — 저작권 때문에 저장소에 올리지 않는다. 목록과 요약은 papers/INDEX.md (추적)
+papers/*.pdf
