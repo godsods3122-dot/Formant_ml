@@ -68,11 +68,24 @@ def main() -> None:
     ap.add_argument("--from", dest="t0", type=float, default=0.0)
     ap.add_argument("--to", dest="t1", type=float, default=None)
     ap.add_argument("--out", default="out/fit")
+    ap.add_argument("--ext-warp-max", type=float, default=None, metavar="R",
+                    help="시간 늘이기 폭 (기본 0.05 = ±5 %%). voice.EXT_WARP_MAX")
+    ap.add_argument("--ext-warp-tau", type=float, default=None, metavar="S",
+                    help="시간 늘이기 누설 적분 시상수 [s] (기본 0.05). voice.EXT_WARP_TAU")
+    ap.add_argument("--ext-warp", action="store_true",
+                    help="외부 물리 음원을 f0_target / 음원 F0 비율로 시간 늘인다 — 적합기가 F0 를 미세 조정한다 (MEASUREMENTS §52.59)")
+    ap.add_argument("--stop-after-stage", type=int, default=0,
+                    help="2.x 단계를 N 개 돌고 멈춰 저장한다 (진단용, MEASUREMENTS §52.57). 0 이면 끝까지")
+    ap.add_argument("--no-pulse", action="store_true",
+                    help="펄스 항(LF 펄스 위상을 목표 폐쇄 시각에 거는 항) 을 끈다 — 진단용 (MEASUREMENTS §52.55)")
+    ap.add_argument("--external-source", default=None, metavar="NPZ",
+                    help="물리 성문 음원(scripts/physics_source.py 의 .npz) 을 LF 음원 대신 건다. "
+                         "LF 전용 손잡이(f0_target, rd_offset, tilt, jitter, shimmer) 는 얼린다 (MEASUREMENTS §52.31)")
     ap.add_argument("--frame-ms", type=float, default=1.0)
     ap.add_argument("--global-iters", type=int, default=200)
     ap.add_argument("--stage-iters", type=int, default=100)
-    ap.add_argument("--phase-iters", type=int, default=200,
-                    help="마지막 위상 단계. 0 이면 끔 (크기만 맞춘다)")
+    ap.add_argument("--phase-iters", type=int, default=0,
+                    help="마지막 위상 단계 (3 단계). **기본 끔** — 사용자: \"피팅에서 3단계는 하등 도움이 안 되네. 매커니즘을 아예 바꾸던지 중단시켜버리든지 해\" (MEASUREMENTS §52.42). M14 는 위상 단계에서 87.01 → 87.03 %% 였고 50 회에 77.90 %% 까지 파였다. LF 펄스 정렬을 갈아엎는 방식이라 외부 물리 음원에는 닿지도 않는다. 되살리려면 메커니즘을 바꾼 뒤에만")
     ap.add_argument("--lr-phase", type=float, default=None,
                     help="위상 단계의 lr 을 고정한다. 생략하면 짧은 탐침으로 고르는데, "
                          "그 탐침은 **짧은 시야로 작은 lr 에 편향**돼 있다 (MEASUREMENTS §39.1)")
@@ -272,6 +285,9 @@ def main() -> None:
                          "난류가 오면 Re 를 문턱 위로, 앞뒤로 없으면 아래로 민다. 피팅이므로 미래 정보를 쓴다")
     ap.add_argument("--re-lead-ms", type=float, default=None, metavar="MS",
                     help="그 미리보기 창 [ms] (fit.RE_LEAD_MS, 기본 25)")
+    ap.add_argument("--synergy", type=float, default=None, metavar="W",
+                    help="근육군 결합 벌점 (fit.SYNERGY_W, MEASUREMENTS §52.69): 신경 지배로 묶은 군마다 "
+                         "목표에서 잰 협응 방향 밖으로 나가는 빠른 움직임을 문다. 관측의 직교 성분은 빼고 초과분만 센다")
     ap.add_argument("--move-budget", type=float, default=None, metavar="W",
                     help="움직임 예산 (fit.MOVE_W, MEASUREMENTS §51.20): 포먼트·대역폭은 분석 궤적 속도의 1.3 배까지, "
                          "음원 손잡이(voice_gain·tilt·rd_offset·p_sub·adduction)는 생리 상한까지만 빠르게 움직이게 문다")
@@ -318,6 +334,10 @@ def main() -> None:
     ap.add_argument("--recording-lock", default=None, metavar="JSON",
                     help="같은 녹음 환경의 출력 EQ·방 IR을 읽고 고정한다. 발화별 레벨 정규화는 "
                          "유지한다. *_constants.json 또는 *_track.npz; --room-from 과 함께 쓰지 않는다")
+    ap.add_argument("--hf-ladder", choices=("legacy", "spread"), default="legacy",
+                    help="고역 보정 사다리 (§51.58). legacy = 예전(대역폭 하한 0.933, 자리 ±16 %%), "
+                         "spread = 하한 1.65·자리 ±65 %% 로 풀어 **균일한 빗살이 안 서게** 한다. "
+                         "13~19 kHz 에 켜켜이 쌓인 가로줄이 legacy 의 증상이다")
     ap.add_argument("--spec-ripple", type=float, default=None, metavar="W",
                     help="**고역 물결**이 목표보다 얕은 만큼을 문다 (fit.HFRIP_W, §51.53). 포락 손실은 "
                          "멜 띠(12 kHz 에서 516 Hz)가 목표 구조(281 Hz)보다 넓어서 고역의 마루·골을 "
@@ -344,6 +364,10 @@ def main() -> None:
                     help="마찰 가장자리에서 잡아 두기가 풀리는 거리 [ms] (fit.HOLD_RAMP_MS, 기본 15). 전이는 막지 않는다")
     ap.add_argument("--move-cap", action="append", default=None, metavar="이름=값",
                     help="움직임 예산의 생리 상한 덮어쓰기 (fit.MOVE_CAP). 예: --move-cap voice_gain=0.5")
+    ap.add_argument("--artifact", type=float, default=None, metavar="W",
+                    help="**아티팩트 벌점** (fit.ARTIFACT_W): 목표가 그 프레임 정점보다 20 dB 아래로 "
+                         "어두운 칸에서 우리가 3 dB 넘게 크면 문다. --quiet 는 창이 통째로 조용할 "
+                         "때만 보는데, 들리는 아티팩트는 한 프레임 안의 어두운 대역에 난다")
     ap.add_argument("--quiet", type=float, default=None, metavar="W",
                     help="조용한 구간 넘침 벌점 (fit.QUIET_W, MEASUREMENTS §51.11): 목표가 정점 −45 dB 아래인 10 ms 창에서 "
                          "합성이 목표보다 2 dB 넘게 크면 문다 — 발화 끝·시작 앞 숨소리 잡음띠")
@@ -442,10 +466,14 @@ def main() -> None:
         _fit.RE_LEAD_MS = float(a.re_lead_ms)
     if a.move_budget is not None:
         _fit.MOVE_W = float(a.move_budget)
+    if a.synergy is not None:
+        _fit.SYNERGY_W = float(a.synergy)
     if a.fast_only:
         _fit.FAST_ONLY = set(a.fast_only)
     if a.spec_ripple is not None:
         _fit.HFRIP_W = float(a.spec_ripple)
+    if a.artifact is not None:
+        _fit.ARTIFACT_W = float(a.artifact)
     if a.prominence is not None:
         _fit.PROM_W = float(a.prominence)
     if a.attack is not None:
@@ -592,6 +620,49 @@ def main() -> None:
     if config.loaded_source_enabled and (a.open_damp or a.device != "cpu"):
         ap.error("Loaded source requires CPU and cannot be combined with --open-damp")
     eng = VoiceEngine(config, prof)
+    if a.ext_warp_max is not None or a.ext_warp_tau is not None:
+        from formant_ml.engine import voice as _vw
+        if a.ext_warp_max is not None:
+            _vw.EXT_WARP_MAX = float(a.ext_warp_max)
+        if a.ext_warp_tau is not None:
+            _vw.EXT_WARP_TAU = float(a.ext_warp_tau)
+    if a.external_source:
+        if a.pulse_lock or config.loaded_source_enabled:
+            ap.error("--external-source 는 --pulse-lock·loaded 음원과 함께 쓸 수 없다 (위상·유량을 물리가 정한다)")
+        with np.load(a.external_source, allow_pickle=False) as _zs:
+            _du = np.asarray(_zs["du"], dtype=np.float32)
+            _go = np.asarray(_zs["g_open"], dtype=np.float32) if "g_open" in _zs.files else None
+            _f0s = None
+            if a.ext_warp:
+                if "f0_measured" not in _zs.files:
+                    raise SystemExit("--ext-warp 는 음원 파일에 f0_measured 가 있어야 한다 (physics_source.py 로 다시 만들 것)")
+                _fm = np.asarray(_zs["f0_measured"], dtype=np.float64)
+                _fc = np.asarray(_zs["f0_command"], dtype=np.float64) if "f0_command" in _zs.files else _fm
+                _vv = np.asarray(_zs["voiced"], bool) if "voiced" in _zs.files else np.ones(len(_fm), bool)
+                _f0s = np.where(np.isfinite(_fm) & (_fm > 0), _fm, _fc)
+                _f0s = np.where(_vv, _f0s, 0.0)
+            _bad = []
+            if int(_zs["fs"]) != config.sample_rate:
+                _bad.append(f"표본화율 {int(_zs['fs'])} 대 {config.sample_rate}")
+            if abs(float(_zs["frame_ms"]) - track.frame_ms) > 1e-9:
+                _bad.append(f"프레임 {float(_zs['frame_ms'])} 대 {track.frame_ms} ms")
+            if abs(float(_zs["t0"]) - a.t0) > 1e-9:
+                _bad.append(f"시작 {float(_zs['t0'])} 대 {a.t0} s")
+            if int(_zs["n_frames"]) != track.n_frames:
+                _bad.append(f"프레임 수 {int(_zs['n_frames'])} 대 {track.n_frames}")
+        if _bad:
+            raise SystemExit("--external-source 가 이 구간과 맞지 않는다: " + ", ".join(_bad))
+        _n = track.n_frames * config.hop
+        eng.set_external_source(_du[:_n], g_open=(None if _go is None else _go[:_n]), f0_src=_f0s)
+        if _f0s is not None:
+            # f0_target 을 음원 자신의 F0 에서 시작한다 (비율 1). 분석기에서 만든 음원의 실측이지 M 적합 값이 아니다.
+            _k = min(len(_f0s), track.values.shape[0])
+            _col = INDEX["f0_target"]
+            track.values[:_k, _col] = np.where(_f0s[:_k] > 0, _f0s[:_k], track.values[:_k, _col])
+            from formant_ml.engine import voice as _vw2
+            print(f"  시간 늘이기: f0_target 을 음원 F0 에서 시작 (유성 {int(np.sum(_f0s > 0))} 프레임), "
+                  f"폭 ±{100 * _vw2.EXT_WARP_MAX:g} %, 시상수 {1000 * _vw2.EXT_WARP_TAU:g} ms", flush=True)
+        print(f"외부 성문 음원: {a.external_source} ({len(_du)} 샘플, 개방 곡선 {'있음' if _go is not None else '없음'})", flush=True)
     print(f"Source: {config.glottal_source}, load coupling {config.load_coupling:g}"
           f"{' (explicit A/B override)' if source_override else ''}; "
           "new frame controls 0, fitted scalars 0", flush=True)
@@ -663,6 +734,7 @@ def main() -> None:
         _gl10.SRC_EQ = True
     if a.pulse_lock:
         _fit.PULSE_LOCK = True
+    _fit.STOP_AFTER_STAGE = int(a.stop_after_stage)
     if a.mvf is not None and hasattr(eng.aspiration, "log_mvf"):
         import math as _m
         _as = eng.aspiration
@@ -724,6 +796,10 @@ def main() -> None:
         frozen.update(f"hzp{k}_f" for k in range(1, 4))
     if a.pulse_lock:
         frozen.add("f0_target")           # 위상은 목표 펄스가 만든다 — f0 는 관측되지 않는 자유도가 된다
+    if a.external_source:
+        # 외부 음원이 성문 배음을 정하므로 LF 음원 손잡이는 쓰이지 않는다 — 남기면 열만 는다 (§40 열 희석).
+        frozen.update(("rd_offset", "tilt", "jitter", "shimmer") if a.ext_warp
+                      else ("f0_target", "rd_offset", "tilt", "jitter", "shimmer"))
     bad = frozen - set(_DP)
     if bad:
         raise SystemExit(f"--freeze: 적합 대상이 아닌 이름 {sorted(bad)}")
@@ -739,6 +815,10 @@ def main() -> None:
         _an2.HF_FREE = True
         _fit.DEFAULT_PARAMS = tuple(_fit.DEFAULT_PARAMS) + ("f5", "f6", "f7", "f8",
                                                            "bw5", "bw6", "bw7", "bw8")
+    if a.hf_ladder == "legacy":
+        from formant_ml.engine import tract as _tr14
+        _tr14.EXTRA_BW_FLOOR, _tr14.EXTRA_BW_CEIL = 0.933, 2.499
+        _tr14.HF_DF_LIM = 0.15
     if a.aux_zeros:
         from formant_ml.engine import tract as _tr11
         _tr11.AUX_ZEROS = True
@@ -790,6 +870,12 @@ def main() -> None:
                           initial_gain_db=initial_utterance.get("gain_db"),
                           initial_pulse_phi0=initial_utterance.get("pulse_phi0", 0.0),
                           params=tuple(p for p in _DP if p not in frozen))
+    if a.no_pulse:
+        fit.pulse_weight = 0.0
+    if a.external_source:
+        # 펄스 항은 LF 펄스 위상을 목표 폐쇄 시각에 거는 항이라 외부 음원에는 닿지 않는다. 남기면 기울기가 거의 0 이라
+        # 균형 가중이 수백 배로 올라 손실을 지배했다 (M18 594, M20 436 — MEASUREMENTS §52.46).
+        fit.pulse_weight = 0.0
     inactive = sorted(set(locked_constants) - fit.constant_parameters.keys())
     if inactive:
         print("  현재 렌더 옵션에서 비활성인 저장 상수: " + ", ".join(inactive), flush=True)

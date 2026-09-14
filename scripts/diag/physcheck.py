@@ -9,7 +9,7 @@
 import sys, numpy as np
 sys.path.insert(0, "src")
 from formant_ml.engine import tract as T
-C = getattr(T, "C_SOUND", 34000.0)          # cm/s
+C = getattr(T, "C_SOUND", 35000.0)   # cm/s — 날숨 공기 350 m/s (37 C, 포화습도, CO2 5 %)
 
 for stem in sys.argv[1:]:
     z = np.load(stem + "_track.npz", allow_pickle=True)

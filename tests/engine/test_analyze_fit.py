@@ -718,3 +718,106 @@ def test_l1_makes_the_control_track_sparse():
     l, _, _, _ = f.loss()
     l.backward()
     assert torch.isfinite(f.w.grad).all()
+
+
+def test_artifact_loss_sees_sound_the_target_does_not_have():
+    """아티팩트 벌점: 목표가 어두운 칸에 소리를 내면 는다. 같은 신호면 0 이다.
+
+    `--quiet` 는 10 ms 창이 통째로 조용할 때만 보는데, 들리는 아티팩트는 **한 프레임 안의
+    어두운 대역**에 난다 (MEASUREMENTS §51.50: 마찰 가장자리 11.3 kHz 에서 +24 dB).
+    """
+    import numpy as np
+    import torch
+    from formant_ml.engine import fit as F
+
+    class _Stub:
+        artifact_loss = F.CopySynthFitter.artifact_loss
+
+    rng = np.random.default_rng(0)
+    a = torch.as_tensor(rng.uniform(-90.0, -20.0, (1, 40, 60)), dtype=torch.float64)
+    s = _Stub()
+    s._env_ab = (a, a.clone())
+    assert float(s.artifact_loss()) == 0.0            # 같은 신호 -> 정확히 0
+
+    b = a.clone()
+    dark = a < a.max(dim=-2, keepdim=True).values - F.ARTIFACT_DARK_DB - 10.0
+    b[dark] += 20.0                                   # 어두운 칸에만 +20 dB
+    s._env_ab = (a, b)
+    assert float(s.artifact_loss()) > 0.2
+
+    s._env_ab = (a, b)
+    loud_dark = float(s.artifact_loss())
+    b2 = a.clone()
+    b2[~dark] += 20.0                                 # 밝은 칸만 올리면 훨씬 덜 문다
+    s._env_ab = (a, b2)
+    assert float(s.artifact_loss()) < 0.5 * loud_dark
+
+    b3 = a.clone(); b3[dark] -= 20.0                  # 모자란 쪽은 안 문다
+    s._env_ab = (a, b3)
+    assert float(s.artifact_loss()) == 0.0
+
+
+def _syn_fitter(eng, n=400):
+    """협응 시험용 적합기 — 군을 만들 만큼 긴 트랙에 관측다운 상관을 넣는다."""
+    import numpy as np
+    from formant_ml.engine.control import INDEX
+    tr = _track(n)
+    rng = np.random.default_rng(1)
+    t = np.arange(n)
+    slow = np.sin(2 * np.pi * t / 200.0)
+    common = rng.normal(size=n)                      # 군의 공통(협응) 성분
+    for nm, k in (("f1", 60.0), ("f2", 120.0), ("a_c", 0.3), ("c_place", 0.05)):
+        tr.values[:, INDEX[nm]] = tr.values[0, INDEX[nm]] + k * (0.3 * slow + 0.5 * common)
+    for nm, k in (("adduction", 0.05), ("p_sub", 0.5), ("rd_offset", 0.05)):
+        tr.values[:, INDEX[nm]] = tr.values[0, INDEX[nm]] + k * (0.3 * slow + 0.5 * common)
+    target = np.zeros(n * eng.cfg.hop)
+    return CopySynthFitter(eng, target, 48000, tr)
+
+
+def test_synergy_penalty_is_zero_on_the_observation_and_grows_off_basis(_engine):
+    """§52.69 — 협응 벌점: 관측 자체는 0, 기저 밖으로 흔들면 자란다, 기저 안에서 흔들면 거의 0."""
+    import numpy as np
+    import torch
+
+    from formant_ml.engine import fit as fit_mod
+    from formant_ml.engine.control import INDEX
+
+    fitter = _syn_fitter(_engine)
+    fitter._synergy_setup()
+    assert fitter._syn, "군이 만들어져야 한다"
+    base = torch.as_tensor(fitter.track.values, dtype=torch.float32).unsqueeze(0)
+    e0 = float(fitter.synergy_loss(base))
+    # 무릎이 C² 라 문턱에서 작은 오프셋이 남는다 (move_loss 와 같은 설계). 관측은 그 수준이어야 한다.
+    assert e0 < 0.05
+
+    gname, idx, scale, V, _orth, _tot, _k = fitter._syn[0]
+    rng = np.random.default_rng(0)
+    n = base.shape[1]
+    # 기저 **안**: 협응 방향으로만 흔든다
+    a = torch.as_tensor(rng.normal(size=(n, V.shape[1])), dtype=torch.float64)
+    inside = (a @ V.T) * scale
+    c_in = base.clone().double()
+    c_in[0][:, idx] += inside * 3.0
+    # 기저 **밖**: 직교 성분으로 흔든다
+    full = torch.as_tensor(rng.normal(size=(n, V.shape[0])), dtype=torch.float64)
+    outside = full - (full @ V) @ V.T
+    c_out = base.clone().double()
+    c_out[0][:, idx] += outside * 3.0
+    e_in = float(fitter.synergy_loss(c_in.float()))
+    e_out = float(fitter.synergy_loss(c_out.float()))
+    assert e_out > 0.0
+    assert e_out > 10.0 * max(e_in, e0, 1e-9)
+
+
+def test_synergy_penalty_has_gradient(_engine):
+    import torch
+
+    fitter = _syn_fitter(_engine)
+    fitter._synergy_setup()
+    assert fitter._syn
+    c = torch.as_tensor(fitter.track.values, dtype=torch.float32).unsqueeze(0).clone()
+    c = c + 0.05 * torch.randn_like(c)
+    c.requires_grad_(True)
+    loss = fitter.synergy_loss(c)
+    loss.backward()
+    assert torch.isfinite(c.grad).all() and float(c.grad.abs().max()) > 0.0

@@ -43,6 +43,7 @@ import math
 from dataclasses import dataclass, field
 
 import numpy as np
+from scipy.ndimage import uniform_filter1d
 import torch
 
 from . import room
@@ -614,6 +615,8 @@ MVF_FROZEN = False
 #: 켜면 `f0_target` 은 위상을 만들지 않으므로(배음 개수·기울기·생리 문턱에만 남는다) 적합 대상에서 뺀다 —
 #: 안 그러면 관측되지 않는 자유도가 떠돈다. 펄스 항도 항등적으로 0 이라 끈다.
 PULSE_LOCK = False
+#: 진단용 — 2.x 단계를 이 개수만큼 돌고 멈춘다 (0 이면 끝까지). 2.1 끝의 상태를 저장해 LF·물리 적합의 오차 지도를 같은 조건에서 견준다 (§52.57).
+STOP_AFTER_STAGE = 0
 
 #: **한 파라미터만 격자 하한 아래로 푼다** (MEASUREMENTS §51.19). `copyfit --fast 이름` 이 이 집합을 채우고,
 #: `MOTION_MIN_GRID_MS` 를 1 ms 로 낮춘 뒤 나머지 파라미터는 전부 2 ms 층에서 잠근다(`MOTION_SLOW`).
@@ -626,6 +629,28 @@ PULSE_LOCK = False
 #: 60~150 Hz 를 낼 수 없었다. F0 ≈ 290 Hz 면 한 주기가 3.4 ms 라 **주기별 진폭은 1 ms 격자가 있어야** 표현된다.
 #: `voice_gain` 은 성문 배음에만 곱하므로(잡음 제외) 이것을 풀어도 잡음을 썰지 않는다.
 MOTION_FAST: set[str] = set()
+
+#: **근육군 결합(협응) 벌점** (MEASUREMENTS §52.68·§52.69). 성도의 자유도는 서로 독립이 아니다 — 한 신경이
+#: 여러 파라미터를 동시에 움직인다. 반회후두신경(RLN) 하나가 두께·내전·외전을 쥐고, 후두 높이 하나가 성도 길이·
+#: 이상와 깊이·후두실을 같이 바꾼다. 실측: 분석기가 목표에서 잰 궤적에서 adduction–p_sub 상관이 +0.52 인데
+#: (세게 말하면 폐압을 올리며 더 붙인다) 적합은 −0.12~+0.18 로 그 협응을 깨뜨렸다.
+#:
+#: 벌점은 **목표에서 잰 협응 방향**(군마다 상위 `n_dim` 주성분) 밖으로 나가는 빠른 움직임만 문다. 관측 자체가 가진
+#: 직교 성분을 빼고 그 초과분만 세므로 "화자보다 더 협응하라"고 강요하지 않는다. 0 이면 끈다.
+SYNERGY_W = 0.0
+#: 군 이름 -> (파라미터, 근육 자유도). 자유도는 해부학에서 온다 — 혀는 이설근·설골설근/경돌설근·고유근으로 3,
+#: 입술의 돌출·오므림은 구륜근 하나로 1, 인두·연구개는 수축근과 구개거근으로 2, 내후두근은 TA(두께)·LCA/IA(내전)로 2,
+#: 후두 높이는 올림/내림 길항 하나로 1.
+SYNERGY_GROUPS: dict[str, tuple[tuple[str, ...], int]] = {
+    "tongue": (("f1", "f2", "a_c", "c_place"), 3),
+    "lips": (("f3", "front_len", "obstacle"), 1),
+    "pharynx": (("velum", "nasal_gain", "f1"), 2),
+    "larynx_intrinsic": (("adduction", "p_sub", "rd_offset"), 2),
+    "larynx_height": (("f4", "bw4", "tract_gain"), 1),
+}
+#: 협응을 볼 때 뺄 추세의 길이 [ms]. 음절 윤곽은 협응의 대상이 아니다 (그건 조음 계획이다).
+SYNERGY_TREND_MS = 100.0
+
 
 #: **움직임 예산** (MEASUREMENTS §51.20). 사용자: *"무브먼트가 너무 과해. 억제시킬 방안을 찾아봐."*
 #:
@@ -740,7 +765,28 @@ HOLD_RAMP_MS = 15.0
 #: 양쪽 다 15 ms 로 두면 시작 쪽에서 공명이 15 ms 동안 고원에 못 닿는다 — 감사의 "치찰 대역 시작
 #: 어긋남" 이 M1 에서 17.5~18.5 ms (기준 12) 였던 것이 이것이다. 들어가는 쪽만 5 ms 로 줄인다.
 HOLD_RAMP_IN_MS = 5.0
-HOLD_PARAMS = ("f1", "f2", "f3", "f4", "bw1", "bw2", "bw3", "bw4")
+#: 붙잡을 제어. **치찰음의 공명은 포먼트가 아니라 앞공동이 만든다** (`_front_cavity`:
+#: f_p = c/4·front_len) — 그런데 `front_len`·`obstacle` 이 빠져 있어서 마찰 안에서 자유롭게
+#: 흔들렸다. 사용자: *"치찰음 단에서 흔들림으로 인한 긴 주기의 노이즈가 있고"*. 둘을 더한다.
+#: `a_c` 는 넣지 않는다 — 그것은 공명이 아니라 잡음의 세기라 구간 안에서 변해야 한다.
+HOLD_PARAMS = ("f1", "f2", "f3", "f4", "bw1", "bw2", "bw3", "bw4",
+               "front_len", "obstacle")
+#: **마찰 안에서 세기 쪽 제어를 저역통과한다** (§51.57). 사용자: *"치찰음 세로 토막 나는 걸
+#: 고치고 부드럽게 스무딩하는 걸론 안 되냐? 자꾸 음원들이 쳐 끊기잖아."*
+#:
+#: 실측(`M14/s101`, 마찰 대역 포락의 변조 스펙트럼): 20~40 Hz 에서 목표 1.56 dB 인데 우리가
+#: **2.66 dB (1.70 배)**, 40~80 Hz 도 1.29 배다. 25~50 ms 주기로 끊긴다는 뜻이고 그것이 세로 토막이다.
+#: 그 흔들림을 나르는 것은 `a_c` 다 — 마찰 안 20~80 Hz 로그 변조가 0.18 로 다른 제어의 4 배다.
+#:
+#: **그런데 그 흔들림은 관측에 이미 있다** (관측 0.156 → 적합 0.182, 적합은 17 % 만 더한다).
+#: `--slow a_c=10` 은 **보정분만** 묶으므로 분석 출발점의 흔들림은 그대로 통과한다 — 그래서
+#: 지금껏 평활이 안 먹었다. 여기서는 **렌더되는 제어**(출발점+보정)를 마찰 구간 **안에서만**
+#: 가우시안으로 깎는다.
+#:
+#: σ 12 ms 는 30 Hz 를 −22 dB 로 죽이면서 10 Hz 는 −2.5 dB 만 깎는다. 목표가 실제로 가진
+#: 8~20 Hz 윤곽(우리는 오히려 **모자란다**: 0.65~0.80 배)을 지우지 않는 것이 중요하다.
+HOLD_SMOOTH_PARAMS = ("a_c", "obstacle", "tract_gain")
+HOLD_SMOOTH_MS = 12.0
 
 #: **미래를 보는 레이놀즈 전이** (MEASUREMENTS §51.24). 사용자: *"어차피 지금 하는 건 예측이 아니고
 #: 피팅이니까 그냥 미래 정보도 가져다 써. 미래 데이터에 난류 조짐이 보이면 레이놀즈 현상이 일어나는
@@ -755,6 +801,21 @@ HOLD_PARAMS = ("f1", "f2", "f3", "f4", "bw1", "bw2", "bw3", "bw4")
 RE_LEAD_W = 0.0
 RE_LEAD_MS = 25.0
 RE_MARGIN = 0.15          # 문턱의 ±15 % 까지 밀어붙인다
+#: **아티팩트 벌점** — 목표가 **어두운 칸에서 우리가 소리를 내는** 만큼을 문다.
+#:
+#: 사용자: *"아티팩트가 아직도 남는데 … 아티팩트 자체에 처벌을 강하게 걸어."* `QUIET_W` 는
+#: 10 ms 창이 통째로 조용할 때만 본다 — 그런데 실제로 들리는 아티팩트는 **한 프레임 안의
+#: 어두운 대역**에 난다 (실측 §51.50: 마찰 가장자리 11.3 kHz 에서 우리 −54 dB, 목표 −78 dB).
+#: 그 칸은 프레임 전체로 보면 조용하지 않으므로 `QUIET_W` 가 못 잡는다.
+#:
+#: 재는 법: 멜 dB 에서 **그 프레임의 정점보다 `ARTIFACT_DARK_DB` 아래인 칸**만 골라,
+#: 우리가 목표보다 `ARTIFACT_MARGIN_DB` 넘게 큰 만큼을 문다. 부족한 쪽은 안 문다 —
+#: 그건 포락 항의 일이고, 아티팩트는 **없던 소리를 내는 것**이라 한쪽만 본다.
+#: 골라내기와 넘침 둘 다 부드럽게(시그모이드·softplus) 깐다 — 꺾이면 기울기가 죽는다.
+ARTIFACT_W = 0.0
+ARTIFACT_DARK_DB = 20.0
+ARTIFACT_MARGIN_DB = 3.0
+
 QUIET_DB = 45.0
 QUIET_MARGIN_DB = 2.0
 
@@ -817,7 +878,7 @@ BAL_W: dict[str, float] = {
 #: **제약 항**(상한 안에 있으면 값도 기울기도 0)은 분모가 0 에 가까워 가중이 폭주한다 — 실측 `L76/s101` 에서
 #: 움직임 예산의 가중이 **1.23e+04** 가 됐고 포락이 85.7 → 72.8 로 무너졌다. 이 항들은 `copyfit` 이 준 세기를
 #: 그대로 쓴다. (`--init` 과 `prior` 도 같은 병이다, §51.16 정정.)
-BAL_FIXED = frozenset(("move", "quiet", "relead", "gesture", "event"))
+BAL_FIXED = frozenset(("move", "quiet", "relead", "gesture", "event", "artifact"))
 #: 다중 해상도. 켜면 `set_grid` 가 격자를 **갈아 끼우지 않고 층을 쌓는다** — 20 / 10 /
 #: 5 ms 의 B-스플라인을 동시에 두고 더한다. 거친 층이 제스처를, 고운 층이 미세구조를
 #: 싣고 **모든 층이 C²** 다. DMP (Ijspeert; 음성 적용은 Parrell 2019) 가 임계감쇠
@@ -1915,6 +1976,15 @@ class CopySynthFitter:
         else:
             self._hold_P = self._hold_S = None
         self._hold_idx = [i for i, n in enumerate(self.names) if n in HOLD_PARAMS]
+        self._hold_sidx = [i for i, n in enumerate(self.names) if n in HOLD_SMOOTH_PARAMS]
+        sig = HOLD_SMOOTH_MS / float(self.track.frame_ms)
+        half = max(1, int(math.ceil(3.0 * sig)))
+        ker = np.exp(-0.5 * (np.arange(-half, half + 1) / sig) ** 2)
+        self._hold_ker = torch.as_tensor(ker / ker.sum(), dtype=dtype,
+                                         device=device).view(1, 1, -1)
+        self._hold_half = half
+        # 마찰 안에서만 건다 — 가장자리 램프는 붙잡기와 같은 `m` 을 쓴다.
+        self._hold_sm = torch.as_tensor(m, dtype=dtype, device=device)
 
     def _hold(self, cols: torch.Tensor) -> torch.Tensor:
         """마찰 구간 안에서 `HOLD_PARAMS` 를 그 구간의 고원 값으로 끌어당긴다."""
@@ -1925,6 +1995,18 @@ class CopySynthFitter:
         m = self._hold_m.to(cols.dtype)
         P, S = self._hold_P.to(cols.dtype), self._hold_S.to(cols.dtype)
         out = cols
+        # 세기 쪽 제어: 고원으로 끌지 않고 **마찰 안에서만 저역통과**한다 (HOLD_SMOOTH_PARAMS).
+        if self._hold_sidx:
+            ker = self._hold_ker.to(cols.dtype)
+            h = self._hold_half
+            for i in self._hold_sidx:
+                x = cols[:, i]
+                lx = torch.log(x.clamp_min(1e-9))
+                z = torch.nn.functional.pad(lx.view(1, 1, -1), (h, h), mode="replicate")
+                sm = torch.nn.functional.conv1d(z, ker)[0, 0]
+                y = torch.exp(lx * (1.0 - m) + sm * m)
+                out = out.index_copy(1, torch.tensor([i], device=cols.device), y.unsqueeze(1))
+            cols = out
         for i in self._hold_idx:
             x = cols[:, i]
             lx = torch.log(x.clamp_min(1e-9))
@@ -1994,7 +2076,9 @@ class CopySynthFitter:
         pp = None if self._pulse_phase is None else self._pulse_phase + self.pulse_phi0
         out = self.eng(self.control(), self.track.events, 0.0, pulse_phase=pp)
         y = out["audio"] * torch.exp(self.log_gain).to(torch.float32)
-        self._amp = out.get("amp")               # 무성 벌점이 쓴다 (샘플률 떨림 진폭)
+        # 무성 벌점이 쓴다. 외부 물리 음원이면 LF 떨림 진폭이 아니라 **물리 음원 포락 × voice_gain** 을 문다 (§52.46) —
+        # 외부 경로에서 LF 진폭은 소리를 내지 않고, F0 를 얼리면 기울기도 거의 없어 균형에서 빠졌다.
+        self._amp = out.get("amp_ext") if out.get("amp_ext") is not None else out.get("amp")
         self._re = out.get("reynolds")           # 미래를 보는 레이놀즈 전이 항이 쓴다
         if self.room_ir is not None:
             y = room.apply_ir(y, self.room_ir)
@@ -2380,6 +2464,68 @@ class CopySynthFitter:
             out = out + (self._soft_over(r - lim, 0.15 * lim) / lim) ** 2
         return out
 
+    def _synergy_setup(self) -> None:
+        """군마다 **목표 관측**에서 협응 기저와 직교 에너지를 잰다 (`SYNERGY_W` 참조).
+
+        기저는 분석기가 목표에서 잰 초기 제어열에서 온다 — 적합값이 아니다. 파라미터마다 `MOVE_CAP`(없으면 관측 표준편차)
+        으로 나눠 단위를 맞춘다.
+        """
+        obs = np.asarray(self.track.values, dtype=np.float64)
+        # **기저와 손실이 같은 마스크를 써야 한다.** 예전 판은 여기서 f0 > 0, 손실에서 `track.voiced` 를 써서
+        # 둘이 어긋나면 관측 자체에서도 벌점이 0 이 아니고 기울기가 사라졌다 (시험이 잡았다).
+        voi = np.asarray(getattr(self.track, "voiced", np.zeros(0, dtype=bool)), bool)
+        if voi.size < obs.shape[0]:
+            voi = np.pad(voi, (0, obs.shape[0] - voi.size))
+        voi = voi[:obs.shape[0]] & (obs[:, INDEX["f0_target"]] > 0)
+        if voi.sum() < 8:
+            voi = obs[:, INDEX["f0_target"]] > 0
+        self._syn_voi = torch.as_tensor(voi.astype(np.float64), device=self.device)
+        k = max(3, int(round(SYNERGY_TREND_MS / float(self.track.frame_ms))) | 1)
+        self._syn: list[tuple] = []
+        for gname, (params, n_dim) in SYNERGY_GROUPS.items():
+            cols = [p for p in params if p in self.names and p in INDEX]
+            if len(cols) <= n_dim:
+                continue                                  # 자유도가 파라미터 수 이상이면 묶을 것이 없다
+            idx = [INDEX[p] for p in cols]
+            X = obs[:, idx]
+            X = X - uniform_filter1d(X, k, axis=0, mode="nearest")
+            X = X[voi]
+            if X.shape[0] < 4 * len(cols):
+                continue
+            scale = np.array([MOVE_CAP.get(p, 0.0) or max(float(X[:, i].std()), 1e-9)
+                              for i, p in enumerate(cols)])
+            Xs = X / scale
+            tot = float((Xs * Xs).sum())
+            if not (tot > 0.0):
+                continue
+            _u, sv, vt = np.linalg.svd(Xs, full_matrices=False)
+            V = vt[:n_dim].T                              # (n, n_dim) 협응 기저
+            orth_obs = float(tot - (sv[:n_dim] ** 2).sum())
+            self._syn.append((gname, torch.as_tensor(idx, device=self.device),
+                              torch.as_tensor(scale, dtype=torch.float64, device=self.device),
+                              torch.as_tensor(V, dtype=torch.float64, device=self.device),
+                              orth_obs, tot, k))
+
+    def synergy_loss(self, ctrl: torch.Tensor) -> torch.Tensor:
+        """군마다 협응 기저 밖의 빠른 움직임이 **관측보다 초과한** 몫 (`SYNERGY_W` 참조)."""
+        if getattr(self, "_syn", None) is None:
+            self._synergy_setup()
+        if not self._syn:
+            return torch.zeros((), dtype=torch.float64, device=ctrl.device)
+        w = self._syn_voi
+        c = ctrl[0].double()
+        out = torch.zeros((), dtype=torch.float64, device=ctrl.device)
+        for _g, idx, scale, V, orth_obs, tot, k in self._syn:
+            X = c.index_select(1, idx)
+            trend = torch.nn.functional.avg_pool1d(X.T.unsqueeze(0), k, 1, k // 2,
+                                                   count_include_pad=False)[0].T[:X.shape[0]]
+            Xs = (X - trend) / scale
+            Xs = Xs * w[:Xs.shape[0]].unsqueeze(-1).to(Xs.dtype)
+            orth = Xs - (Xs @ V) @ V.T
+            e = (orth * orth).sum()
+            out = out + (self._soft_over(e - orth_obs, 0.15 * max(tot, 1e-9)) / max(tot, 1e-9)) ** 2
+        return out
+
     def _re_setup(self) -> None:
         """목표의 난류 증거와 그 **미래/과거 창**을 만든다 (`RE_LEAD_W` 참조)."""
         from .segment import FRICATIVE_HL_DB
@@ -2668,6 +2814,20 @@ class CopySynthFitter:
             ramp = self._soft_over(d.abs() - cap2, 0.05 * cap2)
             pen = pen + EVENT_RAMP_W * (ramp / cap2).pow(2).mean()
         return pen
+
+    def artifact_loss(self) -> torch.Tensor:
+        """목표가 어두운 칸에서 우리가 넘치는 만큼 [dB]. `ARTIFACT_W` 참조."""
+        ab = getattr(self, "_env_ab", None)
+        if ab is None:
+            return torch.zeros((), dtype=torch.float64)
+        a, b = ab                                   # (1, F, T) dB, 목표는 상수
+        ref = a.max(dim=-2, keepdim=True).values
+        dark = torch.sigmoid((ref - ARTIFACT_DARK_DB - a) / 3.0)
+        over = 2.0 * torch.nn.functional.softplus((b - a - ARTIFACT_MARGIN_DB) / 2.0)
+        # softplus 는 바닥이 0 이 아니다 — 완벽히 맞아도 남는 상수를 뺀다. 기울기는 그대로다.
+        floor = 2.0 * torch.nn.functional.softplus(
+            torch.as_tensor(-ARTIFACT_MARGIN_DB / 2.0, dtype=over.dtype, device=over.device))
+        return ((dark * (over - floor)).sum() / dark.sum().clamp_min(1.0) / 20.0).clamp_min(0.0)
 
     def quiet_loss(self, y: torch.Tensor) -> torch.Tensor:
         """목표가 조용한 10 ms 창에서 합성이 목표보다 `QUIET_MARGIN_DB` 넘게 큰 만큼(dB)의 제곱 평균."""
@@ -3179,8 +3339,12 @@ class CopySynthFitter:
             add("formant", FORMANT_W, self.formant_loss())
         if QUIET_W > 0.0:
             add("quiet", QUIET_W, self.quiet_loss(y))
+        if ARTIFACT_W > 0.0:
+            add("artifact", ARTIFACT_W, self.artifact_loss())
         if MOVE_W > 0.0:
             add("move", MOVE_W, self.move_loss(self._last_ctrl))
+        if SYNERGY_W > 0.0:
+            add("synergy", SYNERGY_W, self.synergy_loss(self._last_ctrl))
         if RE_LEAD_W > 0.0 and getattr(self, "_re", None) is not None:
             add("relead", RE_LEAD_W, self.re_lead_loss(self._re))
         if CONT_W > 0.0 and self._mel_err is not None:
@@ -3549,6 +3713,10 @@ class CopySynthFitter:
                     print(f"  2.{si + 1} 단계  격자 {grid:g} ms ({tc} 점)  창 {sizes}", flush=True)
                 rep = self.fit(stage_iters, lr_frame * (0.75 ** si), log_every, verbose,
                                sizes=sizes, patience=patience)
+                if STOP_AFTER_STAGE > 0 and si + 1 >= STOP_AFTER_STAGE:
+                    if verbose:
+                        print(f"  2.{si + 1} 단계 뒤 멈춤 (STOP_AFTER_STAGE, 진단용 — MEASUREMENTS §52.57)", flush=True)
+                    break
         # **위상 단계는 기본이다.** 크기만 맞추면 위상은 물리가 강제하는 곳에서만 맞는다.
         # 실측(코퍼스 150 ms 창 4 개): 조화 SNR +3.3/+1.0/+3.5/−2.6 -> +24.7/+16.5/+12.9/+16.2,
         # 위상 모양 오차 7.6/29.9/65.5/25.4° -> 3.4/17.8/32.6/16.4°. 포락은 안 나빠졌다.

@@ -31,6 +31,7 @@ from .profile import SpeakerProfile
 from .residual import ResidualCorrector
 from .rng import NoiseBank
 from .tract import VocalTract
+from .tviir import tv_biquad
 
 LOADED_SOURCE_VERSION = 1
 
@@ -86,6 +87,12 @@ class EngineConfig:
 # 0 이면 항이 통째로 빠지므로 **거동이 예전과 완전히 같다.** 기본값은 실측으로 정한다.
 GLOTTAL_DISPERSION = 0.0
 
+#: **외부 음원 시간 늘이기** (§52.59). 적합기의 f0_target / 음원 자신의 F0 비율을 이 폭 안에 가두고,
+#: (비율 − 1) 을 시상수 EXT_WARP_TAU 의 누설 적분으로 표본 어긋남에 쌓는다 — 어긋남은 EXT_WARP_MAX·τ·fs (5 %·50 ms = 2.5 ms) 를
+#: 넘지 않아 음원이 기식·마찰 경로와 멀어지지 않는다. 짧은 구간의 F0·위상은 LF 의 f0_target 처럼 고칠 수 있다.
+EXT_WARP_MAX = 0.05
+EXT_WARP_TAU = 0.05
+
 class VoiceEngine(nn.Module):
     def __init__(self, cfg: EngineConfig | None = None, profile: SpeakerProfile | None = None):
         super().__init__()
@@ -96,6 +103,12 @@ class VoiceEngine(nn.Module):
         if profile:
             self.cfg.tract_length_cm = profile.tract_length_cm
         self.loaded_source = None
+        # **외부 성문 음원** (1, N) — 물리 시뮬레이션이 만든 dU/dt (docs/MEASUREMENTS §52.31). None 이면 LF 음원 그대로.
+        self.external_du = None
+        # 외부 음원의 **성문 개방 곡선** (1, N) 0~1 — 물리 성문 면적에서 만든다. 있으면 성도의 `OPEN_DAMP` 가 LF 위상 대신 이것을 본다.
+        self.external_open = None
+        self.external_env = None
+        self.external_f0 = None
         if self.cfg.loaded_source_enabled:
             from .loaded_source import ImpedanceLoadedSource
             self._check_source_options()
@@ -145,6 +158,53 @@ class VoiceEngine(nn.Module):
             raise ValueError("Loaded pulse_phase must be finite, unwrapped and strictly increasing")
         return rate
 
+    def set_external_source(self, du, g_open=None, f0_src=None) -> None:
+        """물리 음원 dU/dt (N,) 또는 (1, N) 을 건다. None 이면 떼어 LF 음원으로 돌아간다. 샘플률은 엔진과 같아야 한다.
+
+        `g_open` 은 같은 길이의 0~1 성문 개방 곡선이다 (없으면 성도의 개방기 감쇠는 LF 위상을 본다). 기식 잡음의 주기 변조는
+        아직 LF 위상을 따른다 — 알려진 한계 (§52.38).
+        """
+        if du is None:
+            self.external_du = None
+            self.external_open = None
+            self.external_env = None
+            self.external_f0 = None
+            return
+        t = torch.as_tensor(du, dtype=torch.float32)
+        t = t.reshape(1, -1) if t.ndim == 1 else t
+        if t.ndim != 2 or t.shape[0] != 1 or not bool(torch.isfinite(t).all()):
+            raise ValueError("external source must be a finite (N,) or (1, N) array")
+        self.external_du = t
+        self.external_open = None
+        # 무성 벌점이 쓸 **음원 포락** (1, N) — 프레임 rms 를 5 프레임 평균으로 펴고, 음원이 서 있는 프레임(최대의 1 % 위) 의
+        # 중앙값을 1 로 둔다 (§52.46). 적합기는 이것 × voice_gain 을 무성 구간에서 문다.
+        hop = int(self.cfg.hop)
+        nf = int(t.shape[-1]) // hop
+        if nf == 0:
+            self.external_env = torch.ones_like(t)
+        else:
+            fr_rms = t[0, :nf * hop].double().reshape(nf, hop).pow(2).mean(1).sqrt()
+            if nf >= 5:
+                fr_rms = torch.nn.functional.avg_pool1d(fr_rms.view(1, 1, -1), 5, 1, 2,
+                                                        count_include_pad=False).view(-1)
+            live = fr_rms > fr_rms.max() * 1e-2
+            ref = fr_rms[live].median() if bool(live.any()) else torch.ones((), dtype=fr_rms.dtype)
+            env = (fr_rms / ref.clamp_min(1e-12)).float().repeat_interleave(hop)
+            if env.shape[0] < t.shape[-1]:
+                env = torch.cat([env, env[-1:].expand(int(t.shape[-1]) - env.shape[0])])
+            self.external_env = env.view(1, -1)
+        if g_open is not None:
+            o = torch.as_tensor(g_open, dtype=torch.float32)
+            o = o.reshape(1, -1) if o.ndim == 1 else o
+            if o.shape != t.shape or not bool(torch.isfinite(o).all()) or bool((o < 0).any()) or bool((o > 1).any()):
+                raise ValueError("g_open must be a finite 0..1 array with the same shape as du")
+            self.external_open = o
+        # 음원 자신의 프레임 F0 [Hz] — 있으면 적합기의 f0_target 과의 비율로 음원을 시간 축에서 늘인다 (§52.59). 0 이하는 비율 1.
+        self.external_f0 = None
+        if f0_src is not None:
+            f = torch.as_tensor(np.nan_to_num(np.asarray(f0_src, dtype=np.float64), nan=0.0), dtype=torch.float64)
+            self.external_f0 = f.reshape(1, -1)
+
     def reset(self) -> None:
         self.state = dict(phase=None, amp=None, tract={}, residual={}, glottis={},
                           fric={}, asp={}, frame=0)
@@ -190,6 +250,49 @@ class VoiceEngine(nn.Module):
                 ps, prepared_tracks, st.get("loaded", {}), legacy_du=g["du"])
             g["du"] = loaded["du"]
             st["loaded"] = loaded["state"]
+        if self.external_du is not None:
+            # 외부 음원으로 성문 배음을 **갈아 끼운다.** 진폭·닫힘·지터는 물리가 정하고, 적합기는 성문 배음의 빠른 이득
+            # `voice_gain` 만 곱한다. 기식·마찰 경로(asp_env, ag_dc)는 그대로 LF 생리에서 온다.
+            ext = self.external_du
+            if ext.shape[-1] < s0 + n:
+                raise ValueError(f"external source has {ext.shape[-1]} samples, needs {s0 + n}")
+            vg = frames_to_samples(torch.pow(10.0, c["voice_gain"] / 20.0).unsqueeze(-1), hop)[:, :n, 0]
+            if self.external_f0 is None:
+                g["du"] = ext[:, s0:s0 + n].to(device=vg.device, dtype=vg.dtype).expand(b, -1) * vg
+                if self.external_env is not None:
+                    g["amp_ext"] = (self.external_env[:, s0:s0 + n].to(device=vg.device, dtype=vg.dtype)
+                                    .expand(b, -1) * vg)
+                if self.external_open is not None:
+                    g["open_phase"] = self.external_open[:, s0:s0 + n].to(device=vg.device, dtype=vg.dtype).expand(b, -1)
+            else:
+                # **시간 늘이기** (§52.59): 비율 r = f0_target / 음원 F0 (±EXT_WARP_MAX), 어긋남 D[k] = (r[k] − 1) + a·D[k−1] [표본].
+                t_all_f = c["f0_target"].shape[-1]
+                sf0 = self.external_f0[:, f0i:f0i + t_all_f].to(device=vg.device)
+                if sf0.shape[-1] < t_all_f:
+                    sf0 = torch.cat([sf0, torch.zeros(1, t_all_f - sf0.shape[-1], dtype=sf0.dtype, device=sf0.device)], -1)
+                ft = c["f0_target"].to(torch.float64)
+                ok = (sf0 > 0) & (ft > 0)
+                ratio = torch.where(ok, ft / sf0.clamp_min(1e-6), torch.ones_like(ft))
+                ratio = ratio.clamp(1.0 - EXT_WARP_MAX, 1.0 + EXT_WARP_MAX)
+                rr = frames_to_samples((ratio - 1.0).unsqueeze(-1), hop)[:, :n, 0]
+                a_w = math.exp(-1.0 / (EXT_WARP_TAU * float(self.cfg.sample_rate)))
+                off, zf = tv_biquad(rr, 1.0, 0.0, 0.0, -a_w, 0.0, zi=st.get("ext_warp"))
+                st["ext_warp"] = zf.detach()
+                pos = (torch.arange(s0, s0 + n, device=vg.device, dtype=torch.float64).unsqueeze(0)
+                       + off.to(torch.float64)).clamp(0.0, float(ext.shape[-1] - 2))
+                i0 = pos.detach().floor()
+                w = pos - i0
+                i0 = i0.long()
+
+                def _read(sig):
+                    e = sig[0].to(device=vg.device, dtype=torch.float64)
+                    return e[i0] * (1.0 - w) + e[i0 + 1] * w
+
+                g["du"] = _read(ext).to(vg.dtype) * vg
+                if self.external_env is not None:
+                    g["amp_ext"] = _read(self.external_env).to(vg.dtype) * vg
+                if self.external_open is not None:
+                    g["open_phase"] = _read(self.external_open).to(vg.dtype).detach()
         fr = self.frication(c, g["ag_dc_frames"], g["phase"], g["voiced"], noise=self.noise,
                             frame0=f0i, state=st["fric"], emit=t, noise_am=g["noise_am"])
         asp = self.aspiration(g["asp_env"], noise=self.noise, sample0=s0, state=st["asp"],
@@ -230,6 +333,8 @@ class VoiceEngine(nn.Module):
                           glottal_flow=loaded["glottal_flow"],
                           source_rate=source_rate,
                           reference_flow=g["reference_flow"])
+        if "amp_ext" in g:
+            result["amp_ext"] = g["amp_ext"]
         return result
 
     # ------------------------------------------------------------ 편의 API
