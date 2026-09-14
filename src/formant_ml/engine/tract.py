@@ -285,7 +285,12 @@ HF_Q = 5.0          # (쓰지 않음 — 위 주석의 되돌린 시도)
 #: 균일하게 못 쌓이게 막아야 해."* 0.5 (±65 %) 로 풀어 서로 다른 방향으로 흩어질 수 있게 한다.
 #: 1 차원 관의 사다리는 5~6 kHz 위에서 이미 실제가 아니므로(횡모드) 자리를 묶을 물리적 근거도 없다.
 HF_DF_LIM = 0.5
+#: 이상와 영점의 기본 자리·대역폭·최대 깊이 비. **자리는 화자 프로파일(`piriform_hz`) 이 있으면 그 값을 쓴다** (§52.76).
+#: 적합 범위 `PIR_DF_LIM` 은 로그 ±0.08 (≈ ±8 %) 로 **좁다** — 구조 상수이지 잔여 오차를 메우는 자유도가 아니다.
+#: 예전에는 중심 4500 Hz 에 ±0.3 (3333~6075 Hz) 이었고, 이 화자의 실측 6352 Hz 가 **범위 밖**이라
+#: 여섯 판 중 다섯이 범위 끝에 박혔다 (LF 는 위 끝, 물리는 아래 끝 — 같은 화자인데 반대였다).
 PIR_F0, PIR_BW, PIR_RATIO_MAX = 4500.0, 500.0, 6.0
+PIR_DF_LIM = 0.08
 
 
 def _extra_mult(x: torch.Tensor) -> torch.Tensor:
@@ -311,7 +316,7 @@ class VocalTract(nn.Module):
     def __init__(self, fs: float, hop: int, length_cm: float = 14.6,
                  bw_floor: float = 40.0, bw_slope: float = 0.05,
                  n_formants: int = N_FORMANTS, n_extra: int | None = None,
-                 front_bw_slope: float = 0.20):
+                 front_bw_slope: float = 0.20, piriform_hz: float = 0.0):
         super().__init__()
         self.fs, self.hop = float(fs), int(hop)
         self.length_cm = length_cm
@@ -354,6 +359,8 @@ class VocalTract(nn.Module):
         self.hf_log_bw = nn.Parameter(torch.zeros(n_hf))
         self.hf_eq_db = nn.Parameter(torch.zeros(HF_EQ_N))     # 고역 포락 EQ (HF_EQ)
         self.recording_eq_enabled: bool | None = None
+        #: 이 화자의 이상와 영점 자리 [Hz] — 프로파일에서 온다 (구조 상수).
+        self.pir_f0 = float(piriform_hz if piriform_hz else PIR_F0)
         self.pir_log_f = nn.Parameter(torch.tensor(0.0))
         self.pir_depth = nn.Parameter(torch.tensor(-2.0))     # 시그모이드 — 처음엔 얕게
         # 성문 개방기 감쇠 (OPEN_DAMP): k_b = 4·sigmoid(x) (x = −ln 3 → 1 배), k_f = 0.15·tanh(y) + 0.05
@@ -605,7 +612,7 @@ class VocalTract(nn.Module):
                 x, state[f"{prefix}{i}"] = tv_biquad(x, *resonator_coeffs(fk_t, bw_t, self.fs),
                                                      zi=state.get(f"{prefix}{i}"))
             # 이상와 영점 (극-영점 쌍 노치, 깊이 = 대역폭 비)
-            fz = PIR_F0 * torch.exp(0.3 * torch.tanh(self.pir_log_f / 0.3))
+            fz = self.pir_f0 * torch.exp(PIR_DF_LIM * torch.tanh(self.pir_log_f / PIR_DF_LIM))
             ratio = 1.0 + (PIR_RATIO_MAX - 1.0) * torch.sigmoid(self.pir_depth)
             fz_t = fz.to(ref.dtype).expand_as(ref)
             x, state[f"{prefix}pir"] = tv_biquad(x, *notch_coeffs(fz_t, PIR_BW, self.fs, ratio),
@@ -773,7 +780,10 @@ class VocalTract(nn.Module):
         if not self.output_eq_enabled:
             return x
         g = HF_EQ_LIM * torch.tanh(self.hf_eq_db / HF_EQ_LIM)
-        if float(g.detach().abs().max()) < 1e-4:
+        # **적합 중에는 0 이어도 그래프에 올린다** (`_live` 참조, §51.47·§52.73). 0 에서 가지를 건너뛰면
+        # ∂손실/∂hf_eq_db 가 **존재하지 않아** 초기값 0 인 이 손잡이가 영영 0 에 묶인다 — `--hf-eq` 를 켠
+        # `out/M/M32` 에서 여덟 값이 전부 정확히 0 이었던 것이 이것이다.
+        if not _live(self.hf_eq_db):
             return x
         fc = torch.logspace(math.log10(HF_EQ_LO), math.log10(min(HF_EQ_HI, 0.95 * self.fs / 2)),
                             HF_EQ_N, dtype=torch.float64)

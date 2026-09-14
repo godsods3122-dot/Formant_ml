@@ -732,3 +732,49 @@ def test_phase_lock_command_raises_frequency_before_late_closure():
     before = g[int((0.2 - 0.008) * 1000)]
     assert before > 250.0 and abs(before / 250.0 - 1.0) <= 0.03 + 1e-12
     assert g[0] == 250.0 and g[399] == 250.0
+
+
+def test_adduction_compensation_follows_level_and_is_bounded():
+    # §52.72 — 이득이 주어지면 세기에 비례해 내전이 움직이고, 폭이 막히고, 이득 0 이면 아무 일도 없다.
+    M = _physics_source_module()
+    n = 400
+    level = np.full(n, -30.0)
+    level[100:200] = -20.0
+    level[200:300] = -40.0
+    voiced = np.ones(n, bool)
+    voiced[350:] = False
+    g = -0.0018
+    h = M.adduction_track(level, voiced, 1.0, g)
+    assert np.all(h[350:] == 0.0)
+    assert h[150] < 0.0 and h[250] > 0.0
+    assert abs(h[150] * 1e3 - 10.0 * g) < 0.001
+    assert np.max(np.abs(h)) <= M.ADDUCT_SPAN_MM * 1e-3 + 1e-12
+    assert np.max(np.abs(M.adduction_track(level, voiced, 1.0, 0.0))) == 0.0
+
+
+def test_h1h2_level_slope_recovers_a_planted_slope():
+    # §52.72 — 합성 신호에 심은 기울기를 되찾는가. 세기를 올리면서 H2 를 키워 H1−H2 를 −0.5 dB/dB 로 만든다.
+    M = _physics_source_module()
+    fs, f0v, n = 48000, 200.0, 48000
+    t = np.arange(n) / fs
+    lvl = np.linspace(-6.0, 6.0, n)                       # ±6 dB 훑기
+    amp = 10 ** (lvl / 20.0)
+    h2_extra = 10 ** ((0.5 * lvl) / 20.0)                 # H2 가 수준의 0.5 배로 자란다 -> H1−H2 기울기 −0.5
+    x = amp * (np.sin(2 * np.pi * f0v * t) + h2_extra * 0.5 * np.sin(4 * np.pi * f0v * t))
+    f0 = np.full(n // 48, f0v)
+    good = np.ones(n // 48, bool)
+    s = M.h1h2_level_slope(x, fs, f0, good)
+    assert abs(s - (-0.5)) < 0.12
+
+
+def test_render_source_h0_frames_zero_is_bitwise_bypass():
+    R = _render_lc_module()
+    strains = np.array(R.POSTURE_STRAINS)
+    tas = np.array(R.POSTURE_TAS)
+    F = 250.0 * np.exp(1.5 * strains[None, :] - 0.3 * tas[:, None])
+    f0 = np.full(60, 250.0)
+    voiced = np.ones(60, bool)
+    kw = dict(posture=(strains, tas, F), seg_ms=2.5, fb_gain=0.0)
+    a, _A, _L = R.render_source(f0, 1.0, voiced=voiced, **kw)
+    b, _A, _L = R.render_source(f0, 1.0, voiced=voiced, h0_frames=np.zeros(60), **kw)
+    assert np.array_equal(a, b)

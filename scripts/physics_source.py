@@ -49,6 +49,57 @@ LUNG_TAU_MS = 30.0
 SPEECH_FLOOR_DB = 25.0
 
 
+#: **보상: 세기 ↔ 내전** (§52.71·§52.72). 세게 말하면 성대를 더 붙여 기식이 준다 — H1−H2 가 수준을 따라 내려간다.
+#:
+#: 코퍼스 평균(−0.25 dB/dB) 을 모든 파일에 강제하면 안 된다: 파일별 분포가 [−0.71, +0.27] (10~90 %) 이고 21 % 는
+#: **양수**다. 게다가 물리 음원은 폐압 궤적만으로 이미 −0.19~−0.65 를 내므로(닫힘이 날카로워진다) 평균을 더 얹으면
+#: 두 번 세게 된다 — 실제로 그렇게 해서 목표에서 더 멀어졌다 (§52.72).
+#:
+#: 그래서 **닫힌 고리**로 둔다: 목표 녹음에서 기울기를 재고, 렌더한 음원에서 재고, 그 차이만큼 내전 이득을 고친다.
+#: 이득의 물리 눈금은 내전 스윕(§52.41) 의 h0 0.04 mm -> H1−H2 7.4 dB, 즉 185 dB/mm 다.
+ADDUCT_DB_PER_MM = 185.0
+#: 보상이 움직일 수 있는 폭 [mm] — 내전은 좁은 범위 밖에서 진동이 불안정해진다 (§52.41).
+ADDUCT_SPAN_MM = 0.02
+#: 이득의 상한 [mm/dB] — 폭 안에서도 너무 가파르면 프레임마다 자세가 튄다.
+ADDUCT_GAIN_LIMIT = 0.006
+
+
+def h1h2_level_slope(x, sr, f0, good, nfft=2048, hop=480):
+    """유성 창에서 (수준 dB, H1−H2 dB) 의 회귀 기울기 [dB/dB]. 창이 모자라면 nan."""
+    from scipy.signal import stft
+    f, t_, Z = stft(x, sr, nperseg=nfft, noverlap=nfft - hop)
+    A = np.abs(Z)
+    L, H = [], []
+    for j in range(A.shape[1]):
+        k = min(int(t_[j] * 1000.0), len(good) - 1)
+        if not good[k] or f0[k] <= 0:
+            continue
+        F = f0[k]
+        pk = lambda h: 20 * np.log10(A[(f > h * F - 0.3 * F) & (f < h * F + 0.3 * F), j].max() + 1e-12)  # noqa: E731
+        L.append(20 * np.log10(np.sqrt((A[(f >= 80) & (f < 8000), j] ** 2).mean()) + 1e-12))
+        H.append(pk(1) - pk(2))
+    if len(L) < 20:
+        return float("nan")
+    L = np.asarray(L) - np.median(L)
+    H = np.asarray(H) - np.median(H)
+    if L.std() < 1e-6:
+        return float("nan")
+    return float(np.polyfit(L, H, 1)[0])
+
+
+def adduction_track(level_db, voiced, frame_ms, gain_mm_per_db, span=ADDUCT_SPAN_MM, smooth_ms=31.0):
+    """목표 수준 [dB] -> 휴지 반틈새 보상 [m]. 유성 구간 중앙 수준 대비 편차 × `gain_mm_per_db`."""
+    from scipy.ndimage import uniform_filter1d
+    v = np.asarray(voiced, bool) & np.isfinite(level_db)
+    if not v.any() or not np.isfinite(gain_mm_per_db) or gain_mm_per_db == 0.0:
+        return np.zeros(len(level_db))
+    ref = float(np.median(level_db[v]))
+    w = max(1, int(round(smooth_ms / frame_ms)))
+    lv = uniform_filter1d(np.where(v, level_db, ref), w, mode="nearest")
+    d = np.clip((lv - ref) * float(gain_mm_per_db), -span, span)
+    return np.where(v, d, 0.0) * 1e-3
+
+
 def frame_level_db(seg, sr, n_fr, frame_ms, lo=80.0, hi=8000.0, win_ms=20.0):
     """프레임 중심의 `win_ms` 창 에너지 [dB] (80 Hz~8 kHz 대역)."""
     from scipy.signal import butter, sosfiltfilt
@@ -293,6 +344,8 @@ def main() -> int:
                     help="접촉 강성 배율 (조직 압축). H1−H2·저역을 올린다 (§52.42). 교정표를 다시 만든다")
     ap.add_argument("--c-contact-scale", type=float, default=1.0,
                     help="접촉 감쇠 배율. 8 kHz 위를 줄인다 (§52.42). 교정표를 다시 만든다")
+    ap.add_argument("--adduct-comp", action="store_true",
+                    help="세기 ↔ 내전 보상을 켠다 (§52.74). **기본 꺼짐** — 기울기는 반쯤 당기지만 저음에서 자세가 무너진다")
     ap.add_argument("--tract-compliance", type=float, default=0.0,
                     help="성문 위 공간 순응도 [m³/Pa] (§52.49). 0 이면 준정상 두 오리피스. 녹음의 voice bar 에 맞는 후보 1e-8")
     ap.add_argument("--phase-lock", type=int, default=0,
@@ -354,8 +407,15 @@ def main() -> int:
     abduct = (dict(h0_open=a.abduct_mm * 1e-3, tau_s=a.abduct_tau_ms * 1e-3, lead_ms=a.abduct_lead_ms)
               if a.abduct_mm > 0 else None)
     p_frames = None
+    h0_frames = None
+    lvl = frame_level_db(seg, sr, n_fr, a.frame_ms)
     if not a.no_lung_track:
-        p_frames = lung_pressure_track(frame_level_db(seg, sr, n_fr, a.frame_ms), voiced, a.p_sub, a.frame_ms)
+        p_frames = lung_pressure_track(lvl, voiced, a.p_sub, a.frame_ms)
+    adduct_gain = 0.0
+    slope_tgt = float("nan")
+    if a.adduct_comp:
+        slope_tgt = h1h2_level_slope(seg, sr, f0, voiced)
+        print(f"  보상 목표: 녹음의 H1−H2 대 수준 {slope_tgt:+.3f} dB/dB", flush=True)
         sp = p_frames > 0.5
         print(f"  폐압 궤적: 말 {100 * sp.mean():.0f} % 프레임, 유성 분위 5/50/95 % "
               f"{np.round(np.percentile(p_frames[voiced], [5, 50, 95]), 1)} cmH2O", flush=True)
@@ -363,9 +423,23 @@ def main() -> int:
     for it in range(a.refine + 1):
         U, A_sim, _L = R.render_source(f_cmd, a.frame_ms, p_sub_cm=a.p_sub, h0=a.h0_mm * 1e-3, voiced=voiced,
                                     posture=posture, abduct=abduct, p_ramp_ms=a.p_ramp_ms, outlet=outlet,
-                                    p_frames=p_frames)
+                                    p_frames=p_frames, h0_frames=h0_frames)
         f_meas = frame_f0_from_flow(U, n_fr, a.frame_ms)
         print(f"  추종 (반복 {it}): {tracking_report(f_meas, f0, voiced)}", flush=True)
+        # **보상은 첫 반복에서 한 번만 잡는다.** h0 가 바뀌면 F0 도 바뀌므로, 뒤 반복의 F0 보정이 그것을 흡수해야 한다.
+        # 매 반복 갱신하면 마지막 갱신 뒤에 보정이 없어 추종이 9.6 -> 19.7 센트로 나빠졌다 (§52.73).
+        if it == 0 and np.isfinite(slope_tgt):
+            du_now = resample_poly(np.gradient(U, 1.0 / FS_SIM), 6, 25)
+            slope_src = h1h2_level_slope(du_now, FS_OUT, f0, voiced)
+            if np.isfinite(slope_src):
+                # 음원이 목표보다 더 가파르면(더 음수) 세질 때 덜 붙게 이득을 올린다.
+                raw = adduct_gain + (slope_tgt - slope_src) / ADDUCT_DB_PER_MM
+                adduct_gain = float(np.clip(raw, -ADDUCT_GAIN_LIMIT, ADDUCT_GAIN_LIMIT))
+                if abs(raw) > ADDUCT_GAIN_LIMIT:
+                    print(f"    보상 이득이 상한에 걸렸다 ({raw:+.4f} -> {adduct_gain:+.4f} mm/dB) — 기울기를 다 못 맞춘다", flush=True)
+                h0_frames = adduction_track(lvl, voiced, a.frame_ms, adduct_gain)
+                print(f"    보상: 음원 기울기 {slope_src:+.3f} -> 이득 {adduct_gain:+.4f} mm/dB, "
+                      f"h0 편차 5/95 % {np.round(np.percentile(h0_frames[voiced] * 1e3, [5, 95]), 4)} mm", flush=True)
         if it < a.refine:
             f_cmd = refine_command(f_cmd, f0, f_meas, voiced)
     t_tgt = np.asarray(getattr(track, "pulses", np.zeros(0)), float)
@@ -380,7 +454,7 @@ def main() -> int:
         f_cmd = phase_lock_command(f_cmd, a.frame_ms, tj, d, Tj)
         U, A_sim, _L = R.render_source(f_cmd, a.frame_ms, p_sub_cm=a.p_sub, h0=a.h0_mm * 1e-3, voiced=voiced,
                                        posture=posture, abduct=abduct, p_ramp_ms=a.p_ramp_ms, outlet=outlet,
-                                       p_frames=p_frames)
+                                       p_frames=p_frames, h0_frames=h0_frames)
         f_meas = frame_f0_from_flow(U, n_fr, a.frame_ms)
         rep, _ = alignment_report(closure_times(U), t_tgt)
         print(f"  위상 고정 {it + 1}: {rep} | 추종 {tracking_report(f_meas, f0, voiced)}", flush=True)
@@ -409,6 +483,7 @@ def main() -> int:
     np.savez_compressed(a.out, du=du.astype(np.float32), fs=FS_OUT, t0=a.t0, t1=t1, frame_ms=a.frame_ms,
                         n_frames=n_fr, f0=f0, f0_raw=f0_raw, f0_command=f_cmd, f0_measured=f_meas, voiced=voiced, scale=scale,
                         p_frames=(p_frames if p_frames is not None else np.zeros(0)),
+                        adduct_gain=adduct_gain, slope_target=slope_tgt,
                         g_open=g_open.astype(np.float32), area=area48.astype(np.float32),
                         settings=json.dumps(vars(a)))
     peak = max(float(np.abs(du).max()), 1e-12)

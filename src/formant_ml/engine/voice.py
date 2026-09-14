@@ -123,7 +123,8 @@ class VoiceEngine(nn.Module):
         fbw = float(profile.sibilant.get("front_bw_slope", 0.20)) if profile else 0.20
         self.tract = VocalTract(fs, hop, length_cm=self.cfg.tract_length_cm,
                                 n_extra=self.cfg.n_extra_formants,
-                                front_bw_slope=fbw)
+                                front_bw_slope=fbw,
+                                piriform_hz=(profile.piriform_hz if profile else 0.0))
         self.residual = ResidualCorrector(fs, hop) if self.cfg.residual else None
         self.reset()
 

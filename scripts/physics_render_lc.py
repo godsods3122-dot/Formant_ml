@@ -315,7 +315,7 @@ def register_posture(f0, r, strains, rows, F):
 
 def render_source(f0_track, frame_ms, p_sub_cm=8.0, h0=-0.02e-3, fs_sim=200000.0,
                   seg_ms=2.5, n_modes=6, seed=0, fb_gain=0.0, voiced=None, posture=None, abduct=None,
-                  p_ramp_ms=0.0, outlet=None, p_frames=None):
+                  p_ramp_ms=0.0, outlet=None, p_frames=None, h0_frames=None):
     """F0 궤적을 따라 자려 진동을 **끊김 없이** 적분한다. `self_oscillation.Glottis` 를 그대로 쓴다.
 
     늘어남은 **교정표(앞먹임) 로 2.5 ms 마다** 정한다. 실제 주기를 재서 되먹이는 경로(`fb_gain`) 는 남겨 두었지만
@@ -383,6 +383,8 @@ def render_source(f0_track, frame_ms, p_sub_cm=8.0, h0=-0.02e-3, fs_sim=200000.0
                 else:
                     eps, ta = posture_for(f0_use, p_str, p_ta, p_F)
                     vd, dh0, ps = 1.0, 0.0, 1.0
+            if h0_frames is not None:
+                dh0 = dh0 + float(h0_frames[fr])     # 세기 보상 (§52.71)
             last, changed = (eps, ta, vd, dh0, ps), True
         else:
             (eps, ta, vd, dh0, ps), changed = last, False             # 무성 — 후두 자세는 그대로 두고 벌리기만 한다

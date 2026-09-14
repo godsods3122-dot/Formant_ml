@@ -264,3 +264,93 @@ def test_extra_poles_stay_below_nyquist():
     fr, d = _tract_db(tr, [600, 1800, 3000, 4200, 5400, 6600, 7800, 11500.0])
     import numpy as np
     assert np.isfinite(d).all() and d[(fr > 20000)].max() < 20.0
+
+
+def test_hf_eq_knob_receives_gradient_from_zero():
+    """§52.73 — 고역 EQ 는 초기값 0 에서도 기울기를 받아야 한다 (0 에서 가지를 건너뛰면 영영 안 움직인다)."""
+    import torch
+
+    from formant_ml.engine import tract as tract_mod
+
+    old = tract_mod.HF_EQ
+    tract_mod.HF_EQ = True
+    try:
+        tr = tract_mod.VocalTract(48000, 48).double()
+        assert float(tr.hf_eq_db.abs().max()) == 0.0
+        x = torch.randn(1, 4800, dtype=torch.float64)
+        y = tr._hf_eq(x, {})
+        y.pow(2).sum().backward()
+        g = tr.hf_eq_db.grad
+        assert g is not None and torch.isfinite(g).all()
+        assert float(g.abs().max()) > 0.0
+    finally:
+        tract_mod.HF_EQ = old
+
+
+def test_hf_eq_is_identity_when_disabled():
+    import torch
+
+    from formant_ml.engine import tract as tract_mod
+
+    old = tract_mod.HF_EQ
+    tract_mod.HF_EQ = False
+    try:
+        tr = tract_mod.VocalTract(48000, 48).double()
+        x = torch.randn(1, 480, dtype=torch.float64)
+        assert torch.equal(tr._hf_eq(x, {}), x)
+    finally:
+        tract_mod.HF_EQ = old
+
+
+def test_piriform_zero_comes_from_the_speaker_profile_and_range_is_narrow():
+    """§52.76 — 이상와 영점은 화자 구조 상수다: 프로파일 값을 쓰고, 적합 범위는 그 둘레로 좁다."""
+    import numpy as np
+    import torch
+
+    from formant_ml.engine import tract as tract_mod
+
+    default = tract_mod.VocalTract(48000, 48)
+    assert default.pir_f0 == tract_mod.PIR_F0                 # 프로파일이 없으면 문헌 기본
+    tr = tract_mod.VocalTract(48000, 48, piriform_hz=6352.0)
+    assert tr.pir_f0 == 6352.0
+
+    # 범위: pir_log_f 를 양끝으로 밀어도 ±8 % 안이다
+    lim = tract_mod.PIR_DF_LIM
+    with torch.no_grad():
+        for v in (-50.0, 50.0):
+            tr.pir_log_f.fill_(v)
+            fz = tr.pir_f0 * float(torch.exp(lim * torch.tanh(tr.pir_log_f / lim)))
+            assert abs(np.log(fz / 6352.0)) <= lim + 1e-6   # float32 반올림 여유
+    assert abs(6352.0 * np.exp(lim) - 6881.0) < 20.0          # 위 끝이 실측 90 % 분위(6638) 를 덮는다
+    assert abs(6352.0 * np.exp(-lim) - 5864.0) < 20.0         # 아래 끝이 10 % 분위(6000) 를 덮는다
+
+
+def test_piriform_notch_actually_dips_at_the_profile_frequency():
+    """영점이 프로파일 자리에 실제로 골을 만드는가 — 임펄스 응답에서 잰다."""
+    import numpy as np
+    import torch
+
+    from formant_ml.engine import tract as tract_mod
+
+    old = tract_mod.HF_FIXED
+    tract_mod.HF_FIXED = True
+    try:
+        tr = tract_mod.VocalTract(48000, 48, piriform_hz=6352.0).double()
+        with torch.no_grad():
+            tr.pir_depth.fill_(3.0)                            # 깊게
+            x = torch.zeros(1, 8192, dtype=torch.float64)
+            x[0, 0] = 1.0
+            fz = tr.pir_f0
+            ratio = 1.0 + (tract_mod.PIR_RATIO_MAX - 1.0) * float(torch.sigmoid(tr.pir_depth))
+            f_t = torch.full_like(x, fz)
+            y, _ = tract_mod.tv_biquad(x, *tract_mod.notch_coeffs(f_t, tract_mod.PIR_BW, 48000.0, ratio))
+        S = 20 * np.log10(np.abs(np.fft.rfft(y[0].numpy())) + 1e-12)
+        f = np.fft.rfftfreq(8192, 1 / 48000.0)
+        at = S[np.argmin(np.abs(f - fz))]
+        side = np.mean([S[np.argmin(np.abs(f - (fz - 2000)))], S[np.argmin(np.abs(f - (fz + 2000)))]])
+        assert at < side - 5.0                                  # 자리에서 5 dB 넘게 파여야 한다
+        band = (f > 3000) & (f < 10000)
+        f_min = f[band][int(np.argmin(S[band]))]
+        assert abs(f_min - fz) < 400.0                       # 가장 깊은 자리가 프로파일 주파수여야 한다
+    finally:
+        tract_mod.HF_FIXED = old

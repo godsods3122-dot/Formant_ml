@@ -821,3 +821,59 @@ def test_synergy_penalty_has_gradient(_engine):
     loss = fitter.synergy_loss(c)
     loss.backward()
     assert torch.isfinite(c.grad).all() and float(c.grad.abs().max()) > 0.0
+
+
+def test_band_scores_split_the_envelope_and_catch_a_band_limited_error(_engine):
+    """§52.70 — 대역별 포락 점수: 한 대역만 망가뜨리면 그 대역만 떨어진다."""
+    import numpy as np
+    import torch
+
+    from formant_ml.engine import fit as fit_mod
+
+    tr = _track(80)
+    target = _engine.render(tr)
+    f = CopySynthFitter(_engine, target, 48000, tr)
+    names = [n for n, _m in f._band_masks()]
+    assert names == ["0-6k", "6-10k", "10k+"]
+    # 멜 빈이 대역마다 실제로 있어야 한다
+    for _n, m in f._band_masks():
+        assert int(m.sum()) >= 2
+
+    Mt = f.tgt_M
+    same = f.band_scores(Mt, Mt.clone())
+    assert all(v > 99.0 for v in same.values())
+
+    # 10 kHz 위만 6 dB 낮춘다
+    fc = (f.mel.detach() * torch.linspace(0.0, 24000.0, f.mel.shape[1],
+                                          dtype=f.mel.dtype)).sum(1) / f.mel.detach().sum(1).clamp_min(1e-12)
+    hurt = Mt.clone()
+    hurt[:, fc >= 10000.0] *= 0.5
+    sc = f.band_scores(Mt, hurt)
+    assert sc["0-6k"] > 99.0 and sc["6-10k"] > 99.0
+    assert sc["10k+"] < 60.0
+
+
+def test_band_scores_accept_two_dimensional_mel(_engine):
+    """§52.70 — (멜, 프레임) 2 차원 입력도 받아야 한다 (진단 스크립트가 이 모양으로 준다)."""
+    tr = _track(80)
+    target = _engine.render(tr)
+    f = CopySynthFitter(_engine, target, 48000, tr)
+    M2 = f.tgt_M[0]
+    assert M2.dim() == 2
+    sc = f.band_scores(M2, M2.clone())
+    assert set(sc) == {"0-6k", "6-10k", "10k+"} and all(v > 99.0 for v in sc.values())
+
+
+def test_score_audio_matches_the_fitters_own_number(_engine):
+    """§52.70 — `score_audio` 는 적합기가 자기 렌더에 매기는 점수와 같아야 한다 (경로가 하나여야 한다)."""
+    tr = _track(80)
+    target = _engine.render(tr)
+    f = CopySynthFitter(_engine, target, 48000, tr)
+    rep = f.fit(0)
+    got = f.score_audio(f.synth()[0].detach().cpu().numpy())
+    assert abs(got["env"] - rep.env) < 0.5
+    for k, v in rep.bands.items():
+        assert abs(got[k] - v) < 0.5
+    # 목표 자신을 넣으면 거의 100 %
+    perfect = f.score_audio(target)
+    assert perfect["env"] > 99.0

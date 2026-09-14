@@ -143,5 +143,6 @@
   "timing": "이리닐씨리래 0.69-1.52 s = 830 ms / 6 음절 ≈ 140 ms. 어말 래 220 ms (F0 327→206 하강).",
   "sibilant_voicing": "성문 제스처가 협착보다 35 ms 먼저 열리고 55 ms 늦게 닫힌다 (ADR 0011). 실측: 마찰 진입에서 HNR 이 35 ms 에 걸쳐 꺼지고, 해제 뒤 고역 잡음이 50~70 ms 더 이어진다 — bibitan 1300~1420 ms, 2795~2915 ms.",
   "sibilant_level": "level_db = 마찰 정상부가 뒤따르는 모음보다 몇 dB (실측 A/B 창 자동 검출). 기준점 phones.SIB_REF_DB."
- }
+ },
+ "piriform_hz": 6352.0
 }

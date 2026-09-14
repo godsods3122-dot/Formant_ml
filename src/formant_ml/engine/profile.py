@@ -20,6 +20,10 @@ class SpeakerProfile:
     f0_lo: float = 110.0                 # tension=0
     f0_hi: float = 440.0                 # tension=1
     p_sub: float = 7.5                   # 기본 성문하압 [cmH2O]
+    #: **이상와 영점** [Hz] — 끝이 막힌 곁가지의 c/(4L) 영점. 화자의 구조 상수다 (§52.76).
+    #: 기본 4500 은 문헌값(깊이 1.6~2.0 cm, 남성 3·여성 1 표본) 이다. 화자마다 녹음에서 재서 넣는다 —
+    #: `yang_female` 은 코퍼스 49 파일의 중앙 6352 Hz (되푼 깊이 1.38 cm).
+    piriform_hz: float = 4500.0
     # 모음 (F1, F2, F3) Hz
     vowels: dict = field(default_factory=lambda: {
         "a": [945, 1590, 2850], "eo": [668, 1187, 2882], "o": [486, 889, 2894],

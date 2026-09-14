@@ -630,6 +630,13 @@ STOP_AFTER_STAGE = 0
 #: `voice_gain` 은 성문 배음에만 곱하므로(잡음 제외) 이것을 풀어도 잡음을 썰지 않는다.
 MOTION_FAST: set[str] = set()
 
+#: **보고용 대역 경계** [Hz] (사용자 지시, §52.70). 포락 점수를 이 경계로 갈라 함께 찍는다.
+#: 6 kHz 아래는 포먼트가 지배하고, 6~10 kHz 는 마찰·기식의 몸통, 10 kHz 위는 고차 극 사다리와
+#: 잡음 바닥이 지배해 **적합의 경향이 서로 다르다** — 한 숫자로 묶으면 그 차이가 안 보인다.
+#: 손실은 바꾸지 않는다 (보고 전용). 손실을 대역별로 저울질하는 것은 따로 결정할 일이다.
+REPORT_BAND_EDGES: tuple[float, ...] = (6000.0, 10000.0)
+
+
 #: **근육군 결합(협응) 벌점** (MEASUREMENTS §52.68·§52.69). 성도의 자유도는 서로 독립이 아니다 — 한 신경이
 #: 여러 파라미터를 동시에 움직인다. 반회후두신경(RLN) 하나가 두께·내전·외전을 쥐고, 후두 높이 하나가 성도 길이·
 #: 이상와 깊이·후두실을 같이 바꾼다. 실측: 분석기가 목표에서 잰 궤적에서 adduction–p_sub 상관이 +0.52 인데
@@ -1324,11 +1331,14 @@ class FitReport:
     loss: float
     iters: int
     history: list[tuple[float, float]] = field(default_factory=list)
+    #: 대역별 포락 일치율 % — `REPORT_BAND_EDGES` 로 가른다 (§52.70). 비면 안 쟀다는 뜻이다.
+    bands: dict[str, float] = field(default_factory=dict)
 
     def __str__(self) -> str:
         per = " ".join(f"{n}:{v:.1f}" for n, v in sorted(self.per_size.items()))
+        bd = ("  대역 " + " ".join(f"{k} {v:.1f}" for k, v in self.bands.items())) if self.bands else ""
         return (f"포락 {self.env:5.2f}%  정밀 {self.fine:5.2f}%   평균오차 {self.db:.2f} dB  "
-                f"(손실 {self.loss:.4f}, {self.iters} 회)  [{per}]")
+                f"(손실 {self.loss:.4f}, {self.iters} 회)  [{per}]{bd}")
 
 
 class CopySynthFitter:
@@ -2279,6 +2289,7 @@ class CopySynthFitter:
         env_db = self._weighted_db(e_ab) / 20.0
         self._env_ab = (a.detach(), b)          # 전이 항이 쓴다 (목표 쪽은 상수)
         env_sc = self._sc(Mt, Mp)
+        self._env_bands = self.band_scores(Mt, Mp)
         if FLUX_W > 0.0:
             # **날것 멜**로 잰다 (`_expect` 를 지나면 재려는 흔들림이 이미 없다).
             self._flux_db = self._db(self.mel[:, :Smel_raw.shape[1]] @ Smel_raw)
@@ -2288,6 +2299,60 @@ class CopySynthFitter:
         self._mel_raw_db = self._db(Smel_raw) if SHARP_W > 0.0 else None
         self._harm_db = (harm_raw if (SHARP_W > 0.0 or SUBF0_W > 0.0) else None)
         return sc_sum / len(self.sizes), env_db, env_sc, per
+
+    def _band_masks(self) -> list[tuple[str, torch.Tensor]]:
+        """멜 빈을 `REPORT_BAND_EDGES` 로 가른 (이름, 마스크) 목록. 멜 필터의 무게중심 주파수로 나눈다."""
+        if getattr(self, "_bandm", None) is not None:
+            return self._bandm
+        mel = self.mel.detach()
+        n_freq = mel.shape[1]
+        fr = torch.linspace(0.0, self.fs / 2.0, n_freq, dtype=mel.dtype, device=mel.device)
+        fc = (mel * fr).sum(1) / mel.sum(1).clamp_min(1e-12)
+        edges = [0.0, *REPORT_BAND_EDGES, float(self.fs)]
+        out = []
+        for i in range(len(edges) - 1):
+            lo, hi = edges[i], edges[i + 1]
+            m = (fc >= lo) & (fc < hi)
+            if not bool(m.any()):
+                continue
+            name = f"{lo / 1000:g}-{hi / 1000:g}k" if hi < self.fs else f"{lo / 1000:g}k+"
+            out.append((name, m))
+        self._bandm = out
+        return out
+
+    def band_scores(self, Mt: torch.Tensor, Mp: torch.Tensor) -> dict[str, float]:
+        """대역별 포락 일치율 % (`_sc` 와 같은 자, 대역 안의 멜 빈만).
+
+        멜 축은 **뒤에서 두 번째**로 고정한다 — (멜, 프레임) 도 (배치, 멜, 프레임) 도 받는다.
+        예전 판은 `Mt[:, m]` 이라 2 차원 입력에서 프레임 축을 멜 마스크로 색인해 죽었다.
+        """
+        out = {}
+        for name, m in self._band_masks():
+            idx = torch.nonzero(m, as_tuple=False).flatten()
+            out[name] = float(100.0 * (1.0 - self._sc(Mt.index_select(-2, idx),
+                                                      Mp.index_select(-2, idx)).detach()))
+        return out
+
+    @torch.no_grad()
+    def score_audio(self, y) -> dict[str, float]:
+        """이미 만들어진 오디오를 **적합기와 같은 자**로 채점한다 — 저장된 판을 다시 잴 때 쓴다.
+
+        반환 {"env": 전체 포락 %, 대역 이름: 대역별 %}. 진단 스크립트가 STFT·멜·평활을 흉내 내면
+        경로가 갈라져 음수 점수 같은 것이 나온다 (실제로 그랬다) — 여기서 한 번만 정의한다.
+        """
+        t = torch.as_tensor(np.asarray(y, dtype=np.float32), device=self.device)
+        t = t.reshape(1, -1) if t.dim() == 1 else t
+        n = int(self.target.shape[-1])
+        if t.shape[-1] < n:
+            t = torch.nn.functional.pad(t, (0, n - t.shape[-1]))
+        t = t[:, :n]
+        raw = self._cabs(_stft(t, MEL_FFT, self.wins[MEL_FFT]))[:, :self.bin_max[MEL_FFT]]
+        Mp = self.mel[:, :raw.shape[1]] @ self._expect(raw, MEL_FFT)
+        m = min(Mp.shape[-1], self.tgt_M.shape[-1])
+        Mp, Mt = Mp[..., :m], self.tgt_M[..., :m]
+        out = {"env": float(100.0 * (1.0 - self._sc(Mt, Mp)))}
+        out.update(self.band_scores(Mt, Mp))
+        return out
 
     def _flux_stat(self, mdb: torch.Tensor, make_mask: bool = False):
         """**프레임별** 대역평균 변화율 `mean_k |Δ dB(t,k)|` — 세로 얼룩 그 자체.
@@ -3474,7 +3539,8 @@ class CopySynthFitter:
             with torch.no_grad():
                 loss, sc, env_sc, per = self.loss()
             return FitReport(float(100.0 * (1.0 - env_sc)), float(100.0 * (1.0 - sc)),
-                             self._last_db, per, float(loss), 0, [])
+                             self._last_db, per, float(loss), 0, [],
+                             dict(getattr(self, "_env_bands", {})))
         # **목적함수를 계단으로 바꾸지 않는다** (연속변형 / graduated non-convexity).
         # 위상 단계는 `phase_weight` 를 0 에서 3.0 으로 한 번에 올려 왔고, 그래서 §27 이
         # 적은 대로 **항상 한 번 꺾였다가 회복**한다 — 200 회로는 회복을 못 끝내
@@ -3597,7 +3663,8 @@ class CopySynthFitter:
             env, fine, db, lv, per = best[3]
         else:
             env = fine = db = lv = float("nan"); per = {}
-        return FitReport(env, fine, db, per, lv, len(hist), hist)
+        return FitReport(env, fine, db, per, lv, len(hist), hist,
+                         dict(getattr(self, "_env_bands", {})))
 
     def opt_params(self) -> list:
         """최적화 대상 전부. **한 군데서만 정의한다** — 예전에는 이 목록이 네 곳에
