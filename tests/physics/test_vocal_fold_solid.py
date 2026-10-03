@@ -1,5 +1,6 @@
 """Independent mechanics checks, not validation against human anatomy/audio."""
 from dataclasses import replace
+import warnings
 
 import numpy as np
 import pytest
@@ -52,6 +53,167 @@ def pressure(s, left=100, right=100):
 def total_energy(s):
     d = s.diagnostics()
     return d.kinetic_j + d.strain_j + d.contact_j
+
+
+def assert_same_state(a, b):
+    np.testing.assert_array_equal(a.positions_m, b.positions_m)
+    np.testing.assert_array_equal(a.velocities_m_s, b.velocities_m_s)
+    assert a.time_s == b.time_s
+    assert a.control == b.control
+    assert a.work == b.work
+    assert a.initial_mechanical_j == b.initial_mechanical_j
+    assert a.mesh_signature == b.mesh_signature
+
+
+def test_constant_nodal_force_all_axes_bilateral_work_and_no_persistence():
+    s = make_solid(contact=False, free=True)
+    accelerations = np.empty_like(s.positions_m)
+    accelerations[:s._offset] = [2.0, -3.0, 4.0]
+    accelerations[s._offset:] = [-5.0, 6.0, -7.0]
+    force = s.nodal_mass_kg[:, None] * accelerations
+    supplied = force.copy()
+    reported = s.forces(nodal_force_n=supplied)
+    supplied[:] = 0
+    np.testing.assert_array_equal(reported.applied_nodal_n, force)
+    np.testing.assert_allclose(reported.total_n - s.forces().total_n, force, atol=1e-20)
+    np.testing.assert_array_equal(s.forces().applied_nodal_n, 0)
+    assert s.recommend_timestep(nodal_force_n=force) == s.recommend_timestep()
+    before = s.save_state()
+    dt = 0.1 * s.recommend_timestep(nodal_force_n=force)
+    step = s.step(dt, nodal_force_n=force)
+    np.testing.assert_allclose(s.velocities_m_s, dt * accelerations, atol=1e-14, rtol=1e-12)
+    np.testing.assert_allclose(s.positions_m, before.positions_m + dt**2 * accelerations, atol=2e-18, rtol=0)
+    work = float(np.sum(force * (s.positions_m - before.positions_m)))
+    assert step.diagnostics.work.applied_nodal_j == pytest.approx(work, rel=1e-14, abs=1e-24)
+    d = step.diagnostics
+    expected_residual = (d.kinetic_j + d.strain_j + d.contact_j - before.initial_mechanical_j
+                         + d.work.viscous_dissipated_j + d.work.contact_dissipated_j
+                         - d.work.applied_nodal_j)
+    assert d.energy_balance_residual_j == pytest.approx(expected_residual, abs=1e-25)
+    velocity = s.velocities_m_s
+    s.step(dt)
+    assert s.diagnostics().work.applied_nodal_j == step.diagnostics.work.applied_nodal_j
+    np.testing.assert_array_equal(s.forces().applied_nodal_n, 0)
+    np.testing.assert_allclose(s.velocities_m_s, velocity, atol=2e-13, rtol=0)
+
+
+def test_nodal_work_on_moving_supports_is_not_double_counted():
+    meshes = []
+    for side in ("left", "right"):
+        mesh = nominal_fold_mesh(side, n_ap=2, n_si=1)
+        meshes.append(replace(mesh, anterior_support=np.ones_like(mesh.reference_m, dtype=bool),
+                              posterior_support=np.zeros_like(mesh.reference_m, dtype=bool),
+                              lateral_support=np.zeros_like(mesh.reference_m, dtype=bool)))
+    config = SolidConfig(*meshes, contact=ContactConfig(enabled=False))
+    unloaded, loaded = VocalFoldSolid(config), VocalFoldSolid(config)
+    left_delta, right_delta = (1e-7, -2e-7, 3e-7), (-2e-7, 1e-7, 2e-7)
+    control = BilateralControl(
+        FoldControl(anterior_displacement_m=left_delta, posterior_displacement_m=left_delta),
+        FoldControl(anterior_displacement_m=right_delta, posterior_displacement_m=right_delta))
+    force = np.random.default_rng(920).normal(size=loaded.positions_m.shape) * 1e-4
+    before = loaded.positions_m
+    baseline = unloaded.step(1e-4, control)
+    result = loaded.step(1e-4, control, nodal_force_n=force)
+    work = float(np.sum(force * (loaded.positions_m - before)))
+    np.testing.assert_array_equal(loaded.positions_m, unloaded.positions_m)
+    np.testing.assert_array_equal(loaded.velocities_m_s, unloaded.velocities_m_s)
+    np.testing.assert_allclose(result.support_reaction_n, baseline.support_reaction_n - force, atol=1e-16)
+    assert result.diagnostics.work.applied_nodal_j == pytest.approx(work, rel=1e-14)
+    assert result.diagnostics.work.support_j + work == pytest.approx(
+        baseline.diagnostics.work.support_j, rel=1e-13, abs=1e-22)
+    assert result.diagnostics.energy_balance_residual_j == pytest.approx(
+        baseline.diagnostics.energy_balance_residual_j, abs=1e-22)
+
+
+def test_nodal_force_in_pressure_fixed_point_exact_work_and_replay():
+    s = make_solid(n_ap=3, n_si=2, contact=False, free=True)
+    p = pressure(s, 0, 1000)
+    patch = PressurePatch("left", tuple(s.surface("left").triangles[1]), 2000)
+    force = s.nodal_mass_kg[:, None] * np.array([20.0, 0.0, -30.0])
+    initial_forces = s.forces(pressure=p, pressure_patches=(patch,), nodal_force_n=force)
+    before = s.save_state()
+    dt = 0.3 * s.recommend_timestep(pressure=p, pressure_patches=(patch,), nodal_force_n=force)
+    result = s.step(dt, pressure=p, pressure_patches=(patch,), nodal_force_n=force)
+    after = s.save_state()
+    mean_pressure_force = np.zeros_like(force)
+    for side, offset, values, sweep in (
+        ("left", 0, p.left_pa, result.left_sweep),
+        ("right", s._offset, p.right_pa, result.right_sweep),
+    ):
+        triangles = s.surface(side).triangles + offset
+        for k in range(3):
+            np.add.at(mean_pressure_force, triangles[:, k], -values[:, None] * sweep.mean_area_vectors_m2 / 3)
+    assert result.patch_sweep is not None
+    for k, node in enumerate(patch.triangle_nodes):
+        mean_pressure_force[node] -= patch.pressure_pa * result.patch_sweep.mean_area_vectors_m2[0] / 3
+    nonpressure = (initial_forces.passive_n + initial_forces.viscous_n + initial_forces.active_n
+                   + initial_forces.contact_n + force)
+    expected_velocity = before.velocities_m_s + dt * (nonpressure + mean_pressure_force) / s.nodal_mass_kg[:, None]
+    np.testing.assert_allclose(after.velocities_m_s, expected_velocity,
+                               atol=1.1 * s.config.pressure_tolerance_m / dt + 1e-12, rtol=0)
+    assert after.work.applied_nodal_j == pytest.approx(
+        float(np.sum(force * (after.positions_m - before.positions_m))), rel=1e-14, abs=1e-23)
+    pressure_work = (-p.left_pa @ result.left_sweep.outward_swept_volume_m3
+                     - p.right_pa @ result.right_sweep.outward_swept_volume_m3
+                     - patch.pressure_pa * result.patch_sweep.outward_swept_volume_m3[0])
+    assert after.work.pressure_j == pytest.approx(pressure_work, rel=1e-13, abs=1e-23)
+    s.reset(before)
+    s.step(dt, pressure=p, pressure_patches=(patch,), nodal_force_n=force)
+    assert_same_state(s.save_state(), after)
+    s.reset(after)
+    assert_same_state(s.save_state(), after)
+
+
+def test_signed_nodal_work_is_preserved_in_snapshots():
+    s = make_solid(contact=False, free=True)
+    velocity = np.tile([0.03, -0.02, 0.01], (len(s.positions_m), 1))
+    s.initialize(s.positions_m, velocity)
+    force = -10 * s.nodal_mass_kg[:, None] * velocity
+    before = s.positions_m
+    s.step(0.1 * s.recommend_timestep(), nodal_force_n=force)
+    assert s.diagnostics().work.applied_nodal_j < 0
+    assert s.diagnostics().work.applied_nodal_j == pytest.approx(np.sum(force * (s.positions_m - before)))
+    snapshot = s.save_state()
+    s.reset()
+    s.reset(snapshot)
+    assert_same_state(s.save_state(), snapshot)
+
+
+@pytest.mark.parametrize("method", ["forces", "recommend_timestep", "step"])
+@pytest.mark.parametrize("bad_kind", ["shape", "nan", "inf", "complex", "object"])
+def test_invalid_nodal_force_rejected_before_conversion_without_mutation(method, bad_kind):
+    s = make_solid()
+    shape = s.positions_m.shape
+    value = np.zeros(shape)
+    if bad_kind == "shape":
+        value = value[:, :2]
+    elif bad_kind in ("nan", "inf"):
+        value[0, 0] = float(bad_kind)
+    elif bad_kind == "complex":
+        value = value.astype(complex)
+        value[0, 0] = 1 + 2j
+    else:
+        value = np.full(shape, "not a force", dtype=object)
+    before = s.save_state()
+    with warnings.catch_warnings(record=True) as caught:
+        with pytest.raises(ValueError):
+            if method == "step":
+                s.step(1e-6, nodal_force_n=value)
+            else:
+                getattr(s, method)(nodal_force_n=value)
+    assert not caught
+    assert_same_state(s.save_state(), before)
+
+
+def test_rejected_nodal_loaded_step_preserves_existing_work_and_state():
+    s = make_solid(contact=False, free=True)
+    force = s.nodal_mass_kg[:, None] * np.array([2.0, -3.0, 4.0])
+    s.step(0.1 * s.recommend_timestep(), nodal_force_n=force)
+    before = s.save_state()
+    assert before.work.applied_nodal_j != 0
+    with pytest.raises(ValueError, match="stable"):
+        s.step(2 * s.recommend_timestep(), nodal_force_n=force)
+    assert_same_state(s.save_state(), before)
 
 
 def test_independent_mass_material_assembly_and_shared_interfaces():
@@ -273,13 +435,15 @@ def test_pressure_step_exact_swept_work_and_snapshot_replay():
     assert repeated.diagnostics.work.pressure_j == end.work.pressure_j
 
 
-def test_pressure_fixed_point_failure_is_atomic():
+@pytest.mark.parametrize("with_nodal_force", [False, True])
+def test_pressure_fixed_point_failure_is_atomic(with_nodal_force):
     template = make_solid(n_ap=3, n_si=2, contact=False)
     s = VocalFoldSolid(replace(template.config, pressure_max_iterations=1, pressure_tolerance_m=1e-25))
     p = pressure(s, 2000, 50)
+    nodal = s.nodal_mass_kg[:, None] * np.array([20.0, 0.0, 30.0]) if with_nodal_force else None
     start = s.save_state()
     with pytest.raises(ValueError, match="fixed point"):
-        s.step(s.recommend_timestep(pressure=p) * 0.3, pressure=p)
+        s.step(s.recommend_timestep(pressure=p) * 0.3, pressure=p, nodal_force_n=nodal)
     assert s.time_s == start.time_s
     assert s.save_state().work == start.work
     np.testing.assert_array_equal(s.positions_m, start.positions_m)

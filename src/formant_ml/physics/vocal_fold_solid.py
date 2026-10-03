@@ -58,6 +58,13 @@ the substep: Eulerian axial-band clipping/remapping belongs to the caller.
 Overlapping patches, or patches over nonzero whole-medial pressure, are
 rejected. Patch sweeps and whole-medial sweeps are alternative descriptions
 of the same moving wall; they must not be added when they overlap.
+An optional ``nodal_force_n`` is an explicitly supplied, constant-per-substep
+vector load [N], not pressure and not a persistent force or a material law.
+Its separate work ledger uses sum(force*actual nodal displacement), including
+constrained nodes. Support reactions account for it, without double counting.
+Such a dead load has zero tangent here. Callers supplying viscous fluid
+reaction forces own coupled stability, convergence and refinement, and heat
+accounting; this solver does not infer a damping law from a force sample.
 Cross-sections intersect these same current triangles with z=constant,
 integrating the positive lateral gap along AP, including its zero crossings.
 Unsupported overhangs or unequal AP coverage fail explicitly.
@@ -397,6 +404,7 @@ class WorkTotals:
     pressure_j: float = 0.0
     active_j: float = 0.0
     support_j: float = 0.0
+    applied_nodal_j: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -424,7 +432,11 @@ class SolidDiagnostics:
 
 @dataclass(frozen=True)
 class SolidForces:
-    """Global node ordering is all left nodes followed by all right nodes."""
+    """Global node ordering is all left nodes followed by all right nodes.
+
+    Solver results always include an owned ``applied_nodal_n`` array; its
+    default preserves construction of older six-field result objects.
+    """
 
     passive_n: np.ndarray
     viscous_n: np.ndarray
@@ -432,6 +444,7 @@ class SolidForces:
     pressure_n: np.ndarray
     contact_n: np.ndarray
     total_n: np.ndarray
+    applied_nodal_n: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -814,7 +827,18 @@ class VocalFoldSolid:
                              _tensor(np.concatenate(values)), _tensor(np.concatenate(weights)),
                              _tensor(np.concatenate(fractions)), counts)
 
-    def _evaluate(self, x, v, control, pressure):
+    def _nodal_force(self, value):
+        if value is None:
+            return torch.zeros_like(self._X)
+        force = _array("nodal_force_n", value, tuple(self._X.shape))
+        # _array rejects complex values before any real-valued conversion.
+        with np.errstate(over="ignore", invalid="ignore"):
+            force = force.astype(np.float64)
+        if not np.isfinite(force).all():
+            raise ValueError("nodal_force_n must be finite in float64 SI units")
+        return _tensor(force)
+
+    def _evaluate(self, x, v, control, pressure, nodal_force=None):
         F, Fdot, J = self._kinematics(x, v)
         if not torch.isfinite((self._mass[:, None] * v**2).sum()):
             raise ValueError("nonfinite kinetic energy")
@@ -825,8 +849,8 @@ class VocalFoldSolid:
         fp = triangle_pressure_forces(x, pressure.triangles, pressure.pressure,
                                       shape_weights=pressure.weights, area_fractions=pressure.fractions)
         fc, ec, pc = self._contact(x, v)
-        forces.extend((fp, fc))
-        if not all(torch.isfinite(f).all() for f in forces):
+        forces.extend((fp, fc, torch.zeros_like(x) if nodal_force is None else nodal_force))
+        if not all(torch.isfinite(f).all() for f in forces) or not torch.isfinite(sum(forces)).all():
             raise ValueError("nonfinite assembled force")
         values = (float((self._volume * energy).sum()), float(ec),
                   float((self._volume * power).sum()), float(pc), float(J.min()))
@@ -835,11 +859,17 @@ class VocalFoldSolid:
         return forces, values
 
     def forces(self, control: BilateralControl | None = None, pressure: MedialPressure | None = None,
-               *, pressure_patches: tuple[PressurePatch, ...] = ()) -> SolidForces:
-        """Instantaneous unconstrained forces (including reactions' opposite)."""
+               *, pressure_patches: tuple[PressurePatch, ...] = (),
+               nodal_force_n: np.ndarray | None = None) -> SolidForces:
+        """Unconstrained forces with a copied finite-real (Ntotal,3) nodal load.
+
+        ``nodal_force_n`` is applied only to this call; omission means zero.
+        It contributes to ``total_n`` and is not projected into pressure.
+        """
         control = self._control if control is None else self._checked_control(control)
-        f, _ = self._evaluate(self._x, self._v, control, self._pressure(pressure, pressure_patches))
-        return SolidForces(*(a.numpy().copy() for a in (*f, sum(f))))
+        applied = self._nodal_force(nodal_force_n)
+        f, _ = self._evaluate(self._x, self._v, control, self._pressure(pressure, pressure_patches), applied)
+        return SolidForces(*(a.numpy().copy() for a in (*f[:5], sum(f), f[5])))
 
     @staticmethod
     def _checked_control(control):
@@ -899,13 +929,18 @@ class VocalFoldSolid:
 
     def recommend_timestep(self, control: BilateralControl | None = None,
                            pressure: MedialPressure | None = None, *,
-                           pressure_patches: tuple[PressurePatch, ...] = ()) -> float:
+                           pressure_patches: tuple[PressurePatch, ...] = (),
+                           nodal_force_n: np.ndarray | None = None) -> float:
         """Local maximum step [s]; includes viscosity/contact and pressure.
 
         A changed support posture can tighten this bound once its prescribed
         velocity is known in ``step``. Use small continuous posture increments.
+        Nodal loads are validated but constant, so add no tangent here. Large
+        loads can still invalidate the endpoint; caller-supplied viscous load
+        laws require external coupled stability/convergence/refinement checks.
         """
         control = self._control if control is None else self._checked_control(control)
+        self._nodal_force(nodal_force_n)
         return self._timestep(self._x, self._v, control, self._pressure(pressure, pressure_patches))
 
     def _targets(self, control):
@@ -942,7 +977,7 @@ class VocalFoldSolid:
                         raise ValueError("nonpositive deformation Jacobian along nodal trajectory")
 
     def _pressure_advance(self, dt, velocity, targets, forces, pressure):
-        other = sum(forces[:3]) + forces[4]
+        other = sum(forces[:3]) + sum(forces[4:])
 
         def advance(fp):
             v = velocity + dt * (other + fp) / self._mass[:, None]
@@ -970,14 +1005,18 @@ class VocalFoldSolid:
 
     def step(self, dt_s: float, control: BilateralControl | None = None,
              pressure: MedialPressure | None = None, *,
-             pressure_patches: tuple[PressurePatch, ...] = ()) -> SolidStep:
+             pressure_patches: tuple[PressurePatch, ...] = (),
+             nodal_force_n: np.ndarray | None = None) -> SolidStep:
         """Advance atomically; controls persist, omitted loads are zero.
 
         ``patch_sweep`` follows patch input order, using barycentric vertices
         held fixed for this step. It is not an Eulerian-band remapping rule.
+        ``nodal_force_n`` is copied, held constant for this step only and
+        included in ``work.applied_nodal_j`` as force dot actual displacement.
         """
         _finite("dt_s", dt_s, minimum=0, strict=True)
         control = self._control if control is None else self._checked_control(control)
+        applied = self._nodal_force(nodal_force_n)
         pressure = self._pressure(pressure, pressure_patches)
         targets = self._targets(control)
         velocity = self._v.clone()
@@ -985,11 +1024,11 @@ class VocalFoldSolid:
         limit = self._timestep(self._x, velocity, control, pressure)
         if dt_s > limit * (1 + 1e-12):
             raise ValueError(f"dt_s={dt_s:g} exceeds local stable recommendation {limit:g}")
-        f, values = self._evaluate(self._x, velocity, control, pressure)
+        f, values = self._evaluate(self._x, velocity, control, pressure, applied)
         new_x, new_v, f[3], sweeps, iterations, residual = self._pressure_advance(
             dt_s, velocity, targets, f, pressure)
         self._check_path(self._x, new_x)
-        _, endpoint = self._evaluate(new_x, new_v, control, pressure)
+        _, endpoint = self._evaluate(new_x, new_v, control, pressure, applied)
         endpoint_limit = self._timestep(new_x, new_v, control, pressure)
         if dt_s > endpoint_limit * (1 + 1e-12):
             raise ValueError(f"candidate tightens stable recommendation to {endpoint_limit:g}; retry smaller dt")
@@ -1003,7 +1042,8 @@ class VocalFoldSolid:
                           old.contact_dissipated_j + dt_s * values[3],
                           old.pressure_j + float((f[3] * dx).sum()),
                           old.active_j + float((f[2] * dx).sum()),
-                          old.support_j + float(support_work))
+                          old.support_j + float(support_work),
+                          old.applied_nodal_j + float((f[5] * dx).sum()))
         if not all(np.isfinite(getattr(work, k)) for k in WorkTotals.__dataclass_fields__):
             raise ValueError("nonfinite accumulated work")
         _finite("next time", self.time_s + dt_s)
@@ -1022,7 +1062,7 @@ class VocalFoldSolid:
         w = self._work
         residual = (kinetic + strain + contact - self._initial_energy
                     + w.viscous_dissipated_j + w.contact_dissipated_j
-                    - w.pressure_j - w.active_j - w.support_j)
+                    - w.pressure_j - w.active_j - w.support_j - w.applied_nodal_j)
         return SolidDiagnostics(kinetic, strain, contact, viscous, contact_power, minj, w, residual)
 
     def diagnostics(self) -> SolidDiagnostics:
