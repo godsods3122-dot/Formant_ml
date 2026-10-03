@@ -949,6 +949,14 @@ PSUB_PRIOR_NU = 3.0
 #: 떨림 문턱(KWF_n3: 화자 상수를 생리 범위로 자른 뒤 고음 문턱 8–15)과 고역 밝기를 메운 것이다. 켜면 제어 범위의 상한을 이 값으로 바꾸고, 출발
 #: 판의 폐압 곡선은 0.95 × 상한 위만 잘라 시그모이드 끝에 붙어 기울기를 잃지 않게 한다.
 PSUB_MAX = None
+#: **음원 손잡이의 범위 — 단단히** (§52.536, `copyfit --src-bounds`). 사용자: *"성대 주기문제, 생리 수준을 과도한 무브먼트 문제를 명확히 해결해야 할 거야.
+#: 범위 제한, 손실함수 조정을 해봐"*. `yang_00000000` 0.451–3.271 s 를 `recipes/base.argv` 로 맞춘 판(`out/fit1`)의 유성 틀에서 `voice_gain` 이
+#: −17 … +20 dB, `tilt` 가 −11.8 … +11.9 dB/oct (8.7 % 가 상한 +12 에 붙음), `rd_offset` 이 ±1.5 의 양 끝까지 갔다 — 폐압 13 cmH2O(대화의 두 배)로
+#: 밝힌 고역을 기울기로 다시 깎는 퇴화 쌍이다. 아래 값은 **모형의 선택**이다: `voice_gain` ±12 dB (진폭 4 배), `tilt` 는 분석 기본 +2 dB/oct 에서 ±6,
+#: `rd_offset` ±1.0. 인체 측정 범위를 옮긴 것이 아니다. 켜면 그 열의 제어 범위를 바꾸고, 출발 판은 새 범위의 양 끝 2.5 % 안으로 눌러 넣는다
+#: (`PSUB_MAX` 와 같은 까닭 — 시그모이드 끝에 붙으면 기울기를 잃는다).
+SRC_BOUNDS: dict[str, tuple[float, float]] = {}
+SRC_BOUNDS_DEFAULT = {"voice_gain": (-12.0, 12.0), "tilt": (-4.0, 8.0), "rd_offset": (-1.0, 1.0)}
 SIB_PRIOR_W = 0.0
 SIB_AC_MU = math.log(0.10)
 SIB_AC_S = 0.5
@@ -1148,6 +1156,17 @@ FORMANT_PRIOR_S = 0.10
 FORMANT_PRIOR_STEP = 2
 SHIM_PRIOR_MS = 8.0
 SHIM_PRIOR_S = 0.5
+#: **음원 손잡이의 빠른 요동 사전** (`CopySynthFitter.src_move_loss`, §52.536, `copyfit --src-move W`) — 0 이면 끈다. 시머 사전을 음원 손잡이 전부로
+#: 넓힌 것이다. 각 열에서 σ `SRC_MOVE_MS` 가우시안 추세를 뺀 빠른 몫에 스튜던트 t(ν `SRC_MOVE_NU`, 눈금 `SRC_MOVE_SCALE`), 유성 틀 평균의 합.
+#: `out/fit1` 의 빠른 몫 rms: `voice_gain` 1.18 dB (상위 1 % ±4.1 dB) — 같은 판의 Praat 시머 apq5 3.81 % 대 원본 2.44 %, HNR 16.4 대 19.1 dB.
+#: 적합기가 원본의 주기별 우연을 음원 이득으로 쫓은 것이다. `voice_gain` 눈금 0.35 dB 는 MDVP 의 시머 문턱이다. 나머지 눈금은 모형의 선택이다 —
+#: 음원 기울기·Rd·폐압·성도 이득은 발성 노력·호흡이라 한 주기(3 ms) 안에서 튀지 않는다. 느린 음절 윤곽은 벌하지 않고, t 분포라 실제 개시·정지의
+#: 큰 도약은 로그로만 문다. 성도 이득은 폐쇄 감쇠를 쥐므로 유성 틀만 본다.
+SRC_MOVE_W = 0.0
+SRC_MOVE_MS = 8.0
+SRC_MOVE_NU = 3.0
+SRC_MOVE_SCALE = {"voice_gain": 0.35, "tilt": 0.3, "rd_offset": 0.04, "p_sub": 0.02, "tract_gain": 0.05}
+SRC_MOVE_LOG = frozenset(("p_sub", "tract_gain"))
 WAVE_LO = 80.0
 WAVE_HI = 1500.0
 TOUR_GLOBAL_ITERS = 60
@@ -2467,6 +2486,13 @@ PARAM_TAU_MS: dict[str, float] = {}
 #: 로 펴면 +3.9 / +3.3 dB 로 내려갔다(`out/_tmp/ablate.py`). 20 ms 층의 가우시안 대응은 σ ≈ 0.45 × 20 ms
 #: (20 Hz 에서 −5 dB, 40 Hz 에서 −22 dB). 폐쇄·개방 시각을 쥔 `BASE_SMOOTH_KEEP` 은 거르지 않는다.
 BASE_SMOOTH = 0.0
+#: **출발점을 생리 시상수로 거른다** (§52.536, `copyfit --base-tau`). `BASE_SMOOTH` 는 `MOTION_SLOW` 의 열만 보는데, 기본 조리법에서 출발점의
+#: 빠른 흔들림은 그 밖의 열에 있었다 — `out/fit1/init` (반복 0) 의 생리 모서리 두 배 위 에너지 몫: `p_sub` 7.6 %, `bw1–4` 2.6–6.1 %,
+#: `rd_offset` 4.1 %, `tension` 4.0 %, `adduction` 3.3 %. 보정분은 `PARAM_TAU_MS` 로 걸러지지만 출발점은 그대로 지나가 적합 판에 남는다.
+#: 여기 적힌 열의 출발점을 `PARAM_TAU_PHYS` 의 같은 σ 로 거른다. 관측이 빠른 틀(`_fast_obs_mask`)은 지킨다. 폐쇄·개방 시각을 쥔 `a_c`·
+#: `oral_open`·`tract_gain` 과 `f0_target`, 포먼트 자리는 거르지 않는다.
+BASE_TAU = False
+BASE_TAU_PARAMS = ("bw1", "bw2", "bw3", "bw4", "p_sub", "rd_offset", "tension", "adduction")
 
 #: 마찰 소스 고역 절벽(`FricationNoise.log_lp_ratio`, 정점의 1.6~6.4 배)을 파일 전역으로 적합한다.
 #: 그동안 "적합기가 건드리지 않는 내부값" 이었다 — 그러면 치찰음 12~19 kHz 수준을 폐압·협착(제트 속도)
@@ -3007,6 +3033,16 @@ class CopySynthFitter:
             self.track.values[:, ip] = np.minimum(v, k)
             print(f"  말소리 폐압 상한 {PSUB_MAX:g} cmH2O (단단히): 출발 판 폐압 상한 넘은 틀 {n_over} 개를 눌렀다 "
                   f"(중앙 {np.median(v[v > 1]):.1f} → {np.median(self.track.values[:, ip][v > 1]):.1f})", flush=True)
+        for nm, (lo, hi) in SRC_BOUNDS.items():
+            sp = PARAMS[nm]
+            if not (sp.lo <= lo < hi <= sp.hi) or sp.log:
+                raise ValueError(f"Source bound for {nm} must narrow its linear control range {sp.lo}..{sp.hi}: {(lo, hi)}")
+            i = INDEX[nm]
+            m = 0.025 * (hi - lo)
+            v = self.track.values[:, i]
+            n_out = int(((v < lo + m) | (v > hi - m)).sum())
+            self.track.values[:, i] = np.clip(v, lo + m, hi - m)
+            print(f"  음원 범위 {nm} [{lo:g}, {hi:g}] (단단히): 출발 판 {n_out} 틀을 안으로 눌렀다", flush=True)
         base = torch.as_tensor(self.track.values, dtype=torch.float64, device=device)
         self.base = base
         self.names = [p for p in params
@@ -3016,6 +3052,10 @@ class CopySynthFitter:
         if PSUB_MAX is not None:
             import dataclasses as _dcp
             self.specs = [(_dcp.replace(sp, hi=float(PSUB_MAX)) if nm == "p_sub" else sp) for nm, sp in zip(self.names, self.specs)]
+        if SRC_BOUNDS:
+            import dataclasses as _dcs
+            self.specs = [(_dcs.replace(sp, lo=float(SRC_BOUNDS[nm][0]), hi=float(SRC_BOUNDS[nm][1])) if nm in SRC_BOUNDS else sp)
+                          for nm, sp in zip(self.names, self.specs)]
         bands = FORMANT_BAND if formant_band is None else formant_band
         if bands:
             # **포먼트마다 제 구역을 준다** (MEASUREMENTS §51.38).
@@ -3030,6 +3070,8 @@ class CopySynthFitter:
                           for p, sp in zip(self.names, self.specs)], 1)
         if MOTION and BASE_SMOOTH > 0.0 and MOTION_SLOW:
             u0 = self._smooth_base(u0)
+        if BASE_TAU:
+            u0 = self._smooth_base_tau(u0)
         self.u0 = u0.detach()
         self.scale = torch.tensor([STEP.get(n, STEP_DEFAULT) for n in self.names],
                                   dtype=torch.float64, device=device)
@@ -3273,6 +3315,27 @@ class CopySynthFitter:
             sm = torch.nn.functional.conv1d(x, ker)[0, 0]
             keep = self._fast_obs_mask(u0.shape[0], u0.dtype, u0.device)
             out[:, i] = sm * (1.0 - keep) + u0[:, i] * keep
+        return out
+
+    def _smooth_base_tau(self, u0: torch.Tensor) -> torch.Tensor:
+        """`BASE_TAU_PARAMS` 열의 출발점을 `PARAM_TAU_PHYS` 의 σ 로 가우시안 저역통과 (끝은 복제). 관측이 빠른 틀은 그대로 둔다."""
+        fm = float(self.track.frame_ms)
+        out = u0.clone()
+        keep = self._fast_obs_mask(u0.shape[0], u0.dtype, u0.device)
+        done = []
+        for i, n in enumerate(self.names):
+            if n not in BASE_TAU_PARAMS:
+                continue
+            sig = PARAM_TAU_PHYS.get(n, PARAM_TAU_PHYS_DEFAULT) / fm
+            half = max(1, int(math.ceil(3.0 * sig)))
+            t = torch.arange(-half, half + 1, dtype=u0.dtype, device=u0.device)
+            ker = torch.exp(-0.5 * (t / sig) ** 2)
+            ker = (ker / ker.sum()).view(1, 1, -1)
+            x = torch.nn.functional.pad(u0[:, i].view(1, 1, -1), (half, half), mode="replicate")
+            sm = torch.nn.functional.conv1d(x, ker)[0, 0]
+            out[:, i] = sm * (1.0 - keep) + u0[:, i] * keep
+            done.append(n)
+        print(f"  출발점 생리 평활 (BASE_TAU): {', '.join(done) or '없음'}", flush=True)
         return out
 
     def _build_events(self, device) -> None:
@@ -5522,6 +5585,36 @@ class CopySynthFitter:
         mk = self._sp_mask
         return nll[mk].mean() if bool(mk.any()) else nll.mean() * 0.0
 
+    def src_move_loss(self, c: torch.Tensor) -> torch.Tensor:
+        """음원 손잡이의 빠른 요동 사전 (`SRC_MOVE_W`, §52.536) — 열마다 σ `SRC_MOVE_MS` 가우시안 추세를 뺀 몫에 스튜던트 t(ν `SRC_MOVE_NU`,
+        눈금 `SRC_MOVE_SCALE`), 유성 틀 평균을 열끼리 더한다. 진행 줄에는 t 의 99 분위(|z| > 4.54) 밖 틀의 몫을 찍는다."""
+        names = [n for n in SRC_MOVE_SCALE if n in INDEX]
+        if getattr(self, "_sm_ker", None) is None or self._sm_ker.device != c.device or self._sm_ker.dtype != c.dtype:
+            sg = max(1.0, SRC_MOVE_MS / float(self.track.frame_ms))
+            k = torch.arange(-int(3 * sg), int(3 * sg) + 1, dtype=c.dtype, device=c.device)
+            g = torch.exp(-0.5 * (k / sg) ** 2)
+            self._sm_ker = (g / g.sum()).view(1, 1, -1)
+            voi = np.asarray(getattr(self.track, "voiced", np.zeros(0, dtype=bool)), bool)
+            m = np.zeros(c.shape[1], bool)
+            m[:min(voi.size, m.size)] = voi[:m.size]
+            self._sm_mask = torch.as_tensor(m, device=c.device)
+            self._sm_scale = torch.tensor([SRC_MOVE_SCALE[n] for n in names], dtype=c.dtype, device=c.device)
+            print(f"  음원 요동 사전: 유성 틀 {int(m.sum())} 개, σ {SRC_MOVE_MS:g} ms 추세 제거, t(ν={SRC_MOVE_NU:g}) 눈금 "
+                  + ", ".join(f"{n} {SRC_MOVE_SCALE[n]:g}" for n in names), flush=True)
+        mk = self._sm_mask[: c.shape[1]]
+        if not names or not bool(mk.any()):
+            self._last_srcmove = None
+            return torch.zeros((), dtype=c.dtype, device=c.device)
+        x = torch.stack([torch.log(c[0, :, INDEX[n]].clamp_min(1e-3)) if n in SRC_MOVE_LOG else c[0, :, INDEX[n]]
+                         for n in names], 0).unsqueeze(1)                   # (P, 1, T)
+        h = self._sm_ker.shape[-1] // 2
+        tr = torch.nn.functional.conv1d(torch.nn.functional.pad(x, (h, h), mode="replicate"), self._sm_ker)
+        z = (x - tr)[:, 0] / self._sm_scale[:, None]                         # (P, T)
+        nll = torch.log1p(z * z / SRC_MOVE_NU) * (SRC_MOVE_NU + 1.0) / 2.0
+        with torch.no_grad():
+            self._last_srcmove = {n: float((z[j, mk].abs() > 4.54).double().mean()) for j, n in enumerate(names)}
+        return nll[:, mk].mean(1).sum()
+
     def ga_loss(self, ga: torch.Tensor) -> torch.Tensor:
         """성문 역산 항 (`GA_W`) — 주기 창 평균·RMS 의 상대 제곱 오차, 유성 구간."""
         import torch.nn.functional as F
@@ -6153,6 +6246,8 @@ class CopySynthFitter:
             add("fprior", FORMANT_PRIOR_W, self.formant_prior_loss(self._last_ctrl))
         if SHIM_PRIOR_W > 0.0 and getattr(self, "_last_ctrl", None) is not None:
             add("vprior", SHIM_PRIOR_W, self.shimmer_prior_loss(self._last_ctrl))
+        if SRC_MOVE_W > 0.0 and getattr(self, "_last_ctrl", None) is not None:
+            add("smove", SRC_MOVE_W, self.src_move_loss(self._last_ctrl))
         if RELEASE_PRIOR_W > 0.0 and getattr(self, "rel_log_r", None) is not None:
             add("rprior", RELEASE_PRIOR_W, self.release_prior_loss())
         if self.lam_l1 > 0:
@@ -6521,6 +6616,8 @@ class CopySynthFitter:
                       + ("".join(f"초과{k[:3]} {v * 100:.2f}%  " for k, v in self._last_mprior.items())
                          if getattr(self, "_last_mprior", None) else "")
                       + (f"내전사전밖 {self._last_aprior * 100:.1f}%  " if getattr(self, "_last_aprior", None) is not None else "")
+                      + ("".join(f"요동{k[:4]} {v * 100:.1f}%  " for k, v in self._last_srcmove.items())
+                         if getattr(self, "_last_srcmove", None) else "")
                       + (f"치찰협착 {self._last_sprior:.3f}cm²  " if getattr(self, "_last_sprior", None) is not None else "")
                       + (f"MVF {self._last_mvf:.0f}Hz  " if getattr(self, "_last_mvf", None) is not None else "")
                       + ("개방 " + "/".join(f"{v:.0f}" for v in torch.exp(self.rel_log_r).tolist()) + "cm²/s  "

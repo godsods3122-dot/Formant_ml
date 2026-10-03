@@ -322,6 +322,13 @@ def main() -> None:
     ap.add_argument("--psub-prior", type=float, default=None, metavar="W",
                     help="폐압의 생리 사전 무게 (fit.PSUB_PRIOR_W, §52.487): 말소리 틀의 log 폐압에 스튜던트 t — 중앙 7 cmH2O, 90 %% 약 4–13. "
                          "이어 적합(--prior-w 0)이 분석값 묶음을 풀면 폐압이 이득과 겹치는 방향으로 17–20 cmH2O 까지 부풀었다")
+    ap.add_argument("--src-move", type=float, default=None, metavar="W",
+                    help="음원 손잡이의 빠른 요동 사전 무게 (fit.SRC_MOVE_W, §52.536): voice_gain·tilt·rd_offset·폐압·성도 이득의 8 ms 추세를 뺀 몫에 "
+                         "스튜던트 t (voice_gain 눈금 0.35 dB = MDVP 시머 문턱), 유성 틀만")
+    ap.add_argument("--src-bounds", action="store_true",
+                    help="음원 손잡이 범위를 단단히 (fit.SRC_BOUNDS_DEFAULT, §52.536): voice_gain ±12 dB, tilt −4…+8 dB/oct, rd_offset ±1.0 — 모형의 선택")
+    ap.add_argument("--base-tau", action="store_true",
+                    help="분석 출발점도 생리 시상수로 거른다 (fit.BASE_TAU, §52.536): 대역폭·폐압·Rd·긴장·내전 열, 관측이 빠른 틀은 지킨다")
     ap.add_argument("--larynx", action="store_true",
                     help="후두 구조 (voice_td.LARYNX, §52.489, --td 와 함께): 좌우 이상와 + 후두실 곁관, 가성대 좁힘(쉼 틈 화자 상수 + 내전 제어 ff_add)")
     ap.add_argument("--nose", choices=("default", "vtl"), default="default",
@@ -634,6 +641,12 @@ def main() -> None:
         _vce.TUBE_AC = True
     if a.psub_prior is not None:
         _fit.PSUB_PRIOR_W = float(a.psub_prior)
+    if a.src_move is not None:
+        _fit.SRC_MOVE_W = float(a.src_move)
+    if a.src_bounds:
+        _fit.SRC_BOUNDS = dict(_fit.SRC_BOUNDS_DEFAULT)
+    if a.base_tau:
+        _fit.BASE_TAU = True
     if a.td and a.glottis == "vf":
         from formant_ml.engine import voice_td as _vtdg
         _vtdg.GLOTTIS = "vf"
