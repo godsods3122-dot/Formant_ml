@@ -5653,7 +5653,7 @@ class CopySynthFitter:
         from . import voice_td as vt
         tot = torch.zeros((), dtype=torch.float64, device=tdp.log_ns_len.device)
         for k, (lo, hi) in VF_NS_ANAT.items():
-            if f"td_log_ns_{k}" in self.locked_constants:
+            if f"td_log_ns_{k}" in getattr(self, "locked_constants", ()):
                 continue
             if vt.VF_NS_HARD and k in vt.VF_NS_HARD:
                 hlo, hhi = vt.VF_NS_HARD[k]
