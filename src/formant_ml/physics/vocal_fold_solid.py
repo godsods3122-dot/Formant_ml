@@ -8,6 +8,8 @@ Constitutive assumptions
 -----------------------
 The matrix uses the compressible Neo-Hookean energy already used by
 ``softtissue``: mu/2*(F:F-3)-mu*log(J)+lambda/2*log(J)**2.
+Its equivalent principal-stretch form is evaluated without cancellation near
+rigid rotations; the first-Piola stress law is unchanged.
 Finite bulk modulus approximates incompressibility. Linear displacement tets
 can volumetrically lock; refinement and a future mixed formulation are needed
 before claiming quantitatively converged near-incompressible human mechanics.
@@ -622,6 +624,8 @@ class VocalFoldSolid:
             name: _tensor([getattr(self.config.materials[i], name) for i in self._ids])
             for name in SolidMaterial.__dataclass_fields__
         }
+        self._energy_roundoff_j = (64 * torch.finfo(self._X.dtype).eps
+                                   * float((self._volume * self._parameters["matrix_mu_pa"]).sum()))
         self._mass = torch.zeros(len(self._X), dtype=torch.float64)
         self._mass.index_add_(0, self._t.flatten(),
                               (self._parameters["density_kg_m3"] * self._volume / 4).repeat_interleave(4))
@@ -698,7 +702,14 @@ class VocalFoldSolid:
         mu = p["matrix_mu_pa"]
         lam = p["matrix_bulk_pa"] - 2 * mu / 3
         passive = mu[:, None, None] * (F - inverse_t) + (lam * logj)[:, None, None] * inverse_t
-        energy = 0.5 * mu * ((F * F).sum((1, 2)) - 3) - mu * logj + 0.5 * lam * logj**2
+        log_stretches2 = 2 * torch.log(torch.linalg.svdvals(F))
+        # expm1(t)-t is nonnegative; the series avoids subtracting equal terms.
+        t = log_stretches2
+        matrix_remainder = torch.where(
+            torch.abs(t) < 1e-3,
+            t**2 * (0.5 + t * (1 / 6 + t * (1 / 24 + t * (1 / 120 + t / 720)))),
+            torch.expm1(t) - t)
+        energy = 0.5 * mu * matrix_remainder.sum(1) + 0.5 * lam * logj**2
         b = (F @ self._fib[:, :, None]).squeeze(2)
         stretch = torch.linalg.norm(b, dim=1)
         q = torch.clamp_min(stretch - 1, 0)
@@ -1038,7 +1049,13 @@ class VocalFoldSolid:
         self._initial_energy = diagnostics.kinetic_j + diagnostics.strain_j + diagnostics.contact_j
 
     def reset(self, state: SolidState | None = None) -> None:
-        """Reset to rest or restore a snapshot, validating it before mutation."""
+        """Reset to rest or restore a snapshot, validating it before mutation.
+
+        Historical energy baselines may be negative within 64*eps*sum(mu*V0)
+        joules from cancellation near a rigid rotation. Such roundoff-sized
+        baselines are preserved exactly, not zeroed or applied to stress/J.
+        Materially negative baselines are invalid.
+        """
         if state is None:
             x, v, control, work, time = self._X.clone(), torch.zeros_like(self._X), BilateralControl(), WorkTotals(), 0.0
             initial = None
@@ -1049,7 +1066,7 @@ class VocalFoldSolid:
             v = _tensor(_array("velocities_m_s", state.velocities_m_s, tuple(self._X.shape)))
             control = self._checked_control(state.control)
             _finite("time_s", state.time_s, minimum=0)
-            _finite("initial_mechanical_j", state.initial_mechanical_j, minimum=0)
+            _finite("initial_mechanical_j", state.initial_mechanical_j, minimum=-self._energy_roundoff_j)
             if not isinstance(state.work, WorkTotals):
                 raise ValueError("state work must be WorkTotals")
             for name in WorkTotals.__dataclass_fields__:
