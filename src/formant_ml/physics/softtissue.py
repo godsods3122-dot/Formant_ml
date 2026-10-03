@@ -53,6 +53,31 @@ class Body:
     meta: dict = field(default_factory=dict)
 
 
+def tetrahedral_nodal_forces(P, volume, reference_inverse, tets, n_nodes):
+    """Assemble first-Piola stresses [Pa] into nodal forces [N] (SI tensors)."""
+    H = -volume[:, None, None] * P @ reference_inverse.transpose(1, 2)
+    force = P.new_zeros((n_nodes, 3))
+    for k in range(3):
+        force.index_add_(0, tets[:, k + 1], H[:, :, k])
+    force.index_add_(0, tets[:, 0], -H.sum(2))
+    return force
+
+
+def triangle_area_vectors(x, triangles):
+    """Current oriented triangle area vectors [m²]; winding defines outward."""
+    a, b, c = x[triangles[:, 0]], x[triangles[:, 1]], x[triangles[:, 2]]
+    return 0.5 * torch.cross(b - a, c - a, dim=1)
+
+
+def triangle_pressure_forces(x, triangles, pressure):
+    """Consistent constant-pressure traction: inward positive, [Pa] -> [N]."""
+    force = torch.zeros_like(x)
+    nodal = -(pressure[:, None] * triangle_area_vectors(x, triangles)) / 3.0
+    for k in range(3):
+        force.index_add_(0, triangles[:, k], nodal)
+    return force
+
+
 class FEM:
     """여러 몸을 한꺼번에 (마디를 이어 붙여 한 배열로). 접촉 쌍은 같은 수의 마디 목록 두 개 (같은 매개 격자 위 짝)."""
 
@@ -139,15 +164,9 @@ class FEM:
             lf = torch.linalg.norm(Fd_, dim=1).clamp_min(1e-6)
             sa = a * self.sigma_max * torch.exp(-((lf - 1.0) / 0.45) ** 2)
             P = P + (sa / lf)[:, None, None] * Fd_[:, :, None] * self.fiber[:, None, :]
-        H = -self.V0[:, None, None] * P @ self.Dm_inv.transpose(1, 2)                        # (M,3,3) 열 = 마디 1..3 힘
-        f = torch.zeros_like(x)
-        f.index_add_(0, self.tets[:, 1], H[:, :, 0])
-        f.index_add_(0, self.tets[:, 2], H[:, :, 1])
-        f.index_add_(0, self.tets[:, 3], H[:, :, 2])
-        f.index_add_(0, self.tets[:, 0], -H.sum(2))
+        f = tetrahedral_nodal_forces(P, self.V0, self.Dm_inv, self.tets, self.N)
         if p_surf is not None and self.surf is not None:
-            a_, b_, c_ = x[self.surf[:, 0]], x[self.surf[:, 1]], x[self.surf[:, 2]]
-            nA = 0.5 * torch.cross(b_ - a_, c_ - a_, dim=1)                                  # 넓이 × 바깥 법선
+            nA = triangle_area_vectors(x, self.surf)
             fs = -(p_surf[:, None] * nA) / 3.0
             for k in range(3):
                 f.index_add_(0, self.surf[:, k], fs)
