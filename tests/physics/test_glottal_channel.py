@@ -227,3 +227,45 @@ def test_reference_cavity_size_changes_trapped_pressure_without_any_leak():
         assert channel.diagnostics()["mass_kg"].sum() == pytest.approx(initial_mass)
         pressures.append(pressure)
     assert pressures[0] > pressures[1]
+
+
+def test_closed_pockets_with_nonzero_momentum_are_independent():
+    outputs = []
+    for left_volume_scale in (1.0, 1.02, 0.98):
+        geometry = chamber(gap=0, pocket=1e-3, cells=2, length=2e-3)
+        channel = GlottalChannel(geometry, velocity_m_s=np.array([[0., 20., 0.]]))
+        volume = geometry.storage_volume_m3.copy()
+        volume[0, 0] *= left_volume_scale
+        step = channel.advance(
+            1e-7, Reservoir(0), Reservoir(0),
+            geometry=replace(geometry, storage_volume_m3=volume),
+        )
+        state = channel.snapshot()
+        outputs.append((
+            channel.diagnostics()["pressure_pa"][0, 1],
+            state.mass_kg[0, 1], state.energy_j[0, 1],
+            state.momentum_kg_m_s[0, 1].copy(),
+        ))
+        assert np.max(np.abs(step.momentum_residual_kg_m_s)) < 1e-20
+    for pressure, mass, energy, momentum in outputs[1:]:
+        assert pressure == pytest.approx(outputs[0][0], abs=1e-8)
+        assert mass == outputs[0][1]
+        assert energy == pytest.approx(outputs[0][2], abs=5e-18)
+        np.testing.assert_allclose(momentum, outputs[0][3], atol=1e-20, rtol=0)
+
+
+def test_closing_and_reopening_do_not_delete_one_sided_momentum():
+    opened = chamber(gap=1e-3, cells=2, length=2e-3)
+    closed = replace(opened, open_area_m2=np.zeros((1, 3)), face_gap_m=np.zeros((1, 3)))
+    channel = GlottalChannel(opened, velocity_m_s=np.array([[0., 0.02, 0.]]))
+    for geometry in (closed, closed, opened):
+        before = channel.snapshot()
+        step = channel.advance(1e-8, Reservoir(0), Reservoir(0), geometry=geometry)
+        after = channel.snapshot()
+        assert np.linalg.norm(after.momentum_kg_m_s) > 0
+        change = (after.momentum_kg_m_s - before.momentum_kg_m_s).sum(axis=(1, 2))
+        np.testing.assert_allclose(
+            change, step.input_impulse_n_s - step.wall_impulse_n_s,
+            atol=1e-21, rtol=1e-8,
+        )
+        assert abs(step.energy_residual_j) < 1e-17

@@ -5,8 +5,9 @@ total gas energy are retained, including behind a fully closed throat. Storage
 geometry and conductive aperture are deliberately different inputs. A residual
 cavity must be supplied as geometry, not inferred from a numerical area floor.
 
-Mass and total energy occupy cells; axial momentum occupies staggered dual
-volumes. The axial cuts are fixed in the laboratory frame. Moving sidewall volume must
+Mass and total energy occupy cells. Each cell owns two half-cell axial momenta;
+no kinetic state is shared across a closed face. The axial cuts are fixed in the
+laboratory frame. Moving sidewall volume must
 come from a closed geometric construction. This module does not manufacture
 that construction from a vocal-fold gap profile.
 
@@ -165,6 +166,9 @@ class ChannelStep:
     outlet_mass_kg_s: np.ndarray
     inlet_temperature_k: np.ndarray
     outlet_temperature_k: np.ndarray
+    input_impulse_n_s: np.ndarray
+    wall_impulse_n_s: np.ndarray
+    momentum_residual_kg_m_s: np.ndarray
     wall_pressure_pa: np.ndarray
     wall_work_j: float
     inlet_pressure_work_j: float
@@ -195,16 +199,19 @@ class GlottalChannel:
         T = self._temperature if temperature_k is None else float(temperature_k)
         reservoir = Reservoir(float(pressure_pa), T)
         rho = (air.P_ATM + reservoir.pressure_pa) / (self._R * T)
-        velocity = np.broadcast_to(
-            np.asarray(velocity_m_s, float), geometry.open_area_m2.shape
-        )
+        supplied_velocity = np.asarray(velocity_m_s, float)
+        if supplied_velocity.shape == geometry.shape + (2,):
+            velocity = supplied_velocity
+        else:
+            face_velocity = np.broadcast_to(supplied_velocity, geometry.open_area_m2.shape)
+            velocity = np.stack((face_velocity[:, :-1], face_velocity[:, 1:]), axis=-1)
         if not np.isfinite(velocity).all():
             raise ValueError("initial gas velocity must be finite")
         c = math.sqrt(self._gamma * self._R * T)
         if np.any(np.abs(velocity) > self.config.max_mach * c):
             raise ValueError("initial velocity exceeds low-Mach validity")
         self._mass = rho * geometry.storage_volume_m3
-        self._momentum = self._dual_mass(self._mass) * velocity
+        self._momentum = self._mass[..., None] * velocity / 2
         self._energy = self._mass * self._cv * T + self._kinetic(self._mass, velocity)
         self.time_s = 0.0
         self.input_mass_kg = 0.0
@@ -225,7 +232,7 @@ class GlottalChannel:
         if (state.geometry.shape != self.geometry.shape
                 or state.mass_kg.shape != state.geometry.shape
                 or state.energy_j.shape != state.geometry.shape
-                or state.momentum_kg_m_s.shape != state.geometry.open_area_m2.shape):
+                or state.momentum_kg_m_s.shape != state.geometry.shape + (2,)):
             raise ValueError("channel snapshot shape mismatch")
         self._primitive(state.mass_kg, state.momentum_kg_m_s, state.energy_j,
                         state.geometry.storage_volume_m3)
@@ -244,15 +251,8 @@ class GlottalChannel:
         self.wall_work_j = state.wall_work_j
 
     @staticmethod
-    def _dual_mass(mass):
-        return np.concatenate(
-            (mass[:, :1] / 2, (mass[:, :-1] + mass[:, 1:]) / 2,
-             mass[:, -1:] / 2), axis=1,
-        )
-
-    @staticmethod
     def _kinetic(mass, velocity):
-        return mass * (velocity[:, :-1] ** 2 + velocity[:, 1:] ** 2) / 4
+        return mass * np.sum(velocity ** 2, axis=-1) / 4
 
     def _primitive(self, mass, momentum, energy, volume):
         if not all(np.isfinite(x).all() for x in (mass, momentum, energy, volume)):
@@ -264,7 +264,7 @@ class GlottalChannel:
             return z, np.zeros_like(momentum), z, z, z
         if np.any(mass <= 0) or np.any(volume <= 0):
             raise ValueError("gas mass and storage volume must remain positive")
-        u = momentum / self._dual_mass(mass)
+        u = 2 * momentum / mass[..., None]
         internal = energy - self._kinetic(mass, u)
         if np.any(internal <= 0):
             raise ValueError("gas internal energy must remain positive")
@@ -282,7 +282,7 @@ class GlottalChannel:
             self.geometry.storage_volume_m3,
         )
         area = g.storage_face_area_m2[:, :-1] + g.storage_face_area_m2[:, 1:]
-        speed = np.maximum(np.abs(u[:, :-1]), np.abs(u[:, 1:]))
+        speed = np.max(np.abs(u), axis=-1)
         rate = (c + speed) * area / g.storage_volume_m3
         return self.config.courant / float(rate.max())
 
@@ -298,22 +298,60 @@ class GlottalChannel:
         rho, u, p, e, c = self._primitive(
             mass, momentum, energy, g.storage_volume_m3
         )
-        c_face = np.concatenate(
-            (c[:, :1], np.minimum(c[:, :-1], c[:, 1:]), c[:, -1:]), axis=1
-        )
-        if np.any(np.abs(u) > self.config.max_mach * c_face):
+        if np.any(np.abs(u) > self.config.max_mach * c[..., None]):
             raise ValueError("channel exceeds its declared low-Mach validity regime")
         n_strip, n_cell = g.shape
         inlet_pressure, inlet_temperature = inlet
         outlet_pressure, outlet_temperature = outlet
-        q = g.open_area_m2 * u
-        pf = np.empty_like(q)
-        pf[:, 0] = air.P_ATM + inlet_pressure
-        pf[:, -1] = air.P_ATM + outlet_pressure
-        pf[:, 1:-1] = (p[:, :-1] + p[:, 1:]) / 2
-
-        rho_up = np.empty_like(q)
-        e_up = np.empty_like(q)
+        zeros = np.zeros((n_strip, 1))
+        impedance = rho * c
+        z_left = np.concatenate((zeros, impedance), axis=1)
+        z_right = np.concatenate((impedance, zeros), axis=1)
+        u_left = np.concatenate((zeros, u[..., 1]), axis=1)
+        u_right = np.concatenate((u[..., 0], zeros), axis=1)
+        p_left = np.concatenate(((air.P_ATM + inlet_pressure)[:, None], p), axis=1)
+        p_right = np.concatenate((p, (air.P_ATM + outlet_pressure)[:, None]), axis=1)
+        area = g.open_area_m2
+        opened = area > 0
+        hydraulic_length = np.r_[
+            g.lengths_m[0] / 2,
+            (g.lengths_m[:-1] + g.lengths_m[1:]) / 2,
+            g.lengths_m[-1] / 2,
+        ]
+        resistance = np.zeros_like(area)
+        if self.config.viscosity:
+            numerator = np.broadcast_to(
+                12 * self.config.properties.mu * hydraulic_length
+                / g.widths_m[:, None], area.shape
+            )
+            resistance[opened] = numerator[opened] / g.face_gap_m[opened] ** 3
+        drive = p_left - p_right + z_left * u_left + z_right * u_right
+        linear = np.zeros_like(area)
+        linear[opened] = (
+            (z_left + z_right)[opened] / area[opened] + resistance[opened]
+        )
+        quadratic = np.zeros_like(area)
+        if self.config.exit_loss:
+            for face in (0, -1):
+                exiting = drive[:, face] < 0 if face == 0 else drive[:, face] > 0
+                sel = exiting & opened[:, face]
+                boundary_rho = rho[:, 0] if face == 0 else rho[:, -1]
+                quadratic[sel, face] = (
+                    0.5 * self.config.exit_loss * boundary_rho[sel] / area[sel, face] ** 2
+                )
+        q = np.zeros_like(area)
+        q[opened] = 2 * drive[opened] / (
+            linear[opened] + np.sqrt(
+                linear[opened] ** 2 + 4 * quadratic[opened] * np.abs(drive[opened])
+            )
+        )
+        face_velocity = np.zeros_like(area)
+        face_velocity[opened] = q[opened] / area[opened]
+        star_left = p_left + z_left * (u_left - face_velocity)
+        star_right = p_right + z_right * (face_velocity - u_right)
+        pf = (star_left + star_right) / 2
+        pf[:, 0], pf[:, -1] = p_left[:, 0], p_right[:, -1]
+        rho_up, e_up = np.empty_like(q), np.empty_like(q)
         positive = q[:, 1:-1] >= 0
         rho_up[:, 1:-1] = np.where(positive, rho[:, :-1], rho[:, 1:])
         e_up[:, 1:-1] = np.where(positive, e[:, :-1], e[:, 1:])
@@ -334,55 +372,34 @@ class GlottalChannel:
             pf[:, -1] / ((self._gamma - 1) * rho_out_right)
         )
         mdot = rho_up * q
-        advected = mdot * (e_up + 0.5 * u ** 2)
+        advected = mdot * (e_up + 0.5 * face_velocity ** 2)
         total_flux = advected + pf * q
-
-        hydraulic_length = np.r_[
-            g.lengths_m[0] / 2,
-            (g.lengths_m[:-1] + g.lengths_m[1:]) / 2,
-            g.lengths_m[-1] / 2,
-        ]
-        resistance = np.zeros_like(q)
-        opened = g.open_area_m2 > 0
-        if self.config.viscosity:
-            numerator = np.broadcast_to(
-                12 * self.config.properties.mu * hydraulic_length
-                / g.widths_m[:, None], q.shape
-            )
-            resistance[opened] = numerator[opened] / g.face_gap_m[opened] ** 3
-        drop = resistance * q
-        if self.config.exit_loss:
-            for face in (0, -1):
-                # Loss is on an exiting jet only, never twice on one stream.
-                exiting = q[:, face] < 0 if face == 0 else q[:, face] > 0
-                sel = exiting & opened[:, face]
-                speed = q[sel, face] / g.open_area_m2[sel, face]
-                drop[sel, face] += (
-                    0.5 * self.config.exit_loss * rho_up[sel, face]
-                    * speed * np.abs(speed)
-                )
-
-        dp = np.concatenate(
-            (pf[:, :1] - p[:, :1], p[:, :-1] - p[:, 1:],
-             p[:, -1:] - pf[:, -1:]), axis=1,
-        )
+        face_momentum_flux = mdot * face_velocity
         center_momentum_flux = (
-            (mdot[:, :-1] + mdot[:, 1:]) * (u[:, :-1] + u[:, 1:]) / 4
+            (mdot[:, :-1] + mdot[:, 1:]) * np.mean(u, axis=-1) / 2
         )
-        momentum_in = np.concatenate(
-            ((mdot[:, 0] * u[:, 0])[:, None], center_momentum_flux), axis=1
+        blocked = g.storage_face_area_m2 - area
+        left_force = (
+            area[:, :-1] * (star_right[:, :-1] - p)
+            - blocked[:, :-1] * impedance * u[..., 0]
         )
-        momentum_out = np.concatenate(
-            (center_momentum_flux, (mdot[:, -1] * u[:, -1])[:, None]), axis=1
+        right_force = (
+            area[:, 1:] * (p - star_left[:, 1:])
+            - blocked[:, 1:] * impedance * u[..., 1]
         )
-        blocked = g.storage_face_area_m2 - g.open_area_m2
-        rho_face = self._dual_mass(mass) / self._dual_mass(g.storage_volume_m3)
-        reflection_force = 2 * rho_face * c_face * blocked * u
-        rhs_momentum = (
-            momentum_in - momentum_out + (dp - drop) * g.open_area_m2
-            - reflection_force
+        rhs_momentum = np.stack((
+            face_momentum_flux[:, :-1] - center_momentum_flux + left_force,
+            center_momentum_flux - face_momentum_flux[:, 1:] + right_force,
+        ), axis=-1)
+        reflection = impedance * (
+            blocked[:, :-1] * u[..., 0] ** 2 + blocked[:, 1:] * u[..., 1] ** 2
         )
-        reflection = reflection_force * u
+        external_momentum = (
+            face_momentum_flux[:, 0] + pf[:, 0] * area[:, 0]
+            - face_momentum_flux[:, -1] - pf[:, -1] * area[:, -1]
+        )
+        wall_force = external_momentum - rhs_momentum.sum(axis=(1, 2))
+        drop = resistance * q + quadratic * q * np.abs(q)
         shifted_flux = total_flux - self._h_reference * mdot
         gauge_work = (pf - air.P_ATM) * q
         thermal_flux = shifted_flux - gauge_work
@@ -396,6 +413,7 @@ class GlottalChannel:
             "thermal_flux": thermal_flux,
             "viscous_power": float(np.sum(drop * q)),
             "reflection_power": float(reflection.sum()),
+            "external_momentum": external_momentum, "wall_force": wall_force,
         }
 
     def advance(self, dt_s, inlet: Reservoir | Sequence[Reservoir],
@@ -425,6 +443,7 @@ class GlottalChannel:
             self.geometry = g1
             return ChannelStep(self.time_s, z.copy(), z.copy(), z.copy(), z.copy(),
                                inlet[1].copy(), outlet[1].copy(),
+                               z.copy(), z.copy(), z.copy(),
                                np.zeros(g0.shape), *([0.0] * 9), 0, 0.0)
         if dt > min(self.recommend_timestep(), self.recommend_timestep(g1)) * (1 + 1e-12):
             raise ValueError("channel timestep exceeds the current acoustic-volume bound")
@@ -440,9 +459,7 @@ class GlottalChannel:
         m0, j0, E0 = self._mass, self._momentum, self._energy
         rho0, u0, p0, e0, c0 = self._primitive(m0, j0, E0, g0.storage_volume_m3)
         internal0 = m0 * e0
-        j_scale = self._dual_mass(m0) * np.concatenate(
-            (c0[:, :1], (c0[:, :-1] + c0[:, 1:]) / 2, c0[:, -1:]), axis=1
-        )
+        j_scale = np.broadcast_to((m0 * c0 / 2)[..., None], j0.shape)
         shape = g0.shape
         n = m0.size
         n_momentum = j0.size
@@ -453,7 +470,7 @@ class GlottalChannel:
                 mass = m0 * np.exp(x[:n].reshape(shape))
                 momentum = j_scale * x[n:n + n_momentum].reshape(j0.shape)
                 internal = internal0 * np.exp(x[n + n_momentum:].reshape(shape))
-                velocity = momentum / self._dual_mass(mass)
+                velocity = 2 * momentum / mass[..., None]
                 energy = internal + self._kinetic(mass, velocity)
             return mass, momentum, energy
 
@@ -524,6 +541,10 @@ class GlottalChannel:
             flux["q"][:, 0].copy(), flux["q"][:, -1].copy(),
             flux["mdot"][:, 0].copy(), flux["mdot"][:, -1].copy(),
             flux["temperature"][:, 0].copy(), flux["temperature"][:, -1].copy(),
+            dt * flux["external_momentum"], dt * flux["wall_force"],
+            (j1 - j0).sum(axis=(1, 2)) - dt * (
+                flux["external_momentum"] - flux["wall_force"]
+            ),
             pressure.copy(), wall_work,
             dt * float(flux["gauge_work"][:, 0].sum()),
             dt * float(flux["gauge_work"][:, -1].sum()),
@@ -553,8 +574,8 @@ class GlottalChannel:
             "momentum_kg_m_s": self._momentum.copy(),
             "pressure_pa": p - air.P_ATM if not self.geometry.dry else p,
             "temperature_k": e / self._cv,
-            "velocity_m_s": (u[:, :-1] + u[:, 1:]) / 2,
-            "face_velocity_m_s": u,
+            "velocity_m_s": np.mean(u, axis=-1),
+            "one_sided_velocity_m_s": u,
             "total_energy_j": float(self._energy.sum()),
             "kinetic_energy_j": kinetic,
             "internal_energy_j": float(self._energy.sum()) - kinetic,
@@ -569,7 +590,8 @@ class GlottalChannel:
             "assumptions": (
                 "fixed axial/AP cuts; independent strips; calorically perfect gas",
                 "reference-temperature transport; no thermal wall sink",
-                "staggered midpoint low-Mach FV; unresolved reflecting throat plates",
+                "cell-owned half-cell momentum; local characteristic throat flux",
+                "midpoint low-Mach FV; unresolved one-sided reflecting throat plates",
                 "cavity footprint and solid mapping are caller-owned",
             ),
         }

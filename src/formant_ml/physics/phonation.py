@@ -15,10 +15,10 @@ from scipy.optimize import brentq
 from scipy.optimize import minimize_scalar
 
 from . import air, lungs
-from .acoustic_domain import AcousticDomain
-from .glottal_channel import ChannelGeometry, GlottalChannel, Reservoir
+from .acoustic_domain import AcousticDomain, AcousticSnapshot
+from .glottal_channel import ChannelGeometry, ChannelState, GlottalChannel, Reservoir
 from .vocal_fold_solid import (
-    BilateralControl, FoldControl, PressurePatch, VocalFoldSolid, _slice_curve,
+    BilateralControl, FoldControl, PressurePatch, SolidState, VocalFoldSolid, _slice_curve,
 )
 
 
@@ -606,7 +606,9 @@ class CouplingConfig:
     maximum_port_pressure_fraction: float = 0.05
 
     def __post_init__(self):
-        if (self.subcycles < 1 or self.max_subcycles < self.subcycles
+        if (any(isinstance(v, bool) or not isinstance(v, int) for v in
+                (self.subcycles, self.max_subcycles, self.max_iterations))
+                or self.subcycles < 1 or self.max_subcycles < self.subcycles
                 or self.max_iterations < 1):
             raise ValueError("invalid coupling iteration/subcycle limits")
         for name in ("pressure_tolerance_pa", "position_tolerance_m",
@@ -700,11 +702,11 @@ class SupplyDuct:
 @dataclass(frozen=True)
 class PhonationState:
     owner: object
-    solid: object
-    channel: object
-    lung: object
-    downstream: object
-    upstream: object | None
+    solid: SolidState
+    channel: ChannelState
+    lung: LungState
+    downstream: AcousticSnapshot
+    upstream: AcousticSnapshot | None
     supply: SupplyState | None
     steps: int
 
@@ -803,6 +805,20 @@ class PhonationSystem:
             raise ValueError("channel and acoustic domain must share air.props composition")
         if (upstream is None) != (supply is None):
             raise ValueError("an upstream domain requires its physical supply duct")
+        if upstream is None and (self.upstream_ports or upstream_lung_port is not None):
+            raise ValueError("upstream port names require an actual upstream domain")
+        for component in (lung, supply):
+            if component is None:
+                continue
+            properties = (component.config.properties if isinstance(component, LungReservoir)
+                          else component.properties)
+            if any(not math.isclose(getattr(properties, name),
+                                    getattr(channel.config.properties, name), rel_tol=1e-10)
+                   for name in ("rho", "c", "M", "gamma", "mu")):
+                raise ValueError("lung, supply and channel must share the gas properties")
+        if not math.isclose(downstream.sound_speed_m_s, channel.config.properties.c,
+                            rel_tol=1e-10):
+            raise ValueError("downstream must share the channel sound speed")
         if upstream is not None:
             if (len(self.upstream_ports) != strips
                     or any(p not in upstream.port_names for p in self.upstream_ports)
@@ -814,15 +830,23 @@ class PhonationSystem:
             if not math.isclose(upstream.rho_kg_m3, channel.config.properties.rho,
                                 rel_tol=1e-10):
                 raise ValueError("upstream must share the channel air properties")
+            if not math.isclose(upstream.sound_speed_m_s, channel.config.properties.c,
+                                rel_tol=1e-10):
+                raise ValueError("upstream must share the channel sound speed")
         times = (solid.time_s, channel.time_s, lung.time_s, downstream.time_s)
         if upstream is not None:
             times += (upstream.time_s, supply.time_s)
         if max(times) - min(times) > 1e-13:
             raise ValueError("components must start on a shared physical clock")
         actual = mapper.capture(solid).geometry
-        if not np.allclose(actual.storage_volume_m3, channel.geometry.storage_volume_m3,
-                           rtol=1e-12, atol=1e-24):
-            raise ValueError("channel storage does not match the actual solid geometry")
+        for name in (
+            "lengths_m", "widths_m", "storage_volume_m3", "storage_face_area_m2",
+            "open_area_m2", "face_gap_m",
+        ):
+            expected, supplied = getattr(actual, name), getattr(channel.geometry, name)
+            if (expected.shape != supplied.shape
+                    or not np.allclose(expected, supplied, rtol=1e-12, atol=0)):
+                raise ValueError(f"channel geometry {name} does not match the real mapped solid")
 
     @property
     def dt(self):
@@ -843,6 +867,24 @@ class PhonationSystem:
     def restore(self, state):
         if not isinstance(state, PhonationState) or state.owner is not self._owner:
             raise ValueError("phonation snapshot belongs to a different instance")
+        if (not isinstance(state.steps, int) or state.steps < 0
+                or (self.upstream is None) != (state.upstream is None)
+                or (self.supply is None) != (state.supply is None)):
+            raise ValueError("phonation snapshot component/count mismatch")
+        previous = self.snapshot()
+        try:
+            self._restore_components(state)
+            times = (self.solid.time_s, self.channel.time_s,
+                     self.lung.time_s, self.downstream.time_s)
+            if self.upstream is not None:
+                times += (self.upstream.time_s, self.supply.time_s)
+            if max(times) - min(times) > 1e-13:
+                raise ValueError("snapshot components have different physical clocks")
+        except (ValueError, RuntimeError, FloatingPointError):
+            self._restore_components(previous)
+            raise
+
+    def _restore_components(self, state):
         self.solid.reset(state.solid)
         self.channel.restore(state.channel)
         self.lung.restore(state.lung)

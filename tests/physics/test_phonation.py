@@ -378,3 +378,50 @@ def test_actual_acoustic_backpressure_changes_channel_flow():
         a, b = small.advance(), large.advance()
     assert abs(a.downstream_pressure_pa[0]) > abs(b.downstream_pressure_pa[0]) * 2
     assert abs(a.outlet_flow_m3_s[0] - b.outlet_flow_m3_s[0]) > 1e-12
+
+
+@pytest.mark.parametrize("change", ["closure", "storage_face", "cuts"])
+def test_constructor_rejects_every_stale_geometry_surface(change):
+    system = actual_system()
+    geometry = system.channel.geometry
+    if change == "closure":
+        geometry = replace(
+            geometry, open_area_m2=np.zeros_like(geometry.open_area_m2),
+            face_gap_m=np.zeros_like(geometry.face_gap_m),
+        )
+    elif change == "storage_face":
+        geometry = replace(geometry, storage_face_area_m2=2 * geometry.storage_face_area_m2)
+    else:
+        geometry = replace(geometry, lengths_m=2 * geometry.lengths_m)
+    with pytest.raises(ValueError, match="channel geometry"):
+        PhonationSystem(
+            system.solid, GlottalChannel(geometry), system.mapper, system.lung,
+            system.downstream, system.downstream_ports, wall_patches=system.wall_patches,
+        )
+
+
+@pytest.mark.parametrize("change", ["channel", "late_acoustic", "time", "steps"])
+def test_public_restore_failure_is_atomic_across_all_components(change):
+    system = actual_system()
+    initial = system.snapshot()
+    system.advance()
+    before = system.snapshot()
+    if change == "channel":
+        invalid = replace(initial, channel=replace(
+            initial.channel, mass_kg=np.zeros_like(initial.channel.mass_kg),
+        ))
+    elif change == "late_acoustic":
+        invalid = replace(initial, downstream=replace(initial.downstream, owner=object()))
+    elif change == "time":
+        invalid = replace(initial, channel=replace(initial.channel, time_s=1e-6))
+    else:
+        invalid = replace(initial, steps=-1)
+    with pytest.raises(ValueError):
+        system.restore(invalid)
+    after = system.snapshot()
+    np.testing.assert_array_equal(after.solid.positions_m, before.solid.positions_m)
+    np.testing.assert_array_equal(after.channel.mass_kg, before.channel.mass_kg)
+    np.testing.assert_array_equal(after.channel.energy_j, before.channel.energy_j)
+    assert after.lung == before.lung
+    assert after.steps == before.steps
+    assert all(torch.equal(a, b) for a, b in zip(after.downstream.field, before.downstream.field))
