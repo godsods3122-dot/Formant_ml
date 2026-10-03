@@ -377,7 +377,7 @@ def main() -> None:
                     help="W02 조음의 해부 적응 (voice_td.W02_ANAT, §52.501): VTL AnatomyParams 13 개(후두 길이·폭, 인두 길이 …)를 화자 상수로 적합")
     ap.add_argument("--w02-age", action="store_true",
                     help="나이 축 해부 (voice_td.W02_AGE, §52.523, --w02-anat 을 함께 켠다): W02 해부를 VTL 여성 성장식(Goldstein 1980)의 나이 비율로 옮기고 "
-                         "개인차는 길이 ±15 %·각 ±6° 로 묶는다 — 나이 12–25 세 (성인 여성 성도 길이 범위의 아래 끝이 12–13 세)")
+                         "개인차는 길이 ±15 %%·각 ±6° 로 묶는다 — 나이 12–25 세 (성인 여성 성도 길이 범위의 아래 끝이 12–13 세)")
     ap.add_argument("--codec-aac", default="", metavar="BITRATE",
                     help="실제 AAC 코덱을 적합 고리에 (fit.CODEC_AAC, §52.523) — 원본이 거친 방송 코덱. 손실은 코덱을 거친 소리로, 기울기는 직통. "
                          "결과 _fit.wav 는 코덱 없이, _fit_codec.wav 는 코덱을 거쳐 쓴다. 예: 64k")
@@ -405,20 +405,21 @@ def main() -> None:
                          "vf: 자기 진동 성대 (Birkholz 삼각 성문 두 질량) — 폐압·내전·긴장으로 스스로 떤다. 펄스 잠금·위상 오프셋을 쓰지 않고, "
                          "합성 f0 를 재어 긴장 배율을 고친다 (fit.vf_pitch_lock)")
     ap.add_argument("--vf-ns-lock", action="store_true",
-                    help="모드 3 성대 화자 상수(td_log_ns_*)를 적합하지 않는다 — --vf-ns-calib 의 표 · 문턱 지도가 잰 상수와 어긋나지 않게 (§52.530)")
+                    help="모드 3 성대 배율·뒤쪽 틈·좌우 비대칭을 고정한다. 보정표의 값과 같은지는 별도로 검사하며 값을 자동 복사하지 않는다")
     ap.add_argument("--velum-bounds", action="store_true",
                     help="입 장애음 구간에서 연인두 통로를 0.005 cm² 아래로 단단히 (voice_td.VELUM_BOUNDS, §52.530, --phoneme-targets 와 함께)")
     ap.add_argument("--vf-shear-max", type=float, default=None, metavar="X",
-                    help="모드 3 덮개 상하 전단 배율 (td_log_ns_shear, 기준 MU_COVER 500 Pa) 의 단단한 상한 (§52.533) — z 위상차를 문헌 범위 (개 후두 30–60°/mm) 로: "
-                         "m23 상수에서 2.06 배 17–24°/mm, 0.5 배 30°/mm")
+                    help="모드 3 덮개 상하 전단 배율 (td_log_ns_shear, 기준 MU_COVER 500 Pa)의 모형 상한. "
+                         "m23에서 2.06 배는 17–24°/mm, 0.5 배는 30°/mm; 개 후두 위상차를 인간 강성의 정상범위로 직접 환산할 수 없다")
     ap.add_argument("--vf-body-free", type=float, default=None, metavar="A",
                     help="몸체 구동의 매는 강성을 구동 폭 a 에 따라 a²/(a² + A²) 로 (voice_td.VF_BODY_DRIVE_FREE, §52.533) — 구동이 약할 때 점막 성대가 제 물리로 떤다")
     ap.add_argument("--vf-lr", action="store_true",
-                    help="좌우 성대 따로 (beam_membrane.LR_FOLDS, §52.533) — 긴장 · 질량 비대칭을 화자 상수로 (상한 5 %, 긴장 출발 2 %)")
+                    help="좌우 성대 따로 (beam_membrane.LR_FOLDS, §52.533) — 긴장 · 질량 비대칭을 화자 상수로 (상한 5 %%, 긴장 출발 2 %%)")
     ap.add_argument("--vf-rest-modal", type=float, default=None, metavar="UM",
-                    help="모달 내전 (voice_td.VF_ADD_MODAL) 에서의 성대돌기 위 날 쉼 반틈새 [μm] (voice_td.VF_R_MODAL, §52.532; 기본 0 = VTL 모달, 문헌 90 μm)")
+                    help="모달 내전 (voice_td.VF_ADD_MODAL) 에서의 성대돌기 위 날 쉼 반틈새 [μm] (voice_td.VF_R_MODAL, 기본 0; Zhang 2009의 90 μm는 모형 기하값이지 여성 모집단 평균이 아니다)")
     ap.add_argument("--ff-bounds", action="store_true",
-                    help="공명음 구간에서 가성대 틈을 사람 하한 (2.0 mm, Agarwal 2003) 위로 단단히 (voice_td.FF_BOUNDS, §52.532, --phoneme-targets 와 함께)")
+                    help="공명음 구간의 가성대 틈 모형 하한 2.0 mm (voice_td.FF_BOUNDS, --phoneme-targets 와 함께). "
+                         "간격에서 면적으로의 변환도 근사이며 인체 정상범위의 보편적 하한은 아니다")
     ap.add_argument("--vf-closure-edge", type=float, default=None, metavar="UM",
                     help="모드 3 성대의 닫힘 이음 폭 [μm] (beam_membrane.CLOSURE_EDGE_CM, §52.530; 기본 50)")
     ap.add_argument("--no-vf-lock", action="store_true",
@@ -428,12 +429,14 @@ def main() -> None:
     ap.add_argument("--physio-dyn", action="store_true",
                     help="조음 · 후두 자세의 생리 동역학 (§52.530): 가성대 내전 σ 10 ms + 20 /s, 연구개 σ 10 ms, 조음 평활 σ = 1.6 τ (목표 근사 모형의 대역)")
     ap.add_argument("--vf-ns-hard", action="store_true",
-                    help="성대 화자 상수의 생리 범위를 단단히 (voice_td.VF_NS_HARD, §52.529): 덮개 강성 [0.8, 1.5] (발성 문턱 2–5 cmH2O), 감쇠비 [0.1, 0.3]")
+                    help="모형의 화자 상수 범위를 단단히: 강성 [0.8, 6], 감쇠비 [0.05, 0.3], 길이 [0.85, 1.15], 두께 [0.7, 1.3]. 독립적인 인체 정상범위 측정값은 아니다")
     ap.add_argument("--pth-w", type=float, default=None, metavar="W",
-                    help="발성 문턱 항 무게 (fit.PTH_W, §52.529): 원본 유성 틀은 폐압 > 1.2 × 문턱, 무성 틀은 < 0.8 × 문턱 (모형에서 잰 문턱 지도)")
+                    help="발성 문턱 항 무게 (fit.PTH_W): 원본 유성 틀의 폐압 부족을 벌점으로 (PTH_MARGIN × 모형 문턱). 무성 틀은 이 항에서 제외")
     ap.add_argument("--pth-map", default=None, metavar="npz", help="발성 문턱 지도 (fit.PTH_MAP, out/_tmp/vf/pth_sweep.py 결과)")
     ap.add_argument("--vf-ns-calib", default=None, metavar="npz",
                     help="모드 3 성대의 화자 보정 (scripts/vf_ns_calib.py 결과, §52.530): f0(ε) 표를 바꾸고, --pth-map 이 없으면 같은 파일의 문턱 지도를 쓴다")
+    ap.add_argument("--vf-ns-calib-approx", action="store_true",
+                    help="보정표의 조건 불일치·상수 적합을 경고 후 허용한다 (옛 판 재현용 근사). 생리 검증으로 해석하지 않는다")
     ap.add_argument("--psub-max", type=float, default=None, metavar="P",
                     help="말소리 폐압 상한 [cmH2O] (fit.PSUB_MAX, §52.530, 단단히): 제어 범위 상한을 바꾸고 출발 판 폐압을 눌러 넣는다")
     ap.add_argument("--pitch-w", type=float, default=None, metavar="W",
@@ -565,13 +568,15 @@ def main() -> None:
         _fit.PTH_MAP = a.pth_map
     if a.vf_ns_calib:
         from formant_ml.engine import voice_td as _vtdc
-        _cal = np.load(a.vf_ns_calib)
-        _vtdc.VF_NS_EPS_TAB = tuple(float(v) for v in _cal["eps_tab"])
-        _vtdc.VF_NS_F0_TAB = tuple(float(v) for v in _cal["f0_tab"])
+        from formant_ml.engine.vf_calibration import validate_pitch_table
+        with np.load(a.vf_ns_calib, allow_pickle=False) as _cal:
+            validate_pitch_table(_cal["eps_tab"], _cal["f0_tab"])
+            _vtdc.VF_NS_EPS_TAB = tuple(float(v) for v in _cal["eps_tab"])
+            _vtdc.VF_NS_F0_TAB = tuple(float(v) for v in _cal["f0_tab"])
+            if not a.pth_map and "pth" in _cal.files:
+                _fit.PTH_MAP = a.vf_ns_calib
         print(f"  모드 3 화자 보정 {a.vf_ns_calib}: f0(ε) 표 " + " ".join(f"{e:+.2f}:{f:.0f}" for e, f in zip(_vtdc.VF_NS_EPS_TAB, _vtdc.VF_NS_F0_TAB)),
               flush=True)
-        if not a.pth_map and "pth" in _cal.files:
-            _fit.PTH_MAP = a.vf_ns_calib
     if a.psub_max is not None:
         _fit.PSUB_MAX = float(a.psub_max)
     if a.pulse_regular:
@@ -659,8 +664,7 @@ def main() -> None:
             _v4 = [float(v) for v in a.vf_scale_init.split(",")]
             _vtdg.VF_SCALE_INIT = dict(zip(("len", "thick", "mk", "damp"), _v4))
         _fit.PHI0_FIXED = 0.0                       # 펄스 위상은 쓰이지 않는다 — 오프셋 훑기가 헛돈다
-        # 내전 사전은 코퍼스에서 잰 분포 그대로 (중앙 0.44 = 모달 쉼 변위). W02 가 옮긴 중심(틈 0.035 cm²)은 옛 성문의 뒤쪽 틈 뜻이다 —
-        # 성대 모드에서 뒤쪽 틈은 따로 있다.
+        # 0.44는 옛 엔진 합성음으로 학습한 역모형의 추정 좌표다 (§52.426), 인체 쉼 틈의 직접 측정값은 아니다.
         _fit.ADD_PRIOR_MU = math.log(_vtdg.VF_ADD_MODAL / (1.0 - _vtdg.VF_ADD_MODAL))
         _fit.ADD_PRIOR_S = 0.37
         # 튐 벌점의 비교 창 — 원본 펄스 봉우리를 늘 품게 폭(2w)을 이 화자의 가장 긴 주기(f0 ≈ 180 Hz, 5.5 ms) 넘게. ±1.5 ms 는 펄스 잠금
@@ -1102,10 +1106,26 @@ def main() -> None:
         locked_constants += apply_calibration(eng, recording_constants, ("recording",),
                                               allow_source_override=source_override)
     if getattr(a, "vf_ns_lock", False):
-        from formant_ml.engine import voice_td as _vtdk
-        _lk = tuple(f"td_log_ns_{k}" for k in _vtdk.VF_NS_INIT)
+        from formant_ml.engine.vf_calibration import locked_names
+        _lk = locked_names()
         locked_constants += _lk
         print(f"  모드 3 성대 상수 고정 (§52.530 — f0(ε) 표 · 문턱 지도를 잰 상수): " + ", ".join(_lk), flush=True)
+    if a.vf_ns_calib or (a.pth_map and _fit.PTH_W > 0):
+        from formant_ml.engine.vf_calibration import check_calibration
+        _tables = [a.vf_ns_calib] if a.vf_ns_calib else []
+        if _fit.PTH_W > 0 and _fit.PTH_MAP and _fit.PTH_MAP not in _tables:
+            _tables.append(_fit.PTH_MAP)
+        for _table in _tables:
+            check_calibration(_table, eng.td, locked_constants, approximate=a.vf_ns_calib_approx,
+                              log=lambda m: print(m, flush=True))
+    if a.td and a.glottis == "vf" and a.vf_ns:
+        from formant_ml.engine.vf_calibration import pitch_coverage
+        _cov = pitch_coverage(track["f0_target"], track.voiced if track.voiced.size == track.n_frames else None)
+        print(f"  NS 음높이 보정 범위: {_cov['measured_hz']} Hz, 유성 {_cov['frames']} 틀 중 "
+              f"표 밖 {_cov['outside']} · 늘어남 한계에 포화 {_cov['saturated']}", flush=True)
+        if _cov["outside"]:
+            print("  WARNING: 표 밖 음높이는 외삽이다. vf_ns_calib.py로 허용 늘어남 범위를 다시 측정해야 하며, "
+                  "포화된 목표들은 서로 다른 성대 입력을 만들지 못한다.", flush=True)
     initial_utterance = initial_constants["utterance"] if initial_constants is not None else {}
     if a.phoneme_init and not a.init and (not a.td or a.artic == "cos"):
         import json as _json2

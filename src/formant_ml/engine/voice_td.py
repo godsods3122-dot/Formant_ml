@@ -505,7 +505,7 @@ VF_NS_INIT = dict(len=1.0, thick=1.0, kc=3.0, zeta=0.1, bulge=0.1, shear=1.0)
 #: **좌우 성대 비대칭의 생리 범위** (§52.533, `copyfit --vf-lr`). m23 에 긴장 비대칭 ±2 · ±5 · ±10 % 를 넣어 다시 렌더: 좌우 위상차 (위 줄 변위의 교차상관)
 #: 중앙 2.2 · 5.8 · 7.9 % (최대 6.2 · 11.8 · **50**), 반배음 90 % 값 −9.6 · −13.2 · **−6.3 dB** (원본 −14.9), Praat 지터 1.15 · 1.42 · 2.15 %. ±10 % 는 두 성대의
 #: 잠금이 자리에 따라 풀려 이중 음성이 선다 (Steinecke & Herzel 1995 의 비대칭 분기와 같은 꼴); 정상 습관 발성의 54 % 가 좌우 위상차 ≤ 6 % (PMC7587608) 라
-#: 긴장 비대칭 상한 5 %, 출발 2 %. 질량 비대칭도 같은 상한.
+#: 긴장 비대칭 상한 5 %, 출발 2 %. 질량 비대칭도 같은 상한. 이들은 위 모형 실험의 제한값이며, 측정된 위상차 6 %를 기계적 긴장·질량 5 %로 환산한 인체 범위가 아니다.
 VF_LR_DQ_MAX = 0.05
 VF_LR_DQ_INIT = 0.02
 VF_LR_DM_MAX = 0.05
@@ -519,9 +519,8 @@ VF_NS_HARD = None
 #: (아래 0.056 · 위 0.10 mm) 에서는 m13 상수(덮개 ×3.99, 두께 0.9)가 ε −0.15 … 0.4 (179–413 Hz) 내내 문턱 3.3–4.8 cmH2O (사람 2–4) 였고, 덮개 ×1.5 로
 #: 자른 n1 상수(두께 1.18)는 383–430 Hz 에서 7.8–9.9 로 오히려 높았다 — 문턱은 덮개 하나가 아니라 두께 · 전단 · 내전이 함께 정한다. 덮개의 상한은
 #: 같은 지도에서 어떤 두께로도 문턱이 10 cmH2O 아래로 안 오는 ×8 의 아래 ×6, 하한은 그대로. 문턱은 문턱 항(`fit.PTH_W`)과 폐압 상한이 직접 묶는다.
-#: 감쇠비 하한 정정 (§52.531): 0.1 은 두 질량 모형의 매개변수(Ishizaka & Flanagan 1972)였다 — 조직 측정으로는 성대 덮개의 손실 탄젠트 tan δ = G''/G'
-#: 가 0.1–0.5 (Chan & Titze 1999, 진동수 0.01–15 Hz; 발성 진동수 쪽으로 줄어든다) 라 감쇠비 tan δ / 2 ≈ 0.05–0.25. n6 상수에서 감쇠비 0.1 → 0.055 면
-#: 문턱이 15–25 % 낮다 (419 Hz 10.2 → 7.8 cmH2O).
+#: 감쇠비 하한 0.05 (§52.531)는 유효 모형값이다. Chan & Titze (1999)는 적출 조직의 0.01–15 Hz 소진폭 전단 측정이며, 해당 값을
+#: 발성 주파수의 모드 감쇠비로 바로 옮기거나 손실 탄젠트의 절반으로 확정할 근거는 부족하다. n6의 0.1 → 0.055 문턱 감소 15–25 %는 모형 내부 결과다.
 VF_NS_HARD_DEFAULT = dict(kc=(0.8, 6.0), zeta=(0.05, 0.30), len=(0.85, 1.15), thick=(0.7, 1.3))
 #: **몸체 구동 점막 성대** (§52.523, `copyfit --vf-body-drive`, 모드 3 위에서). 사용자: *"성대를 강체처럼 생각하니까 저런 펄스가 나오지. 성대는
 #: 점막인데"*. 운동학 성문(정한 면적 모양 + 접촉 꺾임)은 주기마다 같은 닫힘 충격으로 고역 가로줄을 세웠고(038 줄 0.19 · 0.26 · 0.11, 원본
@@ -580,7 +579,8 @@ def vf_ns_eps(f0: torch.Tensor) -> torch.Tensor:
     ylo = ee[0] + mm[0] * (x - lf[0])
     yhi = ee[-1] + mm[-1] * (x - lf[-1])
     y = torch.where(inside, yin, torch.where(x < lf[0], ylo, yhi))
-    return y.clamp(-0.3, 0.7)
+    from .vf_calibration import EPS_LIMITS
+    return y.clamp(*EPS_LIMITS)
 
 
 def vf_static(len_s, thick_s, mk_s, damp_s):
@@ -1045,10 +1045,44 @@ class TDPath(nn.Module):
             pc_ = self.vf_pscorr
             st["vf_pscorr"] = (torch.ones_like(c["p_sub"]) if pc_ is None or pc_.shape[-1] != T
                                else pc_.to(c["p_sub"].dtype).to(c["p_sub"].device))
+        self.last_vf_controls = None
         r = self._run(pad(c), pad(st), torch.cat([pre, pp], 1), n_out + n_pre)
+        if self.last_vf_controls is not None:
+            self.last_vf_controls = {k: v[:, K:K + T] for k, v in self.last_vf_controls.items()}
         if self.last_rec is not None:
             self.last_rec = [x[n_pre * OS:(n_pre + n_out) * OS] for x in self.last_rec]
         return {k: v[:, n_pre:n_pre + n_out] for k, v in r.items()}
+
+    def ns_scales(self) -> dict[str, torch.Tensor]:
+        out = {}
+        for k in VF_NS_INIT:
+            p = getattr(self, f"log_ns_{k}")
+            if VF_NS_HARD and k in VF_NS_HARD:
+                lo, hi = VF_NS_HARD[k]
+                if not 0 < lo < hi:
+                    raise ValueError(f"Invalid NS bounds for {k}: {(lo, hi)}")
+                # Use the inward derivative at the projected boundary (clamp's
+                # boundary subgradient differs between PyTorch versions).
+                low, high = p.new_tensor(math.log(lo)), p.new_tensor(math.log(hi))
+                p = torch.where(p < low, low, torch.where(p > high, high, p))
+            out[k] = p.exp()
+        return out
+
+    @torch.no_grad()
+    def project_ns_bounds(self) -> dict[str, tuple[float, float]]:
+        """Keep stored log parameters in the same feasible set as the renderer."""
+        changed = {}
+        for k, (lo, hi) in (VF_NS_HARD or {}).items():
+            if k not in VF_NS_INIT or not 0 < lo < hi:
+                raise ValueError(f"Invalid NS bounds for {k}: {(lo, hi)}")
+            p = getattr(self, f"log_ns_{k}")
+            before = float(p)
+            if not math.isfinite(before):
+                raise ValueError(f"Nonfinite NS speaker parameter: {k}")
+            p.clamp_(math.log(lo), math.log(hi))
+            if float(p) != before:
+                changed[k] = (math.exp(before), float(p.exp()))
+        return changed
 
     def vf_inputs(self, c: dict, st: dict, n_sim: int, pulse_phase: torch.Tensor | None = None):
         """자기 진동 성대의 표본률 입력 — (긴장 Q (B, n), 쉼 변위 (B, n, 2) [cm], 뒤쪽 틈 (B, n) [cm²]).
@@ -1078,11 +1112,9 @@ class TDPath(nn.Module):
                 ta = _slew(ta, VF_VMAX["vf_ta"] * self.hop / self.fs)
             if VF_NEURAL:                                   # 갑상피열근 긴장의 운동 단위 요동 (프레임률, 연축 ~15 ms)
                 ta = (ta * self._neural("ta", ta.shape[-1], self.fs / self.hop, ta.dtype, ta.device)).clamp(0.0, 1.0)
+            self.last_vf_controls = dict(f0_target=f0, adduction=add, rd_offset=rdo, vf_ta=ta)
             eps = vf_ns_eps(f0)
-            e = {k: torch.exp(getattr(self, f"log_ns_{k}")).to(r1.dtype) for k in VF_NS_INIT}
-            if VF_NS_HARD:
-                # 화자 상수의 생리 범위를 단단히 (§52.529) — 범위 밖에서는 기울기 0
-                e = {k: (v.clamp(VF_NS_HARD[k][0], VF_NS_HARD[k][1]) if k in VF_NS_HARD else v) for k, v in e.items()}
+            e = {k: v.to(r1.dtype) for k, v in self.ns_scales().items()}
             _bulge = BM.STATIC_BULGE
             BM.STATIC_BULGE = True
             try:
@@ -1216,6 +1248,8 @@ class TDPath(nn.Module):
             ps_f = _gauss_t(ps_f, VF_PS_SMOOTH_MS / (1000.0 * self.hop / self.fs))
         if vf and SLEW_ON:
             ps_f = _slew(ps_f, VF_VMAX["p_sub"] * self.hop / self.fs)
+        if vf and VF_NS:
+            self.last_vf_controls["p_sub"] = ps_f
         vel = c["velum"].clamp(0.0, 1.0)
         if VELUM_SMOOTH_MS > 0.0:                      # 연구개의 생리 동역학 (§52.530)
             vel = _gauss_t(vel, VELUM_SMOOTH_MS / (1000.0 * self.hop / self.fs))
@@ -1252,6 +1286,7 @@ class TDPath(nn.Module):
                 import numpy as _np
                 self._dumped_in = True
                 _np.savez(_os_env_get("TD_DUMP_IN"), A=A[b].double().detach().numpy(), L=L[b].double().detach().numpy(),
+                          fs=td.FS_SIM, n_pre=getattr(self, "_n_pre_frames", 0) * self.hop * OS,
                           Ag=Ag[b].double().detach().numpy(), Ps=Ps[b].double().detach().numpy(), Av=Av[b].double().detach().numpy(),
                           ng=float(torch.exp(self.log_noise_g)), nc=float(torch.exp(self.log_noise_c)), Q=Q[b].double().detach().numpy(),
                           VQ=VQ[b].double().detach().numpy() if vf else _np.zeros(1), VR=VR[b].double().detach().numpy() if vf else _np.zeros(1),

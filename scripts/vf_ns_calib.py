@@ -27,13 +27,16 @@ import numpy as np
 import torch
 
 from formant_ml.engine import voice_td as VT, tube_td as td
+from formant_ml.engine.vf_calibration import EPS_LIMITS, model_signature, validate_pitch_table
 
 
 def setup(run: str, hard: bool, over: dict | None = None):
     VT.GLOTTIS = "vf"; VT.VF_NS = True; VT.VF_NEURAL = False; VT.VF_BODY_DRIVE = False; VT.SLEW_ON = False
     VT.VF_ADD_SMOOTH_MS = 0.0; VT.VF_TA_SMOOTH_MS = 0.0
     VT.VF_NS_HARD = dict(VT.VF_NS_HARD_DEFAULT) if hard else None
-    Z = dict(np.load(f"out/VF/{run}_track.npz", allow_pickle=False))
+    path = run if run.endswith("_track.npz") else f"out/VF/{run}_track.npz"
+    with np.load(path, allow_pickle=False) as z:
+        Z = dict(z)
     ac = json.loads(str(Z["acoustic_constants"]))["speaker"]
     tdp = VT.TDPath(48000, 48)
     for k, v in ac.items():
@@ -43,12 +46,7 @@ def setup(run: str, hard: bool, over: dict | None = None):
     for k, v in (over or {}).items():
         getattr(tdp, f"log_ns_{k}").data.fill_(float(np.log(v)))
     tdp._vf_jitter = lambda n, dt, dv: torch.ones(n, dtype=dt, device=dv)
-    eff = {}
-    for k in VT.VF_NS_INIT:
-        v = float(np.exp(float(getattr(tdp, f"log_ns_{k}").detach())))
-        if VT.VF_NS_HARD and k in VT.VF_NS_HARD:
-            v = float(np.clip(v, *VT.VF_NS_HARD[k]))
-        eff[k] = v
+    eff = {k: float(v.detach()) for k, v in tdp.ns_scales().items()}
     nfr = int(Z["values"].shape[0])
     dur = nfr * float(Z["frame_ms"]) / 1000.0 if np.ndim(Z["frame_ms"]) == 0 else nfr / 1000.0
     return tdp, eff, dur
@@ -140,7 +138,8 @@ def f0_table(b: Bench, eps_grid, ps_max: float, log=print):
         f0, per, dbl, amp = b.f0_at(p, eps=e)
         rows.append((e, P, f0, per, dbl))
         log(f"  ε {e:+.2f}: 문턱 {P:4.1f} cmH2O → {p:4.1f} 에서 f0 {f0:6.1f} Hz (주기성 {per:.2f}{', 이중 주기' if dbl else ''}, 유량 폭 {amp:.0f})")
-    ok = [(e, f) for e, P, f, per, dbl in rows if np.isfinite(f)]
+    # An inverse for modal pitch cannot use a subharmonic/weakly periodic branch.
+    ok = [(e, f) for e, P, f, per, dbl in rows if np.isfinite(f) and per >= 0.8 and not dbl]
     keep, fmax = [], 0.0
     for e, f in ok:                                         # 단조 증가만 (1 % 넘게 오를 때)
         if f > fmax * 1.01:
@@ -148,10 +147,25 @@ def f0_table(b: Bench, eps_grid, ps_max: float, log=print):
     return rows, np.array([k[0] for k in keep]), np.array([k[1] for k in keep])
 
 
+def reference_frame(path, duration, t):
+    """Read full-rate TD_DUMP_IN, with explicit support for legacy dumps."""
+    with np.load(path, allow_pickle=False) as z:
+        fs = float(z["fs"]) if "fs" in z.files else td.FS_SIM
+        A, L = np.asarray(z["A"], float), np.asarray(z["L"], float)
+        n_pre = int(z["n_pre"]) if "n_pre" in z.files else A.shape[0] - int(round(duration * fs))
+    if (not np.isfinite(fs) or fs <= 0 or A.ndim != 2 or L.shape != (A.shape[0],)
+            or n_pre < 0 or not 0 <= t < duration):
+        raise ValueError("Reference requires full-rate TD_DUMP_IN matching the calibration utterance")
+    i = n_pre + int(t * fs)
+    if not 0 <= i < A.shape[0] or not np.isfinite(A[i]).all() or np.any(A[i] <= 0) or not 0 < L[i] < np.inf:
+        raise ValueError("Invalid reference tract frame")
+    return A[i], float(L[i])
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("run")
-    ap.add_argument("--dump", default="out/_tmp/3d/n1_tdin.npz", help="관 입력 기록 (A, L) — TD_DUMP")
+    ap.add_argument("run", help="out/VF의 판 이름 또는 _track.npz 경로")
+    ap.add_argument("--dump", default="out/_tmp/3d/n1_tdin.npz", help="관 입력 원래 표본률 기록 (A, L) — TD_DUMP_IN, TD_DUMP 아님")
     ap.add_argument("--t", type=float, default=0.10, help="성도 틀 시각 [s] (모음)")
     ap.add_argument("--hard", action="store_true", help="화자 상수를 VF_NS_HARD_DEFAULT 로 자른다 (--vf-ns-hard 판)")
     ap.add_argument("--set", default="", help="화자 상수 덮어쓰기 (배율) 'kc=1.2,len=1.1'")
@@ -159,11 +173,20 @@ def main() -> int:
     ap.add_argument("--rdo", type=float, default=0.0)
     ap.add_argument("--ta", type=float, default=0.25)
     ap.add_argument("--ps-max", type=float, default=15.0, help="표 · 지도의 폐압 상한 [cmH2O]")
+    ap.add_argument("--eps-min", type=float, default=EPS_LIMITS[0])
+    ap.add_argument("--eps-max", type=float, default=EPS_LIMITS[1])
+    ap.add_argument("--eps-step", type=float, default=0.05)
+    ap.add_argument("--lr", action="store_true", help="좌우 성대를 따로 푼 판의 보정")
     ap.add_argument("--edge-um", type=float, default=None, help="닫힘 이음 폭 [μm] (beam_membrane.CLOSURE_EDGE_CM, 판의 --vf-closure-edge 와 같게)")
     ap.add_argument("--rest-modal-um", type=float, default=None, help="모달 쉼 반틈새 [μm] (voice_td.VF_R_MODAL, 판의 --vf-rest-modal 과 같게, §52.532)")
     ap.add_argument("--no-map", action="store_true")
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
+    if (not EPS_LIMITS[0] <= a.eps_min < a.eps_max <= EPS_LIMITS[1]
+            or not np.isfinite(a.eps_step) or a.eps_step <= 0 or not 0 < a.ps_max < np.inf):
+        ap.error("eps 범위는 [-0.3, 0.7] 안, eps-step과 ps-max는 유한한 양수여야 한다")
+    from formant_ml.physics import beam_membrane as _bm
+    _bm.LR_FOLDS = a.lr
     over = {kv.split("=")[0]: float(kv.split("=")[1]) for kv in a.set.split(",") if kv}
     if a.edge_um is not None:
         from formant_ml.physics import beam_membrane as _bm
@@ -172,26 +195,27 @@ def main() -> int:
         from formant_ml.engine import voice_td as _vr
         _vr.VF_R_MODAL = a.rest_modal_um * 1e-4
     tdp, eff, dur = setup(a.run, a.hard, over)
-    D = np.load(a.dump)
-    fs = td.FS_SIM
-    n_pre = D["A"].shape[0] - int(round(dur * fs))
-    i = n_pre + int(a.t * fs)
-    A0, L0 = D["A"][i], float(D["L"][i])
+    A0, L0 = reference_frame(a.dump, dur, a.t)
     print(f"{a.run}: 실효 상수 " + " ".join(f"{k} {v:.3g}" for k, v in eff.items()) +
           f" | 틀 {a.t:.3f} s (관 {L0:.2f} cm) | 내전 {a.add} 수렴 {a.rdo} 갑상피열근 {a.ta}", flush=True)
     b = Bench(tdp, A0, L0, a.add, a.rdo, a.ta)
     t0 = time.time()
-    rows, et, ft = f0_table(b, np.round(np.arange(-0.15, 0.651, 0.05), 3), a.ps_max, log=lambda s: print(s, flush=True))
+    eps_grid = np.arange(a.eps_min, a.eps_max, a.eps_step)
+    eps_grid = np.r_[eps_grid[eps_grid < a.eps_max - 1e-10], a.eps_max]
+    rows, et, ft = f0_table(b, eps_grid, a.ps_max, log=lambda s: print(s, flush=True))
     print(f"  표 ({time.time()-t0:.0f} s): " + " ".join(f"{e:+.2f}:{f:.0f}" for e, f in zip(et, ft)), flush=True)
     if et.size < 3:
         print("  표 점이 3 개보다 적다 — 이 상수로는 떨림 범위가 없다", flush=True)
         return 1
+    validate_pitch_table(et, ft)
     out = dict(eps_tab=et, f0_tab=ft, rows=np.array([(r[0], r[1], r[2], r[3], float(r[4])) for r in rows]),
                consts=json.dumps(eff), cond=json.dumps(dict(run=a.run, dump=a.dump, t=a.t, add=a.add, rdo=a.rdo, ta=a.ta, rest_modal_um=a.rest_modal_um,
-                                                             ps_max=a.ps_max, hard=a.hard, set=over, edge_um=a.edge_um)))
+                                                             ps_max=a.ps_max, hard=a.hard, set=over, edge_um=a.edge_um,
+                                                             eps_min=a.eps_min, eps_max=a.eps_max, eps_step=a.eps_step)),
+               signature=json.dumps(model_signature(tdp)), reference_A=A0, reference_L=L0)
     if not a.no_map:
         VT.VF_NS_EPS_TAB, VT.VF_NS_F0_TAB = tuple(map(float, et)), tuple(map(float, ft))
-        F0 = tuple(float(v) for v in np.round(np.geomspace(max(ft[0], 120.0), ft[-1], 6)))
+        F0 = tuple(float(v) for v in np.geomspace(ft[0], ft[-1], 6))
         ADD, RDO, TA = (0.3, 0.35, 0.45, 0.55), (-1.0, 0.0, 1.0), (0.2, 0.5)
         res = np.full((len(F0), len(ADD), len(RDO), len(TA)), np.nan)
         t0 = time.time()
@@ -204,8 +228,9 @@ def main() -> int:
                 for i0, f0 in enumerate(F0):
                     print(f"    f0 {f0:5.0f}: " + " ".join("  ---" if not np.isfinite(x) else f"{x:5.1f}" for x in res[i0, :, k, l]))
         out.update(pth=res, f0=np.array(F0), add=np.array(ADD), rdo=np.array(RDO), ta=np.array(TA))
-    path = a.out or f"profiles/vf/{a.run}_ns_calib.npz"
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    stem = os.path.basename(a.run).removesuffix("_track.npz")
+    path = a.out or f"profiles/vf/{stem}_ns_calib.npz"
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     np.savez(path, **out)
     print(f"  저장 {path}", flush=True)
     return 0

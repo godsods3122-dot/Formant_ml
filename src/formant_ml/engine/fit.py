@@ -3192,8 +3192,17 @@ class CopySynthFitter:
                                       if parameter_scope(name) == "speaker"}
         self.hf = [p for name, p in self.constant_parameters.items()
                    if name not in self.locked_constants]
+        self._project_ns_bounds(verbose=True)
         if initial_gain_db is None:
             self.calibrate_gain()
+
+    def _project_ns_bounds(self, verbose=False):
+        from . import voice_td as vt
+        if _voice_mod.TD_TUBE and vt.GLOTTIS == "vf" and vt.VF_NS:
+            changed = self.eng.td.project_ns_bounds()
+            if verbose and changed:
+                print("  NS hard-bound projection (same rendered constants): "
+                      + ", ".join(f"{k} {a:.6g} -> {b:.6g}" for k, (a, b) in changed.items()), flush=True)
 
     def acoustic_constants(self) -> dict:
         return capture_calibration(
@@ -4909,28 +4918,37 @@ class CopySynthFitter:
 
     def pth_loss(self, c: torch.Tensor) -> torch.Tensor:
         """발성 문턱 항 (`PTH_W`). c (1, T, C) 제어."""
+        from .vf_calibration import grid_index
         if getattr(self, "_pthm", None) is None:
-            Z = np.load(PTH_MAP)
-            P = np.asarray(Z["pth"], float)                         # (F0, ADD, RDO, TA) [cmH2O], nan = 15 까지 안 떪
+            with np.load(PTH_MAP, allow_pickle=False) as Z:
+                P = np.asarray(Z["pth"], float)                     # (F0, ADD, RDO, TA) [cmH2O], nan = 15 까지 안 떪
+                axes = [np.asarray(Z[k], float) for k in ("f0", "add", "rdo", "ta")]
+            if (any(g.ndim != 1 or not g.size or not np.isfinite(g).all() or np.any(np.diff(g) <= 0) for g in axes)
+                    or P.shape != tuple(g.size for g in axes) or np.any(axes[0] <= 0)
+                    or np.any(P[np.isfinite(P)] <= 0)):
+                raise ValueError(f"Invalid NS threshold grid: {PTH_MAP}")
             P = np.where(np.isfinite(P), P, 20.0)
-            self._pthm = dict(lp=torch.as_tensor(np.log(P), dtype=torch.float64), lf=np.log(np.asarray(Z["f0"], float)),
-                              ad=np.asarray(Z["add"], float), rd=np.asarray(Z["rdo"], float), ta=np.asarray(Z["ta"], float))
+            self._pthm = dict(lp=torch.as_tensor(np.log(P), dtype=torch.float64), lf=np.log(axes[0]),
+                              ad=axes[1], rd=axes[2], ta=axes[3])
             T = int(c.shape[1])
             v = np.asarray(self.track.voiced, bool)[:T] if self.track.voiced.size else np.zeros(T, bool)
             self._pth_vmask = torch.as_tensor(np.pad(v, (0, T - v.size)) if v.size < T else v)
             print(f"  발성 문턱 항: 지도 {PTH_MAP} {P.shape}, 유성 틀 {int(self._pth_vmask.sum())} — 폐압 ≥ {PTH_MARGIN:g} × 문턱", flush=True)
         m = self._pthm
         x = c[0].double()
+        rendered = getattr(getattr(getattr(self, "eng", None), "td", None), "last_vf_controls", None)
+        def control(name):
+            return rendered[name][0].double() if rendered is not None else x[:, INDEX[name]]
+
         def coord(val, grid):
-            g = torch.as_tensor(grid, dtype=torch.float64)
-            if g.numel() == 1:
+            if len(grid) == 1:
                 return torch.zeros_like(val)
-            return (2.0 * (val - g[0]) / (g[-1] - g[0]) - 1.0).clamp(-1.0, 1.0)
-        f0 = x[:, INDEX["f0_target"]].clamp_min(50.0)
+            return 2.0 * grid_index(val, grid) / (len(grid) - 1) - 1.0
+        f0 = control("f0_target").clamp_min(50.0)
         cf = coord(torch.log(f0), m["lf"])
-        ca = coord(x[:, INDEX["adduction"]], m["ad"])
-        cr = coord(x[:, INDEX["rd_offset"]], m["rd"]) if "rd_offset" in INDEX else torch.zeros_like(cf)
-        ta = x[:, INDEX["vf_ta"]] if "vf_ta" in INDEX else torch.full_like(cf, 0.3)
+        ca = coord(control("adduction"), m["ad"])
+        cr = coord(control("rd_offset"), m["rd"])
+        ta = control("vf_ta")
         lp = m["lp"].to(x.device)                                   # (F, A, R, TA)
         grid = torch.stack([cr, ca, cf], -1).view(1, 1, 1, -1, 3)    # grid_sample: (x=W=R, y=H=A, z=D=F)
         vals = []
@@ -4942,10 +4960,13 @@ class CopySynthFitter:
         if len(vals) == 1:
             lpth = vals[0]
         else:
-            tg = torch.as_tensor(m["ta"], dtype=torch.float64)
-            w = ((ta - tg[0]) / (tg[-1] - tg[0])).clamp(0.0, 1.0)
-            lpth = (1 - w) * vals[0] + w * vals[-1]
-        lps = torch.log(x[:, INDEX["p_sub"]].clamp_min(0.05))
+            pos = grid_index(ta, m["ta"])
+            i = pos.detach().floor().long().clamp(max=len(vals) - 2)
+            w = pos - i
+            by_ta = torch.stack(vals, -1)
+            lpth = ((1 - w) * by_ta.gather(1, i[:, None])[:, 0]
+                    + w * by_ta.gather(1, (i + 1)[:, None])[:, 0])
+        lps = torch.log(control("p_sub").clamp_min(0.05))
         vm = self._pth_vmask.to(x.device)[: x.shape[0]]
         h = torch.relu(lpth + math.log(PTH_MARGIN) - lps) ** 2
         self._pth_viol = float((h[vm] > 0).double().mean()) if bool(vm.any()) else float("nan")
@@ -5533,8 +5554,14 @@ class CopySynthFitter:
     def vf_ns_anat_loss(self) -> torch.Tensor:
         """모드 3 화자 상수가 생리 범위(`VF_NS_ANAT`) 밖으로 나간 log 거리의 제곱합 / 0.05²."""
         tdp = self.eng.td
-        tot = torch.zeros((), dtype=torch.float64)
+        from . import voice_td as vt
+        tot = torch.zeros((), dtype=torch.float64, device=tdp.log_ns_len.device)
         for k, (lo, hi) in VF_NS_ANAT.items():
+            if vt.VF_NS_HARD and k in vt.VF_NS_HARD:
+                hlo, hhi = vt.VF_NS_HARD[k]
+                lo, hi = max(lo, hlo), min(hi, hhi)
+                if lo > hi:
+                    raise ValueError(f"Incompatible hard/soft NS bounds for {k}")
             s = getattr(tdp, f"log_ns_{k}").double()
             tot = tot + torch.relu(math.log(lo) - s) ** 2 + torch.relu(s - math.log(hi)) ** 2
         return tot / 0.05 ** 2
@@ -6240,6 +6267,7 @@ class CopySynthFitter:
             self.sizes = list(sizes)
         if iters < 0:
             raise ValueError("iters must be nonnegative")
+        self._project_ns_bounds(verbose=verbose)
         if FREEZE_CONTROLS and iters > 0:
             params = self._hc_leaves()
             if not params:
@@ -6473,7 +6501,9 @@ class CopySynthFitter:
                 # 증거가 아니다 (§27: 위상 단계가 골짜기 한복판에서 멈췄다).
                 stall = stall_before
             torch.nn.utils.clip_grad_norm_(ps, 5.0)
-            opt.step(); sch.step()
+            opt.step()
+            self._project_ns_bounds()
+            sch.step()
             if verbose and (it % log_every == 0 or it == iters - 1):
                 print(f"    [{it:4d}] 포락 {env:6.2f}%  정밀 {fine:6.2f}%  "
                       f"오차 {self._last_db:5.2f} dB  펄스 {self._last_pulse:.3f}  "
