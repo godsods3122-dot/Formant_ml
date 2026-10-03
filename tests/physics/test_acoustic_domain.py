@@ -60,6 +60,124 @@ def two_cavities(*, damping=0.0, courant=0.4, mass=0.02, boundary_layer=False, w
     return g, d, pair
 
 
+def cut_grid(g, vf):
+    patches = wall_patches(g)
+    g.meta = dict(cut=True, vf=vf, walls=dict(
+        cell=np.array([np.ravel_multi_index(p.cell, g.shape) for p in patches]),
+        area=np.array([p.area_m2 * 1e4 for p in patches]),
+        tis=np.array([T_ID[p.tissue] for p in patches]),
+        pos=np.array([p.position_m for p in patches]) * 100,
+        dir=np.array([p.outward_normal for p in patches])))
+    return g
+
+
+@pytest.mark.parametrize("max_dt_s", [None, 1e-7])
+def test_refitted_boundary_layer_actual_matrix_is_stable_and_tail_decays(max_dt_s):
+    g = cut_grid(grid_from_mask(np.ones((1, 1, 1), bool), h=2.),
+                 np.full((1, 1, 1), 1e-4))
+    d = AcousticDomain(g, {"in": VolumeFlowPort(g.inlet)}, courant=1.,
+                       boundary_layer=True, sponge_cells=0, max_dt_s=max_dt_s)
+    sim = d._sim
+    weights, memory = np.array(sim.bl_w), np.array(sim.bl_a)
+    area_cm2 = np.asarray(g.meta["walls"]["area"])
+    gains = sim.dt * sim.rho * sim.c ** 2 * sim.bl_C * area_cm2 / (1e-4 * g.h ** 3)
+    # Independent pressure + per-face/per-pole reservoir amplification matrix.
+    n = 1 + sim.n_wall * len(weights)
+    matrix = np.zeros((n, n))
+    matrix[0, 0] = 1 - gains.sum() * weights.sum()
+    matrix[0, 1:] = (weights[:, None] * gains).ravel()
+    for pole, a in enumerate(memory):
+        for face in range(sim.n_wall):
+            row = 1 + pole * sim.n_wall + face
+            matrix[row, 0], matrix[row, row] = a, 1 - a
+    assert np.max(np.abs(np.linalg.eigvals(matrix))) <= 1 + 2e-12
+    assert gains.sum() * weights.sum() <= .25
+    assert memory.max() <= .25
+
+    initial = d.snapshot()
+    measured = np.zeros_like(matrix)
+    for col in range(n):
+        d.restore(initial)
+        if col == 0:
+            sim.p.fill_(1.)
+            sim.px.fill_(1.)
+        else:
+            pole, face = divmod(col - 1, sim.n_wall)
+            sim.phi[pole][face] = 1.
+        d.advance({})
+        measured[:, col] = np.concatenate(([sim.p.item()], *(phi.numpy() for phi in sim.phi)))
+    np.testing.assert_allclose(measured, matrix, rtol=2e-12, atol=2e-15)
+    d.restore(initial)
+    p0 = d.advance({"in": 1e-14}).pressure_pa["in"]
+    trace = np.array([d.advance({}).pressure_pa["in"] for _ in range(4000)])
+    assert np.isfinite(trace).all()
+    assert np.max(np.abs(trace)) <= p0
+    assert 0 < trace[-1] < .03 * p0
+    # A second construction capped at the accepted clock must accept that clock.
+    shared = AcousticDomain(g, {"in": VolumeFlowPort(g.inlet)}, courant=1.,
+                            boundary_layer=True, sponge_cells=0, max_dt_s=d.dt)
+    assert shared.dt == pytest.approx(d.dt, rel=2e-15, abs=0.)
+
+
+def test_boundary_layer_refinement_has_explicit_bounded_failure(monkeypatch):
+    calls = []
+
+    def unacceptable_fit(fs):
+        calls.append(fs)
+        return np.array([.5]), np.array([0.]), 0.
+
+    monkeypatch.setattr(fdtd3d, "diffusive_weights", unacceptable_fit)
+    g = grid_from_mask(np.ones((1, 1, 1), bool))
+    with pytest.raises(RuntimeError, match="32 coefficient refits"):
+        AcousticDomain(g, {"in": VolumeFlowPort(g.inlet)}, boundary_layer=True, sponge_cells=0)
+    assert len(calls) == 33
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("cut", [False, True])
+def test_canonical_pair_geometry_with_unequal_subdivisions_and_signed_work(dtype, cut):
+    air = np.zeros((5, 5, 3), bool)
+    inside, outside1, outside2 = (1, 1, 1), (3, 1, 1), (3, 3, 1)
+    for cell in (inside, outside1, outside2):
+        air[cell] = True
+    exterior = air.copy()
+    exterior[inside] = False
+    g = grid_from_mask(air, exterior=exterior)
+    for face, fraction in (((2, 1, 1), .3), ((3, 1, 1), .1), ((3, 3, 1), .2)):
+        g.wx[face], g.cx[face] = T_ID["cheek"], fraction
+    if cut:
+        vf = np.zeros_like(air, dtype=float)
+        vf[inside], vf[outside1], vf[outside2] = .2718281828459045, .3123456789123, .6134567891234
+        cut_grid(g, vf)
+    patches = wall_patches(g)
+    pair = WallPair("subdivided", tuple(p.index for p in patches if p.tissue == "cheek" and not p.exterior),
+                    tuple(p.index for p in patches if p.tissue == "cheek" and p.exterior), .02, 1000., 10.)
+    ports = {"inside": VolumeFlowPort(g.inlet), "outside": VolumeFlowPort(exterior)}
+    d = domain(g, ports, wall_pairs=[pair], dtype=dtype)
+    assert d._sim.p.dtype == dtype
+    np.testing.assert_array_equal([p.area_m2 for p in d.patches], [p.area_m2 for p in patches])
+    np.testing.assert_allclose([d.patches[i].area_m2 for i in (*pair.inside, *pair.outside)],
+                               [3e-5, 1e-5, 2e-5], rtol=2e-15, atol=0.)
+    if cut:
+        np.testing.assert_array_equal(d._sim.veff, vf)
+        assert d.diagnostics()["physical_air_volume_m3"] == pytest.approx(
+            vf.sum() * 1e-6, rel=2e-15, abs=0.)
+    for i in range(400):
+        d.advance({"inside": 1e-7 * math.sin(i / 11), "outside": -2e-8 * math.cos(i / 7)})
+    diag = d.diagnostics()
+    tol = 5e-5 if dtype == torch.float32 else 5e-12
+    assert diag["compression_volume_m3"] == pytest.approx(
+        sum(diag["input_volume_m3"].values()), rel=tol, abs=0.)
+    assert diag["staggered_energy_j"] + diag["pair_dissipation_j"] == pytest.approx(
+        diag["input_work_j"], rel=tol, abs=0.)
+    if cut:
+        g.meta["walls"]["area"][pair.outside[0]] *= 1.01
+    else:
+        g.cx[3, 1, 1] *= 1.01
+    with pytest.raises(ValueError, match="equal physical area"):
+        domain(g, ports, wall_pairs=[pair], dtype=dtype)
+
+
 def test_si_conversion_conservation_signed_flow_and_legacy_equivalence():
     g = grid_from_mask(np.ones((4, 3, 3), bool))
     d = domain(g)

@@ -100,7 +100,7 @@ class AcousticSnapshot:
 
 def _patches(sim: fdtd3d.Sim) -> tuple[WallPatch, ...]:
     cells = sim.wall_cell.cpu().numpy()
-    areas = sim.wall_cos.cpu().numpy() * sim.g.h ** 2 * 1e-4
+    areas = sim.wall_face_area_cgs * 1e-4
     return tuple(WallPatch(i, tuple(int(x) for x in np.unravel_index(cell, sim.g.shape)),
                            tuple(sim.wall_pos[i] * 0.01), tuple(sim.wall_dir[i]),
                            float(areas[i]), TISSUE[sim.wall_tis[i]],
@@ -222,17 +222,32 @@ class AcousticDomain:
         bound_air = 12 * self.sound_speed_m_s ** 2 / (self.h_m ** 2 * vf[grid.air].min())
         limit = 1.9 / math.sqrt(bound_air + bound_structural)
         actual_dt = min(sim.dt, limit, max_dt_s if max_dt_s is not None else sim.dt)
+        bl_rate = None
         if boundary_layer and sim.n_wall:
-            # A conservative explicit BL memory/reservoir step, not a fitted gain.
             area_per_cell = np.bincount(sim.wall_cell.cpu().numpy(),
-                                       weights=sim.wall_cos.cpu().numpy() * grid.h ** 2,
+                                       weights=sim.wall_face_area_cgs,
                                        minlength=grid.air.size).reshape(grid.shape)
-            rates = sim.rho * sim.c ** 2 * sim.bl_C * sum(sim.bl_w) * area_per_cell[
+            rates = sim.rho * sim.c ** 2 * sim.bl_C * area_per_cell[
                 grid.air] / (vf[grid.air] * grid.h ** 3)
-            actual_dt = min(actual_dt, 0.25 / max(float(rates.max()), 2 * math.pi * 2e5))
-        actual_courant = actual_dt * sim.c * math.sqrt(3) / grid.h
-        self._sim = fdtd3d.Sim(self.grid, courant=actual_courant,
-                              inactive_walls=selected, **options)
+            bl_rate = float(rates.max())
+        # BL fitting depends on dt. Accept only the coefficients of the actual
+        # final Sim, with margin in each pressure/reservoir update, not a stale fit.
+        for _ in range(32):
+            actual_courant = actual_dt * sim.c * math.sqrt(3) / grid.h
+            self._sim = fdtd3d.Sim(self.grid, courant=actual_courant,
+                                  inactive_walls=selected, **options)
+            if bl_rate is None:
+                break
+            load = max(self._sim.dt * bl_rate * sum(self._sim.bl_w), max(self._sim.bl_a))
+            if not np.isfinite(load) or load < 0:
+                raise RuntimeError("Nonfinite or invalid boundary-layer timestep bound")
+            if load <= .25:
+                break
+            actual_dt = self._sim.dt * min(.5, .2 / load)
+            if not np.isfinite(actual_dt) or actual_dt <= 0:
+                raise RuntimeError("Boundary-layer timestep refinement underflowed")
+        else:
+            raise RuntimeError("No stable boundary-layer timestep after 32 coefficient refits")
         self.requested_courant = courant
         self._volume = self._tensor(volume)
         self._ports = {}
