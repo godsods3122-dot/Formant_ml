@@ -175,6 +175,8 @@ class Sim:
         self.wall_tis = tis
         self.wall_area = {TISSUE[t]: float(cosw[tis == t].sum() * h * h) for t in np.unique(tis)}
         self.wall_area_stair = {TISSUE[t]: float((tis == t).sum() * h * h) for t in np.unique(tis)}
+        # Canonical geometry must not inherit the field tensor's precision.
+        self.wall_face_area_cgs = np.asarray(cosw, dtype=np.float64) * h ** 2
         self.wall_cos = torch.as_tensor(cosw, device=dev, dtype=dtype)
         active = np.ones(len(cells), bool)
         inactive = np.asarray(inactive_walls)
