@@ -363,6 +363,7 @@ class CellPressurePatch:
     strip: int
     cell: int
     patch: PressurePatch
+    projected_area_m2: float
 
 
 @dataclass(frozen=True)
@@ -370,6 +371,10 @@ class MappedChannel:
     geometry: ChannelGeometry
     patches: tuple[CellPressurePatch, ...]
     projected_coverage_m2: np.ndarray
+    hydraulic_path_checked: np.ndarray
+    hydraulic_model_relative_error: np.ndarray
+    hydraulic_quadrature_relative_error: np.ndarray
+    hydraulic_resistance_per_viscosity: np.ndarray
 
     def pressure_patches(self, pressure_pa):
         pressure = np.asarray(pressure_pa, float)
@@ -392,6 +397,41 @@ class MappedChannel:
             volume[item.strip, item.cell] -= outward
         return volume
 
+    def _wall_weights(self, solid):
+        totals = np.zeros(self.geometry.shape + (2,))
+        for item in self.patches:
+            side = 0 if item.patch.side == "left" else 1
+            totals[item.strip, item.cell, side] += item.projected_area_m2
+        left_count = len(solid.surface("left").coordinates_m)
+        for item in self.patches:
+            side = 0 if item.patch.side == "left" else 1
+            offset = 0 if side == 0 else left_count
+            nodes = np.asarray(item.patch.triangle_nodes) + offset
+            weights = np.mean(item.patch.barycentric_vertices, axis=0)
+            weights = weights * item.projected_area_m2 / totals[item.strip, item.cell, side]
+            yield item.strip, item.cell, side, nodes, weights
+
+    def wall_velocity_m_s(self, solid, displacement_m, dt_s):
+        displacement = np.asarray(displacement_m, float)
+        if displacement.shape != solid.positions_m.shape or not np.isfinite(displacement).all():
+            raise ValueError("wall displacement must match real solid nodes")
+        if not math.isfinite(dt_s) or dt_s <= 0:
+            raise ValueError("wall velocity needs positive physical dt")
+        velocity = np.zeros(self.geometry.shape + (2, 2))
+        for strip, cell, side, nodes, weights in self._wall_weights(solid):
+            velocity[strip, cell, side] += weights @ displacement[nodes][:, (0, 2)] / dt_s
+        return velocity
+
+    def nodal_wall_force_n(self, solid, wall_force_n):
+        force = np.asarray(wall_force_n, float)
+        if force.shape != self.geometry.shape + (2, 2) or not np.isfinite(force).all():
+            raise ValueError("wall force must match wet cell sides and projected tangents")
+        nodal = np.zeros_like(solid.positions_m)
+        for strip, cell, side, nodes, weights in self._wall_weights(solid):
+            for node, weight in zip(nodes, weights):
+                nodal[node, (0, 2)] += weight * force[strip, cell, side]
+        return nodal
+
 
 class EulerianGlottis:
     """Exact instantaneous wet-volume clipping between two triangular graphs.
@@ -408,7 +448,9 @@ class EulerianGlottis:
     its minimum actual cross-sectional area, a stated chamber/throat model.
     """
 
-    def __init__(self, ap_edges_m, si_edges_m, *, provenance, neck_half_width_m=0.0):
+    def __init__(self, ap_edges_m, si_edges_m, *, provenance, neck_half_width_m=0.0,
+                 maximum_wall_slope=0.25, hydraulic_model_tolerance=0.1,
+                 hydraulic_quadrature_tolerance=1e-5):
         self.ap_edges_m = np.array(ap_edges_m, dtype=float, copy=True)
         self.si_edges_m = np.array(si_edges_m, dtype=float, copy=True)
         for edges in (self.ap_edges_m, self.si_edges_m):
@@ -420,6 +462,14 @@ class EulerianGlottis:
             raise ValueError("actual solid/cavity geometry provenance is required")
         self.provenance = provenance
         self.neck_half_width_m = float(neck_half_width_m)
+        self.maximum_wall_slope = float(maximum_wall_slope)
+        if not math.isfinite(self.maximum_wall_slope) or self.maximum_wall_slope <= 0:
+            raise ValueError("declare a positive projected-slit slope validity bound")
+        self.hydraulic_model_tolerance = float(hydraulic_model_tolerance)
+        self.hydraulic_quadrature_tolerance = float(hydraulic_quadrature_tolerance)
+        if (not 0 < self.hydraulic_model_tolerance < 1
+                or not 0 < self.hydraulic_quadrature_tolerance < 0.01):
+            raise ValueError("declare finite hydraulic model and quadrature tolerances")
         if (not math.isfinite(self.neck_half_width_m) or self.neck_half_width_m < 0
                 or self.neck_half_width_m >= np.min(np.diff(self.si_edges_m)) / 2):
             raise ValueError("neck bands must be nonnegative and nonoverlapping")
@@ -440,6 +490,10 @@ class EulerianGlottis:
         projected = tuple(t[:, :, (0, 2)] for t in triangles)
         planes, barycentric_maps = [], []
         for tri in triangles:
+            normal = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+            slope = np.linalg.norm(normal[:, (0, 2)], axis=1) / np.abs(normal[:, 1])
+            if not np.isfinite(slope).all() or np.any(slope > self.maximum_wall_slope):
+                raise ValueError("wall slope exceeds the declared projected-slit validity regime")
             matrix = np.concatenate(
                 (tri[:, :, (0, 2)], np.ones((len(tri), 3, 1))), axis=2
             )
@@ -450,7 +504,7 @@ class EulerianGlottis:
             barycentric_maps.append(inverse)
         widths, lengths = np.diff(self.ap_edges_m), np.diff(self.si_edges_m)
         shape = (len(widths), len(lengths))
-        volume, coverage = np.zeros(shape), np.zeros(shape)
+        volume, coverage, wet_area = np.zeros(shape), np.zeros(shape), np.zeros(shape)
         patches = []
         regions = [[[] for _ in lengths] for _ in widths]
         for il, ltri in enumerate(projected[0]):
@@ -484,6 +538,7 @@ class EulerianGlottis:
                             if np.max(gaps) <= 0:
                                 continue
                             volume[strip, cell] += area * float(np.mean(gaps))
+                            wet_area[strip, cell] += area
                             for side_index, triangle_index in ((0, il), (1, ir)):
                                 B = points @ barycentric_maps[side_index][triangle_index]
                                 if np.any(B < -1e-10) or np.any(B > 1 + 1e-10):
@@ -500,7 +555,7 @@ class EulerianGlottis:
                                     "left" if side_index == 0 else "right",
                                     tuple(tri_nodes[side_index][triangle_index]), 0.0, B,
                                 )
-                                patches.append(CellPressurePatch(strip, cell, patch))
+                                patches.append(CellPressurePatch(strip, cell, patch, area))
         expected_coverage = widths[:, None] * lengths[None, :]
         if not np.allclose(coverage, expected_coverage, rtol=1e-9, atol=1e-20):
             raise ValueError("fixed channel cuts lack complete single-valued medial coverage")
@@ -514,7 +569,7 @@ class EulerianGlottis:
                         "component-specific storage or different fixed cuts are required"
                     )
 
-        def area_at(z, strip):
+        def section_at(z, strip):
             curves = [_slice_curve(t, z) for t in triangles]
             x0, x1 = self.ap_edges_m[strip:strip + 2]
             if any(curve[0, 0] > x0 + 1e-12 or curve[-1, 0] < x1 - 1e-12 for curve in curves):
@@ -533,7 +588,13 @@ class EulerianGlottis:
             )
             full = np.unique(np.r_[knots, roots])
             positive = np.maximum(np.interp(full, knots, gap), 0)
-            return float(np.sum(np.diff(full) * (positive[:-1] + positive[1:]) / 2))
+            a, b = positive[:-1], positive[1:]
+            area = float(np.sum(np.diff(full) * (a + b) / 2))
+            cubic = float(np.sum(np.diff(full) * (a**3 + a*a*b + a*b*b + b**3) / 4))
+            return area, cubic
+
+        def area_at(z, strip):
+            return section_at(z, strip)[0]
 
         opened = np.zeros((len(widths), len(lengths) + 1))
         vertex_levels = np.unique(np.concatenate([t[:, :, 2].ravel() for t in triangles]))
@@ -564,13 +625,89 @@ class EulerianGlottis:
         )
         # Storage faces are effective chamber sections, never conductive floors.
         storage_faces = np.maximum(chamber_faces, opened)
+        checked = np.zeros(shape + (2,), bool)
+        model_error, quadrature_error = np.zeros(shape + (2,)), np.zeros(shape + (2,))
+        reference_resistance = np.full(shape + (2,), np.inf)
+        gauss = [np.polynomial.legendre.leggauss(order) for order in (4, 8)]
+        for strip in range(len(widths)):
+            for cell, length in enumerate(lengths):
+                z0, z1 = self.si_edges_m[cell:cell + 2]
+                center = (z0 + z1) / 2
+                for half, (lo, hi, face) in enumerate(((z0, center, cell), (center, z1, cell + 1))):
+                    if opened[strip, face] == 0:
+                        continue
+                    checked[strip, cell, half] = True
+                    corners = np.concatenate([
+                        poly[:, 1] for poly, _ in regions[strip][cell]
+                    ])
+                    breaks = np.unique(np.r_[lo, hi, corners[(corners > lo) & (corners < hi)]])
+                    intervals = []
+                    # Between geometric breakpoints the AP cubic-gap integral
+                    # is quartic in SI. Its extrema expose narrow internal minima.
+                    for a, b in zip(breaks[:-1], breaks[1:]):
+                        t = np.linspace(0, 1, 5)
+                        samples = np.array([section_at(a + x * (b - a), strip)[1] for x in t])
+                        if np.any(samples <= 0) or not np.isfinite(samples).all():
+                            raise ValueError("hydraulic path has a closed section; refine fixed pocket ownership")
+                        coefficients = np.polynomial.polynomial.polyfit(t, samples / samples.max(), 4)
+                        roots = np.polynomial.polynomial.polyroots(
+                            np.polynomial.polynomial.polyder(coefficients)
+                        )
+                        cuts = sorted([a, b] + [
+                            a + float(r.real) * (b - a) for r in roots
+                            if abs(r.imag) < 1e-9 and 0 < r.real < 1
+                        ])
+                        intervals.extend((u, v, 0) for u, v in zip(cuts[:-1], cuts[1:]))
+                    integral, error_bound, evaluated = 0.0, 0.0, 0
+                    while intervals:
+                        a, b, depth = intervals.pop()
+                        estimates = []
+                        for nodes, weights in gauss:
+                            z = (a + b) / 2 + (b - a) * nodes / 2
+                            values = np.array([section_at(level, strip)[1] for level in z])
+                            if np.any(values <= 0) or not np.isfinite(values).all():
+                                raise ValueError("hydraulic quadrature encountered a closed/nonfinite section")
+                            estimates.append(float((b - a) * np.sum(weights / values) / 2))
+                        evaluated += 1
+                        error = abs(estimates[1] - estimates[0])
+                        end_values = [section_at(level, strip)[1] for level in (a, (a + b) / 2, b)]
+                        resolved_contrast = min(end_values) > 0 and max(end_values) / min(end_values) <= 4
+                        if error > self.hydraulic_quadrature_tolerance * estimates[1] or not resolved_contrast:
+                            if depth >= 12 or evaluated > 512:
+                                raise ValueError(
+                                    f"hydraulic quadrature unresolved at strip {strip}, cell {cell}, half {half}"
+                                )
+                            midpoint = (a + b) / 2
+                            intervals.extend(((a, midpoint, depth + 1), (midpoint, b, depth + 1)))
+                        else:
+                            integral += estimates[1]
+                            error_bound += error
+                    actual_resistance = 12 * integral
+                    effective_gap = volume[strip, cell] / wet_area[strip, cell]
+                    represented = (
+                        6 * wet_area[strip, cell] / effective_gap / opened[strip, face] ** 2
+                    )
+                    relative = abs(represented / actual_resistance - 1)
+                    model_error[strip, cell, half] = relative
+                    quadrature_error[strip, cell, half] = error_bound / integral
+                    reference_resistance[strip, cell, half] = actual_resistance
+                    if relative > self.hydraulic_model_tolerance:
+                        raise ValueError(
+                            f"hydraulic resolution invalid at strip {strip}, cell {cell}, half {half}: "
+                            f"model resistance error {relative:.3g}; refine fixed SI/AP/neck geometry"
+                        )
         g = ChannelGeometry(
             lengths, widths, volume, storage_faces, opened,
             opened / widths[:, None],
             self.provenance + "; actual wet triangle volumes; fixed Eulerian cuts; "
-            f"neck_half_width_m={self.neck_half_width_m}",
+            f"neck_half_width_m={self.neck_half_width_m}; "
+            f"maximum_projected_wall_slope={self.maximum_wall_slope}",
+            wet_area,
         )
-        return MappedChannel(g, tuple(patches), coverage)
+        return MappedChannel(
+            g, tuple(patches), coverage, checked, model_error, quadrature_error,
+            reference_resistance,
+        )
 
 
 @dataclass(frozen=True)
@@ -602,6 +739,7 @@ class CouplingConfig:
     position_tolerance_m: float = 1e-11
     volume_tolerance_m3: float = 1e-17
     work_tolerance_j: float = 1e-13
+    force_tolerance_n: float = 1e-10
     relaxation: float = 0.6
     maximum_port_pressure_fraction: float = 0.05
 
@@ -612,7 +750,7 @@ class CouplingConfig:
                 or self.max_iterations < 1):
             raise ValueError("invalid coupling iteration/subcycle limits")
         for name in ("pressure_tolerance_pa", "position_tolerance_m",
-                     "volume_tolerance_m3", "work_tolerance_j"):
+                     "volume_tolerance_m3", "work_tolerance_j", "force_tolerance_n"):
             if not math.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be finite and positive")
         if not 0 < self.relaxation <= 1:
@@ -730,6 +868,13 @@ class PhonationStep:
     downstream_wall_work_j: float
     solid_pressure_work_j: float
     thermal_transport_j: float
+    force_residual_n: float
+    gas_tangential_wall_work_j: float
+    solid_applied_nodal_work_j: float
+    viscous_heat_j: float
+    reflection_heat_j: float
+    exit_heat_j: float
+    gas_energy_residual_j: float
 
 
 class CouplingError(RuntimeError):
@@ -842,6 +987,7 @@ class PhonationSystem:
         for name in (
             "lengths_m", "widths_m", "storage_volume_m3", "storage_face_area_m2",
             "open_area_m2", "face_gap_m",
+            "wet_wall_area_m2",
         ):
             expected, supplied = getattr(actual, name), getattr(channel.geometry, name)
             if (expected.shape != supplied.shape
@@ -955,6 +1101,7 @@ class PhonationSystem:
         position_guess = np.repeat(
             initial.solid.positions_m[None, :, :], subcycles, axis=0
         )
+        force_guess = np.zeros_like(position_guess)
         upstream_guess = np.full((subcycles, strips), self.lung.pressure_pa())
         source_in_guess = self.lung.pressure_pa()
         source_out_guess = 0.0
@@ -969,12 +1116,14 @@ class PhonationSystem:
         alpha = self.config.relaxation
         for iteration in range(1, self.config.max_iterations + 1):
             self.restore(initial)
-            cell_pressure, positions, upstream_pressure = [], [], []
+            cell_pressure, positions, upstream_pressure, nodal_forces = [], [], [], []
             q_in, q_out = np.zeros(strips), np.zeros(strips)
             s_up, s_down = np.zeros(strips), np.zeros(strips)
             channel_wall_work = solid_work = wall_up_work = wall_down_work = 0.0
             channel_in_work = channel_out_work = lung_port_work = 0.0
             thermal_transport = expelled_mass = 0.0
+            gas_tangential_work = solid_nodal_work = 0.0
+            viscous_heat = reflection_heat = exit_heat = gas_energy_residual = 0.0
             volume_error = 0.0
             for k in range(subcycles):
                 self._check_port_pressure(upstream_guess[k])
@@ -982,6 +1131,9 @@ class PhonationSystem:
                 solid_before = self.solid.save_state()
                 midpoint = (solid_before.positions_m + position_guess[k]) / 2
                 mapped = self.mapper.capture(self.solid, positions_m=midpoint)
+                wall_velocity = mapped.wall_velocity_m_s(
+                    self.solid, position_guess[k] - solid_before.positions_m, dt
+                )
                 patches = mapped.pressure_patches(pressure_guess[k])
                 extra = self._port_wall_loads(
                     midpoint, upstream_guess[k], downstream_guess
@@ -990,12 +1142,14 @@ class PhonationSystem:
                     initial.solid.control, target_control, (k + 1) / subcycles
                 )
                 if dt > self.solid.recommend_timestep(
-                    next_control, pressure_patches=patches + extra
+                    next_control, pressure_patches=patches + extra,
+                    nodal_force_n=force_guess[k],
                 ) * (1 + 1e-12):
                     raise _RefineSubcycles()
                 old_volume = self.channel.geometry.storage_volume_m3
                 solid_step = self.solid.step(
-                    dt, next_control, pressure_patches=patches + extra
+                    dt, next_control, pressure_patches=patches + extra,
+                    nodal_force_n=force_guess[k],
                 )
                 solid_after = self.solid.save_state()
                 geometry = self.mapper.capture(self.solid).geometry
@@ -1006,6 +1160,7 @@ class PhonationSystem:
                     tuple(Reservoir(float(p), self._T) for p in upstream_guess[k]),
                     tuple(Reservoir(float(p), self._T) for p in downstream_guess),
                     geometry=geometry,
+                    wall_velocity_m_s=wall_velocity,
                 )
                 swept = np.zeros(shape)
                 for item, s in zip(mapped.patches,
@@ -1044,11 +1199,20 @@ class PhonationSystem:
                 channel_in_work += gas.inlet_pressure_work_j
                 channel_out_work += gas.outlet_pressure_work_j
                 solid_work += solid_after.work.pressure_j - solid_before.work.pressure_j
+                solid_nodal_work += (
+                    solid_after.work.applied_nodal_j - solid_before.work.applied_nodal_j
+                )
+                gas_tangential_work += gas.tangential_wall_work_j
+                viscous_heat += gas.viscous_heat_j
+                reflection_heat += gas.reflection_heat_j
+                exit_heat += gas.exit_heat_j
+                gas_energy_residual += gas.energy_residual_j
                 thermal_transport += (
                     gas.inlet_thermal_transport_j - gas.outlet_thermal_transport_j
                 )
                 cell_pressure.append(gas.wall_pressure_pa)
                 positions.append(solid_after.positions_m)
+                nodal_forces.append(mapped.nodal_wall_force_n(self.solid, gas.wall_force_n))
             injection = {}
             for port, volume in zip(self.downstream_ports, q_out + s_down):
                 injection[port] = injection.get(port, 0.0) + float(volume / self.dt)
@@ -1062,6 +1226,7 @@ class PhonationSystem:
             ])
             new_pressure = np.asarray(cell_pressure)
             new_positions = np.asarray(positions)
+            new_forces = np.asarray(nodal_forces)
             new_upstream = np.asarray(upstream_pressure)
             source_error = source_work_error = 0.0
             if self.upstream is not None:
@@ -1104,15 +1269,18 @@ class PhonationSystem:
                 source_error,
             )
             position_error = float(np.max(np.abs(new_positions - position_guess)))
+            force_error = float(np.max(np.abs(new_forces - force_guess)))
             work_error = max(
                 abs(solid_work - channel_wall_work - wall_up_work - wall_down_work),
                 abs(acoustic_work + wall_down_work - channel_out_work),
                 (abs(lung_port_work - channel_in_work - wall_up_work)
                  if self.upstream is None else source_work_error),
+                abs(solid_nodal_work - gas_tangential_work), abs(gas_energy_residual),
             )
             converged = (
                 pressure_error <= self.config.pressure_tolerance_pa
                 and position_error <= self.config.position_tolerance_m
+                and force_error <= self.config.force_tolerance_n
             )
             if converged and volume_error > self.config.volume_tolerance_m3:
                 raise _RefineSubcycles()
@@ -1131,9 +1299,12 @@ class PhonationSystem:
                     expelled_mass / self.dt, new_downstream.copy(), new_pressure[-1].copy(),
                     channel_wall_work, wall_up_work, wall_down_work, solid_work,
                     thermal_transport,
+                    force_error, gas_tangential_work, solid_nodal_work,
+                    viscous_heat, reflection_heat, exit_heat, gas_energy_residual,
                 )
             pressure_guess += alpha * (new_pressure - pressure_guess)
             position_guess += alpha * (new_positions - position_guess)
+            force_guess += alpha * (new_forces - force_guess)
             upstream_guess += alpha * (new_upstream - upstream_guess)
             downstream_guess += alpha * (new_downstream - downstream_guess)
             if self.upstream is not None:
@@ -1142,5 +1313,5 @@ class PhonationSystem:
         raise CouplingError(
             f"interface iteration exhausted: pressure={pressure_error:g} Pa, "
             f"position={position_error:g} m, volume={volume_error:g} m3, "
-            f"work={work_error:g} J"
+            f"work={work_error:g} J, force={force_error:g} N"
         )

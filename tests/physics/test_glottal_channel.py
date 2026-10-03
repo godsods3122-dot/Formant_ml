@@ -6,7 +6,7 @@ import pytest
 
 from formant_ml.physics import air
 from formant_ml.physics.glottal_channel import (
-    ChannelConfig, ChannelGeometry, GlottalChannel, Reservoir,
+    ChannelConfig, ChannelGeometry, GlottalChannel, Reservoir, parallel_plate_shear,
 )
 
 
@@ -29,6 +29,9 @@ def chamber(gap=1e-4, *, pocket=0.0, cells=3, strips=1, closed=False,
         "Synthetic rectangular gas boxes with specified recessed slab; "
         f"width={width}m length={length}m gap={gap}m pocket={pocket}m; "
         "piston footprint is the full x-z face; no human anatomical provenance.",
+        wet_wall_area_m2=np.full(
+            (strips, cells), width * length / cells if gap + pocket > 0 else 0
+        ),
     )
 
 
@@ -110,12 +113,12 @@ def test_sealed_adiabatic_piston_independent_eos_and_work_refinement():
 
 
 def test_actual_closing_reopening_retains_mass_energy_and_zero_throat():
-    channel = GlottalChannel(chamber(gap=1e-4, pocket=2e-5, cells=1))
+    channel = GlottalChannel(chamber(gap=2e-6, pocket=1e-4, cells=1))
     original = channel.snapshot()
-    for gap in np.linspace(1e-4, 0, 41)[1:]:
+    for gap in np.linspace(2e-6, 0, 41)[1:]:
         result = channel.advance(
             1e-8, Reservoir(0), Reservoir(0),
-            geometry=chamber(gap=gap, pocket=2e-5, cells=1),
+            geometry=chamber(gap=gap, pocket=1e-4, cells=1),
         )
         assert abs(result.energy_residual_j) < 1e-16
     sealed = channel.snapshot()
@@ -129,7 +132,7 @@ def test_actual_closing_reopening_retains_mass_energy_and_zero_throat():
     )
     reopened = channel.advance(
         1e-8, Reservoir(0), Reservoir(0),
-        geometry=chamber(gap=2e-6, pocket=2e-5, cells=1),
+        geometry=chamber(gap=2e-6, pocket=1e-4, cells=1),
     )
     assert channel.snapshot().mass_kg.sum() > 0
     assert abs(reopened.energy_residual_j) < 1e-16
@@ -269,3 +272,58 @@ def test_closing_and_reopening_do_not_delete_one_sided_momentum():
             atol=1e-21, rtol=1e-8,
         )
         assert abs(step.energy_residual_j) < 1e-17
+
+
+def test_slit_shear_translation_couette_heat_and_signed_relative_flow():
+    mu, area, gap = 2e-5, 1e-6, 1e-4
+    fluid = np.array([0.2, -0.3])
+    same = parallel_plate_shear(
+        fluid, np.array([fluid, fluid]), viscosity_pa_s=mu,
+        wet_area_m2=area, wet_gap_m=gap,
+    )
+    np.testing.assert_array_equal(same.wall_force_n, np.zeros((2, 2)))
+    assert same.heat_w == 0
+    wall = np.array([[0.1, 0.2], [-0.1, -0.2]])
+    opposing = parallel_plate_shear(
+        np.zeros(2), wall, viscosity_pa_s=mu, wet_area_m2=area, wet_gap_m=gap,
+    )
+    expected_heat = mu * area / gap * ((0.2) ** 2 + (0.4) ** 2)
+    assert opposing.heat_w == pytest.approx(expected_heat, rel=1e-14)
+    assert opposing.wall_power_w == pytest.approx(-expected_heat, rel=1e-14)
+    forward = parallel_plate_shear(
+        np.array([0.0, 0.1]), np.zeros((2, 2)), viscosity_pa_s=mu,
+        wet_area_m2=area, wet_gap_m=gap,
+    )
+    reverse = parallel_plate_shear(
+        np.array([0.0, -0.1]), np.zeros((2, 2)), viscosity_pa_s=mu,
+        wet_area_m2=area, wet_gap_m=gap,
+    )
+    np.testing.assert_allclose(forward.wall_force_n, -reverse.wall_force_n, rtol=0, atol=0)
+    assert forward.heat_w == reverse.heat_w
+
+
+def test_closed_wet_pocket_keeps_moving_wall_shear_and_energy_work():
+    channel = GlottalChannel(chamber(gap=0, pocket=1e-4, cells=1))
+    initial = channel.diagnostics()
+    walls = np.array([[[[0.1, 0.2], [-0.1, -0.2]]]])
+    step = channel.advance(
+        1e-8, Reservoir(0), Reservoir(0), wall_velocity_m_s=walls,
+    )
+    assert step.inlet_flow_m3_s[0] == step.outlet_flow_m3_s[0] == 0
+    assert step.viscous_heat_j > 0
+    assert step.shear_wall_work_j < 0
+    assert channel.diagnostics()["total_energy_j"] - initial["total_energy_j"] == pytest.approx(
+        -step.tangential_wall_work_j, abs=2e-19,
+    )
+    assert abs(step.energy_residual_j) < 2e-19
+    translating = GlottalChannel(
+        chamber(gap=0, pocket=1e-4, cells=1), velocity_m_s=0.1
+    )
+    translation = np.zeros((1, 1, 2, 2))
+    translation[..., 1] = 0.1
+    result = translating.advance(
+        1e-8, Reservoir(0), Reservoir(0), wall_velocity_m_s=translation,
+    )
+    assert result.viscous_heat_j < 1e-30
+    assert result.reflection_heat_j < 1e-30
+    np.testing.assert_allclose(result.wall_force_n, 0, atol=1e-20)

@@ -28,6 +28,8 @@ from . import air
 
 
 def _array(value, shape=None, *, name, nonnegative=False):
+    if np.iscomplexobj(value):
+        raise ValueError(f"{name} must be real")
     out = np.array(value, dtype=np.float64, copy=True)
     if shape is not None and out.shape != shape:
         raise ValueError(f"{name} must have shape {shape}, got {out.shape}")
@@ -59,6 +61,7 @@ class ChannelGeometry:
     open_area_m2: np.ndarray
     face_gap_m: np.ndarray
     provenance: str
+    wet_wall_area_m2: np.ndarray | None = None
 
     def __post_init__(self):
         lengths = _array(self.lengths_m, name="lengths_m")
@@ -75,6 +78,7 @@ class ChannelGeometry:
             ("storage_face_area_m2", self.storage_face_area_m2, face_shape),
             ("open_area_m2", self.open_area_m2, face_shape),
             ("face_gap_m", self.face_gap_m, face_shape),
+            ("wet_wall_area_m2", self.wet_wall_area_m2, shape),
         ):
             object.__setattr__(
                 self, name, _array(value, expected, name=name, nonnegative=True)
@@ -87,6 +91,10 @@ class ChannelGeometry:
                            widths[:, None] * self.face_gap_m, rtol=1e-12, atol=0):
             raise ValueError("open area must equal strip width times actual slit gap")
         dry = self.storage_volume_m3 == 0
+        if np.any((self.wet_wall_area_m2 == 0) != dry):
+            raise ValueError("positive gas storage requires its actual positive wet wall footprint")
+        if np.any(self.wet_wall_area_m2 > widths[:, None] * lengths[None, :] * (1 + 1e-12)):
+            raise ValueError("wet projected wall footprint exceeds the fixed strip cell")
         if np.any(dry) and not (
             np.all(dry) and not np.any(self.storage_face_area_m2)
             and not np.any(self.open_area_m2)
@@ -155,6 +163,7 @@ class ChannelState:
     input_mass_kg: float
     input_shifted_energy_j: float
     wall_work_j: float
+    tangential_wall_work_j: float
 
 
 @dataclass(frozen=True)
@@ -181,6 +190,56 @@ class ChannelStep:
     energy_residual_j: float
     iterations: int
     residual: float
+    wall_force_n: np.ndarray
+    tangential_wall_work_j: float
+    shear_wall_work_j: float
+    reflection_wall_work_j: float
+    exit_heat_j: float
+    characteristic_dissipation_quadrature_j: float
+
+
+@dataclass(frozen=True)
+class SlitShear:
+    wall_force_n: np.ndarray
+    heat_w: np.ndarray
+    wall_power_w: np.ndarray
+    fluid_pressure_power_w: np.ndarray
+
+
+def parallel_plate_shear(fluid_velocity_m_s, wall_velocity_m_s, *,
+                         viscosity_pa_s, wet_area_m2, wet_gap_m):
+    """Leading-order Couette--Poiseuille law in projected (AP, SI) directions.
+
+    Fluid velocity ends in two tangential components. Wall velocity ends in
+    (left/right wall, AP/SI component). Area is ONE wall's projected wet area.
+    Returned forces act on the walls. Heat is nonnegative and
+    heat + wall_power = fluid_pressure_power, including signed relative flow.
+    """
+    fluid = _array(fluid_velocity_m_s, name="fluid tangential velocity")
+    if fluid.ndim < 1 or fluid.shape[-1] != 2:
+        raise ValueError("fluid tangential velocity must end in (AP, SI)")
+    wall = _array(wall_velocity_m_s, fluid.shape[:-1] + (2, 2),
+                  name="wall tangential velocities")
+    area = np.asarray(wet_area_m2, float)
+    gap = np.asarray(wet_gap_m, float)
+    if (not math.isfinite(viscosity_pa_s) or viscosity_pa_s < 0
+            or not np.isfinite(area).all() or not np.isfinite(gap).all()
+            or np.any(area < 0) or np.any(gap <= 0)):
+        raise ValueError("slit shear requires nonnegative viscosity/area and positive actual wet gap")
+    mean = (wall[..., 0, :] + wall[..., 1, :]) / 2
+    difference = wall[..., 1, :] - wall[..., 0, :]
+    relative = fluid - mean
+    coefficient = viscosity_pa_s * area / gap
+    force = np.stack((
+        coefficient[..., None] * (6 * relative + difference),
+        coefficient[..., None] * (6 * relative - difference),
+    ), axis=-2)
+    heat = coefficient * (
+        12 * np.sum(relative ** 2, axis=-1) + np.sum(difference ** 2, axis=-1)
+    )
+    wall_power = np.sum(force * wall, axis=(-1, -2))
+    pressure_power = np.sum(np.sum(force, axis=-2) * fluid, axis=-1)
+    return SlitShear(force, heat, wall_power, pressure_power)
 
 
 class GlottalChannel:
@@ -217,6 +276,7 @@ class GlottalChannel:
         self.input_mass_kg = 0.0
         self.input_shifted_energy_j = 0.0
         self.wall_work_j = 0.0
+        self.tangential_wall_work_j = 0.0
 
     def snapshot(self):
         return ChannelState(
@@ -224,6 +284,7 @@ class GlottalChannel:
             _array(self._mass, name="mass"), _array(self._momentum, name="momentum"),
             _array(self._energy, name="energy"), self.time_s,
             self.input_mass_kg, self.input_shifted_energy_j, self.wall_work_j,
+            self.tangential_wall_work_j,
         )
 
     def restore(self, state: ChannelState):
@@ -239,6 +300,7 @@ class GlottalChannel:
         if not all(math.isfinite(x) for x in (
             state.time_s, state.input_mass_kg, state.input_shifted_energy_j,
             state.wall_work_j,
+            state.tangential_wall_work_j,
         )) or state.time_s < 0:
             raise ValueError("invalid channel snapshot ledger")
         self.geometry = state.geometry
@@ -249,6 +311,7 @@ class GlottalChannel:
         self.input_mass_kg = state.input_mass_kg
         self.input_shifted_energy_j = state.input_shifted_energy_j
         self.wall_work_j = state.wall_work_j
+        self.tangential_wall_work_j = state.tangential_wall_work_j
 
     @staticmethod
     def _kinetic(mass, velocity):
@@ -294,7 +357,7 @@ class GlottalChannel:
         return (np.array([v.pressure_pa for v in values]),
                 np.array([v.temperature_k for v in values]))
 
-    def _fluxes(self, mass, momentum, energy, g, inlet, outlet):
+    def _fluxes(self, mass, momentum, energy, g, inlet, outlet, wall_velocity):
         rho, u, p, e, c = self._primitive(
             mass, momentum, energy, g.storage_volume_m3
         )
@@ -313,23 +376,25 @@ class GlottalChannel:
         p_right = np.concatenate((p, (air.P_ATM + outlet_pressure)[:, None]), axis=1)
         area = g.open_area_m2
         opened = area > 0
-        hydraulic_length = np.r_[
-            g.lengths_m[0] / 2,
-            (g.lengths_m[:-1] + g.lengths_m[1:]) / 2,
-            g.lengths_m[-1] / 2,
-        ]
-        resistance = np.zeros_like(area)
-        if self.config.viscosity:
-            numerator = np.broadcast_to(
-                12 * self.config.properties.mu * hydraulic_length
-                / g.widths_m[:, None], area.shape
-            )
-            resistance[opened] = numerator[opened] / g.face_gap_m[opened] ** 3
+        mean_wall = np.mean(wall_velocity, axis=-2)
+        wet_gap = g.storage_volume_m3 / g.wet_wall_area_m2
+        viscosity = self.config.properties.mu if self.config.viscosity else 0.0
+        half_drag = 6 * viscosity * g.wet_wall_area_m2 / wet_gap
+        drag_left = np.concatenate((zeros, half_drag), axis=1)
+        drag_right = np.concatenate((half_drag, zeros), axis=1)
+        wall_left = np.concatenate((zeros, mean_wall[..., 1]), axis=1)
+        wall_right = np.concatenate((mean_wall[..., 1], zeros), axis=1)
         drive = p_left - p_right + z_left * u_left + z_right * u_right
         linear = np.zeros_like(area)
+        # Reconstruct the same owned half-cell viscous pressure fall at faces.
+        # This is source balancing, not an additional dissipative wall length.
         linear[opened] = (
-            (z_left + z_right)[opened] / area[opened] + resistance[opened]
+            (z_left + z_right)[opened] / area[opened]
+            + (drag_left + drag_right)[opened] / area[opened] ** 2
         )
+        drive[opened] += (
+            drag_left * wall_left + drag_right * wall_right
+        )[opened] / area[opened]
         quadratic = np.zeros_like(area)
         if self.config.exit_loss:
             for face in (0, -1):
@@ -347,8 +412,19 @@ class GlottalChannel:
         )
         face_velocity = np.zeros_like(area)
         face_velocity[opened] = q[opened] / area[opened]
-        star_left = p_left + z_left * (u_left - face_velocity)
-        star_right = p_right + z_right * (face_velocity - u_right)
+        c_face = np.concatenate((c[:, :1], np.minimum(c[:, :-1], c[:, 1:]),
+                                 c[:, -1:]), axis=1)
+        if np.any(np.abs(face_velocity) > self.config.max_mach * c_face):
+            raise ValueError("throat velocity exceeds declared low-Mach validity")
+        source_left, source_right = np.zeros_like(area), np.zeros_like(area)
+        source_left[opened] = (
+            drag_left * (face_velocity - wall_left)
+        )[opened] / area[opened]
+        source_right[opened] = (
+            drag_right * (face_velocity - wall_right)
+        )[opened] / area[opened]
+        star_left = p_left - source_left + z_left * (u_left - face_velocity)
+        star_right = p_right + source_right + z_right * (face_velocity - u_right)
         pf = (star_left + star_right) / 2
         pf[:, 0], pf[:, -1] = p_left[:, 0], p_right[:, -1]
         rho_up, e_up = np.empty_like(q), np.empty_like(q)
@@ -379,46 +455,72 @@ class GlottalChannel:
             (mdot[:, :-1] + mdot[:, 1:]) * np.mean(u, axis=-1) / 2
         )
         blocked = g.storage_face_area_m2 - area
+        half_fluid = np.stack((np.zeros_like(u), u), axis=-1)
+        half_walls = np.repeat(wall_velocity[:, :, None, :, :], 2, axis=2)
+        shear = parallel_plate_shear(
+            half_fluid, half_walls,
+            viscosity_pa_s=viscosity,
+            wet_area_m2=g.wet_wall_area_m2[..., None] / 2,
+            wet_gap_m=wet_gap[..., None],
+        )
+        shear_force = shear.wall_force_n.sum(axis=2)
+        half_shear_force_z = shear.wall_force_n[..., 1].sum(axis=-1)
+        reflection_force = impedance[..., None] * np.stack(
+            (blocked[:, :-1], blocked[:, 1:]), axis=-1
+        ) * (u - mean_wall[..., 1, None])
         left_force = (
             area[:, :-1] * (star_right[:, :-1] - p)
-            - blocked[:, :-1] * impedance * u[..., 0]
+            - reflection_force[..., 0] - half_shear_force_z[..., 0]
         )
         right_force = (
             area[:, 1:] * (p - star_left[:, 1:])
-            - blocked[:, 1:] * impedance * u[..., 1]
+            - reflection_force[..., 1] - half_shear_force_z[..., 1]
         )
         rhs_momentum = np.stack((
             face_momentum_flux[:, :-1] - center_momentum_flux + left_force,
             center_momentum_flux - face_momentum_flux[:, 1:] + right_force,
         ), axis=-1)
-        reflection = impedance * (
-            blocked[:, :-1] * u[..., 0] ** 2 + blocked[:, 1:] * u[..., 1] ** 2
-        )
+        reflection = np.sum(reflection_force * (u - mean_wall[..., 1, None]), axis=-1)
+        reaction = np.zeros_like(shear_force)
+        reaction[..., 0, 1] = reflection_force.sum(axis=-1) / 2
+        reaction[..., 1, 1] = reflection_force.sum(axis=-1) / 2
+        tangential_force = shear_force + reaction
+        shear_work = np.sum(shear_force * wall_velocity, axis=(-1, -2))
+        reflection_work = np.sum(reaction * wall_velocity, axis=(-1, -2))
         external_momentum = (
             face_momentum_flux[:, 0] + pf[:, 0] * area[:, 0]
             - face_momentum_flux[:, -1] - pf[:, -1] * area[:, -1]
         )
         wall_force = external_momentum - rhs_momentum.sum(axis=(1, 2))
-        drop = resistance * q + quadratic * q * np.abs(q)
+        drop = quadratic * q * np.abs(q)
         shifted_flux = total_flux - self._h_reference * mdot
         gauge_work = (pf - air.P_ATM) * q
         thermal_flux = shifted_flux - gauge_work
         return {
             "mass": mdot[:, :-1] - mdot[:, 1:],
             "momentum": rhs_momentum,
-            "energy": total_flux[:, :-1] - total_flux[:, 1:],
+            "energy": (total_flux[:, :-1] - total_flux[:, 1:]
+                       - shear_work - reflection_work),
             "q": q, "mdot": mdot, "p": p,
             "temperature": e_up / self._cv,
             "shifted_flux": shifted_flux, "gauge_work": gauge_work,
             "thermal_flux": thermal_flux,
-            "viscous_power": float(np.sum(drop * q)),
+            "viscous_power": float(shear.heat_w.sum()),
+            "exit_power": float(np.sum(drop * q)),
             "reflection_power": float(reflection.sum()),
             "external_momentum": external_momentum, "wall_force": wall_force,
+            "tangential_force": tangential_force,
+            "shear_work": float(shear_work.sum()),
+            "reflection_work": float(reflection_work.sum()),
+            "characteristic_power": float(np.sum(
+                area * (z_left * (u_left - face_velocity) ** 2
+                        + z_right * (u_right - face_velocity) ** 2)
+            )),
         }
 
     def advance(self, dt_s, inlet: Reservoir | Sequence[Reservoir],
                 outlet: Reservoir | Sequence[Reservoir], *,
-                geometry: ChannelGeometry | None = None):
+                geometry: ChannelGeometry | None = None, wall_velocity_m_s=None):
         """Advance atomically with constant port pressure over the interval.
 
         Moving geometry is a supplied fixed-cut closed-volume construction.
@@ -430,6 +532,10 @@ class GlottalChannel:
         g0 = self.geometry
         inlet = self._boundary(inlet, g0.shape[0])
         outlet = self._boundary(outlet, g0.shape[0])
+        wall_velocity = _array(
+            np.zeros(g0.shape + (2, 2)) if wall_velocity_m_s is None else wall_velocity_m_s,
+            g0.shape + (2, 2), name="actual projected wall velocity",
+        )
         if not math.isfinite(dt) or dt <= 0:
             raise ValueError("dt_s must be finite and positive")
         if (g1.shape != g0.shape or not np.array_equal(g1.lengths_m, g0.lengths_m)
@@ -444,7 +550,8 @@ class GlottalChannel:
             return ChannelStep(self.time_s, z.copy(), z.copy(), z.copy(), z.copy(),
                                inlet[1].copy(), outlet[1].copy(),
                                z.copy(), z.copy(), z.copy(),
-                               np.zeros(g0.shape), *([0.0] * 9), 0, 0.0)
+                               np.zeros(g0.shape), *([0.0] * 9), 0, 0.0,
+                               np.zeros(g0.shape + (2, 2)), *([0.0] * 5))
         if dt > min(self.recommend_timestep(), self.recommend_timestep(g1)) * (1 + 1e-12):
             raise ValueError("channel timestep exceeds the current acoustic-volume bound")
         gm = ChannelGeometry(
@@ -454,6 +561,7 @@ class GlottalChannel:
             (g0.open_area_m2 + g1.open_area_m2) / 2,
             (g0.face_gap_m + g1.face_gap_m) / 2,
             g1.provenance,
+            (g0.wet_wall_area_m2 + g1.wet_wall_area_m2) / 2,
         )
         dm_volume = g1.storage_volume_m3 - g0.storage_volume_m3
         m0, j0, E0 = self._mass, self._momentum, self._energy
@@ -477,7 +585,7 @@ class GlottalChannel:
         def evaluate(x):
             m1, j1, E1 = decode(x)
             f = self._fluxes((m0 + m1) / 2, (j0 + j1) / 2, (E0 + E1) / 2,
-                             gm, inlet, outlet)
+                             gm, inlet, outlet, wall_velocity)
             residual = np.r_[
                 ((m1 - m0 - dt * f["mass"]) / m0).ravel(),
                 ((j1 - j0 - dt * f["momentum"]) / j_scale).ravel(),
@@ -529,6 +637,7 @@ class GlottalChannel:
         self._primitive(m1, j1, E1, g1.storage_volume_m3)
         pressure = flux["p"] - air.P_ATM
         wall_work = float(np.sum(pressure * dm_volume))
+        tangential_work = dt * (flux["shear_work"] + flux["reflection_work"])
         input_mass = dt * float(np.sum(flux["mdot"][:, 0] - flux["mdot"][:, -1]))
         input_energy = dt * float(np.sum(
             flux["shifted_flux"][:, 0] - flux["shifted_flux"][:, -1]
@@ -552,7 +661,10 @@ class GlottalChannel:
             dt * float(flux["thermal_flux"][:, -1].sum()),
             dt * flux["viscous_power"], dt * flux["reflection_power"],
             float(np.sum(m1 - m0)) - input_mass,
-            delta_energy - input_energy + wall_work, evaluations, error,
+            delta_energy - input_energy + wall_work + tangential_work, evaluations, error,
+            flux["tangential_force"].copy(), tangential_work,
+            dt * flux["shear_work"], dt * flux["reflection_work"],
+            dt * flux["exit_power"], dt * flux["characteristic_power"],
         )
         self.geometry = g1
         self._mass, self._momentum, self._energy = m1, j1, E1
@@ -560,6 +672,7 @@ class GlottalChannel:
         self.input_mass_kg += input_mass
         self.input_shifted_energy_j += input_energy
         self.wall_work_j += wall_work
+        self.tangential_wall_work_j += tangential_work
         return step
 
     def diagnostics(self):
@@ -586,6 +699,8 @@ class GlottalChannel:
             "input_mass_kg": self.input_mass_kg,
             "input_shifted_energy_j": self.input_shifted_energy_j,
             "wall_work_j": self.wall_work_j,
+            "tangential_wall_work_j": self.tangential_wall_work_j,
+            "wet_wall_area_m2": self.geometry.wet_wall_area_m2.copy(),
             "geometry_provenance": self.geometry.provenance,
             "assumptions": (
                 "fixed axial/AP cuts; independent strips; calorically perfect gas",
@@ -593,5 +708,7 @@ class GlottalChannel:
                 "cell-owned half-cell momentum; local characteristic throat flux",
                 "midpoint low-Mach FV; unresolved one-sided reflecting throat plates",
                 "cavity footprint and solid mapping are caller-owned",
+                "cell wet gap=V/wet projected area, not conductive neck gap",
+                "projected AP/SI slit shear; zero AP mean flux constraint",
             ),
         }

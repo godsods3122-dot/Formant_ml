@@ -171,6 +171,7 @@ def test_eulerian_patch_motion_has_measured_convergent_remapping_residual():
     mapper = EulerianGlottis(
         [0.001, 0.005, 0.009], [0.0002, 0.001, 0.0018],
         provenance="test independently moving Eulerian clipping weights",
+        hydraulic_model_tolerance=0.9,
     )
     initial = solid.save_state()
     n_left = len(solid.surface("left").coordinates_m)
@@ -306,6 +307,10 @@ def test_real_components_exchange_pressure_flow_shape_work_and_replay():
     assert result.inlet_flow_m3_s[0] > 0
     assert np.linalg.norm(system.solid.velocities_m_s) > 0
     assert abs(result.upstream_wall_work_j) > 0
+    assert np.isfinite(result.gas_tangential_wall_work_j)
+    assert abs(result.solid_applied_nodal_work_j - result.gas_tangential_wall_work_j) < (
+        system.config.work_tolerance_j
+    )
     assert result.interface_work_residual_j < system.config.work_tolerance_j
     assert result.volume_residual_m3 < system.config.volume_tolerance_m3
     final = system.snapshot()
@@ -425,3 +430,21 @@ def test_public_restore_failure_is_atomic_across_all_components(change):
     assert after.lung == before.lung
     assert after.steps == before.steps
     assert all(torch.equal(a, b) for a, b in zip(after.downstream.field, before.downstream.field))
+
+
+def test_wet_velocity_average_and_nodal_force_scatter_are_transposes():
+    solid = reference_solid()
+    mapper = EulerianGlottis(
+        [0.001, 0.005, 0.009], [0.0002, 0.001, 0.0018],
+        provenance="work transpose test on actual material subtriangles",
+    )
+    mapped = mapper.capture(solid)
+    rng = np.random.default_rng(123)
+    displacement = rng.normal(size=solid.positions_m.shape) * 1e-8
+    forces = rng.normal(size=(2, 2, 2, 2)) * 1e-4
+    dt = 1e-5
+    averaged = mapped.wall_velocity_m_s(solid, displacement, dt)
+    nodal = mapped.nodal_wall_force_n(solid, forces)
+    assert np.sum(nodal * displacement) == pytest.approx(
+        dt * np.sum(forces * averaged), rel=1e-13, abs=1e-25,
+    )

@@ -1,0 +1,39 @@
+{
+  "duration_s": 0.0001,
+  "max_dt_s": 0.0000005,
+  "torch_threads": 2,
+  "air": {
+    "T_c": 37.0,
+    "rh": 1.0,
+    "co2_dry": 0.04
+  },
+  "scene": {
+    "cell_size_m": 0.002,
+    "vp_aperture_fraction": 1.0,
+    "boundary_layer": true,
+    "sponge_cells": 2
+  },
+  "solid": {
+    "n_ap": 2,
+    "n_si": 2,
+    "half_gap_m": 0.00005,
+    "recess_depth_m": 0.00002,
+    "recess_origin": "Synthetic triangular medial recess, 20 micrometres per wall; geometry proof only, not measured human mucosa."
+  },
+  "ap_edges_m": [0.001, 0.009],
+  "si_edges_m": [0.0002, 0.0006, 0.001, 0.0014, 0.0018],
+  "neck_half_width_m": 0.0,
+  "downstream_ports": ["glottis"],
+  "lung": {
+    "initial_fraction": 0.0,
+    "initial_muscle_pressure_pa": 0.0
+  },
+  "controls": [
+    {"time_s": 0.0, "muscle_pressure_pa": 0.0},
+    {"time_s": 0.00002, "muscle_pressure_pa": 200.0}
+  ],
+  "wav": {
+    "sample_rate_hz": 48000,
+    "pa_per_full_scale": 1.0
+  }
+}
