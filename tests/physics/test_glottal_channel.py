@@ -127,8 +127,12 @@ def test_actual_closing_reopening_retains_mass_energy_and_zero_throat():
     hold = channel.advance(1e-8, Reservoir(500), Reservoir(-500))
     assert hold.inlet_flow_m3_s[0] == hold.outlet_flow_m3_s[0] == 0
     np.testing.assert_array_equal(channel.snapshot().mass_kg, sealed.mass_kg)
+    # Retained closing momentum now shears into heat inside the sealed pocket,
+    # so total energy is held to the declared nonlinear solve tolerance.
+    assert hold.viscous_heat_j > 0
     np.testing.assert_allclose(
-        channel.snapshot().energy_j, sealed.energy_j, rtol=0, atol=5e-20
+        channel.snapshot().energy_j, sealed.energy_j, rtol=0,
+        atol=channel.config.tolerance * float(sealed.energy_j.sum()),
     )
     reopened = channel.advance(
         1e-8, Reservoir(0), Reservoir(0),
