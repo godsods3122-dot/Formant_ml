@@ -5645,11 +5645,16 @@ class CopySynthFitter:
         return tot / 0.05 ** 2
 
     def vf_ns_anat_loss(self) -> torch.Tensor:
-        """모드 3 화자 상수가 생리 범위(`VF_NS_ANAT`) 밖으로 나간 log 거리의 제곱합 / 0.05²."""
+        """모드 3 화자 상수가 생리 범위(`VF_NS_ANAT`) 밖으로 나간 log 거리의 제곱합 / 0.05².
+
+        **고정된 상수는 빼고** 잰다 (§52.537). 3D 유한요소에서 잰 상수(`--vf-ns-fem`, 층간 결합 0.05 · 불룩함 0.01 · 두께 0.48)는 이 범위 밖이라
+        기울기 없는 상수 3839 를 손실에 더했고, 정체 판정(상대 변화)이 모든 단계를 20 회 만에 끊었다 (포락 27 %)."""
         tdp = self.eng.td
         from . import voice_td as vt
         tot = torch.zeros((), dtype=torch.float64, device=tdp.log_ns_len.device)
         for k, (lo, hi) in VF_NS_ANAT.items():
+            if f"td_log_ns_{k}" in self.locked_constants:
+                continue
             if vt.VF_NS_HARD and k in vt.VF_NS_HARD:
                 hlo, hhi = vt.VF_NS_HARD[k]
                 lo, hi = max(lo, hlo), min(hi, hhi)
