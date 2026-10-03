@@ -98,3 +98,11 @@ aspiration=20
 --vowel-onset
 --sib-prior-edge
 15
+--psub-max
+11
+--psub-prior
+1
+--src-bounds
+--base-tau
+--src-move
+1
