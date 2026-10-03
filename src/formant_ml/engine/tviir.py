@@ -335,6 +335,22 @@ def peak_coeffs(f_hz, bw_pole_hz, fs: float, zero_ratio: float = 3.0):
     return g + 0.0 * b1, g * b1, g * b2, a1, a2
 
 
+def peaking_coeffs(f_hz, bw_hz, fs: float, gain=3.0):
+    """RBJ 봉우리 EQ (중심 이득 `gain`, 선형). **DC 와 나이퀴스트에서 정확히 이득 1** 이다.
+
+    `peak_coeffs`(극-영점 쌍)는 영점 폭을 넓힐수록 저역 끝과 고역 끝의 이득이 달라진다 — 비 7.5 에서 1 kHz 봉우리가
+    12 kHz 를 −0.6 dB(mix 0.3) 끌어내렸다(§52.199). 이 식은 z = ±1 에서 분자·분모가 같아 그런 치우침이 없다:
+        A = √gain, w0 = 2πf/fs, α = sin(w0)·bw / (2f)
+        b = (1 + αA, −2cos w0, 1 − αA),  a = (1 + α/A, −2cos w0, 1 − α/A),  a0 로 나눈다.
+    """
+    A = gain ** 0.5
+    w0 = TWO_PI * f_hz / fs
+    cs = _cos(w0)
+    alpha = torch.sin(w0) * bw_hz / (2.0 * f_hz) if torch.is_tensor(w0) else math.sin(w0) * bw_hz / (2.0 * f_hz)
+    a0 = 1.0 + alpha / A
+    return (1.0 + alpha * A) / a0, (-2.0 * cs) / a0, (1.0 - alpha * A) / a0, (-2.0 * cs) / a0, (1.0 - alpha / A) / a0
+
+
 def allpass_coeffs(f_hz, r, fs: float):
     """2차 올패스: |H| ≡ 1, 군지연만 바꾼다(위상차 필터).
 

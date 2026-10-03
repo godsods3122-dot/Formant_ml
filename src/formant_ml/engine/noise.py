@@ -46,6 +46,47 @@ FRIC_ENV_MS = 2.0
 # 실측으로 정해야 하므로 상수로 빼 둔다.
 FRIC_AM_DEPTH = 0.35
 
+#: **잡음의 주파수 간 결맞음** (MEASUREMENTS §52.99). 기식·마찰 잡음의 포락은 두 몫으로 이루어진다 —
+#: 성문 제트의 F0 동기 AM 은 **모든 주파수에 공통**이고, 국소 와류의 흔들림은 **대역마다 독립**이다.
+#: 지금까지는 `asp_env` 라는 스칼라 하나만 곱해서 공통 몫이 사실상 1 이었다.
+#:
+#: 실측(코퍼스 12 파일, 512 창·2.7 ms 홉, 포락의 주파수 간 상관 대 간격; 사분범위 ±0.01~0.09):
+#:
+#:     대역      94Hz   188Hz   375Hz   750Hz  1500Hz
+#:     2-6k     0.818   0.698   0.699   0.599   0.575
+#:     6-10k    0.819   0.722   0.668   0.623   0.564
+#:     10-16k   0.803   0.703   0.679   0.614   0.572
+#:     16-22k   0.663   0.501   0.447   0.401   0.304
+#:
+#: 간격이 벌어져도 **평탄해지는 값이 공통 몫** `ρ∞` 다 — 2~16 kHz 에서 0.55, 16 kHz 위에서 0.29.
+#: 94 Hz 지점은 분석창(512, 빈 간격 93.75 Hz)의 누설이 섞이므로 평탄값만 쓴다. 지수 적합의 시간상수가
+#: **결맞음 대역폭** `B` 이고 185 Hz / 145 Hz 로 나온다.
+#:
+#: 그래서 대역 `i` 의 포락을 `slow·[1 + √ρ·m(t) + √(1−ρ)·u_i(t)]` 로 만든다 — `m` 은 공통 AM,
+#: `u_i` 는 대역마다 독립인 `B` 대역 잡음(같은 rms). 상수가 아니라 **측정된 곡선**이므로 화자마다 다시 잰다
+#: (`tmp/cohcurve.py`). `NOISE_BANDS = 0` 이면 예전 거동이다.
+NOISE_BANDS = 6                        # 고역을 나눌 대역 수 (로그 등간격)
+NOISE_SPLIT_HZ = 1500.0                # 이 위를 나눈다 — 아래는 성문 제트가 지배한다
+NOISE_RHO = ((16000.0, 0.55), (1e9, 0.29))   # (상한 Hz, 공통 몫) — 실측
+NOISE_COH_BW_HZ = 170.0                # 독립 성분의 결맞음 대역폭 [Hz]
+#: **대역별 공통 AM 깊이** (사용자의 두 파동, MEASUREMENTS §52.276). `ρ` 는 독립 성분을 **더하기만** 하고 공통 성분 `m` 은
+#: 못 줄인다 — 게다가 독립 성분은 주기 평균에서 상쇄되므로 '펄스에 묶인 정도'를 바꾸지 못한다(실측: ρ 0.25 대 0.85 가
+#: 12 kHz 깊이 7.69 대 7.77 dB). 펄스 동기를 실제로 정하는 것은 **공통 AM 의 깊이**이고, 지금은 모든 대역이 똑같이 받는다.
+#: 제트 난류가 센 대역은 펄스 동기가 풀리고(β 작게), 폐쇄 가장자리가 지배하는 대역은 묶인다(β 크게).
+#: '(상한 Hz, β)' 목록. 기본은 전부 1.0 = 예전 거동.
+NOISE_AM_BETA = ((1e9, 1.0),)
+#: **대역별 기식 세기** [dB] (사용자의 두 파동, MEASUREMENTS §52.276). 펄스 동기 깊이를 실제로 정하는 것은 ρ 도 β 도 아니라
+#: **기식이 펄스 사이를 얼마나 메우느냐**다. 실측(같은 제어열, 기식만 끔): 9~12 kHz 깊이가 4.42 → 15.42 dB 로 뒤집힌다.
+#: 원본은 10.32 로 그 사이다 — 우리는 그 대역에 기식을 **너무 많이** 넣고, 5~9 kHz 에는 **적게** 넣는다.
+#: 제트 난류 스펙트럼은 봉우리를 지나 굴러떨어지는데 우리 색(1 차 셸프)은 20 kHz 까지 평평하다. '(상한 Hz, dB)' 목록.
+NOISE_BAND_GAIN_DB = ((1e9, 0.0),)
+ASP_AM_SLOW_HZ = 60.0
+#: 공통 AM `m = (open_phase − 0.5)` 의 **공칭 rms**. 청크에 의존하지 않도록 상수로 둔다 —
+#: `open_phase = sin²(π·frac/0.65)` (frac < 0.65), 한 주기에 걸친 값이다 (소수 5 자리).
+M_RMS_NOMINAL = 0.41079
+
+
+
 # **앞니 다이폴이 협착 면적비에 붙는 거듭제곱** — 제트의 *기하* 효율.
 #
 # 이게 치찰음 고역의 페이드 인을 만드는 항이다. Shadle 의 장애물 소스는 **좁은
@@ -194,7 +235,8 @@ class FricationNoise(nn.Module):
     def forward(self, c: dict, ag_dc: torch.Tensor, glottal_phase: torch.Tensor,
                 voiced: torch.Tensor, noise=None, frame0: int = 0,
                 state: dict | None = None, emit: int | None = None,
-                noise_am: torch.Tensor | None = None) -> dict:
+                noise_am: torch.Tensor | None = None,
+                po_frames: torch.Tensor | None = None, uc_frames: torch.Tensor | None = None) -> dict:
         """c: 프레임률 (B,T) dict (p_sub, a_c, obstacle, fric_gain). ag_dc: **프레임률** (B,T) 성문 면적.
 
         noise: NoiseBank (위치 기반), frame0: 청크의 첫 프레임, state: 필터 상태(스트리밍).
@@ -215,8 +257,13 @@ class FricationNoise(nn.Module):
         # 연구개가 열리면 기류는 코로 빠진다. 구강 협착을 지나는 유량과 구강압 축적은 (1−velum) 배.
         # (비음의 구강 폐쇄 a_c≈0.02 에서 Re=3700 짜리 마찰 + 방전 버스트가 나던 것 — 측정)
         oral = (1.0 - c["velum"]).clamp(0.0, 1.0)
-        u, _ = series_flow(ps, ag_s, a_c)
-        u = u * up(oral)
+        if uc_frames is not None:
+            # **구강압 상미분방정식의 협착 유량** (glottis.ORAL_ODE, §52.436) — 정상 유량식 대신. 폐쇄 중 쌓인 Po 가 개방에서
+            # U_c = A_c √(2Po/ρ) 로 터져 나오므로 파열의 제트 속도·세기가 따로 된 식 없이 나온다.
+            u = up(uc_frames)
+        else:
+            u, _ = series_flow(ps, ag_s, a_c)
+            u = u * up(oral)
         # 구강압 저장 → 해제 시 방전 (파열음·파찰음의 버스트). 프레임률 1 차 계.
         #   닫힘(a_c < ~0.05): Po → Ps (τ 15 ms). 열림: Po → 정상값 (τ 6 ms).
         #   버스트 유량 = 저장된 초과압의 방전. ㅈ/ㅊ 개시가 10 ms 안에 −70→−30 dB 로 서는 것(계측).
@@ -224,16 +271,23 @@ class FricationNoise(nn.Module):
         closed = closed * closed * (3 - 2 * closed)
         po_ss = c["p_sub"] * agf ** 2 / (agf ** 2 + c["a_c"].clamp_min(1e-3) ** 2)   # 정상 구강압
         dt = hop / fs
-        po = state.get("po", po_ss[:, 0] * 0.0)
-        burst, po_hist = [], []
-        for i in range(t_all):
-            tgt = (closed[:, i] * c["p_sub"][:, i] + (1 - closed[:, i]) * po_ss[:, i]) * oral[:, i]
-            tau = 0.015 * closed[:, i] + 0.006 * (1 - closed[:, i])
-            po = po + dt * (tgt - po) / tau
-            po_hist.append(po)
-            burst.append((po - po_ss[:, i]).clamp_min(0.0) * (1 - closed[:, i]))
-        burst = torch.stack(burst, 1)
-        state["po"] = po_hist[t - 1]                     # 상태는 내보내는 마지막 프레임 기준
+        if po_frames is not None:
+            # **성문이 이미 적분한 값을 그대로 쓴다** (§52.344). 같은 물리를 두 번 적분하면
+            # 두 곳이 조용히 어긋난다 — 성문은 압력차로 떨고 마찰은 딴 압력으로 터진다.
+            po_all = po_frames[:, :t_all]
+        else:
+            po = state.get("po", po_ss[:, 0] * 0.0)
+            po_hist = []
+            for i in range(t_all):
+                tgt = (closed[:, i] * c["p_sub"][:, i]
+                       + (1 - closed[:, i]) * po_ss[:, i]) * oral[:, i]
+                tau = 0.015 * closed[:, i] + 0.006 * (1 - closed[:, i])
+                po = po + dt * (tgt - po) / tau
+                po_hist.append(po)
+            po_all = torch.stack(po_hist, 1)
+        # 틀마다 목록을 쌓지 않고 한 번에 (§52.468 — 같은 값)
+        burst = (po_all - po_ss[:, :t_all]).clamp_min(0.0) * (1 - closed[:, :t_all])
+        state["po"] = po_all[:, t - 1]                   # 상태는 내보내는 마지막 프레임 기준
         burst_env = up(torch.sqrt(burst.clamp_min(0.0) / CMH2O + 1e-12)) * 3.0     # 초과압 → 속도 배율
         re, v, d = reynolds(u, a_c)
         # Stevens: 소스 압력 ∝ ρ·v³·√A. Re = v·d/ν ∝ v·√A 이므로 같은 Re 에서 v³√A ∝ Re³/A —
@@ -245,7 +299,8 @@ class FricationNoise(nn.Module):
         else:
             drive = (((re ** 2 - RE_CRIT ** 2).clamp_min(0.0) / RE_REF ** 2) ** 1.5
                      * (0.1 / a_c.clamp_min(0.02)))
-        drive = drive + burst_env ** 3 * (0.1 / a_c.clamp_min(0.02))   # 버스트: 방전 속도의 세제곱
+        if uc_frames is None:
+            drive = drive + burst_env ** 3 * (0.1 / a_c.clamp_min(0.02))   # 버스트: 방전 속도의 세제곱 (옛 경로)
         env = drive * torch.exp(self.log_amp) * up(c["fric_gain"])
         if FRIC_V2 and FRIC_ENV_MS > 0.0:
             a_s = 1.0 - math.exp(-1000.0 / (FRIC_ENV_MS * fs))
@@ -360,8 +415,46 @@ class FricationNoise(nn.Module):
 #:   * 유성분(떨림 진폭 비례 v): MVF 위 2 차 고역, 바닥 `ASP_V_FLOOR` — 성도의 저 Q 사본으로
 #:   * 무성분(1 − v): 예전 셸프(3 kHz, 바닥 0.3) — **정상 종속 가지**(물리 포먼트)로
 #: MVF 는 파일 전역 적합값(`log_mvf`, 2~9 kHz, 초기 5.5 kHz). 목표도 파일마다 중역 주기성이 다르다.
+#: **기식의 고역 감쇠 모서리** [Hz] (사용자의 두 파동, MEASUREMENTS §52.276). 지금 기식의 색은 고역 셸프와 고역통과뿐이라
+#: **20 kHz 까지 평평하다** — 굴러떨어질 수단이 아예 없다. 실제 제트 난류 스펙트럼은 봉우리를 지나 감쇠한다.
+#: 그래서 우리는 9~16 kHz 에 난류를 과하게 깔고, 그것이 펄스 사이를 메워 세로줄을 지운다 —
+#: 실측(같은 제어열, 기식만 끔): 9~12 kHz 펄스 동기 깊이 4.42 → 15.42 dB, 원본은 10.32 로 그 사이다.
+#: 0 이면 끈다. `ASP_LP_ORDER` 극을 쓴다.
+ASP_LP_HZ = 0.0
+ASP_LP_ORDER = 1
 ASP_SPLIT = False
+#: **유성 기식에도 대역별 결맞음 구조를 건다** (사용자 지시, MEASUREMENTS §52.275). `ASP_SPLIT`(`--noise-v2`)이 켜지면
+#: `forward` 가 먼저 반환해서 `_partial_coherence` 를 **아예 안 부른다** — 대역별 공통/독립 분리(ρ)가 통째로 빠진다.
+#: 그래서 우리 고역 잡음은 대역마다 같은 AM 을 그대로 받아 펄스 동기가 어긋난다(§52.271: 5~9 kHz 과다, 9~16 kHz 부족).
+#: 켜면 유성 성분에만 `_partial_coherence` 를 태운다 — 무성에는 성문 펄스가 없으므로 그대로 둔다.
+ASP_SPLIT_BANDS = False
 ASP_V_FLOOR = 0.05
+
+
+def _asp_rolloff(a, b, fs, state):
+    """기식에 고역 감쇠를 건다 (`ASP_LP_HZ`). 상태는 청크 사이로 이어진다."""
+    if ASP_LP_HZ <= 0.0:
+        return a, b, state
+    r = math.exp(-2 * math.pi * float(ASP_LP_HZ) / float(fs))
+    for k in range(max(1, int(ASP_LP_ORDER))):
+        a, state[f"asplp{k}"] = tv_biquad(a, 1.0 - r, 0.0, 0.0, -r, 0.0, zi=state.get(f"asplp{k}"))
+        if b is not None:
+            b, state[f"asplpu{k}"] = tv_biquad(b, 1.0 - r, 0.0, 0.0, -r, 0.0,
+                                              zi=state.get(f"asplpu{k}"))
+    return a, b, state
+
+
+#: **기식 음원의 셸프 꺾임** [Hz] (MEASUREMENTS §52.432). 3000 은 남성 /아/ 의 4~8 kHz HNR 에 맞춘 값이었다. 문헌: 성문 난류 음원은
+#: 중심 주파수(틈의 면적·유량이 정함) 둘레 **2~3 옥타브에서 평평**하다 (Stevens, "Characteristics of the glottal turbulent noise
+#: source"). 성문 제트 v ≈ 37 m/s, 폭 2~4 mm → 중심 ≈ 2~4 kHz → 평평 ≈ 0.7~10 kHz. 3 kHz 아래를 −10.5 dB 깎으면 파열 뒤 기식의
+#: 0.5~2 kHz 가 원본보다 15~25 dB 약했다(C2 0.176~0.21 s). `copyfit --asp-corner` 로 바꾼다.
+ASP_CORNER_HZ = 3000.0
+#: **셸프 꺾임을 성문 제트의 스트로할 주파수로** (§52.432). 고정 3000 은 모음(좁은 틈, 수 kHz 중심)에 맞고, 파열 뒤 기식(넓은 틈,
+#: 중심 ≈ 1 kHz)에는 중역이 15~25 dB 모자랐다. 둘은 같은 물리다 — 난류 음원의 중심 f ≈ St·v/d (St ≈ 0.2, 제트 소음), 틈이 넓으면 낮다.
+#: 켜면 꺾임 = St·v/d_h 를 표본마다: A = ag_dc + 0.5·GLOT_A_PEAK·amp (평균 면적), d_h = 2A/성대 길이, v = √(2 ΔPg/ρ),
+#: ΔPg = Ps·a_c²/(a_c²+A²). 모달(A≈0.1 cm², Ps 8) → ≈ 3.7 kHz (예전 3000 근처), 벌린 성문(A≈0.45, Ps 20) → ≈ 1.3 kHz.
+ASP_STROUHAL = False
+ASP_ST = 0.2
 
 
 class AspirationNoise(nn.Module):
@@ -369,11 +462,11 @@ class AspirationNoise(nn.Module):
 
     order = 1           # 고역 셸프의 차수 (2 면 1 차 고역통과를 두 번 — 12 dB/oct)
 
-    def __init__(self, fs: float, hop: int, corner_hz: float = 3000.0, floor: float = 0.3,
+    def __init__(self, fs: float, hop: int, corner_hz: float | None = None, floor: float = 0.3,
                  amp_ref: float = 0.3):      # 실측 남성 /아/ HNR 22 dB, 4~8 kHz 대역에 적합 (2026-09-06)
         super().__init__()
         self.fs, self.hop = float(fs), int(hop)
-        self.corner, self.floor = corner_hz, floor
+        self.corner, self.floor = (ASP_CORNER_HZ if corner_hz is None else corner_hz), floor
         self.log_amp = nn.Parameter(torch.tensor(math.log(amp_ref)))
         # v2.1: 유성 기식의 MVF [Hz] — 파일 전역 적합값. 0 에서 5.5 kHz.
         self.log_mvf = nn.Parameter(torch.tensor(0.0))
@@ -386,8 +479,83 @@ class AspirationNoise(nn.Module):
         b0 = math.log(x0 / (1.0 - x0))
         return torch.exp(lo + (hi - lo) * torch.sigmoid(self.log_mvf + b0))
 
+    def _band_gain(self, f_hz: float) -> float:
+        """그 주파수의 **기식 세기 배율** (`NOISE_BAND_GAIN_DB`)."""
+        for hi, g in NOISE_BAND_GAIN_DB:
+            if f_hz < hi:
+                return 10.0 ** (float(g) / 20.0)
+        return 10.0 ** (float(NOISE_BAND_GAIN_DB[-1][1]) / 20.0)
+
+    def _beta(self, f_hz: float) -> float:
+        """그 주파수의 **공통 AM 깊이 배율** (`NOISE_AM_BETA`)."""
+        for hi, b in NOISE_AM_BETA:
+            if f_hz < hi:
+                return float(b)
+        return float(NOISE_AM_BETA[-1][1])
+
+    def _rho(self, f_hz: float) -> float:
+        """그 주파수의 **공통 몫** (`NOISE_RHO`, 실측 곡선)."""
+        for hi, r in NOISE_RHO:
+            if f_hz < hi:
+                return float(r)
+        return float(NOISE_RHO[-1][1])
+
+    def _bands(self, x, state):
+        """누적 저역통과의 차로 대역을 나눈다. **합이 원 신호와 같다** (시험이 고정한다).
+
+        경계는 `NOISE_SPLIT_HZ` 부터 나이퀴스트까지 로그 등간격이고, 첫 대역은 그 아래 전부다.
+        """
+        edges = [NOISE_SPLIT_HZ * (self.fs / 2.0 / NOISE_SPLIT_HZ) ** (i / NOISE_BANDS)
+                 for i in range(1, NOISE_BANDS)]
+        out, prev, lo_f = [], None, NOISE_SPLIT_HZ
+        for i, fc in enumerate([NOISE_SPLIT_HZ] + edges):
+            r = math.exp(-2 * math.pi * fc / self.fs)
+            lp, state[f"nb{i}"] = tv_biquad(x, 1.0 - r, 0.0, 0.0, -r, 0.0, zi=state.get(f"nb{i}"))
+            out.append((lo_f if i else 0.0, fc, lp if prev is None else lp - prev))
+            prev, lo_f = lp, fc
+        out.append((lo_f, self.fs / 2.0, x - prev))
+        return out
+
+    def _partial_coherence(self, colored, asp_env, noise, sample0, state):
+        """대역마다 **공통 AM + 독립 흔들림**을 건다 (`NOISE_BANDS` 참조).
+
+        대역 i 의 포락 = `slow·[1 + √ρ·m + √(1−ρ)·u_i]`. `m` 은 공통(성문 제트) AM 의 정규화 성분이고
+        `u_i` 는 `NOISE_COH_BW_HZ` 로 저역통과한 독립 잡음을 `m` 과 같은 rms 로 맞춘 것이다.
+        두 대역 포락의 상관은 설계상 `ρ` 가 된다 (`u_i` 끼리 독립이므로).
+        첫 대역(`NOISE_SPLIT_HZ` 아래)은 성문 제트가 지배하므로 `ρ = 1` — 공통 AM 그대로다.
+        """
+        slow, fast = self._am_split(asp_env, state)
+        m = fast / slow.clamp_min(1e-9)
+        # **청크 길이에 의존하는 정규화를 쓰면 안 된다.** 처음에는 `m` 과 `u` 를 각자의 rms 로 맞췄는데,
+        # rms 는 그 청크 안에서 계산되므로 스트리밍과 오프라인이 갈렸다 (실측 0.088, 허용 2.5e-4 —
+        # `test_streaming_equals_offline` 이 잡았다). 둘 다 **해석적 상수**로 정규화한다.
+        rl = math.exp(-2 * math.pi * NOISE_COH_BW_HZ / self.fs)
+        u_gain = math.sqrt((1.0 + rl) / (1.0 - rl))     # 1 극 저역통과의 출력 분산 (1−r)/(1+r) 의 역
+        out = torch.zeros_like(colored)
+        for i, (lo_f, hi_f, band) in enumerate(self._bands(colored, state)):
+            if i == 0:
+                out = out + band * asp_env.clamp_min(0.0)
+                continue
+            rho = self._rho(0.5 * (lo_f + hi_f))
+            u = noise.white(f"aspu{i}", sample0, colored.shape[-1], colored.shape[0],
+                            colored.dtype, colored.device)
+            u, state[f"nu{i}"] = tv_biquad(u, 1.0 - rl, 0.0, 0.0, -rl, 0.0, zi=state.get(f"nu{i}"))
+            # `û` 는 단위 분산(해석적), 깊이는 공통 AM 의 **공칭** rms 에서 온다 — 둘 다 청크와 무관하다.
+            d_u = M_RMS_NOMINAL * math.sqrt(max(1.0 - rho, 0.0) / max(rho, 1e-6))
+            fc = 0.5 * (lo_f + hi_f)
+            env = slow * (1.0 + self._beta(fc) * m + d_u * (u * u_gain))
+            out = out + band * env.clamp_min(0.0) * self._band_gain(fc)
+        return out
+
+    def _am_split(self, env, state):
+        """`env` 를 느린 부분과 F0 속도 부분으로 가른다. 돌려주는 값 (느림, 빠름). `ASP_AM_HI` 참조."""
+        r = math.exp(-2 * math.pi * ASP_AM_SLOW_HZ / self.fs)
+        slow, state["amlp"] = tv_biquad(env, 1.0 - r, 0.0, 0.0, -r, 0.0, zi=state.get("amlp"))
+        return slow, env - slow
+
     def forward(self, asp_env: torch.Tensor, noise=None, sample0: int = 0,
-                state: dict | None = None, voiced: torch.Tensor | None = None) -> dict:
+                state: dict | None = None, voiced: torch.Tensor | None = None,
+                corner_t: torch.Tensor | None = None) -> dict:
         b, n = asp_env.shape
         noise = noise or NoiseBank()
         state = {} if state is None else state
@@ -395,7 +563,8 @@ class AspirationNoise(nn.Module):
         if ASP_SPLIT and voiced is not None:
             g = asp_env * torch.exp(self.log_amp)
             v = voiced[:, :n].to(white.dtype).clamp(0.0, 1.0)
-            r_u = math.exp(-2 * math.pi * self.corner / self.fs)
+            r_u = (torch.exp(-2 * math.pi * corner_t / self.fs) if corner_t is not None
+                   else math.exp(-2 * math.pi * self.corner / self.fs))
             hu, state["hu"] = tv_biquad(white, 0.5 * (1 + r_u), -0.5 * (1 + r_u), 0.0, -r_u, 0.0,
                                         zi=state.get("hu"))
             col_u = self.floor * white + (1.0 - self.floor) * hu
@@ -405,17 +574,31 @@ class AspirationNoise(nn.Module):
             hv, state["hv2"] = tv_biquad(hv, 0.5 * (1 + r_v), -0.5 * (1 + r_v), 0.0, -r_v, 0.0,
                                          zi=state.get("hv2"))
             col_v = ASP_V_FLOOR * white + (1.0 - ASP_V_FLOOR) * hv
-            src_v, src_u = col_v * g * v, col_u * g * (1.0 - v)
+            col_v, col_u, state = _asp_rolloff(col_v, col_u, self.fs, state)
+            if ASP_SPLIT_BANDS and NOISE_BANDS > 0:
+                # 유성 기식만 대역별 공통/독립으로 가른다 (ρ). `g` 에 이미 `asp_env` 가 곱해져 있으므로
+                # 포락으로는 `asp_env·v` 를 넘기고 이득만 따로 곱한다.
+                amp = torch.exp(self.log_amp)
+                src_v = self._partial_coherence(col_v, asp_env * v, noise, sample0, state) * amp
+            else:
+                src_v = col_v * g * v
+            src_u = col_u * g * (1.0 - v)
             return dict(source=src_v + src_u, source_v=src_v, source_u=src_u, state=state)
         # 1 차 고역 셸프: floor + (1−floor)·HP(corner)
-        r = math.exp(-2 * math.pi * self.corner / self.fs)
+        r = (torch.exp(-2 * math.pi * corner_t / self.fs) if corner_t is not None
+             else math.exp(-2 * math.pi * self.corner / self.fs))
         hp, state["hp"] = tv_biquad(white, 0.5 * (1 + r), -0.5 * (1 + r), 0.0, -r, 0.0,
                                     zi=state.get("hp"))
         if int(getattr(self, "order", 1)) >= 2:
             hp, state["hp2"] = tv_biquad(hp, 0.5 * (1 + r), -0.5 * (1 + r), 0.0, -r, 0.0,
                                          zi=state.get("hp2"))
         colored = self.floor * white + (1.0 - self.floor) * hp
-        return dict(source=colored * asp_env * torch.exp(self.log_amp), state=state)
+        colored, _, state = _asp_rolloff(colored, None, self.fs, state)
+        g = torch.exp(self.log_amp)
+        if NOISE_BANDS <= 0:
+            return dict(source=colored * asp_env * g, state=state)
+        return dict(source=self._partial_coherence(colored, asp_env, noise, sample0, state) * g,
+                    state=state)
 
 
 # ------------------------------------------------------------ 과도음 템플릿

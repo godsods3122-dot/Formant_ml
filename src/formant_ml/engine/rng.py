@@ -54,3 +54,47 @@ class NoiseBank:
 
     def scalar(self, channel: str, index: int) -> float:
         return float(self.white(channel, index, 1)[0, 0])
+
+class LockedNoiseBank(NoiseBank):
+    """난류 채널을 **목표에서 뽑은 여기**로 갈아 끼운 잡음 은행 (MEASUREMENTS §52.114).
+
+    난수로 난류를 만드는 한, 같은 제어열을 씨앗만 바꿔 렌더한 둘이 서로 96.19 % 다 — 그것이
+    목표 대비 점수의 상한이다. 복제가 목표인 단계에서는 여기를 목표의 **비조화 잔차**(표백)
+    에서 받아 오는 것이 정당하다 (`waveform.whiten_aperiodic`).
+
+    지터·시머·배음 위상 같은 **제어 축**은 그대로 난수다 — 그것들은 난류가 아니라 몸의 떨림이고,
+    펄스 잠금이 이미 목표의 주기 경계를 준다. 여기서 바꾸는 것은 `LOCKED` 의 난류 채널뿐이다.
+    """
+
+    #: 이 이름(또는 접두어)으로 들어오는 요청만 목표 여기로 답한다.
+    LOCKED = ("asp", "fric", "aspu")
+
+    def __init__(self, seed: int = 0, excitation=None, bands=None, cache_blocks: int = 64):
+        super().__init__(seed, cache_blocks)
+        self.exc = None if excitation is None else torch.as_tensor(
+            excitation, dtype=torch.float32).reshape(-1)
+        #: `aspu{i}` 는 대역마다 다른 여기를 받는다 (없으면 통짜를 쓴다).
+        self.bands = None if bands is None else [
+            torch.as_tensor(b, dtype=torch.float32).reshape(-1) for b in bands]
+
+    def _locked_src(self, channel: str):
+        if self.exc is None:
+            return None
+        if channel.startswith("aspu") and self.bands:
+            try:
+                i = int(channel[4:])
+            except ValueError:
+                return self.exc
+            return self.bands[i % len(self.bands)]
+        return self.exc if channel in self.LOCKED else None
+
+    def white(self, channel: str, start: int, n: int, b: int = 1, dtype=torch.float32,
+              device=None) -> torch.Tensor:
+        src = self._locked_src(channel)
+        if src is None:
+            return super().white(channel, start, n, b, dtype, device)
+        # 구간을 벗어나면 되풀이한다 (스트리밍에서 목표보다 길어질 수 있다).
+        idx = torch.arange(start, start + n) % max(len(src), 1)
+        w = src[idx].to(dtype=dtype, device=device)
+        return w.unsqueeze(0).expand(b, n)
+

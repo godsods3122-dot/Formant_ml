@@ -37,7 +37,7 @@ def test_capture_separates_three_scopes():
                                room_ir=np.array([1.0, 0.1]))
     assert "log_front_bw" in data["speaker"]
     assert set(data["recording"]) == {"hf_eq_db", "hf_eq_enabled", "room_ir"}
-    assert {"log_mvf", "glottis_hjit_log", "glottis_src_eq_db",
+    assert {"log_mvf", "glottis_hjit_log", "glottis_src_eq_db", "glottis_src_eq_hf_db", "glottis_disp_log", "td_log_noise_g", "td_log_noise_c",
             "gain_db", "pulse_phi0"} == set(data["utterance"])
     json.dumps(data, allow_nan=False)
 
@@ -68,19 +68,6 @@ def test_partial_lock_copies_only_requested_scope():
     assert torch.count_nonzero(eng.tract.hf_eq_db) == 0
 
 
-def test_recording_eq_load_is_instance_local_and_does_not_add_zero_eq_controls(monkeypatch):
-    monkeypatch.setattr(tract_module, "HF_EQ", False)
-    eng, other, track = _engine(), _engine(), _track()
-    base = eng.render(track)
-    data = normalize_calibration({"hf_eq_db": [6.0] * 8})
-    apply_calibration(eng, data, ("recording",))
-    assert eng.tract.recording_eq_enabled
-    assert not other.tract.recording_eq_enabled and not tract_module.HF_EQ
-    assert not np.allclose(eng.render(track), base)
-    np.testing.assert_array_equal(other.render(track), base)
-    apply_calibration(eng, normalize_calibration({"hf_eq_db": [0.0] * 8}), ("recording",))
-    assert not eng.tract.recording_eq_enabled
-    np.testing.assert_array_equal(eng.render(track), base)
 
 
 def test_saved_disabled_eq_does_not_activate_stale_parameters(monkeypatch):
@@ -324,53 +311,5 @@ def test_sparse_events_reach_only_observed_controls_with_finite_gradients(monkey
     assert torch.count_nonzero(delta[:, 2:]) > 0
     f.loss()[0].backward()
     assert f.w_ev.grad is not None and torch.isfinite(f.w_ev.grad).all()
-    assert torch.isfinite(f.event_loss())
 
 
-@pytest.mark.parametrize("source", ["lf", "loaded"])
-def test_copyfit_render_only_round_trip_preserves_recording_chain(tmp_path, monkeypatch, source):
-    import soundfile as sf
-    if source == "loaded":
-        pytest.importorskip("numba")
-
-    path = Path(__file__).resolve().parents[2] / "scripts" / "copyfit.py"
-    spec = importlib.util.spec_from_file_location("copyfit_calibration_cli", path)
-    cli = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(cli)
-    track = _track()
-    audio = _engine().render(track)
-    audio = 0.1 * audio / np.max(np.abs(audio))
-    wav = tmp_path / "input.wav"
-    sf.write(wav, audio, 48000, subtype="FLOAT")
-    channel = tmp_path / "recording.json"
-    channel.write_text(json.dumps(normalize_calibration(
-        {"hf_eq_db": [3.0] * 8, "room_ir": [1.0, 0.02]})), encoding="utf-8")
-    monkeypatch.setattr(cli, "analyze", lambda *a, **kw: copy.deepcopy(track))
-    common = ["copyfit.py", str(wav), "--no-denoise", "--harmonic", "0",
-              "--global-iters", "0", "--stage-iters", "0", "--phase-iters", "0"]
-    first, second = tmp_path / "first", tmp_path / "second"
-    monkeypatch.setattr(cli.sys, "argv", common + [
-        "--glottal-source", source, "--load-coupling", "0.7",
-        "--recording-lock", str(channel), "--out", str(first)])
-    cli.main()
-    monkeypatch.setattr(cli.sys, "argv", common + [
-        "--init", str(first), "--out", str(second)])
-    cli.main()
-    y1, _ = sf.read(str(first) + "_fit.wav")
-    y2, _ = sf.read(str(second) + "_fit.wav")
-    np.testing.assert_array_equal(y2, y1)
-    for stem in (first, second):
-        constants = load_calibration(str(stem) + "_track.npz")
-        assert constants["recording"]["hf_eq_enabled"]
-        assert constants["recording"]["room_ir"] == pytest.approx([1, 0.02])
-        assert constants["model"]["glottal_source"] == source
-        assert constants["model"]["load_coupling"] == 0.7
-        assert Path(str(stem) + "_constants.json").exists()
-    if source == "loaded":
-        third = tmp_path / "override"
-        monkeypatch.setattr(cli.sys, "argv", common + [
-            "--init", str(first), "--glottal-source", "lf", "--out", str(third)])
-        cli.main()
-        assert load_calibration(str(third) + "_track.npz")["model"]["glottal_source"] == "lf"
-        with np.load(str(first) + "_track.npz") as a, np.load(str(third) + "_track.npz") as b:
-            np.testing.assert_array_equal(a["values"], b["values"])

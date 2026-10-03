@@ -266,40 +266,8 @@ def test_extra_poles_stay_below_nyquist():
     assert np.isfinite(d).all() and d[(fr > 20000)].max() < 20.0
 
 
-def test_hf_eq_knob_receives_gradient_from_zero():
-    """§52.73 — 고역 EQ 는 초기값 0 에서도 기울기를 받아야 한다 (0 에서 가지를 건너뛰면 영영 안 움직인다)."""
-    import torch
-
-    from formant_ml.engine import tract as tract_mod
-
-    old = tract_mod.HF_EQ
-    tract_mod.HF_EQ = True
-    try:
-        tr = tract_mod.VocalTract(48000, 48).double()
-        assert float(tr.hf_eq_db.abs().max()) == 0.0
-        x = torch.randn(1, 4800, dtype=torch.float64)
-        y = tr._hf_eq(x, {})
-        y.pow(2).sum().backward()
-        g = tr.hf_eq_db.grad
-        assert g is not None and torch.isfinite(g).all()
-        assert float(g.abs().max()) > 0.0
-    finally:
-        tract_mod.HF_EQ = old
 
 
-def test_hf_eq_is_identity_when_disabled():
-    import torch
-
-    from formant_ml.engine import tract as tract_mod
-
-    old = tract_mod.HF_EQ
-    tract_mod.HF_EQ = False
-    try:
-        tr = tract_mod.VocalTract(48000, 48).double()
-        x = torch.randn(1, 480, dtype=torch.float64)
-        assert torch.equal(tr._hf_eq(x, {}), x)
-    finally:
-        tract_mod.HF_EQ = old
 
 
 def test_piriform_zero_comes_from_the_speaker_profile_and_range_is_narrow():

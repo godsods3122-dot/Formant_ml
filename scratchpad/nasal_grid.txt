@@ -1,0 +1,15 @@
+  대역: 0.1-0.7 0.7-1.5 1.5-2.7 2.7-4.5 4.5-6k (웅얼거림 − 모음, dB)
+  원본 n ÷ 앞 ʌ                        -4    -6   +19    -3    +3
+  원본 ɲ ÷ 앞 ʌ                        +5    -6    -7    -6    -3
+  tt-alveolar-closure(a) L4 A0.7    ÷ O     -7   -33   -24    -7   -18
+  tt-alveolar-closure(a) L4 A0.5    ÷ O    -10   -42   -32   -11   -24
+  tt-alveolar-closure(a) L4 A0.4    ÷ O    -12   -49   -38   -15   -28
+  tt-alveolar-closure(a) L8 A0.7    ÷ O    -11   -40   -26   -13   -22
+  tt-alveolar-closure(a) L8 A0.5    ÷ O    -14   -50   -35   -18   -28
+  tt-alveolar-closure(a) L8 A0.4    ÷ O    -18   -58   -40   -22   -32
+  tt-alveolar-closure(a) L16 A0.7   ÷ O    -16   -50   -31   -22   -32
+  tt-alveolar-closure(a) L16 A0.5   ÷ O    -22   -60   -40   -30   -39
+  tt-alveolar-closure(a) L16 A0.4   ÷ O    -26   -67   -47   -36   -45
+  tt-alveolar-closure(a) L32 A0.7   ÷ O    -25   -61   -44   -40   -53
+  tt-alveolar-closure(a) L32 A0.5   ÷ O    -31   -71   -56   -50   -65
+  tt-alveolar-closure(a) L32 A0.4   ÷ O    -36   -79   -65   -58   -74

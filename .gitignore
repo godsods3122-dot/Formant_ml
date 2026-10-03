@@ -15,3 +15,4 @@ runs/
 
 # 논문 원문 PDF — 저작권 때문에 저장소에 올리지 않는다. 목록과 요약은 papers/INDEX.md (추적)
 papers/*.pdf
+third_party/

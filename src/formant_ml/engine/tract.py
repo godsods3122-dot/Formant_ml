@@ -27,7 +27,7 @@ import torch.nn as nn
 from .control import N_ALLPASS, N_FORMANTS, frames_to_samples
 from .noise import C_SOUND
 from .tviir import (allpass_coeffs, antiresonator_coeffs, first_difference_coeffs,
-                    lowpass_coeffs, notch_coeffs, peak_coeffs, resonator_coeffs, tv_biquad)
+                    lowpass_coeffs, notch_coeffs, peak_coeffs, peaking_coeffs, resonator_coeffs, tv_biquad)
 
 #: 전역 대역폭 배율 두 개(`log_extra_bw`, `log_front_bw`)의 **물리 범위** [ln 배].
 #: tanh 로 부드럽게 가둔다: 배율이 e^{±HF_BW_LIM} = 0.4~2.5 배 안에 머문다.
@@ -59,6 +59,11 @@ HF_BW_LIM = 0.916
 #: 고차 극 대역폭 배율의 **하한과 상한**. 하한은 위 표의 1.65 — 여기서부터 줄의 지속이
 #: 목표와 같아진다. 상한은 예전 상한(2.5)을 조금 넘겨 3.0 으로 둔다.
 EXTRA_BW_FLOOR = 1.65
+#: **화자 고정 고역 포먼트(F5~F8)만의 폭 하한** (MEASUREMENTS §52.245). `None` 이면 `EXTRA_BW_FLOOR` 와 같다(예전 동작).
+#: 하한 1.65 는 보정 사다리의 "켜켜이 쌓인 가로줄" 을 막으려고 올린 것인데 F5~F8 에도 똑같이 걸려 있었다. 실측:
+#: 목표는 10.4 kHz 에 돌출 13.3 dB · −3 dB 폭 약 520 Hz 의 봉우리가 있고, 하한 1.65 면 F6(10.8 kHz)이 959 Hz 아래로
+#: 못 좁아진다 — 모든 판에서 10 개 중 7~8 개가 하한에 붙어 있었다. 사다리와 포먼트를 따로 묶을 수 있게 가른다.
+HF_FORMANT_BW_FLOOR: float | None = None
 EXTRA_BW_CEIL = 3.0
 
 #: **성도 궤적의 꺾임을 없앤다** — 포먼트·대역폭의 샘플률 궤적에 거는 2 단 1 차 평활의 시간상수 [ms].
@@ -174,7 +179,7 @@ AZR_RATIO = 8.0
 #: 영점열(간격 하나)이 아니라 **자리가 자유로운 영점 셋**으로 둔다. 자리는 겹치는 세 띠 안이다.
 HF_ZEROS = False
 N_HZR = 3
-HZR_BANDS = ((4000.0, 8000.0), (7000.0, 12000.0), (11000.0, 16000.0))
+HZR_BANDS = ((4000.0, 8000.0), (7000.0, 12000.0), (11000.0, 16000.0), (15000.0, 20500.0))   # 넷째는 마루 4 만 쓴다 (§52.413)
 #: 노치 폭 = 자리 × 이 값 × (1 − 깊이·0.5). 실측으로 고역 골의 폭/자리는 중앙 **0.028**
 #: (모음, 분해능 500 Hz) ~ **0.012** (마찰, 분해능 150 Hz) 다. 0.04 로 둔다 — 그보다 좁히면
 #: 한 빈짜리 "얇은 줄" 이 되어 사용자가 지적한 고역의 가는 선이 된다.
@@ -189,9 +194,50 @@ HZR_RATIO = 8.0
 #: 빗살이 된다 (§51.36 의 "층층이 쌓인 것들"). 여기 마루는 프레임마다 깊이가 0 까지 내려갈 수
 #: 있어서 조음과 함께 떴다 가라앉는다.
 HF_POLES = False
-N_HZP = 3
+
+#: **보정을 소유 가지에 붙인다** (MEASUREMENTS §52.356~360, 사용자 지시).
+#:
+#: 사용자: *"극이 용병도 아니고 여기저기 끌려다니네. 철저히 분리할 수 있도록."* 다만 단서가 있다 —
+#: *"말을 일부러 비강을 열어서 할 수도 있잖아? 너무 원칙적으로 접근하지 말고, 누가 봐도 보상적
+#: 측면에서의 겸직일 때만 막아야 해."*
+#:
+#: 무엇이 보상인지는 쟀다. `hzr_k` 와 `hzp_k` 는 같은 자리에 오면 깊이가 **음으로** 상관하고
+#: (−0.87 / −0.40), 그 계층은 적합마다 뒤집힌다(`L8` 59 % ↔ `L12` 0 %). 재현되지 않으므로 물리가
+#: 아니라 보상이다 (§52.357).
+#:
+#: 구조적 원인은 이 보정들이 **합쳐진 뒤의 `y`** 에 걸린다는 것이다. 배음·잡음·앞공동·비강이 전부
+#: 더해진 신호를 보므로 원리적으로 **아무 가지의 일이나 할 수 있다.** 벌점으로 막으면 적합기가
+#: 우회하지만 구조로 막으면 못 한다.
+#:
+#: 켜면 `_hf_peaks`·`_hf_zeros` 를 **잡음 가지(`y_nc`) + 앞공동(`y_f`)** 에만 건다. 이것은 원래
+#: 주석이 적어 둔 의도(*"그 에너지는 배음 가지가 아니라 잡음 가지와 앞공동에서 온다"*)에 **더**
+#: 충실하다 — 예전 형태는 그렇게 적어 놓고 배음 가지까지 함께 걸고 있었다.
+#:
+#: 켜면 반환하는 `glottal_path` 는 배음 캐스케이드만이고 `front_path` 가 보정된 잡음+앞공동이다.
+#: 경로별 진단의 가르는 선이 그만큼 옮겨진다.
+HF_OWNED = False
+N_HZP = 4
 HZP_WFRAC = 0.04
 HZP_RATIO = 3.0
+
+#: **보조 극·영점의 혼합량은 천천히만 움직인다** [ms] (MEASUREMENTS §52.154). 0 이면 끈다.
+#:
+#: 이 손잡이들(`aux{k}_mix`, `azr{k}_mix`, `azr{k}_f`)은 "포먼트가 합쳐졌다 갈라질 때 사이의 극을
+#: **서서히** 켠다" 는 취지인데, 실제 적합에서는 **150~400 Hz 로 깜빡인다**(표준편차 0.09~0.23).
+#: 그 깜빡임이 스펙트럼을 매 프레임 튀게 해 고역에 세로 띠를 만든다.
+#:
+#: 실측 (같은 제어열을 부분만 60 Hz 로 평활하고 재렌더, 6~20 kHz 포락 변조 [dB], 무평활 대비):
+#:
+#:   | 평활한 것 | 120~200 | 200~300 | 400~600 |
+#:   |---|---|---|---|
+#:   | 전부 | −5.47 | −4.38 | −4.25 |
+#:   | `hz*` (고역 영점·극) 만 | −0.01 | +0.02 | −0.00 |
+#:   | **`aux`·`azr` 만** | **−5.47** | **−4.44** | **−3.95** |
+#:   | `hz`·`aux` 를 뺀 나머지 전부 | −0.06 | +0.02 | −0.04 |
+#:
+#: **과잉의 100 %가 `aux`·`azr` 에서 온다.** 벌점이 아니라 **구조로** 막는다 — 취지가 원래
+#: "서서히" 이므로 제약이 아니라 설계의 복원이다.
+AUX_SMOOTH_MS = 0.0
 
 AUX_POLES = False
 #: **틈마다 몇 개를 둘 것인가** (F1–F2, F2–F3, F3–F4). 실측으로 정했다 — 같은 화자 40 개 파일,
@@ -208,6 +254,25 @@ AUX_PER_GAP = (2, 3, 2)
 N_AUX = sum(AUX_PER_GAP)
 #: 보조 공진의 대역폭 = 손실 법칙 × 이 값. 넓게 두어야 켤 때 뾰족한 줄이 아니라 어깨로 올라온다.
 AUX_BW_REL = 1.6
+#: **봉우리형 보조 극** (MEASUREMENTS §52.198). 끄면(기본) 예전 그대로 DC 정규화 공진기(`resonator_coeffs`)를
+#: 젖음/마름으로 섞는다 — 그런데 그 공진기는 극보다 한참 위에서 출력이 0 이라 **고역에서 y ≈ (1 − mix)·x** 가 된다.
+#: 5 kHz 아래 국소 공진 하나를 켜는 것만으로 12~17 kHz 전체가 mix 0.3 에 −3.1 dB, 0.585 에 −7.6 dB 내려가고,
+#: `p96b` 의 실제 `aux1~7_mix` 로는 고역 곱 이득이 −11.5 ~ −0.4 dB 로 오르내렸다 — 사용자가 들은 **고역 지직거림**의
+#: 구조 원인이다.
+#:
+#: 켜면 **RBJ 봉우리 EQ** `peaking_coeffs`(DC·나이퀴스트에서 정확히 이득 1)로 바꾼다. 극-영점 쌍 `peak_coeffs` 는
+#: 영점을 넓히면 양 끝 이득이 달라져 12 kHz 가 −0.6 dB(mix 0.3) 남았다(§52.199, 시험이 잡음). 섞기 구조는 그대로라 mix = 0 이면 정확히 항등이고,
+#: 자리 이득은 1 + mix·(`AUX_PEAK_RATIO` − 1) 이다. 비율 7.5 는 예전 공진기가 보조 극 자리에서 mix 0.3 에 내던
+#: 이득(+7.4~+11.5 dB, 중앙 +9.4)과 같게 맞춘 값이다 — 국소 효과의 크기는 유지하고 고역만 놓아준다.
+AUX_PEAK = False
+AUX_PEAK_RATIO = 7.5
+
+#: **보조 영점을 먼 대역 이득 1 인 봉우리 깎기로** (MEASUREMENTS §52.245). 예전 형태 `notch_coeffs` 는 DC 만 1 로 맞춰
+#: 먼 고역 이득이 1 이 아니다 — 젖음/마름 섞기 `x + mix·(notch − x)` 에서 15 kHz 이득이 mix 0.1 당 +0.25 dB 씩
+#: 움직이고(셋이 겹친다), 그러면 **고역 빈 전체가 한꺼번에** 오르내려 세로선이 된다. 일괄 시상수 판에 남은
+#: 세로선(0.36·0.39·0.51·0.54 s)이 `azr*` 를 얼리면 전부 사라졌다. RBJ 봉우리(이득 1/`AZR_RATIO`)는 DC 와
+#: 나이퀴스트에서 정확히 1 이라 mix 가 먼 대역을 못 건드린다. 기본은 끔 — 예전 판의 제어열은 예전 뜻으로 적합됐다.
+AZR_PEAK = False
 
 NASAL_EXTRA_BW = 2.0
 NOISE_BW_REL = 0.15
@@ -227,6 +292,24 @@ FRONT_Q_LO, FRONT_Q_HI = 1.5, 6.0
 #: 봉우리 Q 는 5.6 이었다. 켜면 `FRONT_Q_OBSTACLE` 보다 먼저 쓴다.
 FRONT_Q_CTRL = False
 
+#: **앞공동을 3D 모드 표로 세운다** (사용자 요청, MEASUREMENTS §52.345). `None` 이면 예전대로
+#: 1/4 파장 근사(극 `c/4L` 과 `3c/4L`)를 쓴다.
+#:
+#: 까닭: 앞공동은 관이 아니라 **상자**다. 폭 2 cm · 높이 1 cm 면 횡모드가 `c/2W` = 8.75 kHz,
+#: `c/2H` = 17.5 kHz 로 **치찰음 대역 한가운데** 서는데 1D 근사는 그것을 모른다. 실측(무손실 FDTD,
+#: L=1.0 cm): 1D 는 8750 Hz 하나를 예측하지만 3D 는 8790 Hz 옆에 17.2 kHz 짜리 높이 모드가 **더 세게**
+#: 선다. L=1.8 cm 에서는 1D 의 4861 Hz 가 아예 안 보인다.
+#:
+#: 3D 를 적합 루프에 넣을 수는 없다(형상 하나에 수 초). 그래서 `scripts/front3d.py` 가 오프라인으로
+#: 모드를 뽑아 표로 만들고, 여기서는 `front_len` 으로 **표를 보간해 병렬 공진기를 세운다** —
+#: 실행 비용은 예전과 같고 파라미터도 늘지 않는다.
+#:
+#: 표에는 **주파수와 세기만** 있다. Q 는 `front_q` 가 목표에서 적합해 낸다 (무손실 FDTD 의 Q 는
+#: 격자와 창이 정하지 물리가 정하지 않는다).
+FRONT3D: dict | None = None
+#: 표에서 쓸 모드 수. 표에 더 있어도 이만큼만 세운다.
+FRONT3D_MODES = 4
+
 #: **화자 고정 고역 구조** (docs/FOUNDATION.md §3.3, 2 단계). 켜면 F5 위 극들이 F4 를 따라 움직이지 않는다.
 #:
 #: 사다리(F_K + n·c/2L)는 F4 에 매달려, 적합기가 F4 를 흔들면 5~16 kHz 극 열 개가 통째로 흔들려 고역을
@@ -240,6 +323,11 @@ FRONT_Q_CTRL = False
 #: **되채우는** 보정이라, 넓히면 모음 성문 경로의 10~12 kHz 가 사다리보다 −25 dB, 14~16 kHz 가 −31 dB
 #: 가 됐다(합성 모음 실측) — L31 의 고역 죽음과 같은 기제다. 위치만 F4 에서 떼어 고정한다.
 HF_FIXED = False
+#: **관 모드** (MEASUREMENTS §52.475). 켜면 F1~F8 과 대역폭 B1~B8 을 조음 손잡이(`art1..art6`)와 성도 길이(`tract_len`)에서
+#: 웹스터 고유모드·손실 계산(`tube.tube_formants`)으로 얻는다. 자유 포먼트(`f*`, `bw*`)·화자 고정 고역 극(HF_FIXED)은 안 쓰인다.
+TUBE = False
+TUBE_WALL_SCALE = 1.0      # 벽 손실 배율 (화자 상수 — 1 = Flanagan 1972 의 성인 값)
+TUBE_RAD_SCALE = 1.0       # 입술 복사 손실 배율
 
 #: **고차 극 꼬리 보정** (MEASUREMENTS §51.7). 켜면 종속 가지(성문·잡음 사본)의 입력에 정적 최소위상 FIR 을
 #: 걸어, 극 14 개(마지막 ≈ 16.1 kHz)에서 끊긴 디지털 캐스케이드를 **무한 개의 극을 가진 손실 균일관**의
@@ -264,6 +352,25 @@ HF_FIXED = False
 #: 물리적인 무한 관에서 꼬리 극이 하는 일과 같다.
 HPC_AT_INPUT = False
 HPC_TAIL = False
+
+#: **기관(성문하) 분기** (MEASUREMENTS §52.105, 문헌 근거). 성문이 열린 동안 성도는 기관과 이어지고,
+#: 기관의 공명이 출력에 **극-영점 쌍**을 만든다. 지금 엔진에는 이 분기가 아예 없고 `OPEN_DAMP` 가
+#: F1 감쇠라는 스칼라 근사로 흉내만 낸다 (§52.96).
+#:
+#: 문헌: 기관은 **성문에서 닫히고 아래쪽이 열린 균일관**으로 잘 기술되며, 음향 길이는 18~23.5 cm 로
+#: 화자 키에 비례한다. 그러면 `f_n = (2n−1)·c/(4L)` 이다. **Sg1 대역에서는 벽이 유연해 파속이 약 4/3 배**
+#: 올라가고(그 위 대역은 강체로 봐도 된다), 그래서 여성 Sg1 이 500~800 Hz 에 온다.
+#: 추정 오차는 Sg1/Sg2/Sg3 각각 30/60/100 Hz 급이다.
+#:
+#: 결합은 **성문 개방 곡선에 비례**한다 — 닫힌 동안에는 기관이 끊기므로 영점이 사라진다. 그래서
+#: `notch_coeffs` 의 깊이를 `g_open` 으로 시변시킨다. `SUB_DEPTH_MAX` 는 화자 전역 적합값의 상한이다.
+SUBGLOTTAL = False
+SUB_LEN_CM = 18.0          # 음향 길이 [cm] (문헌 18~23.5)
+SUB_C_LOW = 4.0 / 3.0      # Sg1 대역의 파속 배율 (유연한 벽)
+SUB_Q = 5.0                # 기관 공명은 넓다 — B = f/Q
+SUB_N = 3                  # Sg1..Sg3
+SUB_DEPTH_MAX = 6.0        # 영점 깊이(극/영점 반지름 비)의 상한
+
 
 #: **성문 개방기 감쇠** (MEASUREMENTS §51.9). 켜면 성문 경로의 F1 대역폭·주파수를 성문 개방 곡선 o(t)(LF 개방기의
 #: sin², 0~1, 성문 주기마다)에 따라 움직인다: B1(t) = B1·(1 + k_b·o), F1(t) = F1·(1 + k_f·o).
@@ -291,20 +398,44 @@ HF_DF_LIM = 0.5
 #: 여섯 판 중 다섯이 범위 끝에 박혔다 (LF 는 위 끝, 물리는 아래 끝 — 같은 화자인데 반대였다).
 PIR_F0, PIR_BW, PIR_RATIO_MAX = 4500.0, 500.0, 6.0
 PIR_DF_LIM = 0.08
+#: **하인두 넓은 골** (MEASUREMENTS §52.231). 이상와 영점과 **별개의 특징**이다 — 코퍼스 216 파일에서
+#: 생 스펙트럼의 골이 8062 Hz(깊이 14 dB, −6 dB 너비 2145 Hz)에 있는데 엔진에는 그것이 없었다. 고차 극
+#: 사다리는 일부러 "틈이 없게" 깔려 있어(아래 주석) 이 골을 원리적으로 못 만든다. 그래서 7~8.5 kHz 가
+#: 메워지고 사용자가 "낮고 두꺼운 잡음" 으로 들었다.
+#:
+#: `notch_coeffs` 로 깊이 14 dB · 너비 2145 Hz 를 내는 값이 bw 1150 Hz, 비 5.5 다(수치로 맞췄다). 적합 범위는
+#: 실측 25~75 % 분위(6955~9381 Hz)를 덮는 ±0.18 로그로 둔다 — 구조 상수이되 모음마다 조금 움직인다.
+TRO_BW, TRO_RATIO_MAX, TRO_RATIO0 = 1150.0, 12.0, 5.5
+TRO_DF_LIM = 0.18
 
 
-def _extra_mult(x: torch.Tensor) -> torch.Tensor:
-    """고차 극 대역폭 배율. 아래로는 `EXTRA_BW_FLOOR`, 위로는 e^{HF_BW_LIM}(2.5 배).
+def hf_log_df_for(f_hz: float, k: int, length_cm: float) -> tuple[float, float]:
+    """화자 고정 고역 극 F_k 를 `f_hz` 에 두는 `hf_log_df` 값과, 범위에 잘린 실제 자리 [Hz] (MEASUREMENTS §52.254).
+
+    F_k = (2k−1)·c/(4L) · exp(HF_DF_LIM·tanh(x/HF_DF_LIM)). 적합이 이 값을 초기값 0 근처에서 거의 못 옮겨 F5 가 균일관 기본
+    자리(약 6.6 kHz)에 박혀 있었다 — 이 음절에서는 목표의 넓은 골 한가운데다. 코퍼스의 5~12 kHz 봉우리는 8.5~9.0 kHz 가 가장 잦다.
+    범위(±`HF_DF_LIM` 로그) 밖이면 끝의 99.9 % 로 자른다.
+    """
+    ab = (2 * k - 1) * C_SOUND / (4.0 * float(length_cm))
+    u = math.log(max(float(f_hz), 1.0) / ab) / HF_DF_LIM
+    u = max(-0.999, min(0.999, u))
+    x = HF_DF_LIM * math.atanh(u)
+    return x, ab * math.exp(HF_DF_LIM * math.tanh(x / HF_DF_LIM))
+
+
+def _extra_mult(x: torch.Tensor, floor: float | None = None) -> torch.Tensor:
+    """고차 극 대역폭 배율. 아래로는 `floor`(기본 `EXTRA_BW_FLOOR`), 위로는 e^{HF_BW_LIM}(2.5 배).
 
     매끈한 한쪽 가둠 — softplus 로 음수 쪽을 접고 tanh 로 위를 가둔다. 꺾임이 없어 손실이
     C² 로 남는다. 하한은 §51.58 의 표에서 온다 (1.65 배부터 줄의 지속이 목표와 같다).
     """
+    fl = EXTRA_BW_FLOOR if floor is None else float(floor)
     w = 0.1
     sp = w * torch.nn.functional.softplus(x / w) - w * math.log(2.0)
-    half = 0.5 * (math.log(EXTRA_BW_CEIL) - math.log(EXTRA_BW_FLOOR))
+    half = 0.5 * (math.log(EXTRA_BW_CEIL) - math.log(fl))
     sp0 = -w * math.log(2.0)                     # softplus 가 음수를 접는 자리 = 하한
     z = torch.tanh(sp / half) - math.tanh(sp0 / half)
-    return EXTRA_BW_FLOOR * torch.exp(half * z)
+    return fl * torch.exp(half * z)
 
 # 고차 극 보정을 최소위상 FIR 로 되돌리는 경로가 여기 있었다. 12 kHz 에서 +160 dB 가
 # 필요해 수치적으로 성립하지 않아 기각했고(ADR 0009·0012), 대역폭 법칙을 하나로
@@ -316,7 +447,8 @@ class VocalTract(nn.Module):
     def __init__(self, fs: float, hop: int, length_cm: float = 14.6,
                  bw_floor: float = 40.0, bw_slope: float = 0.05,
                  n_formants: int = N_FORMANTS, n_extra: int | None = None,
-                 front_bw_slope: float = 0.20, piriform_hz: float = 0.0):
+                 front_bw_slope: float = 0.20, piriform_hz: float = 0.0,
+                 trough_hz: float = 0.0):
         super().__init__()
         self.fs, self.hop = float(fs), int(hop)
         self.length_cm = length_cm
@@ -355,6 +487,8 @@ class VocalTract(nn.Module):
         self.log_front_bw = nn.Parameter(torch.tensor(0.0))
         # 화자 고정 고역 구조 (HF_FIXED). F5~F_K 와 보정 극마다 로그 위치 이동·대역폭 배율, 이상와 영점.
         n_hf = max(0, n_formants - 4) + (6 if n_extra is None else int(n_extra))
+        self.sub_depth = nn.Parameter(torch.tensor(0.0))
+        self.sub_log_f = nn.Parameter(torch.zeros(SUB_N))
         self.hf_log_df = nn.Parameter(torch.zeros(n_hf))
         self.hf_log_bw = nn.Parameter(torch.zeros(n_hf))
         self.hf_eq_db = nn.Parameter(torch.zeros(HF_EQ_N))     # 고역 포락 EQ (HF_EQ)
@@ -363,6 +497,12 @@ class VocalTract(nn.Module):
         self.pir_f0 = float(piriform_hz if piriform_hz else PIR_F0)
         self.pir_log_f = nn.Parameter(torch.tensor(0.0))
         self.pir_depth = nn.Parameter(torch.tensor(-2.0))     # 시그모이드 — 처음엔 얕게
+        #: 이 화자의 하인두 넓은 골 [Hz] — 프로파일에서 온다. 0 이면 끈다 (§52.231).
+        self.tro_f0 = float(trough_hz or 0.0)
+        self.tro_log_f = nn.Parameter(torch.tensor(0.0))
+        #: 실측 중앙 깊이(14 dB = 비 5.5) 에서 출발한다 — 얕게 시작하면 골이 없는 해로 굳는다.
+        self.tro_depth = nn.Parameter(torch.tensor(
+            math.log((TRO_RATIO0 - 1.0) / (TRO_RATIO_MAX - TRO_RATIO0))))
         # 성문 개방기 감쇠 (OPEN_DAMP): k_b = 4·sigmoid(x) (x = −ln 3 → 1 배), k_f = 0.15·tanh(y) + 0.05
         self.open_damp = nn.Parameter(torch.tensor(-math.log(3.0)))
         self.open_f1 = nn.Parameter(torch.tensor(-0.3466))    # 0.15·tanh(−0.3466)+0.05 ≈ 0
@@ -444,6 +584,20 @@ class VocalTract(nn.Module):
         **기본값 대치는 프레임률에서** 한 뒤 샘플률로 보간한다. 샘플률에서 하면
         0 ↔ 값 사이를 선형 보간하며 F1 이 10 Hz 를 지나간다(첫 렌더의 폭주 원인 2).
         """
+        if TUBE and "art1" in c:
+            from .tube import N_ART, tube_formants
+            coef = torch.stack([c[f"art{k}"] for k in range(1, N_ART + 1)], -1)
+            L = c["tract_len"].clamp(10.0, 20.0)
+            F, Bw = tube_formants(coef, L, n_modes=self.K, wall_scale=TUBE_WALL_SCALE, rad_scale=TUBE_RAD_SCALE)
+            cap = self.extra_cap * self.fs / 2.0
+            out = []
+            for k in range(self.K):
+                f = self._soft_cap(F[..., k], cap)
+                bw = Bw[..., k].clamp_min(20.0)
+                if k == 0:      # 연구개가 열리면 F1 이 넓어진다 (에너지가 비강으로 샌다)
+                    bw = bw + 120.0 * c["velum"]
+                out.append((self._up(f), self._up(bw)))
+            return out
         out = []
         prev = None
         for k in range(1, self.K + 1):
@@ -455,7 +609,7 @@ class VocalTract(nn.Module):
                 i = k - 5
                 ab = (2 * k - 1) * C_SOUND / (4.0 * self.length_cm)
                 fk = ab * torch.exp(HF_DF_LIM * torch.tanh(self.hf_log_df[i] / HF_DF_LIM))
-                bk = self.default_bw(fk) * _extra_mult(self.hf_log_bw[i])
+                bk = self.default_bw(fk) * _extra_mult(self.hf_log_bw[i], HF_FORMANT_BW_FLOOR)
                 f = torch.where(f > 0, f, fk.to(f.dtype).expand_as(f))
                 prev = f
                 bw = c[f"bw{k}"]
@@ -482,9 +636,13 @@ class VocalTract(nn.Module):
                       for i, (f, bw) in enumerate(tracks)]
         return tracks
 
-    def _smooth_track(self, x, key, state):
-        """샘플률 궤적 (B, N) 에 2 단 1 차 저역 (`TRACK_SMOOTH_MS`). 상태는 `state[key_p]`."""
-        a = 1.0 - math.exp(-1000.0 / (TRACK_SMOOTH_MS * self.fs))
+    def _smooth_track(self, x, key, state, ms: float | None = None):
+        """샘플률 궤적 (B, N) 에 2 단 1 차 저역. 상태는 `state[key_p]`.
+
+        `ms` 를 주면 그 시상수를 쓴다 (보조 극·영점은 `AUX_SMOOTH_MS`, §52.154).
+        """
+        tau = TRACK_SMOOTH_MS if ms is None else ms
+        a = 1.0 - math.exp(-1000.0 / (tau * self.fs))
         for p in (0, 1):
             k = f"{key}_{p}"
             zi = state.get(k)
@@ -494,75 +652,9 @@ class VocalTract(nn.Module):
             x, state[k] = tv_biquad(x, a, 0.0, 0.0, -(1.0 - a), 0.0, zi=zi)
         return x
 
-    def _uniform_digital_db(self, f: np.ndarray, noise: bool) -> np.ndarray:
-        """균일관 설정의 종속 캐스케이드(K 극 + 보정 극) 크기응답 [dB] — `_cascade`·`_extra_cascade` 와 같은 식."""
-        from .tviir import resonator_coeffs as _rc
-        f1 = C_SOUND / (4.0 * self.length_cm)
-        zi = np.exp(-1j * 2.0 * np.pi * f / self.fs)
-        poles = []
-        for n in range(1, self.K + 1):
-            fn = (2 * n - 1) * f1
-            bn = float(self.default_bw(torch.tensor(fn, dtype=torch.float64)))
-            poles.append((fn, max(bn, NOISE_BW_REL * fn) if noise else bn))
-        f_last, cap = poles[-1][0], self.extra_cap * self.fs / 2.0
-        bx = NOISE_EXTRA_BW if noise else 1.0
-        for _ in range(self.n_extra):
-            raw = f_last + self.extra_spacing
-            f_last = raw
-            fk = float(self._soft_cap(torch.tensor(raw, dtype=torch.float64), cap))
-            poles.append((fk, (float(self.default_bw(torch.tensor(fk, dtype=torch.float64))) + (raw - fk)) * bx))
-        h = np.ones_like(zi)
-        for fn, bn in poles:
-            b0, _, _, a1, a2 = (float(np.asarray(v)) for v in _rc(torch.tensor(fn, dtype=torch.float64),
-                                                                 torch.tensor(bn, dtype=torch.float64), self.fs))
-            h = h * b0 / (1.0 + a1 * zi + a2 * zi * zi)
-        return 20.0 * np.log10(np.abs(h) + 1e-300)
 
-    def _analog_tube_db(self, f: np.ndarray, n_max: int = 4000) -> np.ndarray:
-        """극이 끝없이 이어진 손실 균일관 (아날로그, DC 정규화 극의 곱) [dB]."""
-        f1 = C_SOUND / (4.0 * self.length_cm)
-        n = np.arange(1, n_max)[:, None]
-        fn = (2 * n - 1) * f1
-        bn = np.asarray(self.default_bw(torch.tensor(fn, dtype=torch.float64)), dtype=np.float64)
-        return (-20.0 * np.log10(np.abs(1.0 - (f / fn) ** 2 + 1j * f * bn / fn ** 2))).sum(0)
 
-    def _hpc_kernel(self, kind: str, device, dtype) -> torch.Tensor:
-        """고차 극 꼬리 보정 최소위상 FIR (탭 `HPC_TAPS`). kind = 'g'(성문) / 'n'(잡음 사본). 한 번 만들고 둔다."""
-        cache = self.__dict__.setdefault("_hpc_cache", {})
-        key = (kind, HPC_TAPS, HPC_FMAX, HPC_SMOOTH_HZ, str(device), dtype)
-        if key in cache:
-            return cache[key]
-        nfft = 8192
-        f = np.arange(nfft // 2 + 1) * self.fs / nfft
-        k = max(1, int(round(HPC_SMOOTH_HZ / (self.fs / nfft))))
-        sm = lambda v: np.convolve(np.pad(v, k, mode="edge"), np.ones(2 * k + 1) / (2 * k + 1), "valid")
-        r = sm(self._analog_tube_db(f)) - sm(self._uniform_digital_db(f, kind == "n"))
-        i0 = int(round(HPC_FMAX / (self.fs / nfft)))
-        r[i0:] = r[i0]
-        # 최소위상 (실 켑스트럼 접기)
-        lg = np.log(10.0 ** (r / 20.0))
-        c = np.fft.ifft(np.concatenate([lg, lg[-2:0:-1]])).real
-        fold = np.zeros_like(c)
-        fold[0], fold[nfft // 2] = c[0], c[nfft // 2]
-        fold[1:nfft // 2] = 2.0 * c[1:nfft // 2]
-        h = np.fft.ifft(np.exp(np.fft.fft(fold))).real[:HPC_TAPS]
-        nt = HPC_TAPS // 4
-        h[-nt:] *= 0.5 * (1.0 + np.cos(np.pi * np.arange(nt) / nt))
-        ker = torch.as_tensor(h[::-1].copy(), dtype=dtype, device=device).view(1, 1, -1)
-        cache[key] = ker
-        return ker
 
-    def _hpc(self, x, kind: str, state):
-        """정적 FIR 을 상태(앞 탭−1 샘플)와 함께 건다 — 스트리밍과 오프라인이 같다."""
-        ker = self._hpc_kernel(kind, x.device, x.dtype)
-        m = ker.shape[-1] - 1
-        key = f"hpc_{kind}"
-        prev = state.get(key)
-        if prev is None:
-            prev = torch.zeros(x.shape[0], m, dtype=x.dtype, device=x.device)
-        xx = torch.cat([prev.to(x.dtype), x], -1)
-        state[key] = xx[:, -m:].detach() if not xx.requires_grad else xx[:, -m:]
-        return torch.nn.functional.conv1d(xx.unsqueeze(1), ker)[:, 0]
 
     def _cascade(self, x, tracks, state, prefix):
         for i, (f, bw) in enumerate(tracks):
@@ -617,6 +709,12 @@ class VocalTract(nn.Module):
             fz_t = fz.to(ref.dtype).expand_as(ref)
             x, state[f"{prefix}pir"] = tv_biquad(x, *notch_coeffs(fz_t, PIR_BW, self.fs, ratio),
                                                  zi=state.get(f"{prefix}pir"))
+            if self.tro_f0 > 0.0:                     # 하인두 넓은 골 (§52.231)
+                ft = self.tro_f0 * torch.exp(TRO_DF_LIM * torch.tanh(self.tro_log_f / TRO_DF_LIM))
+                rt = 1.0 + (TRO_RATIO_MAX - 1.0) * torch.sigmoid(self.tro_depth)
+                ft_t = ft.to(ref.dtype).expand_as(ref)
+                x, state[f"{prefix}tro"] = tv_biquad(
+                    x, *notch_coeffs(ft_t, TRO_BW, self.fs, rt), zi=state.get(f"{prefix}tro"))
             return x
         for i in range(self.n_extra):
             key = f"{prefix}{i}"
@@ -633,6 +731,44 @@ class VocalTract(nn.Module):
             # 거기서 손실이 커지는 것은 물리적으로도 맞다 (횡모드·벽 손실).
             bw = (self.default_bw(fk) + (raw - fk)) * bw_scale * bw_extra
             x, state[key] = tv_biquad(x, *resonator_coeffs(fk, bw, self.fs), zi=state.get(key))
+        return x
+
+    def _front_3d(self, x, c, state, l_front, f_z, bw_z):
+        """앞공동을 **3D 모드 표**로 세운다 (`FRONT3D` 참조).
+
+        표는 앞공동 길이마다 (주파수, 세기) 를 준다. 여기서는 `front_len` 으로 선형 보간해
+        `FRONT3D_MODES` 개의 병렬 공진기를 세운다. Q 는 `front_q` 가 정한다 — 표에 Q 는 없다.
+        """
+        tb = FRONT3D
+        dev, dt = x.device, x.dtype
+        if getattr(self, "_f3d_key", None) is not id(tb):
+            self._f3d_L = torch.as_tensor(tb["length_cm"], dtype=torch.float64, device=dev)
+            self._f3d_F = torch.as_tensor(tb["freq"], dtype=torch.float64, device=dev)
+            self._f3d_G = torch.as_tensor(tb["gain"], dtype=torch.float64, device=dev)
+            self._f3d_key = id(tb)
+        Lt, Ft, Gt = self._f3d_L, self._f3d_F, self._f3d_G
+        # 표의 길이 격자에서 선형 보간 — 길이는 샘플률 (B,N) 로 이미 올라와 있다
+        ll = l_front.double().clamp(float(Lt[0]), float(Lt[-1]))
+        idx = torch.searchsorted(Lt, ll.reshape(-1).contiguous()).clamp(1, len(Lt) - 1)
+        lo, hi = Lt[idx - 1], Lt[idx]
+        w = ((ll.reshape(-1) - lo) / (hi - lo).clamp_min(1e-9)).clamp(0.0, 1.0)
+        q = self._up(c["front_q"]).clamp(1.0, 8.0) if FRONT_Q_CTRL else             torch.full_like(l_front, FRONT_Q_MAX)
+        if FRONT_Q_CTRL and TRACK_SMOOTH_MS > 0.0:
+            q = self._smooth_track(q, "sfq", state)
+        acc = None
+        n_mode = min(FRONT3D_MODES, Ft.shape[1])
+        for k in range(n_mode):
+            f_k = (Ft[idx - 1, k] * (1 - w) + Ft[idx, k] * w).reshape(l_front.shape)
+            g_k = (Gt[idx - 1, k] * (1 - w) + Gt[idx, k] * w).reshape(l_front.shape)
+            f_k = f_k.clamp(500.0, 0.45 * self.fs)
+            if TRACK_SMOOTH_MS > 0.0:
+                f_k = self._smooth_track(f_k, f"s3d{k}", state)
+            bw_k = (f_k / q).clamp_min(150.0)
+            y, state[f"f3d{k}"] = tv_biquad(x, *resonator_coeffs(f_k.to(dt), bw_k.to(dt), self.fs),
+                                            zi=state.get(f"f3d{k}"))
+            acc = y * g_k.to(dt) if acc is None else acc + y * g_k.to(dt)
+        x = acc if acc is not None else x
+        x, state["fz"] = tv_biquad(x, *notch_coeffs(f_z, bw_z, self.fs, 3.0), zi=state.get("fz"))
         return x
 
     def _front_cavity(self, x, c, state):
@@ -652,6 +788,8 @@ class VocalTract(nn.Module):
                 f_p = self._smooth_track(f_p, "sfp", state)
                 f_z = self._smooth_track(f_z, "sfz", state)
                 bw_p = self._smooth_track(bw_p, "sbp", state)
+            if FRONT3D is not None:
+                return self._front_3d(x, c, state, l_front, f_z, bw_z)
             f3 = (3.0 * f_p).clamp(max=0.45 * self.fs)
             if FRONT_Q_CTRL:
                 q = self._up(c["front_q"]).clamp(1.0, 8.0)
@@ -678,16 +816,6 @@ class VocalTract(nn.Module):
         x, state["fz"] = tv_biquad(x, *notch_coeffs(f_z, bw_z, self.fs, 3.0), zi=state.get("fz"))
         return x
 
-    def _allpass(self, x, c, state):
-        for k in range(1, N_ALLPASS + 1):
-            f, r = c[f"ap{k}_f"], c[f"ap{k}_r"]
-            if float(f.detach().abs().max()) == 0.0:
-                continue
-            r = torch.where(f > 0, r, torch.zeros_like(r)).clamp(0.0, 0.98)
-            f = torch.where(f > 0, f, torch.full_like(f, 1000.0))
-            f, r = self._up(f), self._up(r)
-            x, state[f"ap{k}"] = tv_biquad(x, *allpass_coeffs(f, r, self.fs), zi=state.get(f"ap{k}"))
-        return x
 
     def _nasal_branch(self, x, c, state):
         """비강 분기 — 성문 소스에서 **갈라져 나와 콧구멍으로 방사**된다 (병렬 경로).
@@ -733,145 +861,14 @@ class VocalTract(nn.Module):
                                                      self.fs), zi=state.get("nbz"))
         return y * self.nasal_gain * self._up(c["nasal_gain"])
 
-    def _aux_poles(self, x, c, tracks, state):
-        """**켰다 끄는 보조 공진** — 이웃 포먼트 사이에 극 하나를 연속으로 띄운다 (§51.40).
-
-        사용자: *"포먼트를 8개 정도 만들어서 그 중 4개 정도만 2개 간격으로 살려놓고, 분기가 생기면
-        그 사이에 있던 죽은 포먼트를 켜서 점진적으로 합류할 수 있도록 하는 거야."*
-
-        왜: 지금 극의 개수가 고정이라, 목표에서 두 포먼트가 **합쳐졌다 갈라질 때** 적합기는 있는 극을
-        끌고 건너가는 수밖에 없다. 그것이 사용자가 들은 과도한 무브먼트다 — 실측으로 목표의 이웃
-        간격이 가장 좁은 20 % 구간에서 우리 제어의 속도가 가장 먼 20 % 보다 **1.7~5.8 배** 빠르다.
-        사이에 잠자는 극이 있으면 새 공진이 제자리에서 서서히 떠오르면 되고 이웃은 가만히 있으면 된다.
-
-        구현은 `_lateral` 과 같은 **젖음/마름 섞기** 다 — `y = x + mix·(reson(x) − x)`. mix=0 이면
-        **정확히 항등**이라 출발점(mix 의 기본값 0)이 전혀 바뀌지 않는다. 주파수는 자유도로 두지 않고
-        이웃 두 포먼트의 **기하평균**에 매단다 — §40 에서 F5~F8 을 자유로 풀었다가 열이 32 → 40 이
-        되어 무너진 전례가 있다. 대역폭은 그 자리의 손실 법칙(`default_bw`)이다.
-        """
-        keys = [f"aux{k}_mix" for k in range(1, N_AUX + 1)]
-        if not any(_live(c[k]) for k in keys if k in c):
-            return x
-        # 틈마다 `AUX_PER_GAP[j]` 개를 **로그 등간격**으로 놓는다 — 포먼트는 로그 축에서 고르다.
-        slots = [(j, i + 1, m + 1) for j, m in enumerate(AUX_PER_GAP) for i in range(m)]
-        y = x
-        for key, (j, i, m1) in zip(keys, slots):
-            if key not in c:
-                continue
-            if not _live(c[key]):
-                continue
-            mix = self._up(c[key])                       # 시그모이드가 이미 (-0.3, 1.0) 로 묶는다
-            fa, _ = tracks[j]
-            fb, _ = tracks[j + 1]
-            fa, fb = fa.clamp_min(1.0), fb.clamp_min(1.0)
-            fk = fa * (fb / fa) ** (i / m1)
-            bw = self.default_bw(fk) * AUX_BW_REL
-            w, state[key] = tv_biquad(y, *resonator_coeffs(fk, bw, self.fs),
-                                       zi=state.get(key))
-            y = y + mix * (w - y)
-        return y
 
     @property
     def output_eq_enabled(self) -> bool:
         return HF_EQ if self.recording_eq_enabled is None else self.recording_eq_enabled
 
-    def _hf_eq(self, x, state):
-        """고역 포락 EQ — 로그 등간격 피킹 필터 `HF_EQ_N` 개. `HF_EQ` 참조."""
-        if not self.output_eq_enabled:
-            return x
-        g = HF_EQ_LIM * torch.tanh(self.hf_eq_db / HF_EQ_LIM)
-        # **적합 중에는 0 이어도 그래프에 올린다** (`_live` 참조, §51.47·§52.73). 0 에서 가지를 건너뛰면
-        # ∂손실/∂hf_eq_db 가 **존재하지 않아** 초기값 0 인 이 손잡이가 영영 0 에 묶인다 — `--hf-eq` 를 켠
-        # `out/M/M32` 에서 여덟 값이 전부 정확히 0 이었던 것이 이것이다.
-        if not _live(self.hf_eq_db):
-            return x
-        fc = torch.logspace(math.log10(HF_EQ_LO), math.log10(min(HF_EQ_HI, 0.95 * self.fs / 2)),
-                            HF_EQ_N, dtype=torch.float64)
-        y = x
-        for i in range(HF_EQ_N):
-            A = torch.pow(torch.tensor(10.0, dtype=torch.float64), g[i].double() / 40.0)
-            w0 = 2.0 * math.pi * float(fc[i]) / self.fs
-            al = math.sin(w0) / (2.0 * HF_EQ_Q)
-            cw = math.cos(w0)
-            a0 = 1.0 + al / A
-            b0, b1, b2 = (1.0 + al * A) / a0, (-2.0 * cw) / a0, (1.0 - al * A) / a0
-            a1, a2 = (-2.0 * cw) / a0, (1.0 - al / A) / a0
-            e = torch.ones_like(y)
-            y, state[f"hfeq{i}"] = tv_biquad(y, b0 * e, b1 * e, b2 * e, a1 * e, a2 * e,
-                                             zi=state.get(f"hfeq{i}"))
-        return y
 
-    def _aux_zeros(self, x, c, tracks, state):
-        """**켰다 끄는 보조 영점** — 이웃 포먼트 사이에서 소리를 죽인다 (§51.46).
 
-        `_lateral`·`_aux_poles` 와 같은 젖음/마름 섞기: `y = x + mix·(notch(x) − x)`.
-        mix=0 이면 **정확히 항등**이다. 자리는 `azr{k}_f` 가 0 이면 이웃 두 포먼트의 기하평균.
-        """
-        keys = [f"azr{k}_mix" for k in range(1, N_AZR + 1)]
-        if not any(_live(c[k]) for k in keys if k in c):
-            return x
-        y = x
-        for j, key in enumerate(keys):
-            if key not in c:
-                continue
-            if not _live(c[key]):
-                continue
-            mix = self._up(c[key])                       # 위와 같다 — 여기서 clamp 하면 0 에서 기울기가 죽는다
-            fa, _ = tracks[j]
-            fb, _ = tracks[j + 1]
-            fa, fb = fa.clamp_min(1.0), fb.clamp_min(1.0)
-            fz = torch.sqrt(fa * fb)
-            fkey = f"azr{j + 1}_f"
-            if fkey in c:                                # 배율 1 이 기하평균 — 늘 그래프에 있다
-                fz = torch.clamp(fz * self._up(c[fkey]), fa * 1.05, fb * 0.95)
-            bw = fz * AZR_WFRAC * (1.0 - 0.5 * mix).clamp_min(0.2)
-            w, state[key] = tv_biquad(y, *notch_coeffs(fz, bw, self.fs, AZR_RATIO),
-                                      zi=state.get(key))
-            y = y + mix * (w - y)
-        return y
 
-    def _hf_zeros(self, x, c, state):
-        """**고역 영점** — F4 위의 좁고 깊은 골을 판다 (§51.50). `HF_ZEROS` 참조.
-
-        `_aux_zeros` 와 같은 젖음/마름 섞기 `y = x + mix·(notch(x) − x)` 라 깊이 0 이면 항등이다.
-        포먼트에 매달지 않고 제 띠(`HZR_BANDS`) 안에서 자리를 스스로 찾는다 — 목표의 골은
-        규칙적인 빗살이 아니다(간격 변동계수 0.83).
-        """
-        keys = [f"hzr{k}_mix" for k in range(1, N_HZR + 1)]
-        if not any(_live(c[k]) for k in keys if k in c):
-            return x
-        y = x
-        for j, key in enumerate(keys):
-            if key not in c or not _live(c[key]):
-                continue
-            mix = self._up(c[key])
-            lo, hi = HZR_BANDS[j]
-            fkey = f"hzr{j + 1}_f"
-            fz = self._up(c[fkey]).clamp(lo, hi) if fkey in c else                 torch.full_like(mix, math.sqrt(lo * hi))
-            bw = fz * HZR_WFRAC * (1.0 - 0.5 * mix).clamp_min(0.2)
-            w, state[key] = tv_biquad(y, *notch_coeffs(fz, bw, self.fs, HZR_RATIO),
-                                      zi=state.get(key))
-            y = y + mix * (w - y)
-        return y
-
-    def _hf_peaks(self, x, c, state):
-        """**고역의 뾰족한 마루** — `_hf_zeros` 의 대칭짝 (§51.51). `HF_POLES` 참조."""
-        keys = [f"hzp{k}_mix" for k in range(1, N_HZP + 1)]
-        if not any(_live(c[k]) for k in keys if k in c):
-            return x
-        y = x
-        for j, key in enumerate(keys):
-            if key not in c or not _live(c[key]):
-                continue
-            mix = self._up(c[key])
-            lo, hi = HZR_BANDS[j]
-            fkey = f"hzp{j + 1}_f"
-            fp = self._up(c[fkey]).clamp(lo, hi) if fkey in c else                 torch.full_like(mix, math.sqrt(lo * hi))
-            bw = fp * HZP_WFRAC * (1.0 - 0.5 * mix).clamp_min(0.2)
-            w, state[key] = tv_biquad(y, *peak_coeffs(fp, bw, self.fs, HZP_RATIO),
-                                      zi=state.get(key))
-            y = y + mix * (w - y)
-        return y
 
     def _lateral(self, x, c, state):
         """설측음의 측지 영점 2 개. 깊이는 `lat_mix` 로 **연속으로** 켜고 끈다.
@@ -910,6 +907,7 @@ class VocalTract(nn.Module):
         return x + mix * (y - x)
 
     # ------------------------------------------------------------ 전체
+
     def forward(self, du: torch.Tensor, fric: torch.Tensor, asp: torch.Tensor,
                 transient: torch.Tensor, c: dict, state: dict | None = None,
                 asp_u: torch.Tensor | None = None, g_open: torch.Tensor | None = None,
@@ -958,44 +956,21 @@ class VocalTract(nn.Module):
             f1_, b1_ = tracks[0]
             tr_g = [(f1_ * (1.0 + kf * o), b1_ * (1.0 + kb * o))] + list(tracks[1:])
         xg_in = x_g * oral
-        if HPC_TAIL and HPC_AT_INPUT:
-            xg_in = self._hpc(xg_in, "g", state)
         y_g = self._cascade(xg_in, tr_g, state, "f")
-        if AUX_POLES:
-            y_g = self._aux_poles(y_g, c, tr_g, state)
-        if AUX_ZEROS:
-            y_g = self._aux_zeros(y_g, c, tr_g, state)
         y_g = self._extra_cascade(y_g, tr_g, state)
-        if HPC_TAIL and not HPC_AT_INPUT:
-            y_g = self._hpc(y_g, "g", state)
         if NOISE_V2:
             # 잡음은 저 Q 사본을 지난다 — 같은 주파수, 대역폭 >= NOISE_BW_REL*f.
             tr_n = [(f, torch.maximum(bw, NOISE_BW_REL * f)) for f, bw in tracks]
-            xn_in = x_n * oral
-            if HPC_TAIL and HPC_AT_INPUT:
-                xn_in = self._hpc(xn_in, "n", state)
             # 비강 여분 극(nx*)과 잡음 사본은 독립된 상태를 쓴다.
-            y_nc = self._extra_cascade(self._cascade(xn_in, tr_n, state, "n"), tr_n,
+            y_nc = self._extra_cascade(self._cascade(x_n * oral, tr_n, state, "n"), tr_n,
                                        state, prefix="noise_x", bw_extra=NOISE_EXTRA_BW)
-            if HPC_TAIL and not HPC_AT_INPUT:
-                y_nc = self._hpc(y_nc, "n", state)
             y_g = y_g + y_nc
         y_f = self._front_cavity((1.0 - leak) * fr_r * oral, c, state)
-        # 비강도 같은 이유로 **입력에** 건다. 출력에 걸면 연구개가 닫힌 동안에도 분기가
-        # 소스를 받아 울리고, 열리는 순간 그 에너지가 통째로 튀어나온다(측정: 12 배 클릭).
+        # 비강도 **입력에** 건다. 출력에 걸면 연구개가 닫힌 동안에도 분기가 소스를 받아 울리고,
+        # 열리는 순간 그 에너지가 통째로 튀어나온다(측정: 12 배 클릭).
         y_n = self._nasal_branch((x_g + x_n if NOISE_V2 else x_g) * nas, c, state)
-        y = y_g + y_f
-        y = self._allpass(y, c, state)
-        y = y + y_n
-        # 고역 영점은 **합쳐진 뒤**에 건다. 고치려는 골은 마찰 구간에 있고, 그 에너지는 배음
-        # 가지(`y_g`)가 아니라 잡음 가지(`y_nc`)와 앞공동(`y_f`)에서 온다 — 배음 가지에만
-        # 걸면 정작 마찰의 고역은 그대로다.
-        if HF_POLES:
-            y = self._hf_peaks(y, c, state)
-        if HF_ZEROS:
-            y = self._hf_zeros(y, c, state)
+        y = y_g + y_f + y_n
         y = self._lateral(y, c, state)
-        y = self._hf_eq(y, state)
         y = y * up(c["tract_gain"])
         return dict(audio=y.to(dt_in), glottal_path=y_g.to(dt_in), front_path=y_f.to(dt_in),
                     nasal_path=y_n.to(dt_in), state=state)

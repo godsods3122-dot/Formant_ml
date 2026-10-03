@@ -97,3 +97,43 @@ def test_poles_and_bandwidths_are_differentiable():
     (f.sum() + b.sum()).backward()
     assert torch.isfinite(la.grad).all()
     assert float(la.grad.abs().max()) > 0.0
+
+
+
+
+# ------------------------------------------------------------ 조음 손잡이 (§52.475)
+from formant_ml.engine.tube import cos_area, invert_formants, tube_formants  # noqa: E402
+
+
+def test_zero_articulation_is_the_uniform_tube():
+    f, b = tube_formants(torch.zeros(1, 6, dtype=torch.float64), torch.tensor([L], dtype=torch.float64), 4)
+    for k in range(4):
+        assert abs(float(f[0, k]) - analytic(k + 1)) / analytic(k + 1) < 0.01
+    assert torch.all(b > 20) and torch.all(b < 600)
+
+
+def test_length_scales_all_formants():
+    c = torch.tensor([[0.4, -0.3, 0.2, 0.0, 0.1, 0.0]], dtype=torch.float64)
+    f1, _ = tube_formants(c, torch.tensor([14.0], dtype=torch.float64), 6, bandwidths=False)
+    f2, _ = tube_formants(c, torch.tensor([17.5], dtype=torch.float64), 6, bandwidths=False)
+    assert torch.allclose(f1 * 14.0, f2 * 17.5, rtol=1e-9)
+
+
+def test_each_cosine_moves_the_formants_and_gradients_flow():
+    c = torch.zeros(1, 6, dtype=torch.float64, requires_grad=True)
+    f, b = tube_formants(c, torch.tensor([L], dtype=torch.float64), 4)
+    (f.sum() + b.sum()).backward()
+    assert torch.isfinite(c.grad).all() and (c.grad.abs() > 1e-6).sum() >= 4
+
+
+def test_area_stays_above_the_vowel_floor():
+    a = cos_area(torch.tensor([[-3.0, -3.0, -3.0, 0.0, 0.0, 0.0]], dtype=torch.float64))
+    assert float(a.min()) >= 0.05 - 1e-9
+
+
+def test_inversion_recovers_the_formants_of_a_known_tube():
+    true = torch.tensor([[0.6, -0.4, 0.3, -0.2, 0.1, 0.0], [0.0, 0.5, -0.3, 0.2, 0.0, -0.1]], dtype=torch.float64)
+    f, _ = tube_formants(true, torch.full((2,), L, dtype=torch.float64), 4, bandwidths=False)
+    est = invert_formants(f, L, n_iter=600, smooth=0.0, ridge=1e-4)
+    g, _ = tube_formants(est, torch.full((2,), L, dtype=torch.float64), 4, bandwidths=False)
+    assert torch.max(torch.abs(torch.log(g / f))) < 0.02            # 포먼트는 2 % 안 (면적은 유일하지 않다)

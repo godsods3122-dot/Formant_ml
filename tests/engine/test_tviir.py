@@ -182,8 +182,8 @@ def test_fast_path_is_much_faster():
     x = torch.randn(1, n)
     co = T.resonator_coeffs(torch.full((1, n), 800.0), torch.full((1, n), 90.0), FS)
     T.tv_biquad(x, *co)                                   # warm-up (jit)
-    t = time.time(); T.tv_biquad(x, *co); fast = time.time() - t
+    t = time.perf_counter(); T.tv_biquad(x, *co); fast = time.perf_counter() - t
     T.USE_FAST_PATH = False
-    t = time.time(); T.tv_biquad(x, *co); scan = time.time() - t
+    t = time.perf_counter(); T.tv_biquad(x, *co); scan = time.perf_counter() - t
     T.USE_FAST_PATH = True
     assert fast < scan

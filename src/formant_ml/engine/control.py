@@ -35,7 +35,7 @@ N_ALLPASS = 3
 
 _P: list[ParamSpec] = [
     # --- 성문 (압력 구동) -------------------------------------------------
-    ParamSpec("p_sub", "cmH2O", 0.0, 20.0, 0.0, False, "성문하압. 0 이면 침묵."),
+    ParamSpec("p_sub", "cmH2O", 0.0, 15.0, 0.0, False, "성문하압. 0 이면 침묵. 상한 15 = 큰 말소리 (대화 5–8, Holmberg 1988; 20 은 외침 — §52.524)."),
     ParamSpec("adduction", "0-1", 0.0, 1.0, 0.6, False, "내전. 0 벌림(속삭임/기식) ~ 1 압착"),
     ParamSpec("tension", "0-1", 0.0, 1.0, 0.5, False, "성대 긴장. F0 와 Rd 를 움직인다"),
     ParamSpec("f0_target", "Hz", 50.0, 800.0, 0.0, True, "0 이 아니면 tension 대신 F0 직접 지정"),
@@ -135,6 +135,67 @@ _P: list[ParamSpec] = [
     ParamSpec("hzp1_f", "Hz", 4000.0, 8000.0, 5656.9, True, "고역 마루 1 의 자리."),
     ParamSpec("hzp2_f", "Hz", 7000.0, 12000.0, 9165.2, True, "고역 마루 2 의 자리."),
     ParamSpec("hzp3_f", "Hz", 11000.0, 16000.0, 13266.5, True, "고역 마루 3 의 자리."),
+    # --- 17~20 kHz 의 움직이는 공명 (MEASUREMENTS §52.413). 원본 스펙트로그램에 발음 따라 움직이는 공명 띠가 17~20 kHz 에
+    # 서는데(0.2~0.4 s 17~19.5 kHz, 1.15~1.3 s 19~20 kHz), 고정 극은 F14 = 16.2 kHz 가 끝이고 마루 1~3 은 16 kHz 까지라
+    # 그 대역이 형체 없이 비어 백색 잡음처럼 들렸다. **목록 끝에 둔다** — 옛 트랙은 깊이 0(항등)으로 채워진다.
+    ParamSpec("hzp4_mix", "0-1", -0.3, 1.0, 0.0, False, "고역 마루 4 (15~20.5 kHz)의 높이."),
+    ParamSpec("hzp4_f", "Hz", 15000.0, 20500.0, 17800.0, True, "고역 마루 4 의 자리."),
+    # --- 관 모드의 조음 손잡이 (tract.TUBE, MEASUREMENTS §52.475). **목록 끝에 둔다** — 옛 트랙은 기본값으로 채워진다.
+    #     log A(x) = log 3 + Σ_k art_k cos(π k x), x = 0 성문 → 1 입술. 포먼트·대역폭은 이것과 성도 길이에서 계산된다.
+    ParamSpec("art1", "log-area", -3.0, 3.0, 0.0, False, "조음 1 — 로그 면적의 cos(πx) 성분 (인두 대 구강의 넓이 차)"),
+    ParamSpec("art2", "log-area", -3.0, 3.0, 0.0, False, "조음 2 — cos(2πx) 성분 (가운데 좁힘)"),
+    ParamSpec("art3", "log-area", -3.0, 3.0, 0.0, False, "조음 3 — cos(3πx)"),
+    ParamSpec("art4", "log-area", -3.0, 3.0, 0.0, False, "조음 4 — cos(4πx)"),
+    ParamSpec("art5", "log-area", -3.0, 3.0, 0.0, False, "조음 5 — cos(5πx)"),
+    ParamSpec("art6", "log-area", -3.0, 3.0, 0.0, False, "조음 6 — cos(6πx)"),
+    ParamSpec("tract_len", "cm", 11.0, 19.0, 14.6, False, "성도 길이 (후두 높이·입술 내밂). 모든 포먼트를 1/L 로 옮긴다"),
+    # 고차 조음 성분 (§52.479) — F4~F6 자리(4–5.5 kHz 몸통)를 놓을 공간 해상도. **목록 끝에 둔다** — 옛 트랙은 0 으로 채워진다.
+    ParamSpec("art7", "log-area", -3.0, 3.0, 0.0, False, "조음 7 — cos(7πx)"),
+    ParamSpec("art8", "log-area", -3.0, 3.0, 0.0, False, "조음 8 — cos(8πx)"),
+    ParamSpec("art9", "log-area", -3.0, 3.0, 0.0, False, "조음 9 — cos(9πx)"),
+    ParamSpec("art10", "log-area", -3.0, 3.0, 0.0, False, "조음 10 — cos(10πx)"),
+    # 펄스 위상의 연속 보정 (§52.480, 사용자: *"위상 변환까지 싹다 모션으로 두고 조정해야"*) — 창별 지연 교정(이산) 대신 다른 손잡이처럼
+    # 다중 격자 모션·시상수로 기울기 적합한다. 단위는 주기. **목록 끝에 둔다**.
+    ParamSpec("pulse_shift", "cycle", -0.5, 0.5, 0.0, False, "성문 펄스 위상의 연속 보정 (주기 단위, + 이면 늦춘다)"),
+    # 성대 변위의 속도 몫 (§52.481) — 벌어지는 몫. 크면 닫힘이 빨라 고역이 산다. 쉼 틈(rd_offset)이 열림 몫·접촉을 정하는 것과 따로.
+    ParamSpec("fold_skew", "0-1", 0.30, 0.85, 0.6, False, "성대 변위의 벌어짐 몫 (속도 몫) — 닫힘의 빠르기"),
+    # --- 조음기 (Maeda 1990 선형 조음 모형, `engine/articulation.py`, MEASUREMENTS §52.485). 단위는 원 화자의 표준편차 (대개 ±3).
+    #     `voice_td.ARTIC = "maeda"` 이면 관 모양·성도 길이가 이 일곱에서 나온다 (art1..10·tract_len·a_c·c_place·oral_open 은 쓰지 않는다).
+    #     **목록 끝에 둔다** — 옛 트랙은 중립 자세(0)로 채워진다.
+    ParamSpec("jaw", "sd", -3.0, 3.0, 0.0, False, "턱 (+ 올림·닫힘, − 벌림 — F1 이 오른다)"),
+    ParamSpec("tongue_pos", "sd", -3.0, 3.0, 0.0, False, "혀 몸통 위치 (− 앞: 경구개 쪽 좁힘·F2 ↑, + 뒤: F2 ↓)"),
+    ParamSpec("tongue_shape", "sd", -3.0, 3.0, 0.0, False, "혀 몸통 모양 (등의 굽음)"),
+    ParamSpec("tongue_tip", "sd", -3.0, 3.0, 0.0, False, "혀끝 (+ 올림: 치경 쪽 좁힘)"),
+    ParamSpec("lip_ht", "sd", -3.0, 3.0, 0.0, False, "입술 높이 (+ 열림, − 닫힘: 양순 폐쇄)"),
+    ParamSpec("lip_pr", "sd", -3.0, 3.0, 0.0, False, "입술 돌출 (+ 내밂: 성도가 길어지고 F2 ↓)"),
+    ParamSpec("larynx", "sd", -3.0, 3.0, 0.0, False, "후두 높이 (+ 올림: 성도가 짧아진다)"),
+    # --- VocalTractLab 여성 화자 W02 의 해부학 변수 (§52.486, `voice_td.ARTIC = "w02"`). 단위는 VTL 의 것 (cm, JA 는 도).
+    #     **목록 끝에 둔다** — 옛 트랙은 W02 중립 자세로 채워진다.
+    #     **범위는 말소리 범위다** (§52.506, 사용자: "인간의 생리적 범위로만 작동하게"): W02 화자 파일의 MRI 음소 자세 53 개가 실제로 쓰는
+    #     범위 + 그 폭의 15 % (VTL 해부 한계 안). VTL 해부 한계 그대로면 적합이 틀의 30–76 % 에서 조음기를 해부 끝에 붙였다.
+    ParamSpec("vtl_HX", "vtl", 0.00, 1.00, 0.00, False, "W02 설골 앞뒤"),
+    ParamSpec("vtl_HY", "vtl", -5.86, -3.50, -3.90, False, "W02 설골 높이 (후두 높이)"),
+    ParamSpec("vtl_JX", "vtl", -0.50, 0.00, 0.00, False, "W02 턱 앞뒤"),
+    ParamSpec("vtl_JA", "vtl", -5.58, -1.14, -2.00, False, "W02 턱 각도 [도] (− 벌림)"),
+    ParamSpec("vtl_LP", "vtl", -0.45, 0.95, -0.07, False, "W02 입술 돌출"),
+    ParamSpec("vtl_LD", "vtl", -1.59, 1.64, 0.95, False, "W02 입술 사이 거리 (+ 벌림)"),
+    ParamSpec("vtl_VS", "vtl", 0.00, 1.00, 0.00, False, "W02 연구개 모양"),
+    ParamSpec("vtl_VO", "vtl", -0.10, 1.50, -0.10, False, "W02 연구개 열림 (적합하지 않는다 — 비강 포트는 velum 이 낸다)"),
+    ParamSpec("vtl_TCX", "vtl", -1.10, 2.25, -0.40, False, "W02 혀 몸통 중심 앞뒤"),
+    ParamSpec("vtl_TCY", "vtl", -2.75, 1.00, -1.46, False, "W02 혀 몸통 중심 높이"),
+    ParamSpec("vtl_TTX", "vtl", 1.85, 4.84, 3.50, False, "W02 혀끝 앞뒤"),
+    ParamSpec("vtl_TTY", "vtl", -2.53, 1.62, -1.00, False, "W02 혀끝 높이"),
+    ParamSpec("vtl_TBX", "vtl", 1.41, 4.00, 2.00, False, "W02 혀날 앞뒤"),
+    ParamSpec("vtl_TBY", "vtl", -2.09, 1.95, 0.50, False, "W02 혀날 높이"),
+    ParamSpec("vtl_TRX", "vtl", -3.53, 0.40, 0.00, False, "W02 혀뿌리 앞뒤"),
+    ParamSpec("vtl_TRY", "vtl", -3.97, -0.22, -0.65, False, "W02 혀뿌리 높이"),
+    ParamSpec("vtl_TS1", "vtl", 0.00, 1.00, 0.00, False, "W02 혀 옆면 높이 1"),
+    ParamSpec("vtl_TS2", "vtl", 0.00, 1.00, 0.00, False, "W02 혀 옆면 높이 2"),
+    ParamSpec("vtl_TS3", "vtl", -1.00, 1.00, 0.00, False, "W02 혀 옆면 높이 3"),
+    # 후두 구조 (voice_td.LARYNX, MEASUREMENTS §52.489)
+    ParamSpec("ff_add", "0-1", 0.0, 1.0, 0.0, False, "가성대 내전 — 가성대 틈 = 쉼 틈 × (1 − 0.9·값). 압착·된소리에서 좁아진다"),
+    ParamSpec("vf_ta", "0-1", 0.0, 1.0, 0.5, False,
+              "갑상피열근(TA) 활성의 대리 — 몸체–덮개 성대의 몸체 강성 배율 35^(값 − 0.5) (Story & Titze 1995 경우 A–D: 20–700 N/m, §52.500)"),
 ]
 PARAMS: dict[str, ParamSpec] = {p.name: p for p in _P}
 PARAM_NAMES: list[str] = [p.name for p in _P]
@@ -157,6 +218,9 @@ class ControlTrack:
     voiced: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=bool))
     # 프레임별 마찰 여부(무성 + 고역 우세). 폐쇄와 마찰은 다르게 다뤄야 한다.
     fricative: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=bool))
+    # 프레임별 치찰 여부 (analyze.SIB_OBS, MEASUREMENTS §52.446). 적합의 협착 분포 사전(fit.SIB_PRIOR_W)이 쓴다.
+    # **필드로 선언해야 한다** — 선언 없이 붙인 속성은 제어열을 복사하는 자리에서 조용히 떨어졌다(사전이 0 틀에 걸림).
+    sibilant: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=bool))
     # 파열(스톱 버스트)이 서는 프레임 색인. 분석이 채운다 — 적합이 그 자리에서만
     # 제어의 해상도를 풀고(fit.BURST_FINE), 어택 항이 그 자리를 본다(fit.ATTACK_W).
     bursts: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=int))

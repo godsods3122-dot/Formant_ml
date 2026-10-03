@@ -1,0 +1,11 @@
+profiles/maeda_pb1_spec.dat — Maeda linear articulatory model (LAM) specification for speaker PB
+(semi-polar grid, alpha-beta sagittal-to-area coefficients, lip/tongue/larynx factor loadings, wall contour).
+
+Source: https://github.com/sensein/VocalTractModels (vtcalcs/data/specdata/pb1_spec.dat)
+Copyright [2013-2014] [Satrajit Ghosh, Shinji Maeda]
+Licensed under the Apache License, Version 2.0 (http://www.apache.org/licenses/LICENSE-2.0).
+The model and data are due to Shinji Maeda:
+  S. Maeda (1990), "Compensatory articulation during speech: evidence from the analysis and synthesis of
+  vocal-tract shapes using an articulatory model", in Speech Production and Speech Modelling (Kluwer), 131-149.
+src/formant_ml/engine/articulation.py is a differentiable re-implementation of vtcalcs/src/lam_lib.c
+(lam, sagittal_to_area, semi_polar, convert_scale) from the same repository.

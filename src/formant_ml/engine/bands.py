@@ -249,9 +249,18 @@ def track_bands(obs: np.ndarray, lev: np.ndarray, ok: np.ndarray,
     return path
 
 
+#: **F0 의 불연속 도약도 분기점이다** (MEASUREMENTS §52.419). 성구 전환(삑사리)은 기류가 아니라 **진동 모드**가 갈아타는
+#: 자리라 협착·폐압·유성 어느 것으로도 안 잡혔다 — 그래서 밴드 걸음이 C3 1.111 s 의 전환(한 주기에 141 → 128 표본, H1–H2 +16 dB)을
+#: 20 ms 에 걸쳐 문질렀다. 켜면 `F0_FLIP_WIN` 프레임 사이 log F0 차가 `F0_FLIP_LOG` 를 넘는 곳을 뒤집힘으로 본다. 억양의
+#: 매끈한 오르내림(수십 ms 에 반음 몇 개)은 문턱 밑이다.
+BAND_F0_FLIP = False
+F0_FLIP_WIN = 3
+F0_FLIP_LOG = 0.05
+
+
 def flow_flip(a_c: np.ndarray, p_sub: np.ndarray, voiced: np.ndarray,
-              win: int = 5) -> np.ndarray:
-    """기류 조건이 뒤집힌 정도 0~1 — 협착 면적·폐압의 상대 변화율과 유성 전환.
+              win: int = 5, f0: np.ndarray | None = None) -> np.ndarray:
+    """기류 조건이 뒤집힌 정도 0~1 — 협착 면적·폐압의 상대 변화율과 유성 전환 (+ `BAND_F0_FLIP` 면 F0 도약).
 
     조음이 바뀌는 순간에는 성대의 분지가 실제로 갈아타므로, 그때는 연속성을 풀어 준다.
     """
@@ -263,6 +272,13 @@ def flow_flip(a_c: np.ndarray, p_sub: np.ndarray, voiced: np.ndarray,
     r = rate(a_c) / 0.05 + rate(p_sub) / 0.02
     v = np.abs(np.gradient(np.asarray(voiced, float)))
     v = np.convolve(v, np.ones(win) / win, mode="same") * 4.0
+    if BAND_F0_FLIP and f0 is not None:
+        lf = np.log(np.maximum(np.asarray(f0, float), 1.0))
+        w = int(F0_FLIP_WIN)
+        d = np.zeros_like(lf)
+        d[w:-w] = np.abs(lf[2 * w:] - lf[:-2 * w])
+        jump = np.clip(d / F0_FLIP_LOG - 1.0, 0.0, 1.0) * np.asarray(voiced, float)
+        v = v + np.convolve(jump, np.ones(win) / win, mode="same") * 4.0
     return np.clip(r + v, 0.0, 1.0)
 
 

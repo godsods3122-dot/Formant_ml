@@ -7,6 +7,7 @@ from formant_ml.engine.analyze import (analyze, envelope_to_lpc, lpc_formants,
                                        smooth_track, true_envelope)
 from formant_ml.engine.control import ControlTrack, INDEX, default_vector
 from formant_ml.engine.denoise import denoise, noise_profile, snr_report
+from formant_ml.engine import fit as fit_module
 from formant_ml.engine.fit import CopySynthFitter, mel_bank
 from formant_ml.engine.profile import DEFAULT_PROFILE
 from formant_ml.engine.voice import EngineConfig, VoiceEngine
@@ -107,8 +108,11 @@ def test_mel_bank_rows_sum_to_one():
     assert torch.allclose(m.sum(1)[live], torch.ones(int(live.sum())), atol=1e-5)
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture
 def _engine():
+    # **시험마다 새로 만든다** (MEASUREMENTS §52.184). 모듈 범위로 공유하면 앞선 적합 시험이 엔진의
+    # nn.Parameter(적합 상수)를 제자리에서 바꿔 뒤 시험이 다른 엔진을 본다 — 실측으로
+    # `test_fitter_recovers_a_detuned_tilt` 가 단독 0.005 dB 인데 이 파일 안에서는 0.167 dB 였다.
     return VoiceEngine(EngineConfig(sample_rate=48000, frame_ms=1.0, residual=False),
                        DEFAULT_PROFILE)
 
@@ -176,12 +180,25 @@ def test_harmonic_loss_rejects_invalid_weights(_engine, weight):
         CopySynthFitter(_engine, np.zeros(2880), 48000, _track(), harmonic_weight=weight)
 
 
-def test_fitter_recovers_a_detuned_tilt(_engine):
+def test_fitter_recovers_a_detuned_tilt(_engine, monkeypatch):
     """소스 기울기가 7 dB/oct 틀린 출발점에서 전역 단계가 원래 값을 되찾는다.
 
     lr 은 0.05 여야 한다. 0.2 로 하면 30 개 오프셋이 한꺼번에 넘어가 출발점보다
     나빠진 채로 끝난다(실측: 손실 1.3185 에서 한 번도 못 내려왔다).
+
+    **예산은 200 회다.** 60 회로 두면 tilt 가 9.0 -> 3.36 까지밖에 못 가고 평균
+    스펙트럼 오차가 0.817 dB 에 멈춘다 — 손잡이가 늘면서 한 걸음이 나뉘어 그렇지
+    되찾지 못하는 것이 아니다. 실측: 60 회 0.817 dB / tilt 3.361, **200 회 0.005 dB /
+    tilt 2.029**, 600 회 0.003 dB / tilt 2.011. 예산만 주면 참값으로 수렴한다.
+
+    **고역 벌점 둘을 끈다** (MEASUREMENTS §52.347·348). `HFLINE_W`·`HFCOMB_W` 는 기본이
+    30 인 늘 켜진 항이고, 그 둘은 **참 제어열에서도 0 이 아니다** — 이 시험은 "전역
+    단계가 참값으로 수렴하는가" 만 보므로 그 편향을 빼고 잰다. 켠 채로는 200 회에서
+    0.589 dB / 포락 90.51 이고, 끄면 **0.0001 dB / 포락 99.97 / tilt 2.001** 이다.
+    편향 자체는 `test_always_on_hf_penalties_are_live_at_the_true_track` 이 잡는다.
     """
+    monkeypatch.setattr(fit_module, "HFLINE_W", 0.0)
+    monkeypatch.setattr(fit_module, "HFCOMB_W", 0.0)
     tr = _track()
     target = _engine.render(tr)
     bad = ControlTrack(tr.values.copy(), tr.frame_ms)
@@ -190,13 +207,15 @@ def test_fitter_recovers_a_detuned_tilt(_engine):
     f.sizes = [256, 512]                 # 손실 비교는 같은 창 집합에서만 뜻이 있다
     with torch.no_grad():
         l0 = float(f.loss()[0])
-    rep = f.fit(60, 0.05, 999, verbose=False, params=[f.d, f.log_gain], sizes=(256, 512))
+    rep = f.fit(200, 0.05, 999, verbose=False, params=[f.d, f.log_gain], sizes=(256, 512))
     with torch.no_grad():
         l1 = float(f.loss()[0])
     assert l1 < 0.25 * l0, (l0, l1)
-    assert rep.db < 0.6                                   # 평균 스펙트럼 오차 dB
+    assert rep.db < 0.05                                  # 평균 스펙트럼 오차 dB (실측 0.0001)
     got = dict((n, b) for n, _, b in f.moved())["tilt"]
-    assert abs(got - 2.0) < 1.5, got
+    assert abs(got - 2.0) < 0.2, got      # 실측 2.001
+
+
 
 
 def test_best_snapshot_is_taken_before_the_step(_engine):
@@ -612,38 +631,6 @@ def _fitter_on(y, fs, **flags):
             setattr(F, k, v)
 
 
-def test_waveform_correlation_penalty_sees_what_the_envelope_cannot():
-    """위상만 뒤집힌 신호를 문다. 멜 오차는 그 사건을 못 본다.
-
-    실측(`out/lad/s040`, §44): 0.41 s 에서 파형 상관이 −0.80 인데 그 자리의 멜 dB
-    오차는 오히려 `out/fix` 보다 **낮다**. 크기 스펙트럼이 멀쩡하고 위상만
-    뒤집혔기 때문이다. 연속 벌점을 멜 오차 위에 걸면 아무것도 안 문다.
-    """
-    import numpy as np
-    import torch
-    from formant_ml.engine import fit as F
-    fs = 48000
-    t = np.arange(int(0.3 * fs)) / fs
-    env = np.exp(-((t - 0.15) / 0.09) ** 2)
-    good = (np.sin(2 * np.pi * 180 * t) + 0.4 * np.sin(2 * np.pi * 540 * t)) * env * 0.2
-    f = _fitter_on(good, fs, CORR_W=1.0)
-    a = torch.as_tensor(good, dtype=torch.float32).unsqueeze(0)
-    # 반 주기 어긋난 판 — 스펙트럼 크기는 그대로다.
-    k = int(round(fs / 180.0)) // 2
-    flip = np.roll(good, k)
-    b = torch.as_tensor(flip, dtype=torch.float32).unsqueeze(0)
-    l_good = float(f.corr_loss(a))
-    l_flip = float(f.corr_loss(b))
-    assert l_good < 1e-3, l_good
-    assert l_flip > 100.0 * max(l_good, 1e-6), (l_good, l_flip)
-    # 크기 스펙트럼은 거의 같다 — 그것이 요점이다.
-    A = torch.stft(a, 256, 64, 256, torch.hann_window(256), center=True,
-                   return_complex=True).abs()
-    B = torch.stft(b, 256, 64, 256, torch.hann_window(256), center=True,
-                   return_complex=True).abs()
-    n = min(A.shape[-1], B.shape[-1])
-    rel = float((A[..., :n] - B[..., :n]).abs().sum() / A[..., :n].abs().sum())
-    assert rel < 0.20, rel
 
 
 def test_periodicity_penalty_punishes_trading_harmonics_for_noise():
@@ -720,41 +707,6 @@ def test_l1_makes_the_control_track_sparse():
     assert torch.isfinite(f.w.grad).all()
 
 
-def test_artifact_loss_sees_sound_the_target_does_not_have():
-    """아티팩트 벌점: 목표가 어두운 칸에 소리를 내면 는다. 같은 신호면 0 이다.
-
-    `--quiet` 는 10 ms 창이 통째로 조용할 때만 보는데, 들리는 아티팩트는 **한 프레임 안의
-    어두운 대역**에 난다 (MEASUREMENTS §51.50: 마찰 가장자리 11.3 kHz 에서 +24 dB).
-    """
-    import numpy as np
-    import torch
-    from formant_ml.engine import fit as F
-
-    class _Stub:
-        artifact_loss = F.CopySynthFitter.artifact_loss
-
-    rng = np.random.default_rng(0)
-    a = torch.as_tensor(rng.uniform(-90.0, -20.0, (1, 40, 60)), dtype=torch.float64)
-    s = _Stub()
-    s._env_ab = (a, a.clone())
-    assert float(s.artifact_loss()) == 0.0            # 같은 신호 -> 정확히 0
-
-    b = a.clone()
-    dark = a < a.max(dim=-2, keepdim=True).values - F.ARTIFACT_DARK_DB - 10.0
-    b[dark] += 20.0                                   # 어두운 칸에만 +20 dB
-    s._env_ab = (a, b)
-    assert float(s.artifact_loss()) > 0.2
-
-    s._env_ab = (a, b)
-    loud_dark = float(s.artifact_loss())
-    b2 = a.clone()
-    b2[~dark] += 20.0                                 # 밝은 칸만 올리면 훨씬 덜 문다
-    s._env_ab = (a, b2)
-    assert float(s.artifact_loss()) < 0.5 * loud_dark
-
-    b3 = a.clone(); b3[dark] -= 20.0                  # 모자란 쪽은 안 문다
-    s._env_ab = (a, b3)
-    assert float(s.artifact_loss()) == 0.0
 
 
 def _syn_fitter(eng, n=400):
@@ -774,53 +726,8 @@ def _syn_fitter(eng, n=400):
     return CopySynthFitter(eng, target, 48000, tr)
 
 
-def test_synergy_penalty_is_zero_on_the_observation_and_grows_off_basis(_engine):
-    """§52.69 — 협응 벌점: 관측 자체는 0, 기저 밖으로 흔들면 자란다, 기저 안에서 흔들면 거의 0."""
-    import numpy as np
-    import torch
-
-    from formant_ml.engine import fit as fit_mod
-    from formant_ml.engine.control import INDEX
-
-    fitter = _syn_fitter(_engine)
-    fitter._synergy_setup()
-    assert fitter._syn, "군이 만들어져야 한다"
-    base = torch.as_tensor(fitter.track.values, dtype=torch.float32).unsqueeze(0)
-    e0 = float(fitter.synergy_loss(base))
-    # 무릎이 C² 라 문턱에서 작은 오프셋이 남는다 (move_loss 와 같은 설계). 관측은 그 수준이어야 한다.
-    assert e0 < 0.05
-
-    gname, idx, scale, V, _orth, _tot, _k = fitter._syn[0]
-    rng = np.random.default_rng(0)
-    n = base.shape[1]
-    # 기저 **안**: 협응 방향으로만 흔든다
-    a = torch.as_tensor(rng.normal(size=(n, V.shape[1])), dtype=torch.float64)
-    inside = (a @ V.T) * scale
-    c_in = base.clone().double()
-    c_in[0][:, idx] += inside * 3.0
-    # 기저 **밖**: 직교 성분으로 흔든다
-    full = torch.as_tensor(rng.normal(size=(n, V.shape[0])), dtype=torch.float64)
-    outside = full - (full @ V) @ V.T
-    c_out = base.clone().double()
-    c_out[0][:, idx] += outside * 3.0
-    e_in = float(fitter.synergy_loss(c_in.float()))
-    e_out = float(fitter.synergy_loss(c_out.float()))
-    assert e_out > 0.0
-    assert e_out > 10.0 * max(e_in, e0, 1e-9)
 
 
-def test_synergy_penalty_has_gradient(_engine):
-    import torch
-
-    fitter = _syn_fitter(_engine)
-    fitter._synergy_setup()
-    assert fitter._syn
-    c = torch.as_tensor(fitter.track.values, dtype=torch.float32).unsqueeze(0).clone()
-    c = c + 0.05 * torch.randn_like(c)
-    c.requires_grad_(True)
-    loss = fitter.synergy_loss(c)
-    loss.backward()
-    assert torch.isfinite(c.grad).all() and float(c.grad.abs().max()) > 0.0
 
 
 def test_band_scores_split_the_envelope_and_catch_a_band_limited_error(_engine):

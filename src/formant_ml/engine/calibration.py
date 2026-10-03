@@ -21,6 +21,9 @@ FIELDS = {
     "hf_log_bw": ("tract", "hf_log_bw", "speaker", "hf_params"),
     "pir_log_f": ("tract", "pir_log_f", "speaker", "hf_params"),
     "pir_depth": ("tract", "pir_depth", "speaker", "hf_params"),
+    # 하인두 넓은 골 (§52.231) — 이상와와 별개의 화자 구조 상수다.
+    "tro_log_f": ("tract", "tro_log_f", "speaker", "hf_params"),
+    "tro_depth": ("tract", "tro_depth", "speaker", "hf_params"),
     "fric_log_lp_ratio": ("frication", "log_lp_ratio", "speaker", "hf_params"),
     "open_damp": ("tract", "open_damp", "speaker", "hf_params"),
     "open_f1": ("tract", "open_f1", "speaker", "hf_params"),
@@ -28,6 +31,58 @@ FIELDS = {
     "log_mvf": ("aspiration", "log_mvf", "utterance", "asp_params"),
     "glottis_hjit_log": ("glottis", "hjit_log", "utterance", "hf_params"),
     "glottis_src_eq_db": ("glottis", "src_eq_db", "utterance", "hf_params"),
+    "glottis_src_eq_hf_db": ("glottis", "src_eq_hf_db", "utterance", "hf_params"),
+    # 성문 분산 세기 배율 (glottis.DISP_FIT, §52.121). 발화마다 다르므로 utterance 다.
+    "glottis_disp_log": ("glottis", "disp_log", "utterance", "hf_params"),
+    # 시간 영역 관 경로 (voice.TD_TUBE, §52.476): 성대 진동 최대 면적 (화자), 성문·협착 난류 세기 (발화).
+    "td_log_ag_max": ("td", "log_ag_max", "speaker", "hf_params"),
+    "td_log_noise_g": ("td", "log_noise_g", "utterance", "hf_params"),
+    "td_log_noise_c": ("td", "log_noise_c", "utterance", "hf_params"),
+    "td_log_epi_area": ("td", "log_epi_area", "speaker", "hf_params"),
+    "td_log_contact_eps": ("td", "log_contact_eps", "speaker", "hf_params"),
+    # Maeda 조음 모형의 화자 배율 (voice_td.ARTIC = "maeda", §52.485): 원 화자(남성 PB) → 이 화자의 인두·구강 길이, 단면.
+    "td_log_sc_ph": ("td", "log_sc_ph", "speaker", "hf_params"),
+    "td_log_sc_or": ("td", "log_sc_or", "speaker", "hf_params"),
+    "td_log_sc_area": ("td", "log_sc_area", "speaker", "hf_params"),
+    # W02 (VocalTractLab 여성) 화자 적응 (voice_td.ARTIC = "w02", §52.486): 성도 길이·단면 배율.
+    "td_log_w02_len": ("td", "log_w02_len", "speaker", "hf_params"),
+    "td_log_w02_area": ("td", "log_w02_area", "speaker", "hf_params"),
+    # W02 해부 적응 (voice_td.W02_ANAT, §52.501): VTL AnatomyParams 13 개 — 학습 범위 안 시그모이드 좌표 (0 = W02 해부).
+    "td_w02a_0": ("td", "w02a_u0", "speaker", "hf_params"),
+    "td_w02a_1": ("td", "w02a_u1", "speaker", "hf_params"),
+    "td_w02a_2": ("td", "w02a_u2", "speaker", "hf_params"),
+    "td_w02a_3": ("td", "w02a_u3", "speaker", "hf_params"),
+    "td_w02a_4": ("td", "w02a_u4", "speaker", "hf_params"),
+    "td_w02a_5": ("td", "w02a_u5", "speaker", "hf_params"),
+    "td_w02a_6": ("td", "w02a_u6", "speaker", "hf_params"),
+    "td_w02a_7": ("td", "w02a_u7", "speaker", "hf_params"),
+    "td_w02a_8": ("td", "w02a_u8", "speaker", "hf_params"),
+    "td_w02a_9": ("td", "w02a_u9", "speaker", "hf_params"),
+    "td_w02a_10": ("td", "w02a_u10", "speaker", "hf_params"),
+    "td_w02a_11": ("td", "w02a_u11", "speaker", "hf_params"),
+    "td_w02a_12": ("td", "w02a_u12", "speaker", "hf_params"),
+    # 나이 축 해부 (voice_td.W02_AGE, §52.523): 여성 성장식의 나이 좌표 하나 + 개인차 13 개 (tanh 좌표, 0 = 성장 곡선 위).
+    "td_w02_age": ("td", "w02_age_u", "speaker", "hf_params"),
+    **{f"td_w02d_{i}": ("td", f"w02d_u{i}", "speaker", "hf_params") for i in range(13)},
+    # 자기 진동 성대 (voice_td.GLOTTIS = "vf", §52.488): 뒤쪽(연골부) 틈 면적.
+    "td_log_vf_chink": ("td", "log_vf_chink", "speaker", "hf_params"),
+    # 성대 정적 변수의 화자 배율 (§52.489): 길이, 두께, 질량·강성 공통, 감쇠비.
+    "td_log_vf_len": ("td", "log_vf_len", "speaker", "hf_params"),
+    "td_log_vf_thick": ("td", "log_vf_thick", "speaker", "hf_params"),
+    "td_log_vf_mk": ("td", "log_vf_mk", "speaker", "hf_params"),
+    "td_log_vf_damp": ("td", "log_vf_damp", "speaker", "hf_params"),
+    # N 줄 보–막 성대 (voice_td.VF_NS, §52.504): 길이·두께 배율, 층간 결합 배율, 세로 조직 감쇠비, 갑상피열근 불룩함 이득.
+    "td_log_ns_len": ("td", "log_ns_len", "speaker", "hf_params"),
+    "td_log_ns_thick": ("td", "log_ns_thick", "speaker", "hf_params"),
+    "td_log_ns_kc": ("td", "log_ns_kc", "speaker", "hf_params"),
+    "td_log_ns_zeta": ("td", "log_ns_zeta", "speaker", "hf_params"),
+    "td_log_ns_bulge": ("td", "log_ns_bulge", "speaker", "hf_params"),
+    "td_log_ns_shear": ("td", "log_ns_shear", "speaker", "hf_params"),
+    # 좌우 성대 비대칭 (beam_membrane.LR_FOLDS, §52.533): 긴장 (σ 좌표) · 질량 (tanh 좌표).
+    "td_ns_lr_q": ("td", "ns_lr_u_q", "speaker", "hf_params"),
+    "td_ns_lr_m": ("td", "ns_lr_u_m", "speaker", "hf_params"),
+    # 가성대 쉼 틈 (voice_td.LARYNX, §52.489)
+    "td_log_ff_area": ("td", "log_ff_area", "speaker", "hf_params"),
 }
 EXTRA_FIELDS = {"room_ir": "recording", "hf_eq_enabled": "recording", "gain_db": "utterance",
                 "pulse_phi0": "utterance"}
@@ -169,6 +224,10 @@ def capture_calibration(engine, *, gain_db: float | None = None,
     return normalize_calibration(out)
 
 
+#: 뒤에 대역을 더해도 되는 파라미터 — 옛 판의 짧은 벡터를 0 으로 채워 복원한다 (0 dB = 항등).
+PAD_ZERO = frozenset({"glottis_src_eq_hf_db"})
+
+
 def apply_calibration(engine, data: Mapping,
                       scopes: Sequence[str] = SCOPES, *,
                       allow_source_override: bool = False) -> tuple[str, ...]:
@@ -193,6 +252,9 @@ def apply_calibration(engine, data: Mapping,
             a = torch.as_tensor(value, dtype=p.dtype, device=p.device)
             if not torch.isfinite(a).all():
                 raise ValueError(f"{name} exceeds the engine parameter precision")
+            if name in PAD_ZERO and a.ndim == 1 and p.ndim == 1 and a.numel() < p.numel():
+                # 대역을 **더한** EQ — 옛 판에 없던 대역은 0 dB(항등)로 채운다. 복원된 소리는 그대로다 (§52.413).
+                a = torch.cat([a, torch.zeros(p.numel() - a.numel(), dtype=a.dtype, device=a.device)])
             if a.numel() != p.numel() or (p.ndim > 0 and a.shape != p.shape):
                 raise ValueError(f"Calibration shape mismatch for {name}: "
                                  f"saved {tuple(a.shape)}, engine {tuple(p.shape)}")

@@ -178,3 +178,117 @@ def loss_bandwidths(area: torch.Tensor, length_cm: float, f: torch.Tensor,
 def uniform_area(n: int, value: float = 3.0, **kw) -> torch.Tensor:
     """균일관 면적 함수 — 해석해와 대조할 때 쓴다."""
     return torch.full((n,), float(value), **kw)
+
+
+# ============================================================================
+# 조음 손잡이 → 면적 함수 → 포먼트·대역폭 (MEASUREMENTS §52.475)
+# ============================================================================
+# 사용자: *"포먼트도 물리 공식화 할 수 있는 부분 있나 다 살펴서 통제가능하게 해놔."*
+#
+# 엔진의 성도는 F1~F4 와 대역폭을 프레임마다 **자유롭게** 두고 그 위에 보조 극·영점·고역 극·영점을 덧댔다. 적합기는 그 자유로
+# 대역폭을 비물리적으로 좁히고(W17e F2 대역폭 중앙 139 Hz → 갈라짐의 일부, §52.474) 첫머리 고역 공진을 과하게 울렸다(F5~F8 사다리,
+# §52.474). 여기서는 포먼트를 **관의 고유모드**로, 대역폭을 **손실 계산**으로 얻는다. 손잡이는 로그 면적의 코사인 성분 `N_ART` 개와
+# 성도 길이 하나다 — Mermelstein (1967, JASA 41:1283) 이 보인 대로 로그 면적의 코사인 성분이 포먼트를 거의 하나씩 움직인다.
+
+N_CELLS = 32          # 면적 함수 칸 수 (32 면 F8 까지 이산화 오차 < 0.3 %, test_discretisation_is_second_order)
+N_ART = 10            # 조음 손잡이 수 (로그 면적의 코사인 성분) — 6 에서 10 으로 (§52.479: 4–5.5 kHz 몸통)
+A0_CM2 = 3.0          # 기준 단면적 [cm²] (중립 모음의 평균 단면)
+A_MIN_CM2 = 0.05      # 모음 성도의 최소 단면 — 이보다 좁으면 마찰·폐쇄로 넘어간다 (그쪽은 a_c 가 맡는다)
+#: 성도 단면의 **생리적 상한** [cm²] (Fant 1960, Story et al. 1996: 인두·구강 최대 7~8 cm²). 코사인 성분에 제한이 없어 역산·적합이
+#: 입술 쪽 41 cm² · 성문 쪽 0.3 cm² (비 119) 같은 불가능한 관을 만들었고, 넓은 입술이 방사 임피던스를 낮춰 6~16 kHz 가 넘쳤다 (§52.476).
+A_MAX_CM2 = 7.0
+
+
+def cos_area(coef: torch.Tensor, n: int = N_CELLS, a0: float = A0_CM2) -> torch.Tensor:
+    """조음 손잡이 (…, K) → 면적 함수 (…, n) [cm²]. x = 0 성문, 1 입술.
+
+        log A(x) = log a0 + Σ_k c_k cos(π k x)
+
+    최소 단면은 `A_MIN_CM2` 로 부드럽게 막는다 (softplus — 미분 가능).
+    """
+    K = coef.shape[-1]
+    x = (torch.arange(n, dtype=coef.dtype, device=coef.device) + 0.5) / n
+    k = torch.arange(1, K + 1, dtype=coef.dtype, device=coef.device)
+    basis = torch.cos(math.pi * k[:, None] * x[None, :])              # (K, n)
+    la = math.log(a0) + coef @ basis
+    raw = torch.exp(la)
+    capped = 1.0 / (1.0 / raw + 1.0 / A_MAX_CM2)          # 부드러운 상한 — 작은 면적은 그대로, 큰 면적은 7 cm² 로
+    return A_MIN_CM2 + torch.nn.functional.softplus(capped - A_MIN_CM2, beta=20.0)
+
+
+def _loss_bw_len(area: torch.Tensor, length: torch.Tensor, f: torch.Tensor, p: torch.Tensor,
+                 c: float = C_SOUND, wall_shape: float = 1.0, wall_scale: float = 1.0,
+                 rad_scale: float = 1.0) -> torch.Tensor:
+    """`loss_bandwidths` 와 같은 식인데 성도 길이가 **프레임마다 다른** 텐서다. length: area 의 배치 모양 (…)."""
+    a = area.clamp_min(1e-4)
+    n = a.shape[-1]
+    h = (length / n)
+    hMN = h[..., None, None]
+    hM = h[..., None]
+    w = 2.0 * math.pi * f.clamp_min(1.0)
+    S = _perimeter(a) * wall_shape
+    pm = p.transpose(-1, -2)
+    inner = torch.sqrt(a[..., :-1] * a[..., 1:])
+    du = (pm[..., 1:] - pm[..., :-1]) / hMN
+    u_face = -inner.unsqueeze(-2) * du
+    u_lip = -a[..., -1:].unsqueeze(-2) * (-2.0 * pm[..., -1:]) / hMN
+    u_all = torch.cat([torch.zeros_like(u_face[..., :1]), u_face, u_lip], dim=-1)
+    u_cell = 0.5 * (u_all[..., :-1] + u_all[..., 1:])
+    k1 = 1.0 / (w * RHO).unsqueeze(-1)
+    U = u_cell * k1
+    U_lip = u_all[..., -1:] * k1
+    w_kin = 0.25 * (RHO / a).unsqueeze(-2) * U * U
+    W = 2.0 * w_kin.sum(-1) * hM
+    ww = w.unsqueeze(-1)
+    Sb, ab = S.unsqueeze(-2), a.unsqueeze(-2)
+    R_v = (Sb / (ab * ab)) * torch.sqrt(RHO * MU * ww / 2.0)
+    G_t = (Sb / (RHO * c * c)) * (GAMMA - 1.0) * torch.sqrt(LAMBDA_TH * ww / (2.0 * RHO * CP))
+    zi = ww * WALL_M - WALL_K / ww
+    G_w = wall_scale * Sb * WALL_R / (WALL_R * WALL_R + zi * zi)
+    a_lip = a[..., -1:].unsqueeze(-2)
+    ka = ww * torch.sqrt(a_lip / math.pi) / c
+    ka2 = ka * ka
+    R_rad = rad_scale * (RHO * c / a_lip) * ka2 / (2.0 + ka2)
+    P = 0.5 * ((R_v * U * U).sum(-1) * hM
+               + ((G_t + G_w) * pm * pm).sum(-1) * hM
+               + (R_rad * U_lip * U_lip).sum(-1))
+    return P / (2.0 * math.pi * W.clamp_min(1e-30))
+
+
+def tube_formants(coef: torch.Tensor, length: torch.Tensor, n_modes: int = 8, bandwidths: bool = True,
+                  wall_scale: float = 1.0, rad_scale: float = 1.0, c: float = C_SOUND):
+    """조음 손잡이 (…, K), 성도 길이 (…) [cm] → (포먼트 (…, n_modes) [Hz], 대역폭 (…, n_modes) [Hz] 또는 None).
+
+    길이 1 로 고유모드를 한 번 풀고 주파수를 1/L 로 늘인다 (관 방정식은 길이에 대해 정확히 척도 불변이다).
+    """
+    area = cos_area(coef)
+    f1, p = webster_modes(area, 1.0, n_modes, c)
+    f = f1 / length[..., None]
+    if not bandwidths:
+        return f, None
+    return f, _loss_bw_len(area, length, f, p, c, wall_scale=wall_scale, rad_scale=rad_scale)
+
+
+def invert_formants(f_obs: torch.Tensor, length: float, weight: torch.Tensor | None = None, n_iter: int = 400,
+                    lr: float = 0.05, smooth: float = 1.0, ridge: float = 0.05, K: int = N_ART) -> torch.Tensor:
+    """관측 포먼트 (T, M) [Hz] → 조음 손잡이 (T, K). 로그 포먼트 제곱 오차 + 이웃 틀 매끄러움 + 작은 릿지.
+
+    역문제는 유일하지 않다(같은 F1~F4 를 내는 면적이 여럿) — 매끄러움과 릿지가 중립에 가까운 해를 고른다. 0 이하 관측은 가중 0.
+    """
+    f_obs = torch.as_tensor(f_obs, dtype=torch.float64)
+    T, M = f_obs.shape
+    ok = (f_obs > 50.0).to(torch.float64)
+    wgt = ok if weight is None else ok * torch.as_tensor(weight, dtype=torch.float64)[:, None]
+    lf = torch.log(f_obs.clamp_min(50.0))
+    Lt = torch.full((T,), float(length), dtype=torch.float64)
+    coef = torch.zeros(T, K, dtype=torch.float64, requires_grad=True)
+    opt = torch.optim.Adam([coef], lr=lr)
+    for _ in range(n_iter):
+        opt.zero_grad()
+        f, _ = tube_formants(coef, Lt, n_modes=M, bandwidths=False)
+        e = ((torch.log(f) - lf) ** 2 * wgt).sum() / wgt.sum().clamp_min(1.0)
+        d = ((coef[1:] - coef[:-1]) ** 2).mean() if T > 1 else coef.sum() * 0
+        loss = e + smooth * d + ridge * (coef ** 2).mean()
+        loss.backward()
+        opt.step()
+    return coef.detach()

@@ -256,6 +256,210 @@ def phonation_mode(strain: float, contact: float = 0.0, vib_depth: float = 1.0,
     return float(f[i]), float(a[i])
 
 
+# ---------------------------------------------------------------------------------------------------------------------
+# **층 구조 막** (§52.504) — 점막(덮개)·인대·갑상피열근(몸체) 세 층, 층마다 조직 응력–변형과 능동 응력 (`fold_rules`).
+#
+# 위 한 층 모형은 이 화자의 F0 범위에 맞춘 상수 하나(σ0 3 kPa, 전단 12 kPa)로 모든 층을 대신했다. 여기서는 층마다 후속 연구의 조직
+# 법칙을 쓴다: 세로 응력 λ·σ̄_i(ε) (Serry et al. 2026 식 11 — 늘어난 단면 기준의 유효 응력) 가 가로 변위의 기하 강성 σ·k² 가 되고, 접선
+# 영률 λ²·dσ̄_i/dε 가 세로 강성이다. 단면(내외측 깊이 × 상하 두께)의 전단은 층마다 μ (덮개 500 · 몸체 1000 Pa, Zañartu 코드). 늘어나면
+# 비압축 조건으로 두께·깊이가 1/√λ (Serry 식 4). 바깥 벽(갑상연골)은 고정, 나머지는 자유.
+#
+# 그리고 **Titze–Story 의 경험 규칙이 하던 일을 모드에서 뽑는다** (`layered_lumped`): 마디점(아래·위 덮개의 경계)은 흔들 모드의 내측면
+# 변위가 부호를 바꾸는 자리, 세 블록(아래 덮개·위 덮개·몸체)의 질량·용수철은 가장 낮은 세 모드를 그 블록 좌표로 정확히 축약한 계를
+# 몸체–덮개 위상(질량 대각, 용수철 넷)에 최소제곱으로 맞춘 것이다.
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+def _dmats(nx: int, ny: int, dx: float, dy: float):
+    """1 차 중앙차분 (자유 경계는 한쪽 차분) — `bands` 와 같은 연산자."""
+    n = nx * ny
+    out = []
+    for axis in (0, 1):
+        rows, cols, vals = [], [], []
+        for i in range(nx):
+            for j in range(ny):
+                p = i * ny + j
+                if axis == 0:
+                    a = max(i - 1, 0); b = min(i + 1, nx - 1); h = (b - a) * dx
+                    rows += [p, p]; cols += [a * ny + j, b * ny + j]
+                else:
+                    a = max(j - 1, 0); b = min(j + 1, ny - 1); h = (b - a) * dy
+                    rows += [p, p]; cols += [i * ny + a, i * ny + b]
+                vals += [-1.0 / h, 1.0 / h]
+        out.append(sp.coo_matrix((vals, (rows, cols)), shape=(n, n)).tocsr())
+    return out
+
+
+def layered_geometry(eps: float, sex: str = "female", scale: float = 1.0):
+    """늘어남 ε → (L, T, 층 깊이 {muc, lig, ta}) [m]. 비압축: 두께·깊이 1/√λ."""
+    from .fold_rules import DIMS
+    d = DIMS[sex]
+    lam = 1.0 + float(eps)
+    s = scale / np.sqrt(lam)
+    return (d["L0"] * scale * lam, d["T0"] * s,
+            {"muc": d["Dmuc"] * s, "lig": d["Dlig"] * s, "ta": d["Dmus"] * s})
+
+
+def _layered_system(eps: float, a_ta: float, k: float, tissue: str, sex: str, nx: int, ny: int,
+                    mu_c: float | None, mu_b: float | None, scale: float):
+    """k 하나에서의 (K, M) — 바깥 벽 고정 자유도를 뺀 것 — 와 정보."""
+    from . import fold_rules as FR
+    mu_c = FR.MU_COVER if mu_c is None else mu_c
+    mu_b = FR.MU_BODY if mu_b is None else mu_b
+    L, T, dep = layered_geometry(eps, sex, scale)
+    lam = 1.0 + float(eps)
+    D = dep["muc"] + dep["lig"] + dep["ta"]
+    dx, dy = D / (nx - 1), T / (ny - 1)
+    n = nx * ny
+    xs = np.repeat(np.arange(nx) * dx, ny)
+    ys = np.tile(np.arange(ny) * dy, nx)
+    lay = np.where(xs < dep["muc"] - 1e-12, 0, np.where(xs < dep["muc"] + dep["lig"] - 1e-12, 1, 2))
+    st = FR.layer_stress(eps, a_ta, tissue)
+    em = FR.layer_modulus(eps, a_ta, tissue)
+    sig_l = np.array([float(st["muc"]), float(st["lig"]), float(st["ta"])]) * lam
+    ez_l = np.maximum(np.array([float(em["muc"]), float(em["lig"]), float(em["ta"])]) * lam ** 2, 50.0)
+    mu_l = np.array([mu_c, 0.5 * (mu_c + mu_b), mu_b])
+    Cl = [_stiffness_matrix(ez_l[q], 2.0 * mu_l[q] * (1.0 + NU_T), mu_l[q]) for q in range(3)]
+    Cn = np.stack([Cl[q] for q in lay])                    # (n, 6, 6)
+    sig = sig_l[lay]
+    Dx, Dy = _dmats(nx, ny, dx, dy)
+    I = sp.identity(n, format="csr")
+    Z = sp.csr_matrix((n, n))
+    w_cell = dx * dy
+    M = sp.identity(3 * n, format="csr") * (FR.RHO * w_cell)
+    fixed = [c * n + ((nx - 1) * ny + j) for j in range(ny) for c in range(3)]    # 바깥 벽(갑상연골) 고정
+    keep = np.setdiff1d(np.arange(3 * n), fixed)
+    Cb = sp.bmat([[sp.diags(Cn[:, a, b]) for b in range(6)] for a in range(6)], format="csr")
+    B = sp.bmat([[Dx, Z, Z], [Z, Dy, Z], [Z, Z, -k * I], [Dy, Dx, Z], [k * I, Z, Dx], [Z, k * I, Dy]], format="csr")
+    K = (B.T @ Cb @ B) * w_cell
+    sg = sp.diags(sig * k * k * w_cell)
+    K = K + sp.block_diag([sg, sg, Z], format="csr")
+    info = dict(L=L, T=T, D=D, dep=dep, xs=xs, ys=ys, lay=lay, nx=nx, ny=ny, n=n, keep=keep, dy=dy, dx=dx,
+                m_node=FR.RHO * w_cell, sig=sig_l, ez=ez_l)
+    return K[keep][:, keep].tocsc(), M[keep][:, keep].tocsc(), info
+
+
+def layered_bands(k_list, eps: float, a_ta: float = 0.0, tissue: str = "ts2002", sex: str = "female",
+                  nx: int = 25, ny: int = 11, n_modes: int = 12, mu_c: float | None = None, mu_b: float | None = None,
+                  scale: float = 1.0):
+    """층 구조 막의 밴드 ω_n(k). 반환 (f (len(k), n_modes) [Hz], vec (len(k), 3n, n_modes) M-정규, info dict)."""
+    out, vs, info = [], [], None
+    for k in np.asarray(k_list, float):
+        Kr, Mr, info = _layered_system(eps, a_ta, k, tissue, sex, nx, ny, mu_c, mu_b, scale)
+        v0 = np.random.default_rng(12345).standard_normal(Kr.shape[0])
+        vals, vecs = spla.eigsh(Kr, k=n_modes, M=Mr, sigma=0.0, which="LM", v0=v0)
+        o = np.argsort(vals)
+        full = np.zeros((3 * info["n"], n_modes))
+        full[info["keep"]] = vecs[:, o]
+        out.append(np.sqrt(np.maximum(vals[o], 0.0)) / (2 * np.pi))
+        vs.append(full)
+    return np.array(out), np.array(vs), info
+
+
+def layered_lumped(eps: float, a_ta: float = 0.0, tissue: str = "ts2002", sex: str = "female", nx: int = 25, ny: int = 11,
+                   cover_lig: float = 0.5, iters: int = 6, verbose: bool = False, mu_c: float | None = None,
+                   mu_b: float | None = None, scale: float = 1.0):
+    """층 구조 막 → 몸체–덮개 집중 매개변수 (`fold_rules.Lumped`, 온 성대 기준 SI) + 진단.
+
+    **하중 Ritz 축약** — 성문이 성대에 거는 것은 아래·위 내측면의 압력이다. 그 하중에 대한 연속체의 정적 응답 φ_l = K⁻¹f_l,
+    φ_u = K⁻¹f_u 와 몸체의 관성 하중 응답 φ_b = K⁻¹M·1_몸체 를 기저로 삼아 (Wilson 의 하중 의존 Ritz 벡터) 3 자유도계
+    Φᵀ K Φ, Φᵀ M Φ 를 만든다. 가장 낮은 모드로 고르면 무른 갑상피열근 속의 깊이 모드(ε 0.2 에서 279–399 Hz 에 12 개)가 먼저 걸려
+    덮개를 놓쳤다. 블록 좌표는 **아래·위 내측면의 평균 가로 변위** (압력이 일하는 좌표 — 집중 모형의 질량 변위가 면적을 정하는 것과
+    같다) 와 몸체 블록의 평균. 마디점 Zn 은 Ritz 계의 흔들 모드(아래·위 좌표의 부호가 반대인 모드)의 내측면 변위가 0 을 지나는
+    자리 — 규칙 (1 + a_TA)T/3 대신 — 로, Zn 을 바꾸면 하중이 바뀌므로 몇 번 되풀이한다. 끝으로 몸체–덮개 위상(질량 대각, 용수철
+    kl·ku·kc·kb) 을 Ritz 계의 세 고유진동수(log)와 블록 좌표 모드 모양에 최소제곱으로 맞춘다. 단위 z 길이당 값에 L 을 곱한다
+    (Titze–Story 관례).
+    """
+    from scipy.linalg import eigh
+    from scipy.optimize import least_squares
+    from . import fold_rules as FR
+    L = layered_geometry(eps, sex, scale)[0]
+    Kr, Mr, info = _layered_system(eps, a_ta, np.pi / L, tissue, sex, nx, ny, mu_c, mu_b, scale)
+    lu = spla.splu(Kr)
+    n, keep, xs, ys, T, dep = info["n"], info["keep"], info["xs"], info["ys"], info["T"], info["dep"]
+    Dc = dep["muc"] + cover_lig * dep["lig"]
+    pos = np.full(3 * n, -1)
+    pos[keep] = np.arange(len(keep))
+    med = np.flatnonzero(xs < 1e-12)
+    ym = ys[med]
+    body = np.flatnonzero((xs >= Dc - 1e-12) & (xs < info["D"] - 1e-12))
+    m_node = float(Mr.diagonal().mean())
+
+    def red_vec(idx_u, w):
+        f = np.zeros(Kr.shape[0])
+        p = pos[idx_u]
+        ok = p >= 0
+        np.add.at(f, p[ok], np.asarray(w, float)[ok])
+        return f
+
+    zn, rock = T / 3.0, None
+    for _ in range(iters):
+        sl, su = ym < zn, ym >= zn
+        f_l = red_vec(med[sl], np.where(ym[sl] <= 1e-12, 0.5, 1.0) * info["dy"])
+        f_u = red_vec(med[su], np.where(ym[su] >= T - 1e-12, 0.5, 1.0) * info["dy"])
+        f_b = red_vec(body, np.full(len(body), m_node))
+        Phi = np.stack([lu.solve(f_l), lu.solve(f_u), lu.solve(f_b)], 1)
+        Kp, Mp = Phi.T @ (Kr @ Phi), Phi.T @ (Mr @ Phi)
+        w2, A = eigh(Kp, Mp)
+        U = Phi @ A                                        # M-정규 Ritz 모드 (감소 자유도)
+        Uf = np.zeros((3 * n, 3))
+        Uf[keep] = U
+        um = Uf[med]                                       # 내측면 u (ny, 3)
+        rock = None
+        for j in range(3):
+            a_, b_ = um[sl, j].mean(), um[su, j].mean()
+            if a_ * b_ < 0:
+                rock = j
+                break
+        if rock is None:
+            break
+        s = np.sign(um[:, rock])
+        jj = np.flatnonzero(s[:-1] * s[1:] < 0)
+        if not len(jj):
+            break
+        j0 = jj[0]
+        zn_new = ym[j0] + (ym[j0 + 1] - ym[j0]) * um[j0, rock] / (um[j0, rock] - um[j0 + 1, rock])
+        zn_new = float(np.clip(zn_new, 0.15 * T, 0.85 * T))
+        done = abs(zn_new - zn) < 0.01 * T
+        zn = zn_new
+        if done:
+            break
+    sl, su = ym < zn, ym >= zn
+    W = np.zeros((3, 3 * n))
+    W[0, med[sl]] = 1.0 / sl.sum()
+    W[1, med[su]] = 1.0 / su.sum()
+    W[2, body] = 1.0 / len(body)
+    Psi = (W @ Uf) / np.sqrt(L)                          # 온 성대 기준 (질량·강성 ×L)
+    Om = np.sqrt(np.maximum(w2, 0.0))
+    Pi = np.linalg.inv(Psi)
+    Mq = Pi.T @ Pi
+    Kq = Pi.T @ np.diag(Om ** 2) @ Pi
+    Tl, Tu = zn, T - zn
+    x0 = np.log(np.concatenate([np.abs(np.diag(Mq)),
+                                np.maximum(np.abs([Kq[0, 2], Kq[1, 2], Kq[0, 1], Kq[2].sum()]), 1e-4 * np.abs(Kq).max())]))
+
+    def lump(x):
+        e = np.exp(x)
+        return FR.Lumped(eps, L, T, Tl, Tu, e[0], e[1], e[2], e[3], e[4], e[5], e[6])
+
+    def res(x):
+        Ml, Kl = lump(x).matrices()
+        ww, Vl = eigh(Kl, Ml)
+        r = [0.5 * np.log(np.maximum(ww, 1e-9) / np.maximum(Om ** 2, 1e-9))]
+        for j in range(3):
+            a = Vl[:, j] * np.sign(Vl[:, j] @ Psi[:, j] + 1e-30)
+            r.append((a - Psi[:, j]) / np.linalg.norm(Psi[:, j]))
+        return np.concatenate(r)
+
+    sol = least_squares(res, x0, method="lm", max_nfev=6000)
+    lp = lump(sol.x)
+    diag = dict(zn=zn, T=T, f_ritz=Om / (2 * np.pi), Mq=Mq, Kq=Kq, Psi=Psi, fit_rms=float(np.sqrt(np.mean(sol.fun ** 2))),
+                Dc=Dc, D=info["D"], sig=info["sig"], rock=rock)
+    if verbose:
+        print(f"  ε {eps:+.2f} a_TA {a_ta:.2f}: Zn/T {zn / T:.2f} · Ritz {np.round(diag['f_ritz'], 0)} Hz · 맞춤 rms {diag['fit_rms']:.3f}")
+    return lp, diag
+
+
 def main() -> int:
     print("성대 막 고유모드 — 늘어남에 따른 최저 가지 (검증표)")
     print("  ε      L[mm]  T[mm]  E_z[kPa]  σ[kPa]   k=π/L 에서의 최저 4 가지 [Hz]")

@@ -4,7 +4,7 @@
  "tract_length_cm": 14.6,
  "f0_nominal": 240.0,
  "f0_lo": 120.0,
- "f0_hi": 580.0,
+ "f0_hi": 950.0,
  "p_sub": 7.5,
  "vowels": {
   "a": [
@@ -144,5 +144,6 @@
   "sibilant_voicing": "성문 제스처가 협착보다 35 ms 먼저 열리고 55 ms 늦게 닫힌다 (ADR 0011). 실측: 마찰 진입에서 HNR 이 35 ms 에 걸쳐 꺼지고, 해제 뒤 고역 잡음이 50~70 ms 더 이어진다 — bibitan 1300~1420 ms, 2795~2915 ms.",
   "sibilant_level": "level_db = 마찰 정상부가 뒤따르는 모음보다 몇 dB (실측 A/B 창 자동 검출). 기준점 phones.SIB_REF_DB."
  },
- "piriform_hz": 6352.0
+ "piriform_hz": 6352.0,
+ "trough_hz": 8062.0
 }

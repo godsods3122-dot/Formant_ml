@@ -28,6 +28,7 @@
 from __future__ import annotations
 
 import numpy as np
+from scipy.signal import lfilter
 
 
 def harmonic_basis(n: int, f0: float, fs: float, k_max: int,
@@ -164,3 +165,58 @@ def report(target: np.ndarray, synth: np.ndarray, fs: float, f0: np.ndarray,
         n_frames=len(ph),
         n_harmonics=float(np.mean(nk)) if nk else 0.0,
     )
+
+def _lpc(x: np.ndarray, p: int):
+    """자기상관법 LPC (Levinson). 실패하면 None."""
+    w = x * np.hanning(len(x))
+    r = np.correlate(w, w, "full")[len(w) - 1:len(w) + p]
+    if r[0] <= 0:
+        return None
+    r = r.copy()
+    r[0] *= 1.0 + 1e-6                       # 백색 바닥 — 조건수를 지킨다
+    a = np.zeros(p + 1); a[0] = 1.0
+    e = r[0]
+    for i in range(1, p + 1):
+        k = -(a[:i] @ r[i:0:-1]) / e
+        a[:i + 1] = a[:i + 1] + k * a[i::-1]
+        e *= (1 - k * k)
+        if e <= 0:
+            return None
+    return a
+
+
+def whiten_aperiodic(y: np.ndarray, fs: float, f0: np.ndarray, hop: int,
+                     order: int = 32, win: int = 1024, unit_ms: float = 20.0):
+    """목표의 **비조화 잔차를 표백**해 (평균 0, 분산 1) 돌려준다.
+
+    복사합성에서 난류의 **실현**까지 베끼기 위한 여기다 (MEASUREMENTS §52.114). 같은 제어열을
+    씨앗만 바꿔 두 번 렌더하면 서로 96.19 % 밖에 안 나온다 — 난수로 난류를 만드는 한 그것이
+    상한이다. 목표에서 잔차를 꺼내 **성도와 음원 포락을 LPC 로 벗기면**, 남는 것은 여기 수준의
+    난류다. 그것을 잡음 채널에 넣으면 실현이 원리적으로 일치한다.
+
+    조화부는 `decompose` 가 빼므로 성문 펄스는 들어가지 않는다 (이중 계상 방지).
+    창마다 분산을 1 로 맞춰 **세기 정보는 버린다** — 세기는 엔진의 기식/마찰 포락이 정한다.
+    """
+    _, _, res = decompose(y, fs, f0, hop)
+    n = len(res)
+    h = win // 4
+    out = np.zeros(n)
+    wsum = np.zeros(n)
+    w = np.hanning(win)
+    for s in range(0, max(n - win, 0) + 1, h):
+        seg = res[s:s + win]
+        if len(seg) < win:
+            break
+        a = _lpc(seg, order)
+        z = lfilter(a, [1.0], seg) if a is not None else seg.copy()
+        out[s:s + win] += z * w
+        wsum[s:s + win] += w
+    out = np.where(wsum > 1e-9, out / np.maximum(wsum, 1e-9), 0.0)
+    # 창마다 분산 1 (세기는 버리고 **잔결**만 남긴다)
+    u = max(8, int(unit_ms * fs / 1000.0))
+    k = np.ones(u) / u
+    rms = np.sqrt(np.convolve(out ** 2, k, mode="same")) + 1e-9
+    g = np.median(rms[rms > 1e-8]) if (rms > 1e-8).any() else 1.0
+    out = out / np.maximum(rms, 0.05 * g)
+    sd = out.std()
+    return (out / sd).astype(np.float32) if sd > 0 else out.astype(np.float32)
