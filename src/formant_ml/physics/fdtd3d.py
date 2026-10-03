@@ -66,9 +66,17 @@ class Result:
 
 
 class Sim:
+    """Legacy CGS solver; optional coupling hooks leave default behavior unchanged.
+
+    ``inactive_walls`` disables only structural oscillators at those indices;
+    viscothermal layers remain active. ``physical_cut_volume`` opts out of legacy
+    volume stabilization: the caller must supply a sufficiently small Courant
+    number for physical cut volumes and any coupled loads.
+    """
+
     def __init__(self, g: Grid, T_c: float = 35.5, rh: float = 1.0, courant: float = 0.5, sponge_cells: int = 20,
                  sponge_sigma: float | None = None, walls: str = "soft", boundary_layer: bool = True, device: str = "cuda",
-                 dtype=torch.float32):
+                 dtype=torch.float32, *, inactive_walls=(), physical_cut_volume: bool = False):
         a = _air.props(T_c, rh).cgs()
         self.rho, self.c = a["RHO"], a["C_SOUND"]
         nu = a["MU"] / a["RHO"]
@@ -159,7 +167,8 @@ class Sim:
         if self.cut:                                   # 절단 칸 (`tract3d_cut`): 벽은 칸마다, 넓이는 고운 경계 면에서
             W_ = g.meta["walls"]
             cells, tis = np.asarray(W_["cell"]), np.asarray(W_["tis"])
-            cosw = (np.asarray(W_["area"]) / (h * h)).astype(np.float32)
+            cosw = (np.asarray(W_["area"]) / (h * h)).astype(
+                np.float64 if physical_cut_volume else np.float32)
             self.wall_pos, self.wall_dir = np.asarray(W_["pos"]), np.asarray(W_["dir"])
         self.n_wall = len(cells)
         self.wall_cell = torch.as_tensor(cells, device=dev, dtype=torch.long)
@@ -167,6 +176,13 @@ class Sim:
         self.wall_area = {TISSUE[t]: float(cosw[tis == t].sum() * h * h) for t in np.unique(tis)}
         self.wall_area_stair = {TISSUE[t]: float((tis == t).sum() * h * h) for t in np.unique(tis)}
         self.wall_cos = torch.as_tensor(cosw, device=dev, dtype=dtype)
+        active = np.ones(len(cells), bool)
+        inactive = np.asarray(inactive_walls)
+        if inactive.size:
+            if (inactive.ndim != 1 or not np.issubdtype(inactive.dtype, np.integer)
+                    or np.any((inactive < 0) | (inactive >= len(cells)))):
+                raise ValueError("inactive_walls must contain valid wall indices")
+            active[inactive] = False
         # 무른 벽 계수 (단단·배플·성문 끝은 움직이지 않는다)
         m = np.zeros(len(cells), np.float64)
         r = np.zeros(len(cells), np.float64)
@@ -178,6 +194,7 @@ class Sim:
                 mm = RHO_TISSUE * th
                 m[sel], k[sel], r[sel] = mm, mm * (2 * math.pi * f0) ** 2, 2 * math.pi * f0 * mm / Q
                 soft[sel] = True
+        soft &= active
         self.soft = torch.as_tensor(soft, device=dev)
         dt = self.dt
         den = m / dt + r / 2
@@ -200,14 +217,15 @@ class Sim:
         self.kp = self.dt * self.rho * self.c ** 2 / h
         self.ku = self.dt / (self.rho * h)
         if self.cut:
-            vf = np.asarray(g.meta["vf"], np.float32)
-            veff = stable_volume(vf, g.ax, g.ay, g.az, courant)
+            vf = np.asarray(g.meta["vf"], np.float64 if physical_cut_volume else np.float32)
+            veff = vf.copy() if physical_cut_volume else stable_volume(vf, g.ax, g.ay, g.az, courant)
             self.veff = veff
-            self.inv_v = T(np.where(veff > 0, 1.0 / np.maximum(veff, 1e-6), 0.0))
+            volume_den = np.where(veff > 0, veff, 1.0) if physical_cut_volume else np.maximum(veff, 1e-6)
+            self.inv_v = T(np.where(veff > 0, 1.0 / volume_den, 0.0))
             vin = vf[g.inlet]
             self.v_inlet = float(vin.sum()) * h ** 3
             # 음원 칸마다 dp = dt ρc² u · (V_칸/ΣV) / (V_eff,칸 h³)
-            self.src_w = T((vin / vin.sum()) / np.maximum(veff[g.inlet], 1e-6) * vin.sum())
+            self.src_w = T((vin / vin.sum()) / volume_den[g.inlet] * vin.sum())
         else:
             self.inv_v = None
             self.v_inlet = float(g.inlet.sum()) * h ** 3
@@ -233,7 +251,21 @@ class Sim:
         self.wg_n = int(n_groups)
         self.wg_area = (self.wall_cos[self.wg_sel] * self.g.h ** 2)
 
-    def step(self, u_src: float):
+    def _add_cell_flows(self, cell_flows):
+        """Sparse (flat cell indices, signed volume flows [cm3/s]); no normalization."""
+        if cell_flows is not None:
+            cells, flows = cell_flows
+            dp = self.dt * self.rho * self.c ** 2 / self.g.h ** 3 * flows
+            if self.inv_v is not None:
+                dp = dp * self.inv_v.reshape(-1)[cells]
+            self.px.reshape(-1).index_add_(0, cells, dp)
+
+    def step(self, u_src: float, *, cell_flows=None):
+        """Advance legacy inlet flow plus optional sparse per-cell flow [cm3/s].
+
+        ``cell_flows=(indices, flows)`` uses colocated device tensors, flat air
+        indices and signed unnormalized flows; intended for validated couplers.
+        """
         p, h = self.p, self.g.h
         self.ux[1:-1] -= self.ku * (p[1:] - p[:-1])
         self.uy[:, 1:-1] -= self.ku * (p[:, 1:] - p[:, :-1])
@@ -273,13 +305,14 @@ class Sim:
                 self.px.view(-1).index_add_(0, self.inlet, torch.full((self.inlet.numel(),), k_, device=self.dev, dtype=self.dtype))
             else:
                 self.px.view(-1).index_add_(0, self.inlet, k_ * self.src_w)
+        self._add_cell_flows(cell_flows)
         self.px *= self.air * self.dpx
         self.py *= self.air * self.dpy
         self.pz *= self.air * self.dpz
         torch.add(self.px, self.py, out=self.p)
         self.p += self.pz
 
-    def _step_t(self, u_t: torch.Tensor):
+    def _step_t(self, u_t: torch.Tensor, *, cell_flows=None):
         """한 걸음 — 제자리 연산만 (CUDA 그래프에 담을 수 있게). u_t: 0 차원 텐서 [cm³/s]."""
         p = self.p
         self.ux[1:-1].sub_(self.ku * (p[1:] - p[:-1]))
@@ -309,6 +342,7 @@ class Sim:
                 vout = vout + self.bl_C * acc
             self.px.view(-1).index_add_(0, self.wall_cell, -self.kw * vout)
         self.px.view(-1).index_add_(0, self.inlet, (self.src_coef * u_t) * self.src_vec)
+        self._add_cell_flows(cell_flows)
         self.px.mul_(self.mpx)
         self.py.mul_(self.mpy)
         self.pz.mul_(self.mpz)
