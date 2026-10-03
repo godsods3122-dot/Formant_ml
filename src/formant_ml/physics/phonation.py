@@ -474,7 +474,10 @@ class EulerianGlottis:
                 or self.neck_half_width_m >= np.min(np.diff(self.si_edges_m)) / 2):
             raise ValueError("neck bands must be nonnegative and nonoverlapping")
 
-    def capture(self, solid, *, positions_m=None):
+    def capture(self, solid, *, positions_m=None, hydraulics=True):
+        """``hydraulics=False`` skips only the adaptive resolution check of the cell hydraulic model
+        (``hydraulic_*`` stay unchecked); geometry, volumes and patches are identical. ``PhonationSystem``
+        uses it inside coupling iterations and checks every accepted subcycle geometry once (§52.537)."""
         left, right = solid.surface("left"), solid.surface("right")
         if positions_m is None:
             xyz = (left.coordinates_m, right.coordinates_m)
@@ -634,7 +637,7 @@ class EulerianGlottis:
                 z0, z1 = self.si_edges_m[cell:cell + 2]
                 center = (z0 + z1) / 2
                 for half, (lo, hi, face) in enumerate(((z0, center, cell), (center, z1, cell + 1))):
-                    if opened[strip, face] == 0:
+                    if opened[strip, face] == 0 or not hydraulics:
                         continue
                     checked[strip, cell, half] = True
                     corners = np.concatenate([
@@ -1130,7 +1133,7 @@ class PhonationSystem:
                 self._check_port_pressure(downstream_guess)
                 solid_before = self.solid.save_state()
                 midpoint = (solid_before.positions_m + position_guess[k]) / 2
-                mapped = self.mapper.capture(self.solid, positions_m=midpoint)
+                mapped = self.mapper.capture(self.solid, positions_m=midpoint, hydraulics=False)
                 wall_velocity = mapped.wall_velocity_m_s(
                     self.solid, position_guess[k] - solid_before.positions_m, dt
                 )
@@ -1152,7 +1155,7 @@ class PhonationSystem:
                     nodal_force_n=force_guess[k],
                 )
                 solid_after = self.solid.save_state()
-                geometry = self.mapper.capture(self.solid).geometry
+                geometry = self.mapper.capture(self.solid, hydraulics=False).geometry
                 if dt > self.channel.recommend_timestep(geometry) * (1 + 1e-12):
                     raise _RefineSubcycles()
                 gas = self.channel.advance(
@@ -1292,6 +1295,9 @@ class PhonationSystem:
                     times += (self.upstream.time_s, self.supply.time_s)
                 if max(times) - min(times) > 1e-13:
                     raise CouplingError("component physical clocks diverged")
+                # Hydraulic resolution of every accepted channel geometry (raises -> atomic restore in advance).
+                for k in range(subcycles):
+                    self.mapper.capture(self.solid, positions_m=new_positions[k])
                 self.steps += 1
                 return PhonationStep(
                     self.time_s, iteration, subcycles, pressure_error, position_error,

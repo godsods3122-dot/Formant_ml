@@ -411,6 +411,8 @@ def main() -> None:
                     help="성문 모형 (voice_td.GLOTTIS, MEASUREMENTS §52.488, --td 와 함께). kin: 펄스 위상으로 정한 운동학 변위 + 접촉. "
                          "vf: 자기 진동 성대 (Birkholz 삼각 성문 두 질량) — 폐압·내전·긴장으로 스스로 떤다. 펄스 잠금·위상 오프셋을 쓰지 않고, "
                          "합성 f0 를 재어 긴장 배율을 고친다 (fit.vf_pitch_lock)")
+    ap.add_argument("--vf-ns-fem", default=None, metavar="json",
+                    help="모드 3 성대의 화자 상수를 3D 유한요소 성대에서 잰 값으로 고정 (scripts/fem_fold_calib.py 결과, §52.537)")
     ap.add_argument("--vf-ns-lock", action="store_true",
                     help="모드 3 성대 배율·뒤쪽 틈·좌우 비대칭을 고정한다. 보정표의 값과 같은지는 별도로 검사하며 값을 자동 복사하지 않는다")
     ap.add_argument("--velum-bounds", action="store_true",
@@ -1118,6 +1120,18 @@ def main() -> None:
     if recording_constants is not None:
         locked_constants += apply_calibration(eng, recording_constants, ("recording",),
                                               allow_source_override=source_override)
+    if a.vf_ns_fem:
+        import json as _jsonf
+        with open(a.vf_ns_fem, encoding="utf-8") as _fh:
+            _fem = _jsonf.load(_fh)
+        _set = []
+        for _k, _v in _fem["scales"].items():
+            _p = getattr(eng.td, f"log_ns_{_k}")
+            _p.data.fill_(math.log(float(_v)))
+            _set.append(f"{_k} {float(_v):.4g}")
+        _lk = tuple(f"td_log_ns_{_k}" for _k in _fem["scales"])
+        locked_constants += _lk
+        print(f"  모드 3 성대 상수 ← 3D 유한요소 ({a.vf_ns_fem}, §52.537, 고정): " + ", ".join(_set), flush=True)
     if getattr(a, "vf_ns_lock", False):
         from formant_ml.engine.vf_calibration import locked_names
         _lk = locked_names()
