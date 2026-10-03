@@ -48,6 +48,14 @@ Medial sweeps are only the moving WALL contribution to gas volume: moving
 AP/SI caps are the caller's responsibility. Do not count both wall sweep and
 the same gap-profile volume change. End supports can move with controls, and
 inferior/superior medial edges are free by default.
+``PressurePatch`` additionally loads any exterior tetrahedral face or a
+subtriangle described in its barycentric coordinates. Area fraction times the
+parent's actual area, with the subtriangle centroid's shape weights, gives
+work-conjugate nodal quadrature. Patches are material subsets held fixed over
+the substep: Eulerian axial-band clipping/remapping belongs to the caller.
+Overlapping patches, or patches over nonzero whole-medial pressure, are
+rejected. Patch sweeps and whole-medial sweeps are alternative descriptions
+of the same moving wall; they must not be added when they overlap.
 Cross-sections intersect these same current triangles with z=constant,
 integrating the positive lateral gap along AP, including its zero crossings.
 Unsupported overhangs or unequal AP coverage fail explicitly.
@@ -56,6 +64,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import hashlib
+from numbers import Real
 from typing import Literal
 
 import numpy as np
@@ -73,8 +82,8 @@ Side = Literal["left", "right"]
 
 
 def _finite(name, value, *, minimum=None, strict=False):
-    if not np.isfinite(value):
-        raise ValueError(f"{name} must be finite")
+    if not isinstance(value, Real) or not np.isfinite(value):
+        raise ValueError(f"{name} must be a finite real scalar")
     if minimum is not None and (value <= minimum if strict else value < minimum):
         raise ValueError(f"{name} must be {'>' if strict else '>='} {minimum}")
 
@@ -83,6 +92,8 @@ def _array(name, value, shape, *, integer=False, boolean=False):
     a = np.asarray(value)
     if a.shape != shape:
         raise ValueError(f"{name} must have shape {shape}, got {a.shape}")
+    if np.iscomplexobj(a) or not (np.issubdtype(a.dtype, np.number) or a.dtype == np.bool_):
+        raise ValueError(f"{name} must contain real numeric values")
     if integer and not np.issubdtype(a.dtype, np.integer):
         raise ValueError(f"{name} must contain integer indices")
     if boolean and a.dtype != np.bool_:
@@ -290,6 +301,51 @@ class MedialPressure:
 
 
 @dataclass(frozen=True)
+class PressurePatch:
+    """Constant pressure [Pa] on an outward-oriented boundary subtriangle.
+
+    ``triangle_nodes`` indexes the full side-local mesh, as returned by
+    ``boundary_triangles`` or ``surface(...).triangles``. Each row of
+    ``barycentric_vertices`` locates one patch vertex in that parent triangle.
+    Identity loads the full triangle. Rows must be nonnegative and sum to
+    one; ordering must preserve the parent's outward normal. Data is copied
+    into immutable tuples. Patches must not overlap in positive area.
+    Simplex sums and same-face overlap use a 1e-12 roundoff tolerance.
+    """
+
+    side: Side
+    triangle_nodes: tuple[int, int, int]
+    pressure_pa: float
+    barycentric_vertices: tuple[tuple[float, float, float], ...] = (
+        (1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+
+    def __post_init__(self):
+        if self.side not in ("left", "right"):
+            raise ValueError("patch side must be left or right")
+        nodes = _array("triangle_nodes", self.triangle_nodes, (3,), integer=True)
+        if np.any(nodes < 0) or len(np.unique(nodes)) != 3:
+            raise ValueError("patch triangle requires three distinct nonnegative node indices")
+        vertices = _array("barycentric_vertices", self.barycentric_vertices, (3, 3))
+        if np.any(vertices < 0) or np.any(vertices > 1) or not np.allclose(vertices.sum(1), 1, rtol=0, atol=1e-12):
+            raise ValueError("patch barycentric vertices must lie in the unit simplex")
+        fraction = np.linalg.det(vertices)
+        if not np.isfinite(fraction) or not 0 < fraction <= 1 + 1e-12:
+            raise ValueError("patch area must be positive and preserve parent winding")
+        _finite("pressure_pa", self.pressure_pa)
+        object.__setattr__(self, "triangle_nodes", tuple(int(n) for n in nodes))
+        object.__setattr__(self, "barycentric_vertices", tuple(tuple(float(v) for v in row) for row in vertices))
+
+
+@dataclass(frozen=True)
+class _PressureLoad:
+    triangles: torch.Tensor
+    pressure: torch.Tensor
+    weights: torch.Tensor
+    fractions: torch.Tensor
+    counts: tuple[int, int, int]
+
+
+@dataclass(frozen=True)
 class MedialSurface:
     coordinates_m: np.ndarray
     velocities_m_s: np.ndarray
@@ -385,18 +441,23 @@ class SolidStep:
     right_sweep: SurfaceSweep
     pressure_iterations: int
     pressure_residual_m: float
+    patch_sweep: SurfaceSweep | None = None
 
 
 def _tensor(a, dtype=torch.float64):
     return torch.tensor(np.asarray(a).copy(), dtype=dtype)
 
 
-def _sweep_tensors(start, end, triangles):
+def _sweep_tensors(start, end, triangles, weights=None, fractions=None):
     areas = [triangle_area_vectors(x, triangles) for x in (start, (start + end) / 2, end)]
     if any(not torch.isfinite(a).all() or torch.any(torch.linalg.norm(a, dim=1) <= 0) for a in areas):
         raise ValueError("nonfinite/degenerate triangle along surface sweep")
     mean_area = (areas[0] + 4 * areas[1] + areas[2]) / 6
-    displacement = (end[triangles] - start[triangles]).mean(dim=1)
+    if fractions is not None:
+        mean_area = mean_area * fractions[:, None]
+    if weights is None:
+        weights = start.new_full((len(triangles), 3), 1 / 3)
+    displacement = ((end[triangles] - start[triangles]) * weights[:, :, None]).sum(dim=1)
     return mean_area, displacement, (mean_area * displacement).sum(dim=1)
 
 
@@ -505,7 +566,16 @@ def _checked_mesh(mesh, side, n_materials):
             raise ValueError("medial_grid must enumerate each medial node exactly once")
     if np.ptp(x[:, 0]) <= 0:
         raise ValueError("mesh must have positive AP extent")
-    return FoldMesh(x, t, ids, fib, tris, *masks, grid)
+    boundary = []
+    for face, opposite in faces.items():
+        if len(opposite) != 1:
+            continue
+        tri = list(face)
+        a, b, c = x[tri]
+        if np.dot(np.cross(b - a, c - a), x[opposite[0]] - a) > 0:
+            tri[1], tri[2] = tri[2], tri[1]
+        boundary.append(tri)
+    return FoldMesh(x, t, ids, fib, tris, *masks, grid), np.asarray(boundary)
 
 
 class VocalFoldSolid:
@@ -527,8 +597,11 @@ class VocalFoldSolid:
 
     def __init__(self, config: SolidConfig | None = None):
         self.config = config or SolidConfig(nominal_fold_mesh("left"), nominal_fold_mesh("right"))
-        meshes = [_checked_mesh(getattr(self.config, side), side, len(self.config.materials))
-                  for side in ("left", "right")]
+        checked = [_checked_mesh(getattr(self.config, side), side, len(self.config.materials))
+                   for side in ("left", "right")]
+        meshes = [m for m, _ in checked]
+        self._boundary = tuple(b for _, b in checked)
+        self._boundary_faces = tuple({tuple(sorted(tri)): tuple(tri) for tri in b} for b in self._boundary)
         self._meshes = tuple(meshes)
         self._offset = len(meshes[0].reference_m)
         self._slices = (slice(0, self._offset), slice(self._offset, None))
@@ -686,13 +759,49 @@ class VocalFoldSolid:
         power = c.damping_pa_s_per_m * (a * closing**2).sum()
         return force, energy, power
 
-    def _pressure(self, pressure):
+    def _pressure(self, pressure, patches=()):
         if pressure is None:
-            return tuple(torch.zeros(len(t), dtype=torch.float64) for t in self._surfaces)
-        if not isinstance(pressure, MedialPressure):
+            values = [np.zeros(len(t)) for t in self._surfaces]
+        elif not isinstance(pressure, MedialPressure):
             raise ValueError("pressure must be MedialPressure or None")
-        return tuple(_tensor(_array(name, getattr(pressure, name), (len(t),)))
-                     for name, t in zip(("left_pa", "right_pa"), self._surfaces))
+        else:
+            values = [_array(name, getattr(pressure, name), (len(t),))
+                      for name, t in zip(("left_pa", "right_pa"), self._surfaces)]
+        if not isinstance(patches, (tuple, list)) or not all(isinstance(p, PressurePatch) for p in patches):
+            raise ValueError("pressure_patches must be a tuple/list of PressurePatch objects")
+        counts = (len(self._surfaces[0]), len(self._surfaces[1]), len(patches))
+        triangles = [t.numpy() for t in self._surfaces]
+        weights = [np.full((n, 3), 1 / 3) for n in counts[:2]]
+        fractions = [np.ones(n) for n in counts[:2]]
+        medial_faces = [{tuple(sorted(tri)): j for j, tri in enumerate(m.medial_triangles)}
+                        for m in self._meshes]
+        footprints = {}
+        for patch in patches:
+            side = 0 if patch.side == "left" else 1
+            nodes = patch.triangle_nodes
+            key = tuple(sorted(nodes))
+            outward = self._boundary_faces[side].get(key)
+            if outward is None:
+                raise ValueError("pressure patch must reference an actual exterior tetrahedral face")
+            if not any(nodes == outward[k:] + outward[:k] for k in range(3)):
+                raise ValueError("pressure patch parent triangle must be outward wound")
+            medial_index = medial_faces[side].get(key)
+            if medial_index is not None and values[side][medial_index] != 0:
+                raise ValueError("pressure patch overlaps nonzero whole-medial pressure")
+            barycentric = np.asarray(patch.barycentric_vertices)
+            # All patches on a face use the same canonical barycentric frame.
+            footprint = barycentric[:, np.argsort(nodes)][:, 1:]
+            for previous in footprints.get((side, key), []):
+                if _triangle_overlap_fraction(footprint, previous) > 1e-12:
+                    raise ValueError("pressure patches overlap in positive interior area")
+            footprints.setdefault((side, key), []).append(footprint)
+            triangles.append(np.asarray([nodes]) + (0 if side == 0 else self._offset))
+            weights.append(barycentric.mean(0, keepdims=True))
+            fractions.append(np.asarray([np.linalg.det(barycentric)]))
+            values.append(np.asarray([patch.pressure_pa]))
+        return _PressureLoad(_tensor(np.concatenate(triangles), torch.long),
+                             _tensor(np.concatenate(values)), _tensor(np.concatenate(weights)),
+                             _tensor(np.concatenate(fractions)), counts)
 
     def _evaluate(self, x, v, control, pressure):
         F, Fdot, J = self._kinematics(x, v)
@@ -702,8 +811,8 @@ class VocalFoldSolid:
         pp, pv, pa, energy, power = self._constitutive(F, Fdot, control)
         forces = [tetrahedral_nodal_forces(stress, self._volume, self._inverse, self._t, len(x))
                   for stress in (pp, pv, pa)]
-        fp = sum((triangle_pressure_forces(x, tri, p) for tri, p in zip(self._surfaces, pressure)),
-                 torch.zeros_like(x))
+        fp = triangle_pressure_forces(x, pressure.triangles, pressure.pressure,
+                                      shape_weights=pressure.weights, area_fractions=pressure.fractions)
         fc, ec, pc = self._contact(x, v)
         forces.extend((fp, fc))
         if not all(torch.isfinite(f).all() for f in forces):
@@ -714,10 +823,11 @@ class VocalFoldSolid:
             raise ValueError("nonfinite assembled energy/power")
         return forces, values
 
-    def forces(self, control: BilateralControl | None = None, pressure: MedialPressure | None = None) -> SolidForces:
+    def forces(self, control: BilateralControl | None = None, pressure: MedialPressure | None = None,
+               *, pressure_patches: tuple[PressurePatch, ...] = ()) -> SolidForces:
         """Instantaneous unconstrained forces (including reactions' opposite)."""
         control = self._control if control is None else self._checked_control(control)
-        f, _ = self._evaluate(self._x, self._v, control, self._pressure(pressure))
+        f, _ = self._evaluate(self._x, self._v, control, self._pressure(pressure, pressure_patches))
         return SolidForces(*(a.numpy().copy() for a in (*f, sum(f))))
 
     @staticmethod
@@ -754,14 +864,15 @@ class VocalFoldSolid:
             cblock = self._volume[:, None, None] * (self._B.transpose(1, 2) @ c @ self._B)
             kr = self._row_bound(kblock, self._dofs)
             cr = self._row_bound(cblock, self._dofs)
-            for tris, p in zip(self._surfaces, pressure):
-                if not torch.any(p != 0):
-                    continue
+            loaded = pressure.pressure != 0
+            if torch.any(loaded):
+                tris, p = pressure.triangles[loaded], pressure.pressure[loaded]
                 coords = x[tris].detach().requires_grad_(True)
-                nodal = -p[:, None] / 6 * torch.cross(coords[:, 1] - coords[:, 0],
-                                                     coords[:, 2] - coords[:, 0], dim=1)
-                jac = torch.stack([torch.autograd.grad(nodal[:, k].sum(), coords, retain_graph=k < 2)[0].reshape(-1, 9)
-                                   for k in range(3)], dim=1).detach().repeat(1, 3, 1)
+                traction = -(p * pressure.fractions[loaded])[:, None] / 2 * torch.cross(
+                    coords[:, 1] - coords[:, 0], coords[:, 2] - coords[:, 0], dim=1)
+                jac = torch.stack([torch.autograd.grad(traction[:, k].sum(), coords, retain_graph=k < 2)[0].reshape(-1, 9)
+                                   for k in range(3)], dim=1).detach()
+                jac = (jac[:, None] * pressure.weights[loaded, :, None, None]).reshape(-1, 9, 9)
                 dofs = (tris[:, :, None] * 3 + torch.arange(3)).reshape(-1, 9)
                 kr += self._row_bound(jac, dofs)
         if self.config.contact.enabled:
@@ -776,14 +887,15 @@ class VocalFoldSolid:
         return float("inf") if denominator == 0 else self.config.timestep_safety * 2 / denominator
 
     def recommend_timestep(self, control: BilateralControl | None = None,
-                           pressure: MedialPressure | None = None) -> float:
+                           pressure: MedialPressure | None = None, *,
+                           pressure_patches: tuple[PressurePatch, ...] = ()) -> float:
         """Local maximum step [s]; includes viscosity/contact and pressure.
 
         A changed support posture can tighten this bound once its prescribed
         velocity is known in ``step``. Use small continuous posture increments.
         """
         control = self._control if control is None else self._checked_control(control)
-        return self._timestep(self._x, self._v, control, self._pressure(pressure))
+        return self._timestep(self._x, self._v, control, self._pressure(pressure, pressure_patches))
 
     def _targets(self, control):
         targets = self._X.clone()
@@ -829,16 +941,15 @@ class VocalFoldSolid:
             return x, v
 
         x, v = advance(forces[3])
-        if not any(torch.any(p != 0) for p in pressure):
-            sweeps = tuple(_sweep_tensors(self._x, x, tri) for tri in self._surfaces)
+        if not torch.any(pressure.pressure != 0):
+            sweeps = _sweep_tensors(self._x, x, pressure.triangles, pressure.weights, pressure.fractions)
             return x, v, forces[3], sweeps, 0, 0.0
         for iteration in range(1, self.config.pressure_max_iterations + 1):
-            sweeps = tuple(_sweep_tensors(self._x, x, tri) for tri in self._surfaces)
+            sweeps = _sweep_tensors(self._x, x, pressure.triangles, pressure.weights, pressure.fractions)
             fp = torch.zeros_like(x)
-            for tri, p, (area, _, _) in zip(self._surfaces, pressure, sweeps):
-                nodal = -p[:, None] * area / 3
-                for k in range(3):
-                    fp.index_add_(0, tri[:, k], nodal)
+            traction = -pressure.pressure[:, None] * sweeps[0]
+            for k in range(3):
+                fp.index_add_(0, pressure.triangles[:, k], traction * pressure.weights[:, k, None])
             proposed_x, proposed_v = advance(fp)
             residual = float(torch.abs(proposed_x - x).max())
             if residual <= self.config.pressure_tolerance_m:
@@ -847,11 +958,16 @@ class VocalFoldSolid:
         raise ValueError("pressure follower-traction fixed point did not converge; retry smaller dt")
 
     def step(self, dt_s: float, control: BilateralControl | None = None,
-             pressure: MedialPressure | None = None) -> SolidStep:
-        """Advance once, atomically. Pressure omitted means zero; controls persist."""
+             pressure: MedialPressure | None = None, *,
+             pressure_patches: tuple[PressurePatch, ...] = ()) -> SolidStep:
+        """Advance atomically; controls persist, omitted loads are zero.
+
+        ``patch_sweep`` follows patch input order, using barycentric vertices
+        held fixed for this step. It is not an Eulerian-band remapping rule.
+        """
         _finite("dt_s", dt_s, minimum=0, strict=True)
         control = self._control if control is None else self._checked_control(control)
-        pressure = self._pressure(pressure)
+        pressure = self._pressure(pressure, pressure_patches)
         targets = self._targets(control)
         velocity = self._v.clone()
         velocity[self._fixed] = (targets[self._fixed] - self._x[self._fixed]) / dt_s
@@ -882,9 +998,12 @@ class VocalFoldSolid:
         _finite("next time", self.time_s + dt_s)
         self._x, self._v, self._control, self._work = new_x, new_v, control, work
         self.time_s += dt_s
-        outputs = tuple(SurfaceSweep(*(a.numpy().copy() for a in sweep)) for sweep in sweeps)
+        nleft, nright, npatch = pressure.counts
+        def output(lo, hi):
+            return SurfaceSweep(*(a[lo:hi].numpy().copy() for a in sweeps))
         return SolidStep(self.time_s, self._diagnostics(endpoint), reaction.numpy().copy(),
-                         *outputs, iterations, residual)
+                         output(0, nleft), output(nleft, nleft + nright), iterations, residual,
+                         output(nleft + nright, nleft + nright + npatch) if npatch else None)
 
     def _diagnostics(self, values):
         strain, contact, viscous, contact_power, minj = values
@@ -956,6 +1075,12 @@ class VocalFoldSolid:
                              self._x[tris].mean(1).numpy(), area,
                              np.linalg.norm(area, axis=1), np.full((len(tris), 3), 1 / 3))
 
+    def boundary_triangles(self, side: Side) -> np.ndarray:
+        """All outward-wound exterior faces, using side-local node indices."""
+        if side not in ("left", "right"):
+            raise ValueError("side must be left or right")
+        return self._boundary[0 if side == "left" else 1].copy()
+
     def surface_sweep(self, start: SolidState, end: SolidState, side: Side) -> SurfaceSweep:
         """Replay a snapshot-to-snapshot medial sweep without modifying state."""
         if side not in ("left", "right"):
@@ -968,6 +1093,24 @@ class VocalFoldSolid:
         sl = self._slices[i]
         return triangle_surface_sweep(start.positions_m[sl], end.positions_m[sl],
                                       self._meshes[i].medial_triangles)
+
+    def pressure_patch_sweep(self, start: SolidState, end: SolidState,
+                             patches: tuple[PressurePatch, ...]) -> SurfaceSweep:
+        """Work-conjugate sweep in patch input order, with FIXED material weights.
+
+        Changing barycentric coordinates during a trajectory requires caller
+        time/event subdivision or additional integration. This result does
+        not include any such moving Eulerian-band interface transport.
+        """
+        for state in (start, end):
+            if not isinstance(state, SolidState) or state.mesh_signature != self._signature:
+                raise ValueError("sweep state mesh/material signature mismatch")
+            _array("positions_m", state.positions_m, tuple(self._X.shape))
+        load = self._pressure(None, patches)
+        first = load.counts[0] + load.counts[1]
+        sweep = _sweep_tensors(_tensor(start.positions_m), _tensor(end.positions_m),
+                              load.triangles[first:], load.weights[first:], load.fractions[first:])
+        return SurfaceSweep(*(a.numpy().copy() for a in sweep))
 
     def gap_profile(self, si_m: np.ndarray | None = None) -> GlottalProfile:
         """Actual horizontal slices, preserving AP detail (no first-mode projection).
@@ -1049,3 +1192,32 @@ def _slice_curve(triangles, plane):
         if not ys or np.ptp(ys) > 1e-10:
             raise ValueError("medial slice is disconnected or multivalued along AP")
     return np.column_stack((knots, values))
+
+
+def _triangle_overlap_fraction(first, second):
+    """Convex clipping in barycentric 2D; the complete parent has area 1/2."""
+    def cross(a, b):
+        return a[0] * b[1] - a[1] * b[0]
+
+    def twice_area(poly):
+        return sum(cross(a, b) for a, b in zip(poly, np.roll(poly, -1, axis=0)))
+
+    polygon = np.asarray(first)
+    clip = np.asarray(second)
+    if twice_area(clip) < 0:
+        clip = clip[::-1]
+    for a, b in zip(clip, np.roll(clip, -1, axis=0)):
+        output = []
+        if not len(polygon):
+            return 0.0
+        previous = polygon[-1]
+        before = cross(b - a, previous - a)
+        for current in polygon:
+            after = cross(b - a, current - a)
+            if (before >= 0) != (after >= 0):
+                output.append(previous + (current - previous) * before / (before - after))
+            if after >= 0:
+                output.append(current)
+            previous, before = current, after
+        polygon = np.asarray(output)
+    return abs(twice_area(polygon)) if len(polygon) >= 3 else 0.0

@@ -69,12 +69,24 @@ def triangle_area_vectors(x, triangles):
     return 0.5 * torch.cross(b - a, c - a, dim=1)
 
 
-def triangle_pressure_forces(x, triangles, pressure):
-    """Consistent constant-pressure traction: inward positive, [Pa] -> [N]."""
+def triangle_pressure_forces(x, triangles, pressure, *, shape_weights=None, area_fractions=None):
+    """Consistent pressure traction: inward positive, [Pa] -> [N].
+
+    Optional barycentric quadrature weights and area fractions describe
+    subtriangle loads. Callers validate their geometry; defaults load each
+    entire triangle with its constant-pressure centroid rule.
+    """
     force = torch.zeros_like(x)
-    nodal = -(pressure[:, None] * triangle_area_vectors(x, triangles)) / 3.0
-    for k in range(3):
-        force.index_add_(0, triangles[:, k], nodal)
+    traction = -(pressure[:, None] * triangle_area_vectors(x, triangles))
+    if area_fractions is not None:
+        traction = traction * area_fractions[:, None]
+    if shape_weights is None:
+        nodal = traction / 3.0
+        for k in range(3):
+            force.index_add_(0, triangles[:, k], nodal)
+    else:
+        for k in range(3):
+            force.index_add_(0, triangles[:, k], traction * shape_weights[:, k, None])
     return force
 
 

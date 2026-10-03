@@ -12,6 +12,7 @@ from formant_ml.physics.vocal_fold_solid import (
     ContactConfig,
     FoldControl,
     MedialPressure,
+    PressurePatch,
     SolidConfig,
     SolidMaterial,
     VocalFoldSolid,
@@ -232,6 +233,202 @@ def test_pressure_fixed_point_failure_is_atomic():
     assert s.save_state().work == start.work
     np.testing.assert_array_equal(s.positions_m, start.positions_m)
     np.testing.assert_array_equal(s.velocities_m_s, start.velocities_m_s)
+
+
+def _inferior_triangle(s, side="left"):
+    i = 0 if side == "left" else 1
+    x = s._meshes[i].reference_m
+    return next(tuple(t) for t in s.boundary_triangles(side) if np.all(x[t, 2] == 0))
+
+
+def _quarter_patches(side, triangle, value):
+    vertices = (
+        ((1, 0, 0), (0.5, 0.5, 0), (0.5, 0, 0.5)),
+        ((0.5, 0.5, 0), (0, 1, 0), (0, 0.5, 0.5)),
+        ((0.5, 0, 0.5), (0, 0.5, 0.5), (0, 0, 1)),
+        ((0.5, 0.5, 0), (0, 0.5, 0.5), (0.5, 0, 0.5)),
+    )
+    return tuple(PressurePatch(side, triangle, value, v) for v in vertices)
+
+
+def test_patch_actual_geometry_nodal_quadrature_and_virtual_work():
+    s = make_solid(contact=False, free=True)
+    x = s.positions_m @ np.array([[1.04, 0.02, 0], [0.01, 0.98, 0.02], [0, 0.01, 1.03]]).T
+    s.initialize(x)
+    triangle = tuple(s.surface("right").triangles[-1])
+    patches = (PressurePatch("left", _inferior_triangle(s), 1300.0),
+               PressurePatch("right", triangle, -250.0,
+                             ((0.8, 0.1, 0.1), (0.1, 0.8, 0.1), (0.2, 0.1, 0.7))))
+    actual = s.forces(pressure_patches=patches).pressure_n
+    expected = np.zeros_like(x)
+    delta = np.random.default_rng(140).normal(size=x.shape) * 1e-6
+    work = 0.0
+    for patch in patches:
+        nodes = np.asarray(patch.triangle_nodes) + (s._offset if patch.side == "right" else 0)
+        barycentric = np.asarray(patch.barycentric_vertices)
+        vertices = barycentric @ x[nodes]
+        area = np.cross(vertices[1] - vertices[0], vertices[2] - vertices[0]) / 2
+        local_force = np.tile(-patch.pressure_pa * area / 3, (3, 1))
+        expected[nodes] += barycentric.T @ local_force
+        work += np.sum(local_force * (barycentric @ delta[nodes]))
+    np.testing.assert_allclose(actual, expected, atol=1e-17, rtol=1e-14)
+    assert np.sum(actual * delta) == pytest.approx(work, rel=1e-14)
+    np.testing.assert_allclose(s.forces(pressure_patches=patches[::-1]).pressure_n, expected, atol=1e-17)
+
+
+def test_partitioned_patches_equal_full_triangle_and_share_edges_without_overlap():
+    s = make_solid(contact=False, free=True)
+    triangle = tuple(s.surface("left").triangles[1])
+    quarters = _quarter_patches("left", triangle, 1700.0)
+    full = (PressurePatch("left", triangle, 1700.0),)
+    medial = pressure(s, 0, 0)
+    medial.left_pa[1] = 1700.0
+    np.testing.assert_allclose(s.forces(pressure=medial).pressure_n,
+                               s.forces(pressure_patches=full).pressure_n, atol=1e-17, rtol=1e-14)
+    np.testing.assert_allclose(s.forces(pressure_patches=quarters).pressure_n,
+                               s.forces(pressure_patches=full).pressure_n, atol=1e-17, rtol=1e-14)
+    assert s.recommend_timestep(pressure_patches=quarters) == pytest.approx(
+        s.recommend_timestep(pressure_patches=full), rel=1e-14)
+    start = s.save_state()
+    x = s.positions_m
+    x[:s._offset, 2] += 0.02 * x[:s._offset, 0]
+    x[:, 0] *= 1.03
+    s.initialize(x)
+    end = s.save_state()
+    quarter_sweep = s.pressure_patch_sweep(start, end, quarters)
+    full_sweep = s.pressure_patch_sweep(start, end, full)
+    assert quarter_sweep.outward_swept_volume_m3.sum() == pytest.approx(
+        full_sweep.outward_swept_volume_m3[0], rel=1e-14, abs=1e-24)
+    reversed_sweep = s.pressure_patch_sweep(start, end, quarters[::-1])
+    np.testing.assert_array_equal(reversed_sweep.outward_swept_volume_m3,
+                                  quarter_sweep.outward_swept_volume_m3[::-1])
+
+
+def test_nonbinary_shared_edge_partition_has_no_interior_overlap():
+    s = make_solid(contact=False)
+    triangle = tuple(s.surface("left").triangles[0])
+    t = 0.37
+    a, b, c = (1, 0, 0), (0, 1, 0), (0, 0, 1)
+    p, q = (1 - t, t, 0), (1 - t, 0, t)
+    patches = tuple(PressurePatch("left", triangle, 500, vertices)
+                    for vertices in ((a, p, q), (p, b, c), (p, c, q)))
+    np.testing.assert_allclose(s.forces(pressure_patches=patches).pressure_n,
+                               s.forces(pressure_patches=(PressurePatch("left", triangle, 500),)).pressure_n,
+                               atol=1e-17, rtol=1e-14)
+
+
+def test_patch_step_and_fixed_material_sweep_work_in_input_order():
+    s = make_solid(n_ap=3, n_si=2, contact=False, free=True)
+    triangle = tuple(s.surface("right").triangles[-2])
+    patches = (PressurePatch("left", _inferior_triangle(s), 700.0),
+               _quarter_patches("right", triangle, 250.0)[2])
+    start = s.save_state()
+    dt = s.recommend_timestep(pressure_patches=patches) * 0.3
+    result = s.step(dt, pressure_patches=patches)
+    end = s.save_state()
+    assert result.patch_sweep is not None
+    replay = s.pressure_patch_sweep(start, end, patches)
+    np.testing.assert_array_equal(result.patch_sweep.outward_swept_volume_m3,
+                                  replay.outward_swept_volume_m3)
+    assert end.work.pressure_j == pytest.approx(
+        -np.array([p.pressure_pa for p in patches]) @ replay.outward_swept_volume_m3,
+        rel=1e-13, abs=1e-23)
+    for j, patch in enumerate(patches):
+        nodes = np.asarray(patch.triangle_nodes) + (s._offset if patch.side == "right" else 0)
+        weights = np.asarray(patch.barycentric_vertices)
+        before, after = weights @ start.positions_m[nodes], weights @ end.positions_m[nodes]
+        independent = triangle_surface_sweep(before, after, np.array([[0, 1, 2]]))
+        np.testing.assert_allclose(replay.mean_area_vectors_m2[j], independent.mean_area_vectors_m2[0],
+                                   rtol=1e-13, atol=1e-21)
+        assert replay.outward_swept_volume_m3[j] == pytest.approx(
+            independent.outward_swept_volume_m3[0], rel=1e-9, abs=1e-22)
+    s.reset(start)
+    s.step(dt, pressure_patches=patches)
+    np.testing.assert_array_equal(s.positions_m, end.positions_m)
+
+
+def test_closed_boundary_patches_match_independent_tetrahedral_volume_change():
+    s = make_solid(contact=False, free=True)
+    patches = tuple(PressurePatch(side, tuple(tri), 500.0) for side in ("left", "right")
+                    for tri in s.boundary_triangles(side))
+    start = s.save_state()
+    np.testing.assert_allclose(s.forces(pressure_patches=patches).pressure_n.sum(axis=0), 0, atol=1e-16)
+    x = s.positions_m @ np.array([[1.03, 0.01, 0], [0, 0.99, 0.01], [0, 0, 1.02]]).T
+    s.initialize(x)
+    result = s.pressure_patch_sweep(start, s.save_state(), patches)
+    expected = 0.0
+    for mesh, offset in zip(s._meshes, (0, s._offset)):
+        initial = start.positions_m[mesh.tetrahedra + offset]
+        final = x[mesh.tetrahedra + offset]
+        expected += (np.linalg.det(final[:, 1:] - final[:, :1]).sum()
+                     - np.linalg.det(initial[:, 1:] - initial[:, :1]).sum()) / 6
+    assert result.outward_swept_volume_m3.sum() == pytest.approx(expected, rel=1e-12, abs=1e-22)
+
+
+def test_patch_overlap_rejects_actual_interior_not_just_excess_area():
+    s = make_solid(contact=False)
+    triangle = tuple(s.surface("left").triangles[0])
+    quarter = _quarter_patches("left", triangle, 100.0)[0]
+    shifted = PressurePatch("left", triangle, 100.0,
+                            ((0.8, 0.1, 0.1), (0.3, 0.6, 0.1), (0.3, 0.1, 0.6)))
+    assert np.linalg.det(quarter.barycentric_vertices) + np.linalg.det(shifted.barycentric_vertices) < 1
+    with pytest.raises(ValueError, match="overlap"):
+        s.forces(pressure_patches=(quarter, shifted))
+    rotated = PressurePatch("left", triangle[1:] + triangle[:1], 100.0,
+                            np.asarray(quarter.barycentric_vertices)[:, [1, 2, 0]])
+    before = s.save_state()
+    with pytest.raises(ValueError, match="overlap"):
+        s.step(1e-7, pressure_patches=(quarter, rotated))
+    np.testing.assert_array_equal(s.positions_m, before.positions_m)
+    np.testing.assert_array_equal(s.velocities_m_s, before.velocities_m_s)
+    assert s.save_state().work == before.work
+    assert s.time_s == before.time_s
+    with pytest.raises(ValueError, match="whole-medial"):
+        s.forces(pressure=pressure(s), pressure_patches=(quarter,))
+
+
+@pytest.mark.parametrize("vertices", [
+    ((1, 0, 0), (0, 0, 1), (0, 1, 0)),
+    ((1, 0, 0), (1, 0, 0), (0, 0, 1)),
+    ((1, 0, 0), (-0.1, 1.1, 0), (0, 0, 1)),
+    ((1, 0, 0), (0, 0.9, 0), (0, 0, 1)),
+    ((float("nan"), 0, 0), (0, 1, 0), (0, 0, 1)),
+])
+def test_invalid_patch_barycentric_geometry(vertices):
+    with pytest.raises(ValueError):
+        PressurePatch("left", (0, 1, 2), 100, vertices)
+
+
+def test_patch_exterior_winding_immutability_and_stability_checks():
+    s = make_solid(contact=False, free=True)
+    triangle = tuple(s.surface("left").triangles[0])
+    with pytest.raises(ValueError, match="outward"):
+        s.forces(pressure_patches=(PressurePatch("left", triangle[::-1], 100),))
+    with pytest.raises(ValueError, match="exterior"):
+        s.forces(pressure_patches=(PressurePatch("left", (10000, 10001, 10002), 100),))
+    owners = {}
+    for t in s._meshes[0].tetrahedra:
+        for k in range(4):
+            face = tuple(sorted(np.delete(t, k)))
+            owners[face] = owners.get(face, 0) + 1
+    interior = next(face for face, count in owners.items() if count == 2)
+    with pytest.raises(ValueError, match="exterior"):
+        s.forces(pressure_patches=(PressurePatch("left", interior, 100),))
+    vertices = np.eye(3)
+    patch = PressurePatch("left", triangle, 1e11, vertices)
+    vertices[:] = 0
+    assert patch.barycentric_vertices == ((1, 0, 0), (0, 1, 0), (0, 0, 1))
+    assert s.recommend_timestep(pressure_patches=(patch,)) < s.recommend_timestep() / 10
+    before = s.save_state()
+    with pytest.raises(ValueError, match="stable"):
+        s.step(s.recommend_timestep(), pressure_patches=(patch,))
+    np.testing.assert_array_equal(s.positions_m, before.positions_m)
+    with pytest.raises(ValueError):
+        PressurePatch("left", triangle, float("inf"))
+    with pytest.raises(ValueError, match="real"):
+        PressurePatch("left", triangle, 100 + 20j)
+    with pytest.raises(ValueError, match="real"):
+        PressurePatch("left", triangle, 100, np.eye(3, dtype=complex))
 
 
 def test_contact_action_reaction_energy_damping_and_separation():
