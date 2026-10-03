@@ -111,6 +111,57 @@ def test_rest_without_activation_does_not_create_energy():
     np.testing.assert_allclose(s.forces().active_n, 0, atol=0)
 
 
+@pytest.mark.parametrize("degrees", [1.0, 7.0, 23.0, -41.0, 89.0])
+def test_free_rigid_rotation_own_snapshot_reset_and_replay(degrees):
+    s = make_solid(contact=False, free=True)
+    angle = np.deg2rad(degrees)
+    rotation = np.array([[np.cos(angle), 0, np.sin(angle)], [0, 1, 0],
+                         [-np.sin(angle), 0, np.cos(angle)]])
+    s.initialize(s.positions_m @ rotation.T)
+    initial = s.save_state()
+    assert s.diagnostics().minimum_jacobian == pytest.approx(1.0, abs=1e-13)
+    assert 0 <= initial.initial_mechanical_j < s._energy_roundoff_j
+    s.reset(initial)
+    assert s.save_state().initial_mechanical_j == initial.initial_mechanical_j
+    np.testing.assert_array_equal(s.positions_m, initial.positions_m)
+    np.testing.assert_array_equal(s.velocities_m_s, initial.velocities_m_s)
+    p = pressure(s, 150, 50)
+    dt = 0.1 * s.recommend_timestep(pressure=p)
+    s.step(dt, pressure=p)
+    evolved = s.save_state()
+    s.reset(initial)
+    s.step(dt, pressure=p)
+    replay = s.save_state()
+    np.testing.assert_array_equal(replay.positions_m, evolved.positions_m)
+    np.testing.assert_array_equal(replay.velocities_m_s, evolved.velocities_m_s)
+    assert replay.work == evolved.work
+    assert replay.time_s == evolved.time_s
+    assert replay.initial_mechanical_j == initial.initial_mechanical_j
+
+
+def test_historical_roundoff_baseline_preserved_and_negative_energy_rejected():
+    s = make_solid(contact=False, free=True)
+    p = pressure(s)
+    s.step(s.recommend_timestep(pressure=p) * 0.1, pressure=p)
+    # Baseline produced by the old trace/log evaluation at a 1-degree rotation.
+    historical = replace(s.save_state(), initial_mechanical_j=-1.8873791418627416e-20)
+    s.reset(historical)
+    restored = s.save_state()
+    assert restored.initial_mechanical_j == historical.initial_mechanical_j
+    assert restored.work == historical.work
+    assert restored.time_s == historical.time_s
+    np.testing.assert_array_equal(restored.positions_m, historical.positions_m)
+    np.testing.assert_array_equal(restored.velocities_m_s, historical.velocities_m_s)
+    with pytest.raises(ValueError, match="initial_mechanical_j"):
+        s.reset(replace(historical, initial_mechanical_j=-100 * s._energy_roundoff_j))
+    after = s.save_state()
+    assert after.initial_mechanical_j == restored.initial_mechanical_j
+    assert after.work == restored.work
+    assert after.time_s == restored.time_s
+    np.testing.assert_array_equal(after.positions_m, restored.positions_m)
+    np.testing.assert_array_equal(after.velocities_m_s, restored.velocities_m_s)
+
+
 def test_active_stress_measure_and_side_specific_activation():
     s = make_solid(contact=False, free=True)
     F = torch.diag(torch.tensor([1.1, 0.96, 0.97], dtype=torch.float64)).expand(len(s._t), -1, -1)
